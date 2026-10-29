@@ -9,6 +9,7 @@ use std::sync::Arc;
 use steel_core::behavior::InteractionResult;
 use steel_core::entity::LivingEntity as _;
 use steel_core::entity::MobEffectInstance;
+use steel_core::inventory::container::Container as _;
 use steel_core::player::Player;
 use steel_core::player::player_inventory::Prediction;
 use steel_registry::item_stack::ItemStack;
@@ -79,8 +80,18 @@ fn open_chest(
     match kind {
         chest::ChestKind::Normal | chest::ChestKind::Sacred => {
             let reward = chest::roll(kind);
+            let reward_stack = reward.stack(binding::bound_owner(stack));
+            if binding::bound_owner(stack).is_some()
+                && !can_fit_after_consumption(player, hand, &reward_stack)
+            {
+                player.send_message(
+                    &TextComponent::plain("Освободите место в инвентаре перед открытием сундука.")
+                        .color(Color::Red),
+                );
+                return InteractionResult::Fail;
+            }
             consume_one(player, hand);
-            grant(player, reward);
+            player.add_item_or_drop(reward_stack, Prediction::ServerOnly);
             player.send_message(
                 &TextComponent::plain(format!(
                     "{}: {}.",
@@ -94,6 +105,7 @@ fn open_chest(
         chest::ChestKind::Choice => {
             // The rolled options are stored on the chest itself, so closing the
             // menu and opening it again cannot reroll the choice.
+            let bound_owner = binding::bound_owner(stack);
             let options = if let Some(options) = chest::stored_options(stack) {
                 options
             } else {
@@ -105,7 +117,7 @@ fn open_chest(
                     [chest::Reward::Shadow(0); 3]
                 }
             };
-            super::choice_menu::open(player, hand, &options);
+            super::choice_menu::open(player, hand, bound_owner, &options);
             InteractionResult::Success
         }
     }
@@ -122,6 +134,28 @@ fn store_options(player: &Player, hand: InteractionHand, options: &mut [chest::R
     inventory.set_item_in_hand(hand, held);
 }
 
+/// Whether a reward fits after consuming one item from `hand`.
+fn can_fit_after_consumption(player: &Player, hand: InteractionHand, reward: &ItemStack) -> bool {
+    let inventory = player.inventory.lock();
+    let consumed_slot = match hand {
+        InteractionHand::MainHand => usize::from(inventory.get_selected_slot()),
+        InteractionHand::OffHand => 40,
+    };
+    (0..inventory.get_container_size()).any(|slot| {
+        let mut current = inventory.get_item(slot).clone();
+        if slot == consumed_slot {
+            if current.count <= 1 {
+                current = ItemStack::empty();
+            } else {
+                current.count -= 1;
+            }
+        }
+        current.is_empty()
+            || ItemStack::is_same_item_same_components(&current, reward)
+                && current.count < current.max_stack_size()
+    })
+}
+
 /// Removes a single item from the hand that was used.
 fn consume_one(player: &Player, hand: InteractionHand) {
     let mut inventory = player.inventory.lock();
@@ -135,9 +169,4 @@ fn consume_one(player: &Player, hand: InteractionHand) {
         held = ItemStack::empty();
     }
     inventory.set_item_in_hand(hand, held);
-}
-
-/// Gives the player one reward, dropping it when the inventory is full.
-fn grant(player: &Arc<Player>, reward: chest::Reward) {
-    player.add_item_or_drop(reward.stack(None), Prediction::ServerOnly);
 }

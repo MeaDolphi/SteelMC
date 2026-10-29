@@ -310,7 +310,7 @@ impl OrganizationMenuKind {
             (Button::Personal(index), Action::Primary) => {
                 let contract = state.turn_in_personal_contract(uuid, index)?;
                 format!(
-                    "Задание сдано: {}. Начислено {} Won.",
+                    "Сдача задания «{}» отправлена. Оплата — {} Won.",
                     contract.template.title(),
                     contract.payment()
                 )
@@ -322,7 +322,7 @@ impl OrganizationMenuKind {
             (Button::Group(index), Action::Primary) => {
                 let payout = state.turn_in_group_contract(uuid, index)?;
                 format!(
-                    "Групповое задание сдано: {}. По {} Won получили {} участн.",
+                    "Сдача группового задания «{}» отправлена. По {} Won: {} участн.",
                     payout.contract.template.title(),
                     payout.contract.payment(),
                     payout.paid.len()

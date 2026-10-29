@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use steel_core::inventory::container::Container as _;
 use steel_core::inventory::prelude::*;
-use steel_core::player::player_inventory::Prediction;
 use steel_registry::{vanilla_items, vanilla_menu_types};
 use steel_utils::locks::IntoShared;
 use steel_utils::{DowncastType, DowncastTypeKey};
@@ -157,16 +156,14 @@ impl MenuKind for ShopMenuKind {
             return ClickOutcome::Consume;
         };
         let uuid = player.gameprofile.id();
-        match self.state.charge_shop_offer(uuid, index) {
+        match self.state.request_shop_purchase(player, index) {
             Ok(offer) => {
-                player.add_item_or_drop_with_guard(
-                    guard,
-                    offer.stack(uuid),
-                    Prediction::ServerOnly,
-                );
                 player.send_message(
-                    &TextComponent::plain(format!("Куплено: {}.", offer.display_name()))
-                        .color(Color::Green),
+                    &TextComponent::plain(format!(
+                        "Покупка «{}» обрабатывается.",
+                        offer.display_name()
+                    ))
+                    .color(Color::Gold),
                 );
             }
             Err(error) => {

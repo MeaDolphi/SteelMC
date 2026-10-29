@@ -25,12 +25,12 @@ use text_components::format::Color;
 use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
-use crate::commands;
 use crate::dungeon::instance;
 use crate::dungeon::is_instance_world;
 use crate::dungeon::runtime::TEST_GATE_ON_JOIN;
 use crate::item;
 use crate::item::chest::ChestKind;
+use crate::item::crystal::CrystalSaleError;
 use crate::main_menu;
 use crate::organization::Event;
 use crate::organization_menu;
@@ -156,7 +156,19 @@ impl GameplayHooks for SoloLevelingHooks {
             notice.show(player);
         }
         if self.state.take_crystal_sale(player_uuid) {
-            commands::crystal::sell(&self.state, player);
+            match self.state.sell_crystals(player) {
+                Ok(()) => {
+                    player
+                        .send_message(&TextComponent::plain("Продажа кристаллов обрабатывается."));
+                }
+                Err(error) => {
+                    let message = match error {
+                        CrystalSaleError::NoCrystals => "В инвентаре нет магических кристаллов.",
+                        CrystalSaleError::Storage => "Организация не может рассчитаться сейчас.",
+                    };
+                    player.send_message(&TextComponent::plain(message).color(Color::Red));
+                }
+            }
         }
         let window = SystemQuest::window_at(unix_seconds);
         let update = self.state.observe_quest(
@@ -257,8 +269,16 @@ impl GameplayHooks for SoloLevelingHooks {
     }
 
     fn allow_item_drop(&self, _player: &Player, stack: &ItemStack) -> bool {
-        // The System book is permanent; it is put back in its slot instead.
-        !item::menu_book::is_menu_book(stack)
+        // The System book is permanent; personal rewards cannot be passed on.
+        !item::menu_book::is_menu_book(stack) && item::binding::may_drop(stack)
+    }
+
+    fn allow_item_storage(&self, _player: &Player, stack: &ItemStack) -> bool {
+        item::binding::may_store(stack)
+    }
+
+    fn allow_item_retrieve(&self, player: &Player, stack: &ItemStack) -> bool {
+        item::binding::may_retrieve(stack, player.gameprofile.id())
     }
 
     fn on_player_use_block(

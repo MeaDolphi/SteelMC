@@ -35,7 +35,9 @@ use crate::{
     player::{Player, PlayerConnection},
 };
 
-use crate::inventory::click::{Click, ClickOutcome, SwapTarget, can_item_quick_replace};
+use crate::inventory::click::{
+    Click, ClickOutcome, QuickCraft, SwapTarget, can_item_quick_replace,
+};
 
 /// A menu opened by a player: the shared click machinery plus one
 /// [`MenuKind`].
@@ -59,6 +61,103 @@ impl fmt::Debug for Menu {
 }
 
 impl Menu {
+    fn slot_is_external_storage(&self, slot_index: usize, player: &Player) -> bool {
+        let player_inventory = ContainerId::from_arc(&player.inventory);
+        self.behavior
+            .slots()
+            .get(slot_index)
+            .and_then(|slot| slot.storage().physical_key())
+            .is_some_and(|(container, _)| container != player_inventory)
+    }
+
+    fn item_transfer_denied(&self, click: Click, player: &Player) -> bool {
+        let hooks = &player.get_world().gameplay_hooks;
+        let player_inventory = ContainerId::from_arc(&player.inventory);
+        let external_stack_is_forbidden = |slot_index: usize, guard: &ContainerLockGuard| {
+            let slot = &self.behavior.slots()[slot_index];
+            let Some((container, _)) = slot.storage().physical_backing() else {
+                return false;
+            };
+            let stack = slot.get_item(guard);
+            if container.container_id() == player_inventory {
+                return !stack.is_empty() && !hooks.allow_item_storage(player, stack);
+            }
+            !stack.is_empty() && !hooks.allow_item_retrieve(player, stack)
+        };
+        match click {
+            Click::Pickup { slot, .. } if self.slot_is_external_storage(slot, player) => {
+                let guard = self.behavior.lock_all_containers();
+                external_stack_is_forbidden(slot, &guard)
+                    || (!self.behavior.carried().is_empty()
+                        && !hooks.allow_item_storage(player, self.behavior.carried()))
+            }
+            Click::QuickMove { slot }
+                if self
+                    .layout
+                    .routes
+                    .iter()
+                    .any(|route| route.from.contains(&slot)) =>
+            {
+                let guard = self.behavior.lock_all_containers();
+                let source = self.behavior.slots()[slot].get_item(&guard);
+                if self.slot_is_external_storage(slot, player) {
+                    !source.is_empty() && !hooks.allow_item_retrieve(player, source)
+                } else if !source.is_empty()
+                    && self
+                        .behavior
+                        .slots()
+                        .iter()
+                        .enumerate()
+                        .any(|(index, _)| self.slot_is_external_storage(index, player))
+                {
+                    !hooks.allow_item_storage(player, source)
+                } else {
+                    false
+                }
+            }
+            Click::Swap { slot, with } if self.slot_is_external_storage(slot, player) => {
+                let guard = self.behavior.lock_all_containers();
+                let external_item_denied = external_stack_is_forbidden(slot, &guard);
+                let inventory_slot = match with {
+                    SwapTarget::Hotbar(slot) => usize::from(slot),
+                    SwapTarget::Offhand => 40,
+                };
+                let inventory = player.inventory.lock();
+                let carried = inventory.get_item(inventory_slot);
+                let carried_denied =
+                    !carried.is_empty() && !hooks.allow_item_storage(player, carried);
+                external_item_denied || carried_denied
+            }
+            Click::QuickCraft(QuickCraft::AddSlot { slot })
+                if self.slot_is_external_storage(slot, player)
+                    && !self.behavior.carried().is_empty() =>
+            {
+                !hooks.allow_item_storage(player, self.behavior.carried())
+            }
+            Click::PickupAll { .. } => {
+                if self.behavior.carried().is_empty() {
+                    return false;
+                }
+                let guard = self.behavior.lock_all_containers();
+                self.behavior
+                    .slots()
+                    .iter()
+                    .enumerate()
+                    .any(|(index, slot)| {
+                        let item = slot.get_item(&guard);
+                        self.slot_is_external_storage(index, player)
+                            && !item.is_empty()
+                            && ItemStack::is_same_item_same_components(
+                                self.behavior.carried(),
+                                item,
+                            )
+                            && !hooks.allow_item_retrieve(player, item)
+                    })
+            }
+            _ => false,
+        }
+    }
+
     /// Assembles a menu from its parts.
     pub(super) fn from_parts(
         behavior: MenuBehavior,
@@ -273,6 +372,12 @@ impl Menu {
                 "Ignoring programmatic container click that violates parsed-click invariants: \
                  {click:?}"
             );
+            return;
+        }
+        if self.item_transfer_denied(click, player) {
+            self.behavior_mut().reset_quick_craft();
+            self.behavior_mut()
+                .send_all_data_to_remote(&player.connection);
             return;
         }
 

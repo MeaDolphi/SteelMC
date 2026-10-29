@@ -44,12 +44,11 @@ pub fn register(
                                 shop::SLOTS - 1
                             ))
                         })?;
-                        let offer = buy_state
-                            .buy_shop_offer(player, slot)
+                        buy_state
+                            .request_shop_purchase(player, slot)
                             .map_err(purchase_error)?;
                         player.send_message(
-                            &TextComponent::plain(format!("Куплено: {}.", offer.display_name()))
-                                .color(Color::Green),
+                            &TextComponent::plain("Покупка обрабатывается.").color(Color::Gold),
                         );
                         Ok(1)
                     },

@@ -115,7 +115,12 @@ impl Player {
     pub(super) fn finish_death_inventory(&self, pending: DeferredDeathInventory) {
         if pending.drop_items {
             let drops = self.inventory.lock().take_death_drops();
+            let mut kept = Vec::new();
             for item in drops {
+                if !self.get_world().gameplay_hooks.allow_item_drop(self, &item) {
+                    kept.push(item);
+                    continue;
+                }
                 let power = rand::random_range(0.0f32..0.5);
                 let angle = rand::random_range(0.0f32..TAU);
                 let velocity = DVec3::new(
@@ -130,6 +135,20 @@ impl Player {
                 {
                     entity.set_pickup_delay(40);
                 }
+            }
+            if !kept.is_empty() {
+                let mut inventory = self.inventory.lock();
+                for mut item in kept {
+                    let _ = inventory.add(&mut item);
+                    if !item.is_empty() {
+                        log::error!(
+                            "gameplay-protected death item could not be restored for {}",
+                            self.gameprofile.id()
+                        );
+                    }
+                }
+                drop(inventory);
+                self.send_inventory_to_remote();
             }
             if pending.experience > 0 {
                 ExperienceOrbEntity::award(

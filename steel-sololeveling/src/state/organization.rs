@@ -303,26 +303,6 @@ impl SoloLevelingState {
         Ok(contract)
     }
 
-    /// Pays a finished personal contract exactly once.
-    ///
-    /// The contract leaves the book before the Won credit is queued, and the
-    /// credit commits the book together with the balance.
-    pub fn turn_in_personal_contract(
-        &self,
-        uuid: Uuid,
-        index: usize,
-    ) -> Result<Contract, OrganizationError> {
-        if !self.persistence.lock().accepts_writes(uuid) {
-            return Err(OrganizationError::Storage);
-        }
-        let contract = self
-            .sessions
-            .with_mut(uuid, |session| session.organization.turn_in(index))
-            .ok_or(OrganizationError::NoSession)??;
-        self.credit_won(uuid, contract.payment());
-        Ok(contract)
-    }
-
     /// Accepts a group contract on behalf of the leader's whole party.
     ///
     /// The members are fixed now, the rank is capped by the weakest of them,
@@ -370,6 +350,7 @@ impl SoloLevelingState {
         party.contracts.push(GroupContract {
             contract: Contract::new(template),
             participants: members.clone(),
+            pending_turn_in: false,
         });
         drop(parties);
         for member in members {
@@ -389,46 +370,10 @@ impl SoloLevelingState {
         if index >= party.contracts.len() {
             return Err(OrganizationError::Missing);
         }
+        if party.contracts[index].pending_turn_in {
+            return Err(OrganizationError::Storage);
+        }
         Ok(party.contracts.remove(index).contract)
-    }
-
-    /// Pays every remaining participant of a finished group contract once.
-    ///
-    /// Shares of members who left are not redistributed.
-    pub fn turn_in_group_contract(
-        &self,
-        leader: Uuid,
-        index: usize,
-    ) -> Result<GroupPayout, OrganizationError> {
-        let mut parties = self.party_runtime.lock();
-        let party = parties.led_party_mut(leader).map_err(party_error)?;
-        let group = party
-            .contracts
-            .get(index)
-            .ok_or(OrganizationError::Missing)?;
-        if !group.contract.is_complete() {
-            return Err(OrganizationError::NotComplete);
-        }
-        {
-            let persistence = self.persistence.lock();
-            if group
-                .participants
-                .iter()
-                .any(|participant| !persistence.accepts_writes(*participant))
-            {
-                return Err(OrganizationError::Storage);
-            }
-        }
-        let group = party.contracts.remove(index);
-        drop(parties);
-        let payment = group.contract.payment();
-        for participant in &group.participants {
-            self.credit_won(*participant, payment);
-        }
-        Ok(GroupPayout {
-            contract: group.contract,
-            paid: group.participants,
-        })
     }
 
     /// Queues an event that personal and group contracts may count.
@@ -477,6 +422,9 @@ impl SoloLevelingState {
             let mut parties = self.party_runtime.lock();
             for party in parties.parties_mut() {
                 for group in &mut party.contracts {
+                    if group.pending_turn_in {
+                        continue;
+                    }
                     if group
                         .participants
                         .iter()
@@ -545,7 +493,7 @@ fn officer_guild(guilds: &mut GuildRegistry, actor: Uuid) -> Result<&mut Guild, 
     Ok(guild)
 }
 
-const fn party_error(error: PartyError) -> OrganizationError {
+pub(super) const fn party_error(error: PartyError) -> OrganizationError {
     match error {
         PartyError::NotLeader => OrganizationError::NotLeader,
         _ => OrganizationError::NotInParty,
@@ -652,17 +600,22 @@ mod tests {
 
         let payout = state
             .turn_in_group_contract(leader, 0)
-            .expect("finished contract is paid");
+            .expect("finished contract is queued");
         assert_eq!(payout.paid, vec![leader, first]);
         assert_eq!(
+            state.with_session_mut(leader, |session| session.won.amount()),
+            Some(0)
+        );
+        assert_eq!(state.party_of(leader).expect("party").contracts().len(), 1);
+        assert_eq!(
             state.turn_in_group_contract(leader, 0),
-            Err(OrganizationError::Missing)
+            Err(OrganizationError::Storage)
         );
         fs::remove_dir_all(directory).expect("cleanup");
     }
 
     #[test]
-    fn personal_contract_is_paid_once_after_completion() {
+    fn personal_contract_is_queued_without_early_payment_or_removal() {
         let (state, directory) = state();
         let uuid = hunter(&state, 1);
         state
@@ -674,11 +627,20 @@ mod tests {
         );
         state.record_organization_event(vec![uuid], Event::Boss);
         assert_eq!(state.apply_organization_events().len(), 1);
-        let paid = state.turn_in_personal_contract(uuid, 0).expect("paid");
-        assert_eq!(paid.template, BOSS_E);
+        let queued = state
+            .turn_in_personal_contract(uuid, 0)
+            .expect("queue turn-in");
+        assert_eq!(queued.template, BOSS_E);
+        assert_eq!(
+            state.with_session_mut(uuid, |session| (
+                session.won.amount(),
+                session.organization.contracts.len()
+            )),
+            Some((0, 1))
+        );
         assert_eq!(
             state.turn_in_personal_contract(uuid, 0),
-            Err(OrganizationError::Missing)
+            Err(OrganizationError::Storage)
         );
         fs::remove_dir_all(directory).expect("cleanup");
     }

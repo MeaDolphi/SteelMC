@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::{
     combat_reward::HunterReward,
     economy::{SystemPoints, Won},
+    organization::OrganizationBook,
     player_data::{PlayerDataStorage, SoloLevelingPlayerData},
     state::SoloLevelingState,
 };
@@ -56,12 +57,18 @@ pub(crate) enum AccountUpdate {
         reward: HunterReward,
         points: SystemPoints,
     },
+    Organization {
+        uuid: Uuid,
+        book: OrganizationBook,
+    },
 }
 
 impl AccountUpdate {
     const fn owner(&self) -> Uuid {
         match self {
-            Self::Won { uuid, .. } | Self::Progress { uuid, .. } => *uuid,
+            Self::Won { uuid, .. }
+            | Self::Progress { uuid, .. }
+            | Self::Organization { uuid, .. } => *uuid,
         }
     }
 
@@ -81,6 +88,10 @@ impl AccountUpdate {
                     let level_up = session.stats.grant_experience(reward.experience);
                     session.system_points = points;
                     Some((reward, level_up, session.stats.level))
+                }
+                Self::Organization { book, .. } => {
+                    session.organization = book;
+                    None
                 }
             }
         });

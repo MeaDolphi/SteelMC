@@ -53,8 +53,49 @@ pub fn bound_to_other(stack: &ItemStack, player: Uuid) -> bool {
     bound_owner(stack).is_some_and(|owner| owner != player)
 }
 
+/// Returns whether a stack may be deposited into storage outside its owner's inventory.
+#[must_use]
+pub fn may_store(stack: &ItemStack) -> bool {
+    bound_owner(stack).is_none()
+}
+
+/// Returns whether `player` may retrieve a stack from external storage.
+#[must_use]
+pub fn may_retrieve(stack: &ItemStack, player: Uuid) -> bool {
+    bound_owner(stack).is_none_or(|owner| owner == player)
+}
+
+/// Returns whether a stack may be dropped into the world.
+#[must_use]
+pub fn may_drop(stack: &ItemStack) -> bool {
+    bound_owner(stack).is_none()
+}
+
 /// Rebuilds the Solo Leveling record of `stack` after its kind fields changed,
 /// so binding it does not drop the fields that describe the item.
 fn binding_record(stack: &ItemStack) -> NbtCompound {
     read_tag(stack).unwrap_or_else(|| record(BOUND_KIND))
+}
+
+#[cfg(test)]
+mod tests {
+    use steel_registry::{init_vanilla_registry, item_stack::ItemStack, vanilla_items};
+    use uuid::Uuid;
+
+    use super::{bind, may_drop, may_retrieve, may_store};
+
+    #[test]
+    fn a_personal_item_stays_with_its_owner_across_transfer_routes() {
+        init_vanilla_registry();
+        let owner = Uuid::new_v4();
+        let stranger = Uuid::new_v4();
+        let mut item = ItemStack::new(&vanilla_items::DIAMOND);
+        bind(&mut item, owner);
+
+        assert!(!may_store(&item));
+        assert!(!may_drop(&item));
+        assert!(may_retrieve(&item, owner));
+        assert!(!may_retrieve(&item, stranger));
+        assert!(may_store(&ItemStack::new(&vanilla_items::DIAMOND)));
+    }
 }

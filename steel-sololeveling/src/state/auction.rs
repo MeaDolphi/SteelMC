@@ -16,7 +16,7 @@ use steel_core::player::Player;
 use steel_core::player::player_data_storage::transaction::{
     ExtensionStorageWrite, TransactionCommit,
 };
-use steel_core::player::player_inventory::Prediction;
+use steel_core::player::player_inventory::{PlayerInventory, Prediction};
 use steel_core::server::Server;
 use steel_registry::data_components::vanilla_components::CUSTOM_NAME;
 use steel_registry::item_stack::ItemStack;
@@ -686,7 +686,7 @@ struct Charge {
 }
 
 /// Returns a copy of the stack in the hunter's main hand.
-fn main_hand_stack(player: &Player) -> Option<ItemStack> {
+pub(super) fn main_hand_stack(player: &Player) -> Option<ItemStack> {
     let inventory = player.inventory.lock();
     let held = inventory
         .get_item_in_hand(InteractionHand::MainHand)
@@ -695,16 +695,21 @@ fn main_hand_stack(player: &Player) -> Option<ItemStack> {
 }
 
 /// Moves the main-hand stack into a free storage slot and returns that slot.
-fn park_main_hand_stack(player: &Player) -> Option<usize> {
+pub(super) fn park_main_hand_stack(player: &Player) -> Option<usize> {
+    park_hand_stack(player, InteractionHand::MainHand)
+}
+
+/// Moves one equipped stack into a free storage slot.
+pub(super) fn park_hand_stack(player: &Player, hand: InteractionHand) -> Option<usize> {
     let mut inventory = player.inventory.lock();
-    let held = inventory
-        .get_item_in_hand(InteractionHand::MainHand)
-        .clone();
+    let held = inventory.get_item_in_hand(hand).clone();
     if held.is_empty() {
         return None;
     }
-    let slot = usize::from(inventory.get_free_slot()?);
-    inventory.set_item_in_hand(InteractionHand::MainHand, ItemStack::empty());
+    let selected = usize::from(inventory.get_selected_slot());
+    let slot = (0..PlayerInventory::INVENTORY_SIZE)
+        .find(|slot| *slot != selected && inventory.get_item(*slot).is_empty())?;
+    inventory.set_item_in_hand(hand, ItemStack::empty());
     inventory.set_item(slot, held);
     drop(inventory);
     player.send_inventory_to_remote();

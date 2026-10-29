@@ -239,6 +239,8 @@ pub enum ShopError {
     Busy,
     /// The hunter cannot afford the price.
     InsufficientPoints,
+    /// The hunter has no room for the complete purchased stack.
+    InventoryFull,
     /// The purchase could not be persisted.
     Storage,
 }
@@ -253,6 +255,7 @@ impl ShopError {
             Self::AlreadyBought => "Этот слот уже куплен сегодня.",
             Self::Busy => "Дождитесь завершения другой финансовой операции.",
             Self::InsufficientPoints => "Недостаточно очков Системы.",
+            Self::InventoryFull => "Освободите место в инвентаре для покупки.",
             Self::Storage => "Не удалось сохранить покупку. Обратитесь к администратору.",
         }
     }

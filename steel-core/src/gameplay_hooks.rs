@@ -202,6 +202,21 @@ pub trait GameplayHooks: Send + Sync {
         true
     }
 
+    /// Called before a player moves an item into storage other than their own
+    /// inventory, including containers, crafting slots, and guild banks.
+    ///
+    /// `false` cancels the transfer but still lets the player move the item
+    /// around within their own inventory.
+    fn allow_item_storage(&self, _player: &Player, _stack: &ItemStack) -> bool {
+        true
+    }
+
+    /// Called before a player retrieves an item from storage outside their
+    /// inventory, including containers, crafting slots, and guild banks.
+    fn allow_item_retrieve(&self, _player: &Player, _stack: &ItemStack) -> bool {
+        true
+    }
+
     /// Called when a player dies, after vanilla death handling has run.
     ///
     /// Non-player deaths have no reachable [`Server`] handle at the vanilla

@@ -1005,6 +1005,15 @@ impl Player {
         if !self.can_drop_items() {
             return;
         }
+        let selected = self.inventory.lock().get_selected_item().clone();
+        if !self
+            .get_world()
+            .gameplay_hooks
+            .allow_item_drop(self, &selected)
+        {
+            self.send_inventory_to_remote();
+            return;
+        }
 
         let removed = {
             let mut inventory = self.inventory.lock();
@@ -1061,8 +1070,13 @@ impl Player {
             return None;
         }
         // A gameplay layer may keep some of its items from ever leaving the
-        // player, which also covers drops on death.
+        // player. Restore a stack already removed by a menu/drop handler.
         if !self.get_world().gameplay_hooks.allow_item_drop(self, &item) {
+            let mut item = item;
+            let mut inventory = self.inventory.lock();
+            let _ = inventory.add(&mut item);
+            drop(inventory);
+            self.send_inventory_to_remote();
             return None;
         }
 

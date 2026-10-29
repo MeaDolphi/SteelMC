@@ -252,9 +252,12 @@ impl MainMenuKind {
                 None => tell(player, "Призвать теней сейчас нельзя.", Color::Red),
             },
             Category::Auction => tell(player, &board(&state.auction_lots()), Color::Yellow),
-            // Selling empties inventory slots, which this menu's open click
-            // already holds locked; the sale runs on the hunter's next tick.
-            Category::Crystals => state.request_crystal_sale(uuid),
+            // The menu callback owns the inventory lock, so request the sale
+            // for the next player tick instead of scanning the inventory here.
+            Category::Crystals => {
+                state.defer_crystal_sale(uuid);
+                tell(player, "Продажа кристаллов запрошена.", Color::Gold);
+            }
         }
     }
 }

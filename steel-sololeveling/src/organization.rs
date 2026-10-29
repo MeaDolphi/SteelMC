@@ -380,6 +380,8 @@ pub struct GroupContract {
     pub contract: Contract,
     /// Members entitled to the payment; leaving forfeits the share.
     pub participants: Vec<Uuid>,
+    /// An accepted payout transaction is in flight.
+    pub(crate) pending_turn_in: bool,
 }
 
 /// Returns the highest contract rank a guild of `level` may take.

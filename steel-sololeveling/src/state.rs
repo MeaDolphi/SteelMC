@@ -15,7 +15,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use glam::DVec3;
 use rustc_hash::{FxHashMap, FxHashSet};
 use steel_core::entity::LivingEntity;
-use steel_core::inventory::container::Container as _;
 use steel_core::player::player_inventory::Prediction;
 use steel_core::player::{Player, PlayerInput};
 use steel_core::server::Server;
@@ -29,7 +28,7 @@ use crate::combat_reward::HunterReward;
 use crate::daily;
 use crate::dungeon::runtime::{self, DungeonRuntime, RunDeath};
 use crate::guild::{Guild, GuildError, GuildRegistry, GuildRole};
-use crate::item::crystal::{self, CrystalSale, CrystalSaleError};
+use crate::item::crystal::CrystalSaleError;
 use crate::notice::Notice;
 use crate::organization::Event;
 use crate::party::{Party, PartyError, PartyExit, PartyRuntime};
@@ -38,7 +37,7 @@ use crate::rank::HunterRank;
 use crate::session::{HunterSession, QuestUpdate, SessionRegistry, SidebarChange};
 use crate::shadow::{RECOVERY_HEALTH_PER_MINUTE, Shadow, ShadowStat, army_limit};
 use crate::shadow_runtime::ShadowRuntime;
-use crate::shop::{Offer, ShopDay, ShopError};
+use crate::shop::ShopDay;
 use crate::sidebar::{ContractScope, SidebarView};
 use crate::stats::{HunterStat, HunterStats, LevelUp};
 
@@ -379,50 +378,6 @@ impl SoloLevelingState {
         self.dungeon_runtime.lock().request_test_gate(player_uuid);
     }
 
-    /// Buys one daily shop offer for the calling hunter.
-    ///
-    /// The debit and the daily counter change together under the session lock;
-    /// a refused purchase never charges points, and the granted item is bound to
-    /// the buyer so it cannot be resold.
-    pub fn buy_shop_offer(&self, player: &Arc<Player>, slot: usize) -> Result<Offer, ShopError> {
-        let uuid = player.gameprofile.id();
-        let offer = self.charge_shop_offer(uuid, slot)?;
-        player.add_item_or_drop(offer.stack(uuid), Prediction::ServerOnly);
-        Ok(offer)
-    }
-
-    /// Charges one daily shop offer and marks it bought, without handing out
-    /// the item; the caller delivers [`Offer::stack`] itself, which lets a menu
-    /// deliver it under the inventory lock it already holds.
-    pub fn charge_shop_offer(&self, uuid: Uuid, slot: usize) -> Result<Offer, ShopError> {
-        let today = daily::today();
-        let offer = self
-            .sessions
-            .with_mut(uuid, |session| {
-                if session.economic_busy {
-                    return Err(ShopError::Busy);
-                }
-                session.shop.roll_over(today);
-                let offer = session.shop.offer(slot).ok_or(ShopError::UnknownSlot)?;
-                if session.shop.bought(slot) {
-                    return Err(ShopError::AlreadyBought);
-                }
-                if !session.system_points.debit(offer.price) {
-                    return Err(ShopError::InsufficientPoints);
-                }
-                if !session.shop.mark(slot) {
-                    return Err(ShopError::UnknownSlot);
-                }
-                Ok(offer)
-            })
-            .ok_or(ShopError::NoSession)??;
-
-        if let Err(error) = self.save_session(uuid) {
-            log::warn!("sololeveling: failed to persist a shop purchase of {uuid}: {error}");
-        }
-        Ok(offer)
-    }
-
     /// Returns today's shop of a hunter, rolling and saving it on first look.
     pub fn shop_day(&self, uuid: Uuid) -> Option<ShopDay> {
         let today = daily::today();
@@ -435,38 +390,9 @@ impl SoloLevelingState {
         Some(day)
     }
 
-    /// Sells every magic crystal in a hunter's inventory to the Organization.
-    ///
-    /// Crystals leave the inventory before the Won credit is queued, so a failed
-    /// account write cannot pay twice; ordinary diamonds carry no rank and are
-    /// therefore never bought.
-    pub fn sell_crystals(&self, player: &Player) -> Result<CrystalSale, CrystalSaleError> {
-        let uuid = player.gameprofile.id();
-        if !self.persistence.lock().accepts_writes(uuid) {
-            return Err(CrystalSaleError::Storage);
-        }
-
-        let mut sale = CrystalSale::default();
-        let mut inventory = player.inventory.lock();
-        for slot in 0..inventory.get_container_size() {
-            let stack = inventory.get_item(slot).clone();
-            let Some(rank) = crystal::rank(&stack) else {
-                continue;
-            };
-            let count = u32::try_from(stack.count).unwrap_or(0);
-            sale.count = sale.count.saturating_add(count);
-            sale.total = sale
-                .total
-                .saturating_add(crystal::sale_price(rank).saturating_mul(u64::from(count)));
-            inventory.set_item(slot, ItemStack::empty());
-        }
-        drop(inventory);
-
-        if sale.count == 0 {
-            return Err(CrystalSaleError::NoCrystals);
-        }
-        self.credit_won(uuid, sale.total);
-        Ok(sale)
+    /// Queues a crystal sale for an atomic inventory/account transaction.
+    pub fn sell_crystals(&self, player: &Player) -> Result<(), CrystalSaleError> {
+        self.request_crystal_sale(player)
     }
 
     /// Records a death observed by the world-owned gameplay hook.
@@ -602,15 +528,12 @@ impl SoloLevelingState {
         self.notices.lock().remove(&uuid)
     }
 
-    /// Asks for a crystal sale on the hunter's next tick.
-    ///
-    /// A menu click holds the inventory lock the sale needs, so the sale
-    /// cannot run inside it.
-    pub fn request_crystal_sale(&self, uuid: Uuid) {
+    /// Defers a crystal sale requested from a menu until its inventory locks are released.
+    pub fn defer_crystal_sale(&self, uuid: Uuid) {
         self.crystal_sales.lock().insert(uuid);
     }
 
-    /// Takes a pending crystal sale request of `uuid`.
+    /// Takes a pending menu-triggered crystal sale request.
     pub fn take_crystal_sale(&self, uuid: Uuid) -> bool {
         self.crystal_sales.lock().remove(&uuid)
     }
