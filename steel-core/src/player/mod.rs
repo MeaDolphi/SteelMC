@@ -1,6 +1,7 @@
 //! This module contains all things player-related.
 mod abilities;
 pub mod advancement;
+pub mod boss_bar;
 pub mod chat;
 pub mod chunk_sender;
 /// This module contains the `PlayerConnection` trait that abstracts network connections.
@@ -13,6 +14,7 @@ pub mod food_data;
 /// Game mode specific logic for player interactions.
 pub mod game_mode;
 mod health_sync;
+pub mod inventory_transaction;
 mod item_cooldowns;
 mod lifecycle;
 pub mod movement;
@@ -21,6 +23,7 @@ pub mod player_data;
 pub mod player_data_storage;
 pub mod player_inventory;
 mod profile;
+mod scoreboard;
 mod session;
 mod sleep;
 mod sleep_state;
@@ -105,7 +108,6 @@ use crate::config::RuntimeConfig;
 use crate::enchantment_helper;
 use crate::entity::LivingEntityRef;
 use crate::entity::damage::DamageSource;
-use crate::entity::entities::ExperienceOrbEntity;
 use crate::entity::{
     ActiveItemUseState, DEATH_DURATION, Entity, EntityAnchor, EntityBase, EntityEventSource,
     EntityMoveError, EntityMovementEmission, EntitySyncedData, LivingEntity, LivingEntityBase,
@@ -133,7 +135,6 @@ use crate::server::{
     jobs::{JobPoll, ServerJob, ServerJobContext},
 };
 use crate::world::player_spawn_finder::{PlayerSpawnSearch, PlayerSpawnSearchPoll};
-use steel_registry::vanilla_damage_types;
 
 use steel_protocol::packets::{
     common::SCustomPayload,
@@ -357,6 +358,9 @@ impl Player {
 
     /// Starts using the item currently held in `hand`.
     pub fn start_using_item(&self, hand: InteractionHand) {
+        if self.inventory_transaction_active() {
+            return;
+        }
         let item = {
             let inventory = self.inventory.lock();
             let item = inventory.get_item_in_hand(hand);
@@ -796,6 +800,11 @@ impl Player {
     /// `world` is vanilla's explicit `ServerLevel` argument and controls
     /// difficulty scaling and damage gamerules.
     pub fn hurt(&self, world: &World, source: &DamageSource, amount: f32) -> bool {
+        if source.causing_entity().is_some_and(|attacker| {
+            self.is_allied_to(attacker.as_ref()) || attacker.is_allied_to(self)
+        }) {
+            return false;
+        }
         if LivingEntity::is_invulnerable_to(self, world, source) {
             return false;
         }
@@ -945,16 +954,18 @@ impl Player {
             });
         }
 
-        if !world.get_game_rule(&KEEP_INVENTORY) && self.game_mode() != GameType::Spectator {
-            let drops = self.inventory.lock().take_death_drops();
-            for item in drops {
-                let _ = self.spawn_dropped_item(item, true, false);
-            }
-
-            let reward = self.experience.lock().death_xp_reward();
-            if reward > 0 {
-                ExperienceOrbEntity::award(&world, self.position(), reward);
-            }
+        let inventory_death = inventory_transaction::DeferredDeathInventory {
+            world: Arc::clone(&world),
+            item_position: DVec3::new(self.position().x, self.get_eye_y() - 0.3, self.position().z),
+            experience_position: self.position(),
+            drop_items: !world.get_game_rule(&KEEP_INVENTORY)
+                && self.game_mode() != GameType::Spectator,
+            experience: self.experience.lock().death_xp_reward(),
+        };
+        if self.inventory_transaction_active() {
+            *self.session.deferred_death_inventory.lock() = Some(inventory_death);
+        } else {
+            self.finish_death_inventory(inventory_death);
         }
 
         // TODO: Increment DEATH_COUNT objective criterion
@@ -970,6 +981,12 @@ impl Player {
 
         self.clear_fire();
         self.set_ticks_frozen(0);
+
+        // Vanilla `ServerPlayer.die()` never calls `super.die()`, so the hook
+        // site of `LivingEntity::die` is not reached for players.
+        if let Some(server) = self.try_server() {
+            server.gameplay_hooks.on_player_death(&server, self);
+        }
 
         if world.get_game_rule(&IMMEDIATE_RESPAWN) {
             self.respawn();
@@ -997,6 +1014,16 @@ impl Player {
         self.server
             .upgrade()
             .expect("player must not outlive server")
+    }
+
+    /// Returns the server this player belongs to, or `None` if it is no
+    /// longer alive.
+    ///
+    /// Used by call sites that may run against a `Player` built without a
+    /// live `Server` (test fixtures), unlike [`Player::server`] which
+    /// assumes one is always present.
+    pub(crate) fn try_server(&self) -> Option<Arc<Server>> {
+        self.server.upgrade()
     }
 
     /// Returns the identity of the player's current continuous domain stay.
@@ -1667,15 +1694,6 @@ impl Entity for Player {
         }
     }
 
-    fn on_below_world(&self) {
-        let world = self.get_world();
-        self.hurt(
-            &world,
-            &DamageSource::environment(&vanilla_damage_types::OUT_OF_WORLD),
-            4.0,
-        );
-    }
-
     fn dimensions_for_pose(&self, pose: EntityPose) -> EntityDimensions {
         let dimensions = Player::dimensions_for_pose(pose);
         if pose == EntityPose::Sleeping || self.entity_type().fixed {
@@ -1817,6 +1835,10 @@ impl LivingEntity for Player {
             return;
         }
 
+        if let Some(server) = self.try_server() {
+            server.gameplay_hooks.on_player_tick(self);
+        }
+
         self.tick_living_state();
 
         self.tick_open_menu();
@@ -1952,6 +1974,9 @@ impl LivingEntity for Player {
         player: &Player,
         hand: InteractionHand,
     ) -> InteractionResult {
+        if self.inventory_transaction_active() || player.inventory_transaction_active() {
+            return InteractionResult::Pass;
+        }
         let item_stack = {
             let inventory = player.inventory.lock();
             let item_stack = inventory.get_item_in_hand(hand);
@@ -2090,7 +2115,9 @@ impl LivingEntity for Player {
 
     fn ai_step(&self, entity: &SharedEntity) -> Option<MoveResult> {
         self.tick_regeneration();
-        InventoryTickContext::tick_player_inventory(&self.get_world(), self);
+        if !self.inventory_transaction_active() {
+            InventoryTickContext::tick_player_inventory(&self.get_world(), self);
+        }
         if self.is_flying() && !self.is_passenger() {
             self.reset_fall_distance();
         }

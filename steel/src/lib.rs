@@ -2,6 +2,11 @@
 //!
 //! The main library for the Steel Minecraft server.
 
+// Wiring the gameplay layer into the server asks the compiler to prove
+// `Send`/`Sync` through nested lock and chunk-map types, which needs more
+// trait-evaluation depth than the default recursion limit allows.
+#![recursion_limit = "256"]
+
 use std::sync::atomic::Ordering;
 use std::{
     error::Error,
@@ -10,12 +15,18 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use std::path::Path;
+
+use steel_core::config::{StorageSelection, WorldEntryConfig};
+use steel_core::gameplay_hooks::GameplayHooks;
 use steel_core::{
     GIT_HASH_SHORT, command::CommandRegistry, permission::PermissionGroupManager, server::Server,
 };
 use steel_login::{JavaTcpClient, ServerConnectionSession};
+use steel_sololeveling::{commands, hooks::SoloLevelingHooks, state::SoloLevelingState};
 use tokio::{net::TcpListener, runtime::Runtime, select};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use toml::{Value, map::Map};
 
 /// Server configuration module.
 pub mod config;
@@ -67,18 +78,42 @@ impl fmt::Display for SteelServerError {
 impl Error for SteelServerError {}
 
 impl SteelServer {
-    /// Creates a new Steel server.
+    /// Creates a new Steel server with the Solo Leveling gameplay layer attached.
     ///
+    /// Solo Leveling player data is stored under a `sololeveling_playerdata`
+    /// directory next to the vanilla world save directory
+    /// (`steel_config.worlds.save_path`).
     pub async fn new(
         chunk_runtime: Arc<Runtime>,
         cancel_token: CancellationToken,
-        steel_config: config::SteelConfig,
+        mut steel_config: config::SteelConfig,
     ) -> Result<Self, SteelServerError> {
+        ensure_sololeveling_instance_world(&mut steel_config)?;
+        let sololeveling_dir = Path::new(&steel_config.worlds.save_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("sololeveling_playerdata");
+        let sololeveling_state =
+            Arc::new(SoloLevelingState::new(sololeveling_dir).map_err(|source| {
+                SteelServerError::Core(format!(
+                    "failed to initialize Solo Leveling player data storage: {source}"
+                ))
+            })?);
+        let gameplay_hooks: Arc<dyn GameplayHooks> =
+            Arc::new(SoloLevelingHooks::new(Arc::clone(&sololeveling_state)));
+        let mut command_registry = CommandRegistry::new();
+        commands::register(&mut command_registry, sololeveling_state).map_err(|error| {
+            SteelServerError::Core(format!(
+                "failed to register Solo Leveling commands: {error}"
+            ))
+        })?;
+
         Self::new_with_commands(
             chunk_runtime,
             cancel_token,
             steel_config,
-            CommandRegistry::new(),
+            command_registry,
+            gameplay_hooks,
         )
         .await
     }
@@ -89,6 +124,7 @@ impl SteelServer {
         cancel_token: CancellationToken,
         steel_config: config::SteelConfig,
         command_registry: CommandRegistry,
+        gameplay_hooks: Arc<dyn GameplayHooks>,
     ) -> Result<Self, SteelServerError> {
         log::info!("Starting Steel Server ({GIT_HASH_SHORT})");
 
@@ -111,6 +147,7 @@ impl SteelServer {
             worlds_config,
             permission_groups,
             command_registry,
+            gameplay_hooks,
         )
         .await
         .map_err(SteelServerError::Core)?;
@@ -126,11 +163,20 @@ impl SteelServer {
                 source,
             })?;
 
+        let server = Arc::new(server);
+        // Runs before the accept loop starts, so no player can join while the
+        // gameplay layer is still reading its own stored documents.
+        server
+            .gameplay_hooks
+            .prepare_server(Arc::clone(&server))
+            .await
+            .map_err(SteelServerError::Core)?;
+
         Ok(Self {
             tcp_listener,
             cancel_token,
             client_id: 0,
-            server: Arc::new(server),
+            server,
             connection_session: Arc::new(ServerConnectionSession::default()),
         })
     }
@@ -179,4 +225,53 @@ impl SteelServer {
         }
         let _ = server_handle.await;
     }
+}
+
+fn ensure_sololeveling_instance_world(
+    steel_config: &mut config::SteelConfig,
+) -> Result<(), SteelServerError> {
+    let Some(domain) = steel_config
+        .worlds
+        .domains
+        .values_mut()
+        .find(|domain| domain.default)
+    else {
+        return Err(SteelServerError::Core(
+            "worlds.toml must declare a default domain before Solo Leveling can add its instance world"
+                .to_owned(),
+        ));
+    };
+    if domain
+        .worlds
+        .iter()
+        .any(|world| world.name == "sololeveling_instances")
+    {
+        return Ok(());
+    }
+
+    domain.worlds.push(WorldEntryConfig {
+        name: "sololeveling_instances".to_owned(),
+        generator: steel_utils::Identifier::from_steel("empty"),
+        default: false,
+        seed: None,
+        default_gamemode: None,
+        difficulty: None,
+        storage: Some(StorageSelection {
+            kind: steel_utils::Identifier::from_steel("ram"),
+            config: None,
+        }),
+        nether_portal_target: None,
+        end_portal_target: None,
+        config: Some(empty_world_generator_config("overworld")),
+    });
+    Ok(())
+}
+
+/// Builds the generator config `steel:empty` requires: only a dimension type,
+/// which fixes the build height and sky of the instance world.
+fn empty_world_generator_config(dimension_type: &str) -> Value {
+    Value::Table(Map::from_iter([(
+        "dimension_type".to_owned(),
+        Value::String(format!("minecraft:{dimension_type}")),
+    )]))
 }

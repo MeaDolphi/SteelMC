@@ -865,6 +865,7 @@ pub(crate) use spawn::{
     SpawnGroupData, add_spawned_entity, apply_implicit_item_stack_components,
     create_entity_instance, spawn_entity,
 };
+pub use spawn::{MobSpawnError, spawn_mob};
 pub(crate) use storage::{EntityStorage, EntityStorageAddResult};
 pub use synced_data::{EntitySyncedData, LivingEntitySyncedData};
 pub(crate) use ticking::{

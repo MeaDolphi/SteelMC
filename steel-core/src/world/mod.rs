@@ -18,6 +18,7 @@ use crate::chunk::light::{
 };
 use crate::chunk::status::ChunkStatus;
 use crate::entity::damage::DamageHistory;
+use crate::gameplay_hooks::GameplayHooks;
 use crate::poi::OccupationStatus;
 use crate::portal::WorldChangeRequest;
 use crate::world::game_event::{
@@ -210,6 +211,8 @@ pub enum ConditionalBlockSetResult {
 pub struct WorldConfig {
     /// Server-owned history; the caller retains it while the world runs.
     pub damage_history: Arc<DamageHistory>,
+    /// Gameplay observer invoked from world-owned entity lifecycle paths.
+    pub gameplay_hooks: Arc<dyn GameplayHooks>,
     /// Domain game-time authority, bound during construction.
     pub game_time_source: GameTimeSource,
     /// Storage configuration for chunk persistence.
@@ -241,6 +244,7 @@ pub struct WorldConfig {
 /// A struct that represents a world.
 pub struct World {
     pub(crate) damage_history: Weak<DamageHistory>,
+    pub(crate) gameplay_hooks: Arc<dyn GameplayHooks>,
     /// The chunk map of the world.
     pub chunk_map: Arc<ChunkMap>,
     /// All players in the world with dual indexing by UUID and entity ID.
@@ -427,6 +431,7 @@ impl World {
 
             Self {
                 damage_history: Arc::downgrade(&config.damage_history),
+                gameplay_hooks: Arc::clone(&config.gameplay_hooks),
                 chunk_map,
                 players: PlayerMap::new(),
                 player_area_map: PlayerAreaMap::new(),

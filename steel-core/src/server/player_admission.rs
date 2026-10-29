@@ -221,13 +221,20 @@ impl Server {
     }
 
     async fn prepare_and_queue_player_join(server: Arc<Self>, player: Arc<Player>) {
-        let state = match server.load_join_domain(&player).await {
-            Ok(target_domain) => {
-                server
-                    .load_domain_player_state(&player, &target_domain, None)
-                    .await
-            }
+        let preparation = server
+            .gameplay_hooks
+            .prepare_player_join(Arc::clone(&server), player.gameprofile.id())
+            .await;
+        let state = match preparation {
             Err(error) => Err(error),
+            Ok(()) => match server.load_join_domain(&player).await {
+                Ok(target_domain) => {
+                    server
+                        .load_domain_player_state(&player, &target_domain, None)
+                        .await
+                }
+                Err(error) => Err(error),
+            },
         };
         server
             .pending_player_joins
@@ -308,6 +315,7 @@ impl Server {
         if player.mark_joined_world() {
             player.send_inventory_to_remote();
         }
+        self.gameplay_hooks.on_player_join(self, &player);
         self.schedule_domain_restores(&player, residence_token, restores);
         if player.connection.closed() {
             self.queue_player_disconnect(player);
@@ -554,7 +562,7 @@ impl Server {
     pub(super) fn process_player_disconnects(&self) -> Vec<PendingPlayerDisconnect> {
         // Connection implementations report transport state; the server owns player removal.
         self.online_players.iter_players(|_, player| {
-            if player.connection.closed() {
+            if player.connection.closed() && !player.inventory_transaction_active() {
                 self.queue_player_disconnect(Arc::clone(player));
             }
             true
@@ -583,6 +591,9 @@ impl Server {
         &self,
         player: Arc<Player>,
     ) -> Option<PendingPlayerDisconnect> {
+        if player.inventory_transaction_active() {
+            return None;
+        }
         let uuid = player.gameprofile.id();
         if !self.reserve_player_disconnect(&player) {
             return None;
@@ -636,6 +647,7 @@ impl Server {
             log::error!("Failed to save global player data for {uuid}: {e}");
         }
 
+        self.gameplay_hooks.on_player_disconnect(self, uuid);
         player.cleanup();
         self.release_player_admission(uuid, PlayerAdmissionState::Disconnecting);
         log::info!("Player {uuid} removed in {:?}", start.elapsed());

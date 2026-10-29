@@ -3,9 +3,12 @@
 //! This module defines the data format for saving and loading player state.
 
 use rustc_hash::FxHashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use steel_registry::item_stack::ItemStack;
 use steel_registry::stat::Stat;
 use steel_utils::types::GameType;
+
+static SNAPSHOT_ORDER: AtomicU64 = AtomicU64::new(1);
 
 use super::{
     Player, PlayerRespawnConfig, abilities::Abilities, experience::Experience, food_data::FoodData,
@@ -31,6 +34,10 @@ pub const PLAYER_DATA_VERSION: i32 = 6;
 /// server runtime storage so compatibility logic does not constrain the native format.
 #[derive(Debug, Clone)]
 pub struct PersistentPlayerData {
+    /// Process-local capture order; not serialized into vanilla player data.
+    pub(crate) save_order: u64,
+    /// Runtime-only marker: ordinary saves must not capture a reserved inventory.
+    pub(crate) inventory_transaction_snapshot: bool,
     /// Position (x, y, z) in absolute world coordinates.
     pub pos: [f64; 3],
 
@@ -236,6 +243,8 @@ impl PersistentPlayerData {
         let stats = Self::stats_from_player(player);
 
         Self {
+            save_order: Self::next_save_order(),
+            inventory_transaction_snapshot: inventory.transaction_reserved,
             pos: [pos.x, pos.y, pos.z],
             motion: [delta.x, delta.y, delta.z],
             rotation: [yaw, pitch],
@@ -280,6 +289,15 @@ impl PersistentPlayerData {
             ender_items,
             stats,
         }
+    }
+
+    pub(crate) fn next_save_order() -> u64 {
+        let Ok(order) = SNAPSHOT_ORDER.try_update(Ordering::Relaxed, Ordering::Relaxed, |order| {
+            order.checked_add(1)
+        }) else {
+            panic!("player snapshot sequence exhausted");
+        };
+        order
     }
 
     /// Snapshots the player's live in-flight ender pearls for persistence.

@@ -1,0 +1,297 @@
+//! The Solo Leveling [`GameplayHooks`] implementation.
+//!
+//! Wires vanilla server lifecycle events into Solo Leveling's own
+//! player-data storage, kept fully separate from `PersistentPlayerData`.
+
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::{future::Future, pin::Pin};
+
+use steel_core::behavior::InteractionResult;
+use steel_core::entity::Entity;
+use steel_core::entity::LivingEntity;
+use steel_core::entity::SharedEntity;
+use steel_core::entity::damage::DamageSource;
+use steel_core::gameplay_hooks::GameplayHooks;
+use steel_core::player::Player;
+use steel_core::server::Server;
+use steel_core::world::World;
+use steel_registry::item_stack::ItemStack;
+use steel_utils::BlockPos;
+use steel_utils::types::{BlockStateId, InteractionHand};
+use text_components::TextComponent;
+use uuid::Uuid;
+
+use crate::dungeon::instance;
+use crate::dungeon::is_instance_world;
+use crate::dungeon::runtime::TEST_GATE_ON_JOIN;
+use crate::item;
+use crate::quest::SystemQuest;
+use crate::session::HunterSession;
+use crate::sidebar;
+use crate::state::SoloLevelingState;
+
+/// Solo Leveling's [`GameplayHooks`] implementation.
+///
+/// Holds the storage used to persist each player's Solo Leveling data as a
+/// separate JSON file, keyed by `Uuid`, plus the live in-memory session for
+/// each online player (so hooks like `on_player_tick` do not re-read the
+/// JSON file every tick).
+#[derive(Debug)]
+pub struct SoloLevelingHooks {
+    state: Arc<SoloLevelingState>,
+}
+
+impl SoloLevelingHooks {
+    /// Creates hooks backed by the state shared with Solo Leveling commands.
+    #[must_use]
+    pub const fn new(state: Arc<SoloLevelingState>) -> Self {
+        Self { state }
+    }
+}
+
+impl GameplayHooks for SoloLevelingHooks {
+    fn prepare_server(
+        &self,
+        server: Arc<Server>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move { state.load_auction(&server).await })
+    }
+
+    fn prepare_player_join(
+        &self,
+        _server: Arc<Server>,
+        uuid: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move { state.prepare_join(uuid).await })
+    }
+
+    fn flush(
+        &self,
+        server: Arc<Server>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move { state.flush_persistence(server).await })
+    }
+
+    fn on_server_tick(&self, server: &Arc<Server>, tick_count: u64) {
+        self.state.tick_persistence(server);
+        self.state.tick_auction(server, tick_count);
+        self.state.tick_dungeons(server, tick_count);
+    }
+
+    fn on_player_join(&self, _server: &Arc<Server>, player: &Player) {
+        let player_uuid = player.gameprofile.id();
+        match self.state.take_prepared_player(player_uuid) {
+            Some(data) => {
+                data.stats.apply_to(&mut player.attributes().lock());
+                sidebar::show(
+                    player,
+                    &data.stats,
+                    data.won,
+                    data.system_points,
+                    &data.quest,
+                );
+                self.state.begin_session(player_uuid, data);
+                if let Err(error) = self.state.save_session(player_uuid) {
+                    log::error!("sololeveling: could not queue initial player save: {error}");
+                }
+                if self.state.has_pending_delivery(player_uuid) {
+                    self.state.request_auction_delivery(player_uuid);
+                }
+                if TEST_GATE_ON_JOIN {
+                    self.state.request_test_gate(player_uuid);
+                }
+            }
+            None => {
+                player.disconnect(TextComponent::plain(
+                    "Gameplay data was not prepared for this connection.",
+                ));
+            }
+        }
+    }
+
+    fn on_player_disconnect(&self, server: &Server, player_uuid: Uuid) {
+        self.state.on_party_disconnect(player_uuid);
+        self.state.recall_shadows(player_uuid);
+        self.state.end_player_run(server, player_uuid);
+        self.state.retire_session(player_uuid);
+    }
+
+    fn on_player_tick(&self, player: &Player) {
+        let player_uuid = player.gameprofile.id();
+        let unix_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        let window = SystemQuest::window_at(unix_seconds);
+        let _ = self.state.observe_quest(
+            player_uuid,
+            window,
+            player.position(),
+            player.last_client_input(),
+        );
+
+        let due = self
+            .state
+            .with_session_mut(player_uuid, HunterSession::tick_sidebar_throttle);
+        if due != Some(true) {
+            return;
+        }
+        let changed = self
+            .state
+            .with_session_mut(player_uuid, HunterSession::sidebar_changed);
+        if changed != Some(true) {
+            return;
+        }
+        let Some((stats, won, system_points, quest)) =
+            self.state.with_session_mut(player_uuid, |session| {
+                (
+                    session.stats,
+                    session.won,
+                    session.system_points,
+                    session.quest,
+                )
+            })
+        else {
+            return;
+        };
+        sidebar::refresh(player, &stats, won, system_points, &quest);
+    }
+
+    fn on_player_death(&self, _server: &Arc<Server>, player: &Player) {
+        self.state.recall_shadows(player.gameprofile.id());
+        self.state.observe_dungeon_player_death(player);
+    }
+
+    fn on_player_respawn(&self, _server: &Arc<Server>, player: &Player) {
+        let player_uuid = player.gameprofile.id();
+        let Some((stats, won, system_points, quest)) =
+            self.state.with_session_mut(player_uuid, |session| {
+                session.mark_sidebar_sent();
+                (
+                    session.stats,
+                    session.won,
+                    session.system_points,
+                    session.quest,
+                )
+            })
+        else {
+            return;
+        };
+        stats.apply_to(&mut player.attributes().lock());
+        // Vanilla respawns at full health; vitality modifiers are re-applied
+        // after that, so the replacement is topped up to its new maximum.
+        player.set_health(player.get_max_health());
+        sidebar::restore(player, &stats, won, system_points, &quest);
+    }
+
+    fn allow_block_break(&self, world: &World, _player: &Player, pos: BlockPos) -> bool {
+        // Dungeons are sealed rooms: a hunter may only extract the crystals built
+        // into their walls, so the layout and the boss cannot be bypassed.
+        if !is_instance_world(world) {
+            return true;
+        }
+        instance::is_crystal_ore(world.get_block_state(pos))
+    }
+
+    fn allow_block_place(&self, world: &World, _player: &Player, _pos: BlockPos) -> bool {
+        // Nothing may be built inside a dungeon, including the walls a hunter
+        // cannot break.
+        !is_instance_world(world)
+    }
+
+    fn on_block_drops(
+        &self,
+        world: &World,
+        _player: &Player,
+        _pos: BlockPos,
+        state: BlockStateId,
+        drops: &mut Vec<ItemStack>,
+    ) {
+        if state != instance::CRYSTAL_ORE.default_state() {
+            return;
+        }
+        let Some(rank) = self.state.instance_rank(world) else {
+            return;
+        };
+        drops.clear();
+        drops.push(item::crystal::stack(rank));
+    }
+
+    fn on_player_use_item(
+        &self,
+        player: &Arc<Player>,
+        _world: &Arc<World>,
+        stack: &ItemStack,
+        hand: InteractionHand,
+    ) -> Option<InteractionResult> {
+        item::consume::use_item(&self.state, player, stack, hand)
+    }
+
+    fn on_living_entity_hurt(
+        &self,
+        world: &World,
+        entity: &dyn LivingEntity,
+        source: &DamageSource,
+        amount: f32,
+    ) {
+        let Some(killer) = source.causing_entity() else {
+            return;
+        };
+        let hunter = credited_hunter(killer);
+        if let Some(hunter) = hunter {
+            self.state
+                .observe_raid_boss_damage(world, entity.id(), hunter, amount);
+        }
+    }
+
+    fn on_living_entity_loot(
+        &self,
+        world: &World,
+        entity_id: i32,
+        _source: &DamageSource,
+        drops: &mut Vec<ItemStack>,
+    ) {
+        self.state.capture_raid_loot(world, entity_id, drops);
+    }
+
+    fn on_living_entity_death(
+        &self,
+        world: &World,
+        entity: &dyn LivingEntity,
+        source: &DamageSource,
+    ) {
+        self.state.observe_shadow_death(entity.uuid());
+        let Some(killer) = source.causing_entity() else {
+            let _ = self
+                .state
+                .observe_dungeon_mob_death(world, entity.id(), None);
+            return;
+        };
+        let hunter = credited_hunter(killer);
+        let dungeon_mob = self
+            .state
+            .observe_dungeon_mob_death(world, entity.id(), hunter);
+        if dungeon_mob
+            && let Some(player) = killer.as_player()
+            && let Some(shadow) = self.state.arise_from_player_kill(player, world, entity)
+        {
+            player.send_message(&TextComponent::plain(format!(
+                "{} arose from the shadows.",
+                shadow.name
+            )));
+        }
+        let _ = self.state.credit_shadow_kill(killer.uuid(), entity, world);
+    }
+}
+
+/// Returns the hunter credited for a hit or a kill: the attacker itself, or the
+/// owner of the shadow that attacked for it.
+fn credited_hunter(entity: &SharedEntity) -> Option<Uuid> {
+    if let Some(player) = entity.as_player() {
+        return Some(player.gameprofile.id());
+    }
+    entity.as_mob()?.allied_owner()
+}

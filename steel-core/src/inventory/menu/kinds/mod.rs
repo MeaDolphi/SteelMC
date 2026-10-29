@@ -14,7 +14,7 @@ mod shulker_box_menu;
 pub use anvil_menu::{AnvilKind, anvil};
 pub use basic_menu::BasicKind;
 pub use beacon_menu::{BeaconKind, beacon};
-pub use chest_menu::{ChestKind, chest};
+pub use chest_menu::{ChestKind, chest, chest_with_kind};
 pub use crafting_menu::{CraftingKind, crafting};
 pub use ender_chest_menu::{EnderChestKind, ender_chest};
 pub use furnace_menu::{FurnaceMenuKind, furnace_menu};

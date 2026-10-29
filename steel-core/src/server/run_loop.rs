@@ -87,7 +87,11 @@ impl Server {
     /// Panics if a player's menus cannot be removed, which means packets are still being
     /// processed. Callers must stop packet processing before calling this; the standalone
     /// server does so by closing its task tracker and awaiting the drain.
-    pub async fn save_and_shutdown(&self) {
+    pub async fn save_and_shutdown(self: &Arc<Self>) {
+        self.jobs.finish_all().await;
+        if let Err(error) = self.gameplay_hooks.flush(Arc::clone(self)).await {
+            log::error!("Failed to flush gameplay data during shutdown: {error}");
+        }
         if let Err(error) = self.flush_known_players().await {
             log::error!("Failed to flush known player cache during shutdown: {error}");
         }
@@ -258,6 +262,7 @@ impl Server {
             }
             self.tick_jobs(tick_count, runs_normally);
             self.process_player_joins();
+            self.gameplay_hooks.on_server_tick(&self, tick_count);
 
             {
                 let server = Arc::clone(&self);
@@ -293,10 +298,10 @@ impl Server {
             }
         }
 
-        self.jobs.cancel_all();
+        self.packet_processor.stop();
+        self.jobs.finish_all().await;
         pending_command_executions.cancel_all();
         self.command_requests.clear();
-        self.packet_processor.stop();
         self.start_player_disconnect_saves(&mut player_disconnect_saves);
         self.pending_player_disconnects.clear();
         while let Some(result) = player_disconnect_saves.join_next().await {
@@ -308,6 +313,9 @@ impl Server {
             if let Err(error) = result {
                 log::error!("Command data autosave task failed during shutdown: {error}");
             }
+        }
+        if let Err(error) = self.gameplay_hooks.flush(Arc::clone(&self)).await {
+            log::error!("Failed to drain gameplay persistence after ticks stopped: {error}");
         }
     }
 

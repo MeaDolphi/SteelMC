@@ -11,6 +11,7 @@ members = [
     "steel-core",
     "steel-crypto",
     "steel-math",
+    "steel-sololeveling",
 ]
 
 [workspace.package]
@@ -27,6 +28,7 @@ steel-login = { path = "steel-login" }
 steel-macros = { path = "steel-macros" }
 steel-protocol = { path = "steel-protocol" }
 steel-registry = { path = "steel-registry" }
+steel-sololeveling = { path = "steel-sololeveling" }
 steel-utils = { path = "steel-utils" }
 steel-worldgen = { path = "steel-worldgen" }
 steel-math = { path = "steel-math" }

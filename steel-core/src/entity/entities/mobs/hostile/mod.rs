@@ -4,4 +4,7 @@
 
 /// Hostile endermite entity module.
 pub mod endermite;
+/// Hostile zombie entity module.
+pub mod zombie;
 pub use endermite::EndermiteEntity;
+pub use zombie::ZombieEntity;

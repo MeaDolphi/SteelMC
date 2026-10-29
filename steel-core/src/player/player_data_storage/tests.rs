@@ -28,7 +28,7 @@ fn temp_storage_root(name: &str) -> PathBuf {
     env::temp_dir().join(format!("steelmc-player-storage-{name}-{suffix}"))
 }
 
-fn sample_player_file(data_version: i32) -> PlayerDataFile {
+pub(super) fn sample_player_file(data_version: i32) -> PlayerDataFile {
     PlayerDataFile {
         data_version,
         pos: [1.0, 2.0, 3.0],

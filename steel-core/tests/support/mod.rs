@@ -1,5 +1,6 @@
 use crate::config::ResolvedDomainConfig;
 use crate::entity::damage::DamageHistory;
+use crate::gameplay_hooks::NoopGameplayHooks;
 use crate::server::worlds::WorldMap;
 use std::cell::{Cell, RefCell};
 use std::ops::Deref;
@@ -356,6 +357,7 @@ pub(crate) fn create_test_world_with_damage_history(
             0,
             WorldConfig {
                 damage_history: Arc::clone(history),
+                gameplay_hooks: Arc::new(NoopGameplayHooks),
                 game_time_source,
                 storage: WorldStorageConfig::RamOnly,
                 level_data_path: None,

@@ -41,7 +41,7 @@ pub fn chest(
 /// # Panics
 /// Panics if `rows` is 0 or greater than 6.
 #[must_use]
-pub(crate) fn chest_with_kind(
+pub fn chest_with_kind(
     inventory: Shared<PlayerInventory>,
     container_id: u8,
     container: impl Into<ContainerRef>,

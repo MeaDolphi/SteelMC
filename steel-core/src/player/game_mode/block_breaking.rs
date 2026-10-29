@@ -86,6 +86,25 @@ impl Default for BlockBreakingManager {
 }
 
 impl BlockBreakingManager {
+    /// Stops active and delayed mining before a durable inventory reservation.
+    pub(crate) fn cancel_for_inventory_transaction(&mut self, player: &Player, world: &Arc<World>) {
+        for (active, position) in [
+            (self.is_destroying_block, self.destroy_pos),
+            (self.has_delayed_destroy, self.delayed_destroy_pos),
+        ] {
+            if active {
+                world.broadcast_block_destruction(player.id(), position, -1);
+                player.send_packet(CBlockUpdate {
+                    pos: position,
+                    block_state: world.get_block_state(position),
+                });
+            }
+        }
+        self.is_destroying_block = false;
+        self.has_delayed_destroy = false;
+        self.last_sent_state = -1;
+    }
+
     /// Creates a new block breaking manager.
     #[must_use]
     pub const fn new() -> Self {
@@ -339,6 +358,10 @@ impl BlockBreakingManager {
         clippy::unused_self,
         reason = "method belongs logically to BlockBreakingManager and will use self when additional state is added"
     )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one linear pass: permission, drops, gameplay hook, then block removal"
+    )]
     fn destroy_block(&self, player: &Player, world: &Arc<World>, pos: BlockPos) -> bool {
         let state = world.get_block_state(pos);
 
@@ -354,6 +377,10 @@ impl BlockBreakingManager {
         // TODO: Check for GameMasterBlock (command blocks, etc.)
 
         if player.block_action_restricted(world, pos) {
+            return false;
+        }
+
+        if !world.gameplay_hooks.allow_block_break(world, player, pos) {
             return false;
         }
 
@@ -586,11 +613,15 @@ fn drop_block_loot(
         .get_value(vanilla_attributes::LUCK)
         .unwrap_or(0.0) as f32;
 
-    let drops = BlockLootContext::new(world, pos)
+    let mut drops = BlockLootContext::new(world, pos)
         .with_luck(luck)
         .with_tool(tool)
         .with_block_entity(block_entity)
         .get_drops(state);
+
+    world
+        .gameplay_hooks
+        .on_block_drops(world, player, pos, state, &mut drops);
 
     // Spawn each dropped item using the player's world reference (Arc<World>)
     for item in drops {

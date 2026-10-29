@@ -62,6 +62,34 @@ use super::{
     transfer_leashables_to_holder, trapdoor_usable_as_ladder_state,
 };
 
+#[test]
+fn runtime_owned_mobs_are_allied_to_each_other() {
+    init_vanilla_registry();
+    let world_fixture = fresh_test_world("runtime_owned_mob_allies");
+    let world = &world_fixture.world;
+    let owner = Uuid::new_v4();
+    let first = PigEntity::new(
+        &vanilla_entities::PIG,
+        1,
+        DVec3::new(0.5, 64.0, 0.5),
+        Arc::downgrade(world),
+    );
+    let second = PigEntity::new(
+        &vanilla_entities::PIG,
+        2,
+        DVec3::new(1.5, 64.0, 0.5),
+        Arc::downgrade(world),
+    );
+
+    first.set_allied_owner(Some(owner));
+    second.set_allied_owner(Some(owner));
+
+    assert!(first.is_allied_to(&second));
+    assert!(second.is_allied_to(&first));
+    assert!(!first.should_save());
+    assert!(!second.should_save());
+}
+
 struct PushableTestEntity {
     base: EntityBase,
 }

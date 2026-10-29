@@ -23,6 +23,9 @@ pub fn use_item_on(
     hand: InteractionHand,
     hit_result: &BlockHitResult,
 ) -> InteractionResult {
+    if player.inventory_transaction_active() {
+        return InteractionResult::Pass;
+    }
     let pos = hit_result.block_pos;
     let state = world.get_block_state(pos);
 
@@ -100,6 +103,13 @@ pub fn use_item_on(
         {
             return InteractionResult::Pass;
         }
+        // A gameplay layer may forbid building anywhere in a dimension, which
+        // only concerns items that actually place a block.
+        if REGISTRY.items.is_block_item(item_ref)
+            && !world.gameplay_hooks.allow_block_place(world, player, pos)
+        {
+            return InteractionResult::Fail;
+        }
 
         let mut context = UseOnContext::new(
             player,
@@ -155,6 +165,9 @@ pub fn use_item(
     world: &Arc<World>,
     hand: InteractionHand,
 ) -> InteractionResult {
+    if player.inventory_transaction_active() {
+        return InteractionResult::Pass;
+    }
     // Spectator mode: can only open menus
     if player.game_mode() == GameType::Spectator {
         return InteractionResult::Pass;
@@ -167,6 +180,15 @@ pub fn use_item(
     if !is_empty {
         if player.is_item_on_cooldown(&stack_before_use) {
             return InteractionResult::Pass;
+        }
+
+        if let Some(result) =
+            world
+                .gameplay_hooks
+                .on_player_use_item(player, world, &stack_before_use, hand)
+        {
+            player.apply_item_use_cooldown(&stack_before_use);
+            return result;
         }
 
         let mut context = crate::behavior::UseItemContext::new(

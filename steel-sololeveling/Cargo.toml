@@ -1,0 +1,39 @@
+[package]
+name = "steel-sololeveling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Internal crates
+steel-core.workspace = true
+steel-registry.workspace = true
+steel-utils.workspace = true
+glam.workspace = true
+
+# Text components
+text_components.workspace = true
+
+# Hashing
+rustc-hash.workspace = true
+
+# Runtime gate placement and penalty selection
+rand.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+simdnbt.workspace = true
+
+# UUID
+uuid.workspace = true
+
+# Logging
+log.workspace = true
+
+[lints]
+workspace = true

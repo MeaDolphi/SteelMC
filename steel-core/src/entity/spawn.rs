@@ -94,7 +94,7 @@ pub(crate) struct EntitySpawnRequest<'a> {
     pub user_is_operator: bool,
 }
 
-/// Failure from the shared spawn coordinator.
+/// Failure from the shared entity-spawn coordinator.
 #[derive(Debug)]
 pub(crate) enum EntitySpawnError {
     InvalidPosition,
@@ -102,6 +102,62 @@ pub(crate) enum EntitySpawnError {
     MissingFactory,
     InvalidEntityData,
     AddEntity,
+}
+
+/// Failure while spawning a gameplay-controlled mob.
+#[derive(Debug)]
+pub enum MobSpawnError {
+    /// The requested block position is outside the world spawn bounds.
+    InvalidPosition,
+    /// The world is peaceful and the entity cannot exist there.
+    Peaceful,
+    /// Steel has no factory registered for the requested entity type.
+    MissingFactory,
+    /// Entity initialization rejected its spawn data.
+    InvalidEntityData,
+    /// The initialized entity could not be inserted into the world.
+    AddEntity,
+}
+
+impl From<EntitySpawnError> for MobSpawnError {
+    fn from(error: EntitySpawnError) -> Self {
+        match error {
+            EntitySpawnError::InvalidPosition => Self::InvalidPosition,
+            EntitySpawnError::Peaceful => Self::Peaceful,
+            EntitySpawnError::MissingFactory => Self::MissingFactory,
+            EntitySpawnError::InvalidEntityData => Self::InvalidEntityData,
+            EntitySpawnError::AddEntity => Self::AddEntity,
+        }
+    }
+}
+
+/// Spawns and finalizes a living mob at a block position.
+///
+/// This is the narrow public spawn path for server gameplay systems that need
+/// vanilla entity initialization without exposing the internal request model.
+/// The caller must invoke it from the serialized gameplay phase for `world`.
+pub fn spawn_mob(
+    world: &Arc<World>,
+    entity_type: EntityTypeRef,
+    pos: BlockPos,
+) -> Result<SharedEntity, MobSpawnError> {
+    spawn_entity(
+        world,
+        EntitySpawnRequest {
+            entity_type,
+            placement: EntitySpawnPlacement::Block {
+                pos,
+                try_move_down: true,
+                moved_up: false,
+            },
+            reason: EntitySpawnReason::Event,
+            finalize_spawn: true,
+            play_ambient_sound: false,
+            item_stack: None,
+            user_is_operator: false,
+        },
+    )
+    .map_err(MobSpawnError::from)
 }
 
 /// Creates an entity instance through the generated entity factory registry.

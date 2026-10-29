@@ -87,6 +87,12 @@ impl Player {
 
     /// Handles a player action packet (block breaking, item dropping, etc.).
     pub fn handle_player_action(self: &Arc<Self>, packet: SPlayerAction) {
+        if self.inventory_transaction_active() {
+            self.ack_block_changes_up_to(packet.sequence);
+            self.send_block_updates(packet.pos, packet.direction);
+            self.send_inventory_to_remote();
+            return;
+        }
         if !self.has_client_loaded() {
             return;
         }
@@ -182,6 +188,10 @@ impl Player {
     ///
     /// Panics if the behavior registry has not been initialized.
     pub fn handle_pick_item_from_block(&self, packet: SPickItemFromBlock) {
+        if self.inventory_transaction_active() {
+            self.send_inventory_to_remote();
+            return;
+        }
         if !self.is_within_block_interaction_range(packet.pos) {
             return;
         }

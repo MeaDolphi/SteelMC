@@ -373,6 +373,9 @@ impl Server {
         &self,
         player: &Player,
     ) -> Result<(Arc<World>, PendingWorldChangeToken), String> {
+        if player.inventory_transaction_active() {
+            return Err("inventory transaction is still in progress".to_owned());
+        }
         let current_world = self
             .live_world_for_player(player)
             .ok_or_else(|| "player is not present in a live world".to_owned())?;

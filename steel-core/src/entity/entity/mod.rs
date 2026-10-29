@@ -11,6 +11,8 @@ const FUDGE_SMALL_DIMENSION_LIMIT: f32 = 4.0;
 const FUDGE_POSITION_EPSILON: f64 = 1.0e-6;
 
 const MAX_ENTITY_MOTION_COMPONENT: f64 = 10.0;
+/// Damage per tick vanilla `LivingEntity.onBelowWorld` deals below the world.
+const BELOW_WORLD_DAMAGE: f32 = 4.0;
 
 fn landing_particle_count(fall_distance: f64, safe_fall_distance: f64) -> Option<i32> {
     let power = (fall_distance + 1.0e-6 - safe_fall_distance)
@@ -311,6 +313,7 @@ pub trait Entity: EntityEventSource + ErasedType + Send + Sync + 'static {
     fn nbt_for_passenger_save(&self) -> Option<NbtCompound> {
         if !self.removal_reason().is_none_or(RemovalReason::should_save)
             || !self.entity_type().can_serialize
+            || !self.should_save()
         {
             return None;
         }
@@ -526,8 +529,26 @@ pub trait Entity: EntityEventSource + ErasedType + Send + Sync + 'static {
     }
 
     /// Returns whether this entity is allied to `other`.
-    fn is_allied_to(&self, _other: &dyn Entity) -> bool {
-        false
+    fn is_allied_to(&self, other: &dyn Entity) -> bool {
+        self.as_mob().is_some_and(|mob| mob.is_allied_with(other))
+    }
+
+    /// Returns whether this entity belongs in persistent world storage.
+    ///
+    /// Runtime-owned allies are reconstructed by their gameplay layer from a
+    /// durable roster and must never become ordinary saved mobs after a
+    /// restart or chunk unload.
+    fn should_save(&self) -> bool {
+        self.as_mob().is_none_or(|mob| mob.allied_owner().is_none())
+    }
+
+    /// Assigns this mob to a runtime-only allied owner.
+    ///
+    /// Non-mob entities ignore the assignment.
+    fn set_runtime_allied_owner(&self, owner: Option<Uuid>) {
+        if let Some(mob) = self.as_mob() {
+            mob.set_allied_owner(owner);
+        }
     }
 
     /// Returns whether this entity is a marker armor stand.
@@ -1011,8 +1032,24 @@ pub trait Entity: EntityEventSource + ErasedType + Send + Sync + 'static {
     }
 
     /// Runs entity-specific behavior after falling below the world.
+    ///
+    /// Vanilla splits this as a `LivingEntity` override of `Entity.onBelowWorld`,
+    /// taking four void damage per tick there. Steel resolves the capability
+    /// here because trait methods dispatch statically.
     fn on_below_world(&self) {
-        self.set_removed(RemovalReason::Discarded);
+        if self.as_living_entity().is_none() {
+            self.set_removed(RemovalReason::Discarded);
+            return;
+        }
+        let Some(world) = self.level() else {
+            return;
+        };
+
+        self.hurt(
+            &world,
+            &DamageSource::environment(&vanilla_damage_types::OUT_OF_WORLD),
+            BELOW_WORLD_DAMAGE,
+        );
     }
 
     /// Runs vanilla pre-tick despawn checks.

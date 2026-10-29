@@ -456,6 +456,10 @@ impl Player {
         if !Self::should_process_respawn(health) {
             return;
         }
+        if self.inventory_transaction_active() {
+            self.defer_death_respawn();
+            return;
+        }
 
         let source_world = self.get_world();
         let Some(player_arc) = source_world.players.get_by_entity_id(self.id()) else {
@@ -653,6 +657,9 @@ impl Player {
         self.rebind_ender_pearls_to(&replacement);
 
         server.resend_player_context(&replacement);
+        server
+            .gameplay_hooks
+            .on_player_respawn(&server, &replacement);
 
         if kind == RespawnRequestKind::Death
             && let Some(pos) = spawn.anchor_deplete_sound_pos

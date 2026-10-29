@@ -22,6 +22,9 @@ pub struct PlayerInventory {
     pub(super) selected: u8,
     /// Counter incremented on every change.
     pub(super) times_changed: u32,
+    /// Main storage is reserved by a durable operation. Equipment continues
+    /// receiving automatic damage; player-driven transfers are suspended.
+    pub(crate) transaction_reserved: bool,
 }
 
 impl Default for PlayerInventory {
@@ -72,6 +75,7 @@ impl PlayerInventory {
             items: array::from_fn(|_| ItemStack::empty()),
             selected: 0,
             times_changed: 0,
+            transaction_reserved: false,
         }
     }
 
@@ -85,6 +89,7 @@ impl PlayerInventory {
             }),
             selected: self.selected,
             times_changed: 0,
+            transaction_reserved: false,
         }
     }
 

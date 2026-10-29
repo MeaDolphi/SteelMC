@@ -123,7 +123,7 @@ impl World {
     pub(super) fn spawn_pos_in_chunk(&self, chunk_pos: ChunkPos) -> Option<BlockPos> {
         for x in chunk_min_block_x(chunk_pos)..=chunk_max_block_x(chunk_pos) {
             for z in chunk_min_block_z(chunk_pos)..=chunk_max_block_z(chunk_pos) {
-                if let Some(pos) = self.level_respawn_pos(x, z) {
+                if let Some(pos) = self.safe_surface_position(x, z) {
                     return Some(pos);
                 }
             }
@@ -132,7 +132,12 @@ impl World {
         None
     }
 
-    pub(super) fn level_respawn_pos(&self, x: i32, z: i32) -> Option<BlockPos> {
+    /// Finds a solid, dry surface position suitable for spawning a player or
+    /// server-created gameplay structure at `x`, `z`.
+    ///
+    /// Returns `None` until the relevant heightmaps and full chunk are
+    /// available, and excludes water-covered surfaces.
+    pub fn safe_surface_position(&self, x: i32, z: i32) -> Option<BlockPos> {
         let top_y = if self.dimension_type.has_ceiling {
             self.chunk_map
                 .world_gen_context

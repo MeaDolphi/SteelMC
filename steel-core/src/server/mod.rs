@@ -40,6 +40,7 @@ use crate::entity::damage::DamageHistory;
 use crate::entity::{
     Entity, EntityBase, PendingWorldChangeToken, RemovalReason, SharedEntity, change_entity_world,
 };
+use crate::gameplay_hooks::{GameplayHooks, NoopGameplayHooks};
 
 use crate::chunk_saver::{ChunkStorage, PersistentEntity, registry::WorldStorageRegistry};
 use crate::level_data::{GameTimeSource, LevelDataManager, RespawnData, WorldGenerationSettings};
@@ -268,6 +269,7 @@ pub async fn test_server_with_worlds_and_config(
         pending_world_changes: SyncMutex::new(Vec::new()),
         pending_domain_switches: SyncMutex::new(Vec::new()),
         player_idle_timeout: AtomicI32::new(0),
+        gameplay_hooks: Arc::new(NoopGameplayHooks),
     }))
 }
 
@@ -530,6 +532,8 @@ pub struct Server {
     pub pending_world_changes: SyncMutex<Vec<(SharedEntity, WorldChangeRequest)>>,
     /// Queued domain switches to process after world ticks.
     pending_domain_switches: SyncMutex<Vec<DomainSwitchRequest>>,
+    /// Gameplay layer attached to this server, defaulting to a no-op.
+    pub gameplay_hooks: Arc<dyn GameplayHooks>,
 }
 
 struct GameTickTaskGuard {
@@ -609,7 +613,7 @@ impl Server {
         suggestions.into_iter().collect()
     }
 
-    /// Creates a new server with only Steel's built-in commands.
+    /// Creates a new server with only Steel's built-in commands and no gameplay layer attached.
     pub async fn new(
         chunk_runtime: Arc<Runtime>,
         cancel_token: CancellationToken,
@@ -624,6 +628,7 @@ impl Server {
             worlds_config,
             permission_groups,
             CommandRegistry::new(),
+            Arc::new(NoopGameplayHooks),
         )
         .await
     }
@@ -640,6 +645,7 @@ impl Server {
         worlds_config: WorldsConfig,
         permission_groups: PermissionGroupManager,
         command_registry: CommandRegistry,
+        gameplay_hooks: Arc<dyn GameplayHooks>,
     ) -> Result<Self, String> {
         validate_login_security(config.online_mode, config.encryption).map_err(str::to_owned)?;
         let config = Arc::new(config);
@@ -748,6 +754,7 @@ impl Server {
                 world_seed,
                 WorldConfig {
                     damage_history: Arc::clone(&damage_history),
+                    gameplay_hooks: Arc::clone(&gameplay_hooks),
                     game_time_source,
                     storage: storage_output.storage,
                     level_data_path: storage_output
@@ -855,6 +862,7 @@ impl Server {
             pending_player_disconnects: PlayerDisconnectQueue::new(),
             pending_world_changes: SyncMutex::new(vec![]),
             pending_domain_switches: SyncMutex::new(vec![]),
+            gameplay_hooks,
         })
     }
 

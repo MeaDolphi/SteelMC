@@ -38,6 +38,11 @@ pub const DEFAULT_DISTANCE_BUFFER: f32 = 4.0;
 /// [`crate::inventory::lock::ContainerRef::owned_by_block_entity`], which runs
 /// only after every container lock has been released.
 pub trait Container: ErasedType + Send + Sync {
+    /// Whether a durable operation temporarily owns player-driven mutations.
+    fn is_transaction_reserved(&self) -> bool {
+        false
+    }
+
     /// Returns the items in this container
     fn items(&self) -> &[ItemStack];
     /// Returns mutable references to the items in this container.

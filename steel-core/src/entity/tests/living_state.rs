@@ -229,3 +229,24 @@ fn closest_open_space_direction_skips_full_collision_neighbors() {
         Direction::Up
     );
 }
+
+/// A mob that falls out of the world has to die, not disappear: vanilla
+/// `LivingEntity.onBelowWorld` deals void damage, and only non-living entities
+/// are discarded.
+#[test]
+fn living_entities_below_the_world_take_void_damage() {
+    init_vanilla_registry();
+    let world_fixture = fresh_test_world("below_world_void_damage");
+    let world = &world_fixture.world;
+
+    let entity = LivingFluidTestEntity::new_in_world(0.0, 0.0, true, world).with_health(20.0);
+
+    entity.on_below_world();
+
+    assert!(!entity.is_removed());
+    assert_eq!(
+        entity.damage_type_keys(),
+        vec![vanilla_damage_types::OUT_OF_WORLD.key.clone()]
+    );
+    assert_f32_close(entity.get_health(), 16.0);
+}

@@ -129,7 +129,8 @@ impl PlayerSpawnSearch {
                 ready_candidates_checked += 1;
                 match pending.kind {
                     SpawnCandidateKind::Candidate => {
-                        let Some(spawn_pos) = world.level_respawn_pos(pending.x, pending.z) else {
+                        let Some(spawn_pos) = world.safe_surface_position(pending.x, pending.z)
+                        else {
                             if ready_candidates_checked >= ready_candidate_budget {
                                 self.pending = Some(self.next_candidate(world));
                                 return PlayerSpawnSearchPoll::Pending;

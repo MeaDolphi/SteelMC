@@ -203,6 +203,14 @@ pub struct ContainerLockGuard {
 }
 
 impl ContainerLockGuard {
+    /// Returns whether any participating container is reserved by a transaction.
+    #[must_use]
+    pub fn has_transaction_reservation(&self) -> bool {
+        self.guards
+            .iter()
+            .any(|(_, container)| container.is_transaction_reserved())
+    }
+
     /// Create a new lock guard and lock all containers in deterministic order.
     ///
     /// Containers are sorted by their pointer address before locking to ensure

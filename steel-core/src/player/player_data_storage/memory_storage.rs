@@ -3,9 +3,12 @@ use steel_utils::locks::SyncMutex;
 use uuid::Uuid;
 
 use super::GlobalPlayerData;
+use super::transaction::{PlayerStorageTransaction, TransactionCommit};
 use crate::permission::PermissionSubjectIndex;
+use crate::player::KnownPlayers;
 use crate::player::player_data::PersistentPlayerData;
-use crate::player::{KnownPlayers, Player};
+use steel_utils::Identifier;
+use tokio::io;
 
 /// Player data storage that keeps everything in RAM and never touches disk.
 #[derive(Default)]
@@ -19,14 +22,10 @@ struct MemoryState {
     global_players: FxHashMap<Uuid, GlobalPlayerData>,
     permission_subjects: PermissionSubjectIndex,
     known_players: KnownPlayers,
+    extensions: FxHashMap<Identifier, Vec<u8>>,
 }
 
 impl MemoryPlayerDataStorage {
-    pub(crate) fn save_domain(&self, domain: &str, player: &Player) {
-        let data = PersistentPlayerData::from_player(player);
-        self.save_domain_data(domain, player.gameprofile.id(), &data);
-    }
-
     pub(crate) fn save_domain_data(&self, domain: &str, uuid: Uuid, data: &PersistentPlayerData) {
         self.state
             .lock()
@@ -43,6 +42,38 @@ impl MemoryPlayerDataStorage {
             .get(domain)?
             .get(&uuid)
             .cloned()
+    }
+
+    pub(super) fn load_extension(&self, key: &Identifier) -> Option<Vec<u8>> {
+        self.state.lock().extensions.get(key).cloned()
+    }
+
+    pub(super) fn commit_transaction(
+        &self,
+        transaction: &PlayerStorageTransaction,
+    ) -> io::Result<TransactionCommit> {
+        let mut state = self.state.lock();
+        for extension in &transaction.extensions {
+            if state.extensions.get(&extension.key) != extension.expected.as_ref() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "gameplay document changed",
+                ));
+            }
+        }
+        for player in &transaction.players {
+            state
+                .domain_players
+                .entry(player.domain.clone())
+                .or_default()
+                .insert(player.uuid, player.data.clone());
+        }
+        for extension in &transaction.extensions {
+            state
+                .extensions
+                .insert(extension.key.clone(), extension.replacement.clone());
+        }
+        Ok(TransactionCommit::Committed)
     }
 
     pub(crate) fn save_global(&self, uuid: Uuid, data: &GlobalPlayerData) {

@@ -394,6 +394,9 @@ impl Player {
     /// Returns `true` if the target accepted damage.
     #[must_use]
     pub fn attack(self: &Arc<Self>, target: &SharedEntity) -> bool {
+        if self.inventory_transaction_active() {
+            return false;
+        }
         let entity = target.as_ref();
         if self.cannot_attack(entity) {
             return false;
@@ -528,6 +531,9 @@ impl Player {
         hand: InteractionHand,
         location: DVec3,
     ) -> InteractionResult {
+        if self.inventory_transaction_active() {
+            return InteractionResult::Pass;
+        }
         if self.is_spectator() {
             // TODO: Open entity menu providers in spectator once that foundation exists.
             return InteractionResult::Pass;

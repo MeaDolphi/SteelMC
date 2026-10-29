@@ -27,6 +27,7 @@ use steel_core::chunk::paletted_container::BlockPalette;
 use steel_core::chunk::section::{ChunkSection, Sections};
 use steel_core::chunk::status::ChunkStatus;
 use steel_core::entity::damage::DamageHistory;
+use steel_core::gameplay_hooks::NoopGameplayHooks;
 use steel_core::level_data::{GameTimeSource, WorldGenerationSettings};
 use steel_core::world::{World, WorldConfig, WorldStorageConfig};
 use steel_core::worldgen::generator::generation_benchmark_support;
@@ -590,6 +591,7 @@ fn build_feature_fixture_at(
         sea_level: output.sea_level,
         default_gamemode: GameType::Survival,
         difficulty: Difficulty::Normal,
+        gameplay_hooks: Arc::new(NoopGameplayHooks),
     };
     let world_key = Identifier::new("bench", format!("{}_features", generator_key.path));
     let world = chunk_runtime
@@ -863,6 +865,7 @@ fn build_concurrent_feature_fixture(
         sea_level: output.sea_level,
         default_gamemode: GameType::Survival,
         difficulty: Difficulty::Normal,
+        gameplay_hooks: Arc::new(NoopGameplayHooks),
     };
     let world_key = Identifier::new(
         "bench",
@@ -957,6 +960,7 @@ fn build_concurrent_full_pipeline_fixture(
         sea_level: output.sea_level,
         default_gamemode: GameType::Survival,
         difficulty: Difficulty::Normal,
+        gameplay_hooks: Arc::new(NoopGameplayHooks),
     };
     let world_key = Identifier::new(
         "bench",
@@ -1055,6 +1059,7 @@ fn build_concurrent_light_fixture(
         sea_level: output.sea_level,
         default_gamemode: GameType::Survival,
         difficulty: Difficulty::Normal,
+        gameplay_hooks: Arc::new(NoopGameplayHooks),
     };
     let world_key = Identifier::new("bench", format!("{}_light_concurrent", generator_key.path));
     let world = chunk_runtime

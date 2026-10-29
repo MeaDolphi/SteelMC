@@ -99,6 +99,23 @@ impl Container for PlayerInventory {
         &mut self.items
     }
 
+    fn is_transaction_reserved(&self) -> bool {
+        self.transaction_reserved
+    }
+
+    fn can_place_item(&self, _slot: usize, _stack: &ItemStack) -> bool {
+        !self.transaction_reserved
+    }
+
+    fn can_take_item(
+        &self,
+        _destination: &dyn Container,
+        _slot: usize,
+        _stack: &ItemStack,
+    ) -> bool {
+        !self.transaction_reserved
+    }
+
     fn get_container_size(&self) -> usize {
         Self::CONTAINER_SIZE
     }
@@ -109,6 +126,9 @@ impl Container for PlayerInventory {
     /// placed in armor or equipment slots. Matches vanilla's `Inventory.add()`
     /// behavior which only adds to `this.items` (the 36 main slots).
     fn add(&mut self, stack: &mut ItemStack) -> bool {
+        if self.transaction_reserved {
+            return false;
+        }
         if stack.is_empty() {
             return true;
         }

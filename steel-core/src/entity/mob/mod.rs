@@ -36,6 +36,7 @@ use steel_utils::types::{Difficulty, InteractionHand};
 use steel_utils::{
     BlockPos, ChunkPos, Downcast as _, Identifier, TICKS_PER_SECOND, WorldAabb, axis::Axis,
 };
+use uuid::Uuid;
 
 use crate::behavior::items::SpawnEggItem;
 use crate::behavior::{BLOCK_BEHAVIORS, BlockCollisionContext, ITEM_BEHAVIORS, InteractionResult};
@@ -178,6 +179,11 @@ pub struct MobBase {
     leash_data: SyncMutex<Option<LeashData>>,
     ambient_sound_time: SyncMutex<i32>,
     xp_reward: SyncMutex<i32>,
+    /// Player that owns this runtime-only allied mob.
+    ///
+    /// This is deliberately not serialized: gameplay layers persist the
+    /// durable companion roster and recreate live allies after a restart.
+    allied_owner: SyncMutex<Option<Uuid>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +220,7 @@ impl MobBase {
             leash_data: SyncMutex::new(None),
             ambient_sound_time: SyncMutex::new(0),
             xp_reward: SyncMutex::new(0),
+            allied_owner: SyncMutex::new(None),
         }
     }
 
@@ -225,6 +232,17 @@ impl MobBase {
     #[must_use]
     pub const fn target_selector(&self) -> &SyncMutex<GoalSelector> {
         &self.target_selector
+    }
+
+    /// Returns the player that owns this runtime-only allied mob.
+    #[must_use]
+    pub fn allied_owner(&self) -> Option<Uuid> {
+        *self.allied_owner.lock()
+    }
+
+    /// Assigns or clears the player that owns this runtime-only allied mob.
+    pub fn set_allied_owner(&self, owner: Option<Uuid>) {
+        *self.allied_owner.lock() = owner;
     }
 
     #[must_use]
@@ -389,6 +407,85 @@ pub trait Mob: LivingEntity + Leashable {
 
     fn set_xp_reward(&self, xp_reward: i32) {
         self.mob_base().set_xp_reward(xp_reward);
+    }
+
+    /// Returns the player that owns this runtime-only allied mob.
+    #[must_use]
+    fn allied_owner(&self) -> Option<Uuid> {
+        self.mob_base().allied_owner()
+    }
+
+    /// Makes this mob a runtime-only ally of `owner`, or returns it to normal
+    /// vanilla behavior when `owner` is `None`.
+    fn set_allied_owner(&self, owner: Option<Uuid>) {
+        self.mob_base().set_allied_owner(owner);
+        if owner.is_none() {
+            self.set_target(None);
+        }
+    }
+
+    /// Returns whether `other` is this mob's owner or another ally of that
+    /// owner.
+    #[must_use]
+    fn is_allied_with(&self, other: &dyn Entity) -> bool {
+        let Some(owner) = self.allied_owner() else {
+            return false;
+        };
+        other.uuid() == owner
+            || other
+                .as_mob()
+                .is_some_and(|other_mob| other_mob.allied_owner() == Some(owner))
+    }
+
+    /// Directs a runtime-owned ally toward hostile mobs and otherwise back to
+    /// its owner. This runs after vanilla target goals so an owner is never
+    /// left as their target by a hostile mob's normal player-targeting goal.
+    fn tick_allied_owner_ai(&self) {
+        let Some(owner_uuid) = self.allied_owner() else {
+            return;
+        };
+        let Some(world) = self.level() else {
+            return;
+        };
+        let Some(owner) = world.get_entity_by_uuid(&owner_uuid) else {
+            self.set_target(None);
+            return;
+        };
+        if owner.as_player().is_none() {
+            self.set_target(None);
+            return;
+        }
+
+        let target = self.target().filter(|target| {
+            target.as_monster().is_some()
+                && target.as_living_entity().is_some_and(|living| {
+                    Mob::can_attack(self, living) && !self.is_allied_with(target.as_ref())
+                })
+        });
+        let target = target.or_else(|| {
+            let search = self.bounding_box().inflate(32.0);
+            world.nearest_entity_in_aabb_matching(&search, self.position(), |candidate| {
+                candidate.uuid() != self.uuid()
+                    && candidate.as_monster().is_some()
+                    && candidate.as_living_entity().is_some_and(|living| {
+                        Mob::can_attack(self, living) && !self.is_allied_with(candidate)
+                    })
+            })
+        });
+        if let Some(target) = target {
+            let _ = self.set_target(Some(&target));
+            return;
+        }
+        self.set_target(None);
+
+        if self.tick_count() % 10 != 0
+            || self.position().distance_squared(owner.position()) <= 4.0 * 4.0
+        {
+            return;
+        }
+        if let Some(pathfinder) = self.as_pathfinder_mob() {
+            pathfinder.move_to_pos(owner.position(), 1.2);
+        }
     }
 
     /// Returns this mob's current attack target, if it's still a valid one.
@@ -1566,6 +1663,7 @@ pub trait Mob: LivingEntity + Leashable {
             self.update_control_flags();
         }
         self.tick_goal_selectors(entity);
+        self.tick_allied_owner_ai();
         self.tick_path_navigation();
         self.custom_server_ai_step();
         self.tick_move_control();

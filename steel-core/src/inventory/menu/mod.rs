@@ -258,6 +258,16 @@ impl Menu {
     ///
     /// TODO: Add `tryItemClickBehaviorOverride` for bundle item support.
     pub fn clicked(&mut self, click: Click, player: &Player) {
+        if self
+            .behavior()
+            .lock_all_containers()
+            .has_transaction_reservation()
+        {
+            self.behavior_mut().reset_quick_craft();
+            self.behavior_mut()
+                .send_all_data_to_remote(&player.connection);
+            return;
+        }
         if !click.is_valid_for(self.behavior().slot_count()) {
             log::debug!(
                 "Ignoring programmatic container click that violates parsed-click invariants: \

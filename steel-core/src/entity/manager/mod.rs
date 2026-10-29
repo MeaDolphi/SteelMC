@@ -415,6 +415,7 @@ impl EntityEntry {
             && !self.entity.is_passenger()
             && !self.entity.has_exactly_one_player_passenger()
             && self.entity.entity_type().can_serialize
+            && self.entity.should_save()
     }
 
     fn query_order(&self) -> EntityQueryOrder {

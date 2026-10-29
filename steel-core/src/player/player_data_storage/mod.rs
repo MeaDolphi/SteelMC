@@ -5,12 +5,14 @@ mod known_players;
 mod memory_storage;
 mod permissions;
 mod stats;
+pub mod transaction;
 
 #[cfg(test)]
 mod tests;
 
 use std::{io::Cursor, path::PathBuf};
 
+use rustc_hash::{FxHashMap, FxHashSet};
 use simdnbt::{ToNbtTag, borrow::read_compound as read_borrowed_compound, owned::NbtTag};
 use tokio::io;
 use uuid::Uuid;
@@ -34,7 +36,9 @@ use crate::player::Player;
 use crate::player::player_data_storage::file_storage::FilePlayerDataStorage;
 use crate::player::player_data_storage::memory_storage::MemoryPlayerDataStorage;
 use steel_registry::item_stack::ItemStack;
+use steel_utils::locks::AsyncMutex;
 use steel_utils::{BlockPos, Identifier};
+use transaction::{FileTransactions, PlayerStorageTransaction, TransactionCommit};
 
 const PLAYER_MAGIC: [u8; 4] = *b"STLP";
 const GLOBAL_MAGIC: [u8; 4] = *b"STLG";
@@ -52,6 +56,9 @@ pub struct GlobalPlayerData {
 /// Manages player data persistence.
 pub struct PlayerDataStorage {
     backend: PlayerDataStorageBackend,
+    transactions: Option<FileTransactions>,
+    /// Serializes player snapshots, extension documents and recovery.
+    transaction_gate: AsyncMutex<FxHashMap<(String, Uuid), u64>>,
 }
 
 enum PlayerDataStorageBackend {
@@ -160,8 +167,15 @@ impl PlayerDataStorage {
 
     /// Creates player data storage backed by files under `save_root`.
     pub async fn on_disk(save_root: PathBuf) -> io::Result<Self> {
+        let transactions = FileTransactions::new(save_root.clone());
+        transactions.initialize().await?;
+        transactions.recover().await?;
         let backend = PlayerDataStorageBackend::File(FilePlayerDataStorage::new(save_root).await?);
-        Ok(Self { backend })
+        Ok(Self {
+            backend,
+            transactions: Some(transactions),
+            transaction_gate: AsyncMutex::new(FxHashMap::default()),
+        })
     }
 
     /// Creates player data storage that keeps everything in RAM.
@@ -169,6 +183,8 @@ impl PlayerDataStorage {
     pub fn in_memory() -> Self {
         Self {
             backend: PlayerDataStorageBackend::Memory(MemoryPlayerDataStorage::default()),
+            transactions: None,
+            transaction_gate: AsyncMutex::new(FxHashMap::default()),
         }
     }
 
@@ -187,13 +203,9 @@ impl PlayerDataStorage {
 
     /// Saves a player's data for a specific domain.
     pub async fn save_domain(&self, domain: &str, player: &Player) -> io::Result<()> {
-        match &self.backend {
-            PlayerDataStorageBackend::File(storage) => storage.save_domain(domain, player).await,
-            PlayerDataStorageBackend::Memory(storage) => {
-                storage.save_domain(domain, player);
-                Ok(())
-            }
-        }
+        let data = PersistentPlayerData::from_player(player);
+        self.save_domain_data(domain, player.gameprofile.id(), &data)
+            .await
     }
 
     /// Saves an already captured player data snapshot for a specific domain.
@@ -203,6 +215,21 @@ impl PlayerDataStorage {
         uuid: Uuid,
         data: &PersistentPlayerData,
     ) -> io::Result<()> {
+        if data.inventory_transaction_snapshot {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "inventory transaction has not finished",
+            ));
+        }
+        let mut orders = self.transaction_gate.lock().await;
+        self.recover_transaction().await?;
+        let key = (domain.to_owned(), uuid);
+        if orders
+            .get(&key)
+            .is_some_and(|order| *order > data.save_order)
+        {
+            return Ok(());
+        }
         match &self.backend {
             PlayerDataStorageBackend::File(storage) => {
                 storage.save_domain_data(domain, uuid, data).await
@@ -211,7 +238,9 @@ impl PlayerDataStorage {
                 storage.save_domain_data(domain, uuid, data);
                 Ok(())
             }
-        }
+        }?;
+        orders.insert(key, data.save_order);
+        Ok(())
     }
 
     /// Loads a player's data for a specific domain.
@@ -220,10 +249,91 @@ impl PlayerDataStorage {
         domain: &str,
         uuid: Uuid,
     ) -> io::Result<Option<PersistentPlayerData>> {
+        let _guard = self.transaction_gate.lock().await;
+        self.recover_transaction().await?;
         match &self.backend {
             PlayerDataStorageBackend::File(storage) => storage.load_domain(domain, uuid).await,
             PlayerDataStorageBackend::Memory(storage) => Ok(storage.load_domain(domain, uuid)),
         }
+    }
+
+    async fn recover_transaction(&self) -> io::Result<()> {
+        if let Some(transactions) = &self.transactions {
+            transactions.recover().await?;
+        }
+        Ok(())
+    }
+
+    /// Reads gameplay-owned bytes without adding thematic vanilla player fields.
+    pub async fn load_extension(&self, key: &Identifier) -> io::Result<Option<Vec<u8>>> {
+        transaction::validate_key(key)?;
+        let _guard = self.transaction_gate.lock().await;
+        self.recover_transaction().await?;
+        match (&self.backend, &self.transactions) {
+            (_, Some(transactions)) => transactions.load_extension(key).await,
+            (PlayerDataStorageBackend::Memory(storage), None) => Ok(storage.load_extension(key)),
+            _ => Err(io::Error::other("file storage has no transaction backend")),
+        }
+    }
+
+    /// Publishes vanilla after-images and opaque gameplay documents together.
+    ///
+    /// A returned commit, including uncertain durability, is not a rejection:
+    /// callers must install matching live state. Await this only off-tick;
+    /// a server job applies the result while live state remains reserved.
+    pub async fn commit_transaction(
+        &self,
+        transaction: &PlayerStorageTransaction,
+    ) -> io::Result<TransactionCommit> {
+        let mut orders = self.transaction_gate.lock().await;
+        self.recover_transaction().await?;
+        let mut players = FxHashSet::default();
+        let mut extensions = FxHashSet::default();
+        if transaction.players.is_empty() && transaction.extensions.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty player transaction",
+            ));
+        }
+        for player in &transaction.players {
+            transaction::validate_domain(&player.domain)?;
+            let key = (player.domain.clone(), player.uuid);
+            if !players.insert(key.clone()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "duplicate transaction player",
+                ));
+            }
+            if orders
+                .get(&key)
+                .is_some_and(|order| *order > player.data.save_order)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "stale player snapshot",
+                ));
+            }
+        }
+        for extension in &transaction.extensions {
+            transaction::validate_key(&extension.key)?;
+            if !extensions.insert(&extension.key) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "duplicate transaction document",
+                ));
+            }
+        }
+        let outcome = match (&self.backend, &self.transactions) {
+            (_, Some(storage)) => storage.commit(transaction).await?,
+            (PlayerDataStorageBackend::Memory(storage), None) => {
+                storage.commit_transaction(transaction)?
+            }
+            _ => return Err(io::Error::other("file storage has no transaction backend")),
+        };
+        for player in &transaction.players {
+            orders.insert((player.domain.clone(), player.uuid), player.data.save_order);
+        }
+        Ok(outcome)
     }
 
     /// Loads server-wide player data.
@@ -392,6 +502,8 @@ impl PlayerDataFile {
         }
 
         Ok(PersistentPlayerData {
+            save_order: PersistentPlayerData::next_save_order(),
+            inventory_transaction_snapshot: false,
             pos: self.pos,
             motion: self.motion,
             rotation: self.rotation,

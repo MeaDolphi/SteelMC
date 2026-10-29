@@ -1,10 +1,14 @@
 //! Tick-polled server jobs.
 
 pub(in crate::server) mod domain_switch;
+mod inventory_transaction;
+mod io_completion;
 pub(super) mod teleport;
 
 use std::{
+    future::Future,
     mem,
+    pin::Pin,
     sync::{Arc, Weak},
 };
 
@@ -64,6 +68,17 @@ pub trait ServerJob: Send {
 
     /// Cancels the job before it finishes.
     fn cancel(&mut self) {}
+
+    /// Durable operations cannot be abandoned after their commit task starts.
+    fn is_cancellable(&self) -> bool {
+        true
+    }
+
+    /// Shutdown runs off-tick and must join any durable operation before saves.
+    fn finish_shutdown(mut self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        self.cancel();
+        Box::pin(async {})
+    }
 }
 
 /// Tick-owned job queue.
@@ -136,11 +151,28 @@ impl ServerJobQueue {
         self.jobs.lock().is_empty()
     }
 
-    /// Cancels and removes all queued jobs.
+    /// Cancels ordinary jobs, retaining durable jobs until completion or shutdown.
     pub fn cancel_all(&self) {
         let jobs = mem::take(&mut *self.jobs.lock());
         for mut job in jobs {
-            job.cancel();
+            if job.is_cancellable() {
+                job.cancel();
+            } else {
+                self.jobs.lock().push(job);
+            }
+        }
+    }
+
+    /// Completes durable jobs, then cancels ordinary jobs before final saves.
+    pub async fn finish_all(&self) {
+        loop {
+            let jobs = mem::take(&mut *self.jobs.lock());
+            if jobs.is_empty() {
+                return;
+            }
+            for job in jobs {
+                job.finish_shutdown().await;
+            }
         }
     }
 

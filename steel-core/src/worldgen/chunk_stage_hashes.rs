@@ -27,6 +27,7 @@ use crate::chunk::light::{
 use crate::chunk::section::{ChunkSection, Sections};
 use crate::chunk::status::ChunkStatus;
 use crate::entity::damage::DamageHistory;
+use crate::gameplay_hooks::NoopGameplayHooks;
 use crate::level_data::{GameTimeSource, WorldGenerationSettings};
 use crate::world::{World, WorldConfig, WorldStorageConfig};
 use crate::worldgen::generator::{GenerationChunk, TerrainPhase};
@@ -254,6 +255,7 @@ fn create_test_world(
             seed as i64,
             WorldConfig {
                 damage_history: Arc::clone(damage_history),
+                gameplay_hooks: Arc::new(NoopGameplayHooks),
                 game_time_source: GameTimeSource::Primary,
                 storage: WorldStorageConfig::RamOnly,
                 level_data_path: None,

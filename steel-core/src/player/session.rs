@@ -1,6 +1,6 @@
 use std::sync::{
     Arc, Weak,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use steel_utils::locks::{SyncMutex, SyncRwLock};
@@ -24,6 +24,9 @@ pub struct PlayerSession {
     pub(crate) chat: SyncMutex<ChatState>,
     /// Vanilla keeps creative drop throttling on the connection across respawns.
     pub(super) drop_spam_throttler: SyncMutex<TickThrottler>,
+    pub(super) inventory_transaction_active: AtomicBool,
+    pub(super) deferred_death_inventory:
+        SyncMutex<Option<super::inventory_transaction::DeferredDeathInventory>>,
 }
 
 enum CurrentPlayerSlot {
@@ -50,6 +53,8 @@ impl PlayerSession {
 
         Self {
             id: PlayerSessionId(previous + 1),
+            inventory_transaction_active: AtomicBool::new(false),
+            deferred_death_inventory: SyncMutex::new(None),
             current_player: SyncRwLock::new(CurrentPlayerSlot::Unbound),
             chunk_sender: SyncMutex::new(ChunkSender::default()),
             chat: SyncMutex::new(ChatState::new(

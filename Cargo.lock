@@ -2710,6 +2710,7 @@ dependencies = [
  "serde_json",
  "steel-core",
  "steel-login",
+ "steel-sololeveling",
  "steel-utils",
  "strip-ansi-escapes",
  "text_components",
@@ -2870,6 +2871,25 @@ dependencies = [
  "syn 3.0.9",
  "text_components",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "steel-sololeveling"
+version = "0.16.1+mc26.3"
+dependencies = [
+ "glam",
+ "log",
+ "rand 0.10.3",
+ "rustc-hash 2.1.3",
+ "serde",
+ "serde_json",
+ "simdnbt",
+ "steel-core",
+ "steel-registry",
+ "steel-utils",
+ "text_components",
+ "tokio",
  "uuid",
 ]
 

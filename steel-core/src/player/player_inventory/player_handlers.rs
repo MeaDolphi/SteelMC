@@ -17,9 +17,9 @@ use crate::{
 use glam::DVec3;
 use steel_protocol::packets::game::SSeenAdvancement::Opened;
 use steel_protocol::packets::game::{
-    CContainerClose, COpenScreen, CSetPlayerInventory, ClickType, SContainerButtonClick,
-    SContainerClick, SContainerClose, SContainerSlotStateChanged, SRenameItem, SSeenAdvancement,
-    SSetBeacon, SSetCarriedItem, SSetCreativeModeSlot, SoundSource,
+    CContainerClose, COpenScreen, CSetHeldSlot, CSetPlayerInventory, ClickType,
+    SContainerButtonClick, SContainerClick, SContainerClose, SContainerSlotStateChanged,
+    SRenameItem, SSeenAdvancement, SSetBeacon, SSetCarriedItem, SSetCreativeModeSlot, SoundSource,
 };
 use steel_registry::data_components::vanilla_components::SwingAnimation;
 use steel_registry::item_stack::ItemStack;
@@ -172,7 +172,7 @@ impl Player {
     /// - Calculates pickup area as bounding box inflated by (1.0, 0.5, 1.0)
     /// - Calls `playerTouch()` on each entity in range
     pub(in crate::player) fn touch_nearby_items(&self) {
-        if self.game_mode() == GameType::Spectator {
+        if self.game_mode() == GameType::Spectator || self.inventory_transaction_active() {
             return;
         }
 
@@ -439,6 +439,10 @@ impl Player {
 
     /// Handles a creative mode slot set packet.
     pub fn handle_set_creative_mode_slot(&self, packet: SSetCreativeModeSlot) {
+        if self.inventory_transaction_active() {
+            self.send_inventory_to_remote();
+            return;
+        }
         if self.game_mode() != GameType::Creative {
             return;
         }
@@ -485,6 +489,13 @@ impl Player {
 
     /// Sets selected slot
     pub fn handle_set_carried_item(&self, packet: SSetCarriedItem) {
+        if self.inventory_transaction_active() {
+            self.send_packet(CSetHeldSlot {
+                slot: i32::from(self.inventory.lock().get_selected_slot()),
+            });
+            self.send_inventory_to_remote();
+            return;
+        }
         if self
             .inventory
             .lock()
@@ -932,6 +943,9 @@ impl Player {
         predicate: &dyn Fn(&ItemStack) -> bool,
         amount_to_remove: i32,
     ) -> i32 {
+        if amount_to_remove != 0 && self.inventory_transaction_active() {
+            return 0;
+        }
         let counting_only = amount_to_remove == 0;
         let mut count = self.inventory.lock().clear_or_count_matching_items(
             predicate,
@@ -1104,7 +1118,7 @@ impl Player {
     /// Returns false if the player is dead, removed, or has a flag preventing item drops.
     #[must_use]
     pub fn can_drop_items(&self) -> bool {
-        !self.is_removed()
+        !self.is_removed() && !self.inventory_transaction_active()
         // TODO: Check if player is alive (health > 0)
     }
 

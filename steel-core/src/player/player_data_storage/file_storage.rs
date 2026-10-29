@@ -8,8 +8,8 @@ use super::{
     decode_global_file, decode_player_file, encode_global_file, encode_player_file,
 };
 use crate::permission::PermissionSubjectIndex;
+use crate::player::KnownPlayers;
 use crate::player::player_data::{PersistentPlayerData, PersistentStat};
-use crate::player::{KnownPlayers, Player};
 use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,12 +31,6 @@ impl FilePlayerDataStorage {
             save_root,
             file_locks: SyncMutex::new(FxHashMap::default()),
         })
-    }
-
-    pub(crate) async fn save_domain(&self, domain: &str, player: &Player) -> io::Result<()> {
-        let uuid = player.gameprofile.id();
-        let data = PersistentPlayerData::from_player(player);
-        self.save_domain_data(domain, uuid, &data).await
     }
 
     pub(crate) async fn save_domain_data(

@@ -46,7 +46,9 @@ use steel_registry::blocks::properties::{BlockStateProperties, Direction};
 use steel_registry::data_component_predicate::DataComponentMatchers;
 use steel_registry::data_components::vanilla_components::{CAN_BREAK, EQUIPPABLE};
 use steel_registry::data_components::{AdventureModePredicate, BlockPredicate};
-use steel_registry::packets::play::C_REMOVE_ENTITIES;
+use steel_registry::packets::play::{
+    C_REMOVE_ENTITIES, C_SET_DISPLAY_OBJECTIVE, C_SET_OBJECTIVE, C_SET_SCORE,
+};
 use steel_registry::stat::vanilla_stat_types;
 use steel_registry::{
     RegistryHolderSet, entity_data::EntityData, init_vanilla_registry, item_stack::ItemStack,
@@ -1824,4 +1826,54 @@ fn sword_does_not_destroy_blocks_in_creative() {
         dirt,
         "swords should not destroy blocks when player is in creative mode."
     );
+}
+
+/// Collects the packet ids a recorded player connection received.
+fn sent_packet_ids(packets: &[EncodedPacket]) -> Vec<i32> {
+    packets
+        .iter()
+        .filter_map(|packet| {
+            let mut cursor = Cursor::new(packet.encoded_data.as_slice());
+            VarInt::read(&mut cursor).ok()?;
+            VarInt::read(&mut cursor).ok().map(|id| id.0)
+        })
+        .collect()
+}
+
+/// The client keeps a scoreboard objective until it is removed and drops the
+/// connection on a second add of the same name, so restoring a sidebar for a
+/// respawned player on the same connection must not re-add the objective.
+#[test]
+fn rebinding_a_sidebar_never_re_adds_its_objective() {
+    init_vanilla_registry();
+    let world_fixture = fresh_test_world("sidebar_respawn_restore");
+    let world = &world_fixture.world;
+    let sent_packets = Arc::new(SyncMutex::new(Vec::new()));
+    let connection = Arc::new(PlayerConnection::Other(Box::new(RecordingConnection {
+        sent_packets: Arc::clone(&sent_packets),
+        closed: AtomicBool::new(false),
+    })));
+    let player = TestPlayerBuilder::new(Arc::clone(world), "TestPlayer", 1)
+        .connection(connection)
+        .build();
+
+    player.show_sidebar("sololeveling.hunter", TextComponent::plain("Solo Leveling"));
+    assert!(
+        sent_packet_ids(&sent_packets.lock()).contains(&C_SET_OBJECTIVE),
+        "showing a sidebar for a new connection adds the objective"
+    );
+    sent_packets.lock().clear();
+
+    player.rebind_sidebar("sololeveling.hunter");
+    player.set_sidebar_line(
+        "sololeveling.hunter",
+        "level",
+        1,
+        TextComponent::plain("Level: 1"),
+    );
+
+    let ids = sent_packet_ids(&sent_packets.lock());
+    assert!(!ids.contains(&C_SET_OBJECTIVE));
+    assert!(ids.contains(&C_SET_DISPLAY_OBJECTIVE));
+    assert!(ids.contains(&C_SET_SCORE));
 }

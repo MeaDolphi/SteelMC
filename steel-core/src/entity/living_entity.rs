@@ -1,4 +1,5 @@
 use steel_math::DEGREE_90;
+use steel_registry::attribute::AttributeRef;
 use steel_registry::data_components::vanilla_components::{DEATH_PROTECTION, USE_EFFECTS};
 use steel_registry::stat::vanilla_stat_types;
 use steel_registry::{DyeColor, vanilla_custom_stats};
@@ -141,6 +142,14 @@ pub trait LivingEntity: Entity {
     /// Returns a reference to this entity's attribute map.
     fn attributes(&self) -> &SyncMutex<AttributeMap> {
         self.living_base().attributes()
+    }
+
+    /// Replaces this entity's base value for a vanilla attribute.
+    ///
+    /// Gameplay systems use this for intentional encounter-specific scaling;
+    /// persistent player modifiers should continue to use attribute modifiers.
+    fn set_base_attribute_value(&self, attribute: AttributeRef, value: f64) {
+        self.attributes().lock().set_base_value(attribute, value);
     }
 
     /// Vanilla `LivingEntity.getLuck` - non-players contribute no luck to loot.
@@ -667,6 +676,14 @@ pub trait LivingEntity: Entity {
     /// `world` is the `ServerLevel` supplied by the vanilla caller. It may
     /// intentionally differ from the entity's attached world.
     fn hurt_server(&self, world: &World, source: &DamageSource, amount: f32) -> bool {
+        if source.causing_entity().is_some_and(|attacker| {
+            self.is_allied_to(attacker.as_ref())
+                || self
+                    .as_living_entity()
+                    .is_some_and(|self_entity| attacker.is_allied_to(self_entity))
+        }) {
+            return false;
+        }
         if self.is_invulnerable_to(world, source) {
             return false;
         }
@@ -701,6 +718,16 @@ pub trait LivingEntity: Entity {
         if !damage.is_finite() {
             damage = f32::MAX;
         }
+        // Gameplay layers adjust the input of the vanilla pipeline; armor,
+        // effects, and the damage cooldown below still apply to the result.
+        if let Some(victim) = self.as_living_entity() {
+            damage = world.gameplay_hooks.modify_damage(
+                world,
+                victim,
+                source,
+                damage.clamp(0.0, f32::MAX),
+            );
+        }
 
         let Some((took_full_damage, effective_amount)) = self
             .living_base()
@@ -709,8 +736,17 @@ pub trait LivingEntity: Entity {
             return false;
         };
 
+        let health_before = self.get_health();
         self.before_actually_hurt(source, effective_amount);
         self.actually_hurt(world, source, effective_amount);
+        let health_lost = (health_before - self.get_health()).max(0.0);
+        if health_lost > 0.0
+            && let Some(entity) = self.as_living_entity()
+        {
+            world
+                .gameplay_hooks
+                .on_living_entity_hurt(world, entity, source, health_lost);
+        }
         self.resolve_mob_responsible_for_damage(source);
         self.resolve_player_responsible_for_damage(source);
 
@@ -1031,6 +1067,15 @@ pub trait LivingEntity: Entity {
                 self.drop_all_death_loot(source);
                 // TODO: Create wither rose for killer
             }
+            world
+                .gameplay_hooks
+                .on_living_entity_death(&world, self_entity, source);
+        }
+
+        if let Some(player) = self.as_player()
+            && let Some(server) = player.try_server()
+        {
+            server.gameplay_hooks.on_player_death(&server, player);
         }
 
         self.broadcast_entity_event(EntityStatus::Death);
@@ -1084,6 +1129,12 @@ pub trait LivingEntity: Entity {
 
     /// Runs the currently implemented subset of vanilla `LivingEntity.dropAllDeathLoot`.
     fn drop_all_death_loot(&self, source: &DamageSource) {
+        if self
+            .as_mob()
+            .is_some_and(|mob| mob.allied_owner().is_some())
+        {
+            return;
+        }
         let Some(world) = self.level() else {
             return;
         };
@@ -1180,6 +1231,10 @@ pub trait LivingEntity: Entity {
             mob.clear_custom_death_loot_table();
         }
 
+        let mut drops = drops;
+        world
+            .gameplay_hooks
+            .on_living_entity_loot(world.as_ref(), self.id(), source, &mut drops);
         for item_stack in drops {
             self.spawn_at_location(item_stack, 0.0);
         }
