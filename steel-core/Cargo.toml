@@ -27,6 +27,7 @@ steel-math.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true
+sqlx.workspace = true
 
 # Serialization
 serde.workspace = true

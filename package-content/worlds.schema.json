@@ -77,8 +77,18 @@
       "properties": {
         "type": {
           "type": "string",
-          "description": "steel:disk persists player data under save_path; steel:ram keeps it in memory and discards it on shutdown.",
-          "enum": ["steel:disk", "steel:ram"]
+          "description": "steel:disk persists player data under save_path; steel:ram keeps it in memory and discards it on shutdown; steel:sqlite stores player data in SQLite.",
+          "enum": ["steel:disk", "steel:ram", "steel:sqlite"]
+        },
+        "config": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "SQLite database path relative to save_path. Defaults to global/playerdata.sqlite."
+            }
+          },
+          "additionalProperties": false
         }
       },
       "required": ["type"],

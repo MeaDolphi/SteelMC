@@ -777,8 +777,27 @@ pub fn validate_relative_path(path: &str, field: &str) -> Result<(), String> {
 fn validate_player_storage_selection(selection: &StorageSelection) -> Result<(), String> {
     if selection.kind != Identifier::from_steel("disk")
         && selection.kind != Identifier::from_steel("ram")
+        && selection.kind != Identifier::from_steel("sqlite")
     {
         return Err(format!("unknown player storage {}", selection.kind));
+    }
+    if selection.kind == Identifier::from_steel("sqlite") {
+        let config = selection.config_value();
+        let table = config
+            .as_table()
+            .ok_or_else(|| "sqlite player storage config must be a table".to_owned())?;
+        for key in table.keys() {
+            if key != "path" {
+                return Err(format!("unknown sqlite player storage config key {key}"));
+            }
+        }
+        if let Some(path) = table.get("path") {
+            let path = path
+                .as_str()
+                .ok_or_else(|| "sqlite player storage path must be a string".to_owned())?;
+            validate_relative_path(path, "sqlite player storage path")?;
+        }
+        return Ok(());
     }
     if selection.config.is_some() {
         return Err(format!(

@@ -4,6 +4,7 @@ mod file_storage;
 mod known_players;
 mod memory_storage;
 mod permissions;
+mod sqlite_storage;
 mod stats;
 pub mod transaction;
 
@@ -35,6 +36,7 @@ use crate::player::KnownPlayers;
 use crate::player::Player;
 use crate::player::player_data_storage::file_storage::FilePlayerDataStorage;
 use crate::player::player_data_storage::memory_storage::MemoryPlayerDataStorage;
+use crate::player::player_data_storage::sqlite_storage::SqlitePlayerDataStorage;
 use steel_registry::item_stack::ItemStack;
 use steel_utils::locks::AsyncMutex;
 use steel_utils::{BlockPos, Identifier};
@@ -64,6 +66,7 @@ pub struct PlayerDataStorage {
 enum PlayerDataStorageBackend {
     File(FilePlayerDataStorage),
     Memory(MemoryPlayerDataStorage),
+    Sqlite(SqlitePlayerDataStorage),
 }
 
 #[derive(SchemaWrite, SchemaRead)]
@@ -157,6 +160,23 @@ impl PlayerDataStorage {
             Self::on_disk(save_root).await
         } else if selection.kind == Identifier::from_steel("ram") {
             Ok(Self::in_memory())
+        } else if selection.kind == Identifier::from_steel("sqlite") {
+            let config = selection.config_value();
+            let path = config
+                .get("path")
+                .and_then(toml::Value::as_str)
+                .map_or_else(|| PathBuf::from("global/playerdata.sqlite"), PathBuf::from);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                save_root.join(path)
+            };
+            let backend = SqlitePlayerDataStorage::open(path).await?;
+            Ok(Self {
+                backend: PlayerDataStorageBackend::Sqlite(backend),
+                transactions: None,
+                transaction_gate: AsyncMutex::new(FxHashMap::default()),
+            })
         } else {
             Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -238,6 +258,9 @@ impl PlayerDataStorage {
                 storage.save_domain_data(domain, uuid, data);
                 Ok(())
             }
+            PlayerDataStorageBackend::Sqlite(storage) => {
+                storage.save_domain_data(domain, uuid, data).await
+            }
         }?;
         orders.insert(key, data.save_order);
         Ok(())
@@ -254,6 +277,7 @@ impl PlayerDataStorage {
         match &self.backend {
             PlayerDataStorageBackend::File(storage) => storage.load_domain(domain, uuid).await,
             PlayerDataStorageBackend::Memory(storage) => Ok(storage.load_domain(domain, uuid)),
+            PlayerDataStorageBackend::Sqlite(storage) => storage.load_domain(domain, uuid).await,
         }
     }
 
@@ -270,9 +294,14 @@ impl PlayerDataStorage {
         let _guard = self.transaction_gate.lock().await;
         self.recover_transaction().await?;
         match (&self.backend, &self.transactions) {
-            (_, Some(transactions)) => transactions.load_extension(key).await,
+            (PlayerDataStorageBackend::File(_), Some(transactions)) => {
+                transactions.load_extension(key).await
+            }
             (PlayerDataStorageBackend::Memory(storage), None) => Ok(storage.load_extension(key)),
-            _ => Err(io::Error::other("file storage has no transaction backend")),
+            (PlayerDataStorageBackend::Sqlite(storage), None) => storage.load_extension(key).await,
+            _ => Err(io::Error::other(
+                "player storage transaction backend is unavailable",
+            )),
         }
     }
 
@@ -324,11 +353,20 @@ impl PlayerDataStorage {
             }
         }
         let outcome = match (&self.backend, &self.transactions) {
-            (_, Some(storage)) => storage.commit(transaction).await?,
+            (PlayerDataStorageBackend::File(_), Some(storage)) => {
+                storage.commit(transaction).await?
+            }
             (PlayerDataStorageBackend::Memory(storage), None) => {
                 storage.commit_transaction(transaction)?
             }
-            _ => return Err(io::Error::other("file storage has no transaction backend")),
+            (PlayerDataStorageBackend::Sqlite(storage), None) => {
+                storage.commit_transaction(transaction).await?
+            }
+            _ => {
+                return Err(io::Error::other(
+                    "player storage transaction backend is unavailable",
+                ));
+            }
         };
         for player in &transaction.players {
             orders.insert((player.domain.clone(), player.uuid), player.data.save_order);
@@ -341,6 +379,7 @@ impl PlayerDataStorage {
         match &self.backend {
             PlayerDataStorageBackend::File(storage) => storage.load_global(uuid).await,
             PlayerDataStorageBackend::Memory(storage) => Ok(storage.load_global(uuid)),
+            PlayerDataStorageBackend::Sqlite(storage) => storage.load_global(uuid).await,
         }
     }
 
@@ -349,6 +388,7 @@ impl PlayerDataStorage {
         match &self.backend {
             PlayerDataStorageBackend::File(storage) => storage.load_permission_subjects().await,
             PlayerDataStorageBackend::Memory(storage) => Ok(storage.load_permission_subjects()),
+            PlayerDataStorageBackend::Sqlite(storage) => storage.load_permission_subjects().await,
         }
     }
 
@@ -357,6 +397,7 @@ impl PlayerDataStorage {
         match &self.backend {
             PlayerDataStorageBackend::File(storage) => storage.load_known_players().await,
             PlayerDataStorageBackend::Memory(storage) => Ok(storage.load_known_players()),
+            PlayerDataStorageBackend::Sqlite(storage) => storage.load_known_players().await,
         }
     }
 
@@ -375,6 +416,11 @@ impl PlayerDataStorage {
             PlayerDataStorageBackend::Memory(storage) => {
                 Ok(storage.save_known_players_if_current(players, is_current))
             }
+            PlayerDataStorageBackend::Sqlite(storage) => {
+                storage
+                    .save_known_players_if_current(players, is_current)
+                    .await
+            }
         }
     }
 
@@ -386,6 +432,7 @@ impl PlayerDataStorage {
                 storage.save_global(uuid, data);
                 Ok(())
             }
+            PlayerDataStorageBackend::Sqlite(storage) => storage.save_global(uuid, data).await,
         }
     }
 
@@ -401,6 +448,9 @@ impl PlayerDataStorage {
             PlayerDataStorageBackend::Memory(storage) => {
                 storage.save_permission_subjects(subjects);
                 Ok(())
+            }
+            PlayerDataStorageBackend::Sqlite(storage) => {
+                storage.save_permission_subjects(subjects).await
             }
         }
     }

@@ -11,7 +11,10 @@ difficulty = "normal"
 type = "steel:disk"
 
 [player_storage]
-type = "steel:disk"
+type = "steel:sqlite"
+# The database starts empty; existing file-backed data is not imported.
+# [player_storage.config]
+# path = "global/playerdata.sqlite"
 
 [domains.minecraft]
 default = true
