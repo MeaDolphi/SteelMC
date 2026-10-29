@@ -17,6 +17,7 @@ use steel_core::player::Player;
 use steel_core::server::Server;
 use steel_core::world::World;
 use steel_registry::item_stack::ItemStack;
+use steel_registry::vanilla_entities;
 use steel_utils::BlockPos;
 use steel_utils::types::{BlockStateId, InteractionHand};
 use text_components::TextComponent;
@@ -26,6 +27,8 @@ use crate::dungeon::instance;
 use crate::dungeon::is_instance_world;
 use crate::dungeon::runtime::TEST_GATE_ON_JOIN;
 use crate::item;
+use crate::organization::Event;
+use crate::organization_menu;
 use crate::quest::SystemQuest;
 use crate::session::HunterSession;
 use crate::sidebar;
@@ -80,6 +83,7 @@ impl GameplayHooks for SoloLevelingHooks {
         self.state.tick_persistence(server);
         self.state.tick_auction(server, tick_count);
         self.state.tick_dungeons(server, tick_count);
+        self.state.tick_organization(server);
     }
 
     fn on_player_join(&self, _server: &Arc<Server>, player: &Player) {
@@ -188,6 +192,10 @@ impl GameplayHooks for SoloLevelingHooks {
     }
 
     fn allow_block_break(&self, world: &World, _player: &Player, pos: BlockPos) -> bool {
+        // A board is removed with `/organization board remove`, never by hand.
+        if self.state.is_organization_board(&world.key, pos) {
+            return false;
+        }
         // Dungeons are sealed rooms: a hunter may only extract the crystals built
         // into their walls, so the layout and the boss cannot be bypassed.
         if !is_instance_world(world) {
@@ -228,6 +236,24 @@ impl GameplayHooks for SoloLevelingHooks {
         hand: InteractionHand,
     ) -> Option<InteractionResult> {
         item::consume::use_item(&self.state, player, stack, hand)
+    }
+
+    fn on_player_use_block(
+        &self,
+        player: &Arc<Player>,
+        world: &Arc<World>,
+        pos: BlockPos,
+        hand: InteractionHand,
+    ) -> Option<InteractionResult> {
+        if !self.state.is_organization_board(&world.key, pos) {
+            return None;
+        }
+        // The client offers the off hand only when the main hand passed, so the
+        // board opens once per click.
+        if hand == InteractionHand::MainHand {
+            organization_menu::open(Arc::clone(player), Arc::clone(&self.state));
+        }
+        Some(InteractionResult::Success)
     }
 
     fn on_living_entity_hurt(
@@ -271,6 +297,17 @@ impl GameplayHooks for SoloLevelingHooks {
             return;
         };
         let hunter = credited_hunter(killer);
+        // Players and summoned shadows are not mobs the Organization pays for.
+        if let Some(hunter) = hunter
+            && entity.as_player().is_none()
+            && entity
+                .as_mob()
+                .is_none_or(|mob| mob.allied_owner().is_none())
+        {
+            let zombie = entity.entity_type() == &vanilla_entities::ZOMBIE;
+            self.state
+                .record_organization_event(vec![hunter], Event::Kill { zombie });
+        }
         let dungeon_mob = self
             .state
             .observe_dungeon_mob_death(world, entity.id(), hunter);

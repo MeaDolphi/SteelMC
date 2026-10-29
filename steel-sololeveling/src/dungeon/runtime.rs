@@ -40,6 +40,7 @@ use super::{
     penalty_wave_size, wave_for_gate,
 };
 use crate::item::chest::{self, ChestKind};
+use crate::organization::Event;
 use crate::party::RaidContribution;
 use crate::rank::HunterRank;
 use crate::state::SoloLevelingState;
@@ -1265,6 +1266,8 @@ impl DungeonRuntime {
             })
             .collect();
         state.credit_dungeon_boss(survivors.clone(), progress.rank);
+        state.record_organization_event(survivors.clone(), Event::Boss);
+        state.record_organization_event(survivors.clone(), Event::Dungeon(progress.rank));
         // One roll decides whether the squad gets a chest at all; every survivor
         // then receives the same kind, as the boss reward table specifies.
         progress.boss_chest = chest::boss_chest_for(progress.rank, rand::random_range(0..100));
@@ -1464,7 +1467,7 @@ fn even_share(count: u64, members: usize, index: usize) -> u64 {
     count / members + u64::from((index as u64) < count % members)
 }
 
-fn find_player(server: &Server, uuid: Uuid) -> Option<Arc<Player>> {
+pub(crate) fn find_player(server: &Server, uuid: Uuid) -> Option<Arc<Player>> {
     server
         .get_players()
         .into_iter()

@@ -17,6 +17,10 @@ use steel_registry::stat::vanilla_stat_types;
 /// 4. If block returns `TryEmptyHandInteraction` and main hand: Call block's `use_without_item`
 /// 5. If item not empty: Call item behavior's `use_on` for placement
 /// 6. Handle creative mode infinite materials
+#[expect(
+    clippy::too_many_lines,
+    reason = "mirrors vanilla useItemOn as one sequence, plus the gameplay block hook"
+)]
 pub fn use_item_on(
     player: &Arc<Player>,
     world: &Arc<World>,
@@ -33,6 +37,13 @@ pub fn use_item_on(
     // TODO: Implement menu providers for blocks like chests
     if player.game_mode() == GameType::Spectator {
         return InteractionResult::Pass;
+    }
+
+    if let Some(result) = world
+        .gameplay_hooks
+        .on_player_use_block(player, world, pos, hand)
+    {
+        return result;
     }
 
     // Check if block interaction should be suppressed (sneaking + holding items in either hand)

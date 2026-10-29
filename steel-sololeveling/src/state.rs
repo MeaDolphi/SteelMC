@@ -2,6 +2,8 @@
 
 mod auction;
 pub use auction::{AuctionRequest, LotView};
+mod organization;
+pub use organization::{BoardView, GroupPayout};
 mod persistence;
 
 use std::io;
@@ -25,6 +27,7 @@ use crate::daily;
 use crate::dungeon::runtime::{self, DungeonRuntime, RunDeath};
 use crate::guild::{Guild, GuildError, GuildRegistry, GuildRole};
 use crate::item::crystal::{self, CrystalSale, CrystalSaleError};
+use crate::organization::Event;
 use crate::party::{Party, PartyError, PartyExit, PartyRuntime};
 use crate::player_data::{PlayerDataStorage, SoloLevelingPlayerData};
 use crate::rank::HunterRank;
@@ -46,6 +49,8 @@ pub struct SoloLevelingState {
     active_guild_banks: SyncMutex<FxHashSet<String>>,
     auction: SyncMutex<auction::AuctionState>,
     persistence: SyncMutex<persistence::Persistence>,
+    organization_boards: SyncMutex<organization::Boards>,
+    organization_events: SyncMutex<Vec<(Vec<Uuid>, Event)>>,
 }
 
 impl SoloLevelingState {
@@ -54,6 +59,8 @@ impl SoloLevelingState {
         let storage = PlayerDataStorage::new(base_dir);
         storage.init()?;
         let guilds = GuildRegistry::load(storage.base_dir())?;
+        let boards =
+            organization::Boards::load(storage.base_dir().join("organization_boards.json"))?;
         Ok(Self {
             storage,
             sessions: SessionRegistry::new(),
@@ -64,6 +71,8 @@ impl SoloLevelingState {
             active_guild_banks: SyncMutex::new(FxHashSet::default()),
             auction: SyncMutex::new(auction::AuctionState::default()),
             persistence: SyncMutex::new(persistence::Persistence::default()),
+            organization_boards: SyncMutex::new(boards),
+            organization_events: SyncMutex::new(Vec::new()),
         })
     }
 
@@ -72,6 +81,7 @@ impl SoloLevelingState {
         let mut session = HunterSession::new(data.stats, data.won, data.quest, data.shadows);
         session.system_points = data.system_points;
         session.shop = data.shop;
+        session.organization = data.organization;
         self.sessions.insert(player_uuid, session);
     }
 
@@ -644,6 +654,7 @@ mod tests {
 
     use super::{SoloLevelingPlayerData, SoloLevelingState};
     use crate::economy::{SystemPoints, Won};
+    use crate::organization::OrganizationBook;
     use crate::quest::SystemQuest;
     use crate::shadow::ShadowRoster;
     use crate::shop::ShopDay;
@@ -667,6 +678,7 @@ mod tests {
                 quest: SystemQuest::default(),
                 shadows: ShadowRoster::default(),
                 shop: ShopDay::unset(),
+                organization: OrganizationBook::new(),
             },
         );
 

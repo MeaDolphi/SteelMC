@@ -3,6 +3,8 @@
 use rustc_hash::FxHashMap;
 use uuid::Uuid;
 
+use crate::organization::GroupContract;
+
 /// Maximum number of hunters in one party.
 pub const PARTY_MAX_MEMBERS: usize = 4;
 /// Minecraft ticks for which a party invitation remains valid.
@@ -15,6 +17,8 @@ pub const PARTY_INVITATION_TICKS: u64 = 20 * 60;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Party {
     members: Vec<Uuid>,
+    /// Organization contracts the party took; they share its lifetime.
+    pub(crate) contracts: Vec<GroupContract>,
 }
 
 impl Party {
@@ -23,6 +27,7 @@ impl Party {
     pub fn new(leader: Uuid) -> Self {
         Self {
             members: vec![leader],
+            contracts: Vec::new(),
         }
     }
 
@@ -51,7 +56,22 @@ impl Party {
             return false;
         };
         self.members.remove(index);
+        // A member who leaves forfeits their share; a contract nobody is
+        // entitled to any more is cancelled.
+        for contract in &mut self.contracts {
+            contract
+                .participants
+                .retain(|participant| *participant != player);
+        }
+        self.contracts
+            .retain(|contract| !contract.participants.is_empty());
         true
+    }
+
+    /// Returns the Organization contracts the party holds.
+    #[must_use]
+    pub fn contracts(&self) -> &[GroupContract] {
+        &self.contracts
     }
 }
 
@@ -192,6 +212,21 @@ impl PartyRuntime {
         }
         let _ = self.leave(target);
         Ok(())
+    }
+
+    /// Returns the party led by `leader`, refusing anyone else.
+    pub fn led_party_mut(&mut self, leader: Uuid) -> Result<&mut Party, PartyError> {
+        let key = *self.membership.get(&leader).ok_or(PartyError::NotInParty)?;
+        let party = self.parties.get_mut(&key).ok_or(PartyError::NotInParty)?;
+        if party.leader() != leader {
+            return Err(PartyError::NotLeader);
+        }
+        Ok(party)
+    }
+
+    /// Returns every party, for counting shared contract progress.
+    pub fn parties_mut(&mut self) -> impl Iterator<Item = &mut Party> {
+        self.parties.values_mut()
     }
 
     /// Expires pending invitations. Party membership itself is not timed.

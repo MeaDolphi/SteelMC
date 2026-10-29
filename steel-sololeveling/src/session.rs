@@ -12,6 +12,7 @@ use steel_utils::locks::SyncRwLock;
 use uuid::Uuid;
 
 use crate::economy::{PaymentError, SystemPoints, Won};
+use crate::organization::OrganizationBook;
 use crate::player_data::{PaymentDurability, PlayerDataStorage, SoloLevelingPlayerData};
 use crate::quest::{QUEST_REWARD_STAT_POINTS, SystemQuest};
 use crate::shadow::ShadowRoster;
@@ -43,6 +44,8 @@ pub struct HunterSession {
     pub shadows: ShadowRoster,
     /// Daily personal-shop purchases.
     pub shop: ShopDay,
+    /// Personal Adventurer Organization contracts.
+    pub organization: OrganizationBook,
     /// Ticks elapsed since the sidebar was last refreshed for this player.
     ticks_since_sidebar_update: u64,
     /// Values last sent to the sidebar, so unchanged state is not re-sent.
@@ -72,6 +75,7 @@ impl HunterSession {
             quest,
             shadows,
             shop: ShopDay::unset(),
+            organization: OrganizationBook::new(),
             ticks_since_sidebar_update: 0,
             last_sidebar: None,
             last_quest_position: None,
@@ -91,6 +95,7 @@ impl HunterSession {
             quest: self.quest,
             shadows: self.shadows.clone(),
             shop: self.shop,
+            organization: self.organization.clone(),
         }
     }
 

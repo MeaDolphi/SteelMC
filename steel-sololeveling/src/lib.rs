@@ -24,6 +24,8 @@ pub mod hooks;
 pub mod hunter_stats_menu;
 pub mod identifier;
 pub mod item;
+pub mod organization;
+pub mod organization_menu;
 pub mod party;
 pub mod player_data;
 pub mod quest;

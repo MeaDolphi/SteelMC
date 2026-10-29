@@ -2,6 +2,7 @@
 
 mod auction;
 mod crystal;
+mod organization;
 mod pay;
 mod shop;
 
@@ -34,6 +35,7 @@ pub fn register(
     shop::register(registry, Arc::clone(&state))?;
     crystal::register(registry, Arc::clone(&state))?;
     auction::register(registry, Arc::clone(&state))?;
+    organization::register(registry, Arc::clone(&state))?;
     let hunter_stats_state = Arc::clone(&state);
     let command = CommandRegistration::new(from_sololeveling("hunterstats"), move || {
         let state = Arc::clone(&hunter_stats_state);

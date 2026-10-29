@@ -168,6 +168,21 @@ pub trait GameplayHooks: Send + Sync {
         None
     }
 
+    /// Called when a player uses a block, before the block's vanilla behavior.
+    ///
+    /// Returning `Some` replaces the vanilla interaction, which is how a
+    /// gameplay layer can turn a placed block into its own interactive object.
+    /// Spectators never reach this hook.
+    fn on_player_use_block(
+        &self,
+        _player: &Arc<Player>,
+        _world: &Arc<World>,
+        _pos: BlockPos,
+        _hand: InteractionHand,
+    ) -> Option<InteractionResult> {
+        None
+    }
+
     /// Called when a player dies, after vanilla death handling has run.
     ///
     /// Non-player deaths have no reachable [`Server`] handle at the vanilla

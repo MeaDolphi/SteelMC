@@ -15,6 +15,7 @@ use steel_utils::locks::SyncMutex;
 use uuid::Uuid;
 
 use crate::economy::{SystemPoints, Won};
+use crate::organization::OrganizationBook;
 use crate::quest::SystemQuest;
 use crate::shadow::ShadowRoster;
 use crate::shop::ShopDay;
@@ -45,6 +46,9 @@ pub struct SoloLevelingPlayerData {
     /// Daily personal-shop purchases, reset by the Moscow day counter.
     #[serde(default)]
     pub shop: ShopDay,
+    /// Personal Adventurer Organization contracts and today's allowance.
+    #[serde(default)]
+    pub organization: OrganizationBook,
 }
 
 impl SoloLevelingPlayerData {
@@ -59,6 +63,7 @@ impl SoloLevelingPlayerData {
             quest: SystemQuest::uninitialized(),
             shadows: ShadowRoster::default(),
             shop: ShopDay::default(),
+            organization: OrganizationBook::new(),
         }
     }
 }
