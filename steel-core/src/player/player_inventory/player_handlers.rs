@@ -1060,6 +1060,11 @@ impl Player {
         if item.is_empty() {
             return None;
         }
+        // A gameplay layer may keep some of its items from ever leaving the
+        // player, which also covers drops on death.
+        if !self.get_world().gameplay_hooks.allow_item_drop(self, &item) {
+            return None;
+        }
 
         let pos = self.position();
         let (yaw, pitch) = self.rotation();

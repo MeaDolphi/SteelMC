@@ -196,6 +196,12 @@ pub trait GameplayHooks: Send + Sync {
         None
     }
 
+    /// Called before a player throws or drops an item, including death drops;
+    /// `false` destroys the stack instead of spawning it in the world.
+    fn allow_item_drop(&self, _player: &Player, _stack: &ItemStack) -> bool {
+        true
+    }
+
     /// Called when a player dies, after vanilla death handling has run.
     ///
     /// Non-player deaths have no reachable [`Server`] handle at the vanilla

@@ -30,17 +30,28 @@ const GROUP_COLUMN: usize = 7;
 const GUILD_COLUMN: usize = 8;
 const HELP_SLOT: usize = 8;
 
-/// Opens the board for an online hunter.
-pub fn open(player: Arc<Player>, state: Arc<SoloLevelingState>) {
+/// Opens the board for a hunter standing at it.
+pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
     player.open_menu(
         TextComponent::plain("Организация авантюристов").color(Color::DarkGreen),
-        move |context| build(context.container_id, context.player, Arc::clone(&state)),
+        move |context| build(context.container_id, context.player, state, true),
     );
 }
 
-fn build(container_id: u8, player: &Player, state: Arc<SoloLevelingState>) -> Menu {
+/// Opens a read-only list of the hunter's contracts, away from any board.
+///
+/// Taking and turning in contracts stays at the board, which plays the part
+/// of the Organization's NPC.
+pub fn open_view(player: &Player, state: Arc<SoloLevelingState>) {
+    player.open_menu(
+        TextComponent::plain("Мои задания").color(Color::DarkGreen),
+        move |context| build(context.container_id, context.player, state, false),
+    );
+}
+
+fn build(container_id: u8, player: &Player, state: Arc<SoloLevelingState>, at_board: bool) -> Menu {
     let view = state.organization_view(player.gameprofile.id());
-    let container = SimpleContainer::from_items(menu_items(view.as_ref())).into_shared();
+    let container = SimpleContainer::from_items(menu_items(view.as_ref(), at_board)).into_shared();
     let mut builder = MenuBuilder::new(&vanilla_menu_types::GENERIC_9X6, container_id);
     let buttons = builder.section_all(Arc::clone(&container));
     builder.player_inventory(&player.inventory);
@@ -48,6 +59,7 @@ fn build(container_id: u8, player: &Player, state: Arc<SoloLevelingState>) -> Me
         state,
         buttons,
         container,
+        at_board,
     })
 }
 
@@ -88,13 +100,14 @@ fn button_at(slot: usize) -> Option<Button> {
     }
 }
 
-fn menu_items(view: Option<&BoardView>) -> Vec<ItemStack> {
+fn menu_items(view: Option<&BoardView>, at_board: bool) -> Vec<ItemStack> {
     let mut items = vec![ItemStack::empty(); SLOTS];
     let Some(view) = view else {
         return items;
     };
     for (slot, item) in items.iter_mut().enumerate() {
         *item = match button_at(slot) {
+            Some(Button::Offer(_)) if !at_board => ItemStack::empty(),
             Some(Button::Offer(template)) => offer_item(view, template),
             Some(Button::Personal(index)) => view.book.contracts.get(index).map_or_else(
                 || free_slot("Свободный личный слот"),
@@ -246,6 +259,8 @@ struct OrganizationMenuKind {
     state: Arc<SoloLevelingState>,
     buttons: Section,
     container: Shared<SimpleContainer>,
+    /// Whether the hunter opened the board itself, rather than the read-only list.
+    at_board: bool,
 }
 
 // SAFETY: This Solo Leveling-owned key uniquely identifies the concrete menu kind.
@@ -353,7 +368,12 @@ impl MenuKind for OrganizationMenuKind {
         let Some(target) = button_at(slot - self.buttons.start()) else {
             return ClickOutcome::Consume;
         };
-        match self.act(target, action, player) {
+        let result = if self.at_board {
+            self.act(target, action, player)
+        } else {
+            Err(OrganizationError::NotAtBoard)
+        };
+        match result {
             Ok(message) => {
                 player.send_message(&TextComponent::plain(message).color(Color::Green));
             }
@@ -365,7 +385,10 @@ impl MenuKind for OrganizationMenuKind {
         let view = self.state.organization_view(player.gameprofile.id());
         let container_id = ContainerId::from_arc(&self.container);
         if let Some(container) = guard.get_typed_mut::<SimpleContainer>(container_id) {
-            for (index, item) in menu_items(view.as_ref()).into_iter().enumerate() {
+            for (index, item) in menu_items(view.as_ref(), self.at_board)
+                .into_iter()
+                .enumerate()
+            {
                 container.set_item(index, item);
             }
         }

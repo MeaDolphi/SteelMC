@@ -17,6 +17,7 @@ pub mod chest;
 pub mod choice_menu;
 pub mod consume;
 pub mod crystal;
+pub mod menu_book;
 pub mod nbt;
 pub mod potion;
 pub mod shadow;

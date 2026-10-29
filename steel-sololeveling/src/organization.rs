@@ -96,6 +96,19 @@ impl Template {
         self.objective.base_payment() * rank_multiplier(self.rank)
     }
 
+    /// Returns a short name that fits one sidebar line.
+    #[must_use]
+    pub fn short_title(self) -> String {
+        let rank = self.rank.name();
+        match self.objective {
+            Objective::Mobs => format!("[{rank}] Мобы"),
+            Objective::Zombies => format!("[{rank}] Зомби"),
+            Objective::Boss => format!("[{rank}] Босс"),
+            Objective::RankedDungeon => format!("[{rank}] Данж {rank}"),
+            Objective::Dungeons => format!("[{rank}] Данжи"),
+        }
+    }
+
     /// Returns the contract name shown on the board.
     #[must_use]
     pub fn title(self) -> String {
@@ -237,6 +250,8 @@ pub enum OrganizationError {
     NotInGuild,
     /// Only the guildmaster and officers may manage guild contracts.
     NotOfficer,
+    /// Contracts are taken and turned in at an Organization board.
+    NotAtBoard,
 }
 
 impl OrganizationError {
@@ -256,6 +271,7 @@ impl OrganizationError {
             Self::Storage => "Организация не может рассчитаться сейчас. Попробуйте позже.",
             Self::NotInGuild => "Вы не состоите в гильдии.",
             Self::NotOfficer => "Гильдийными заданиями управляют мастер и офицеры.",
+            Self::NotAtBoard => "Брать и сдавать задания можно у доски Организации.",
         }
     }
 }

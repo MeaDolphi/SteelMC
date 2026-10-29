@@ -18,6 +18,7 @@ use crate::player_data::{PaymentDurability, PlayerDataStorage, SoloLevelingPlaye
 use crate::quest::{PENALTY_DELAY_SECONDS, SystemQuest};
 use crate::shadow::ShadowRoster;
 use crate::shop::ShopDay;
+use crate::sidebar::SidebarView;
 use crate::stats::HunterStats;
 
 /// How many ticks to wait between sidebar refreshes for a given player.
@@ -57,7 +58,7 @@ pub struct HunterSession {
     /// Ticks elapsed since the sidebar was last refreshed for this player.
     ticks_since_sidebar_update: u64,
     /// Values last sent to the sidebar, so unchanged state is not re-sent.
-    last_sidebar: Option<(HunterStats, Won, SystemPoints, SystemQuest)>,
+    last_sidebar: Option<SidebarView>,
     /// Latest observed player position, used to measure horizontal travel.
     last_quest_position: Option<DVec3>,
     /// Last jump input, used to count presses rather than ticks spent holding it.
@@ -126,19 +127,14 @@ impl HunterSession {
         }
     }
 
-    /// Returns whether content visible in the sidebar has changed, recording
-    /// the current values as sent.
-    pub fn sidebar_changed(&mut self) -> bool {
-        let current = (self.stats, self.won, self.system_points, self.quest);
-        let changed = self.last_sidebar != Some(current);
-        self.last_sidebar = Some(current);
-        changed
-    }
-
-    /// Records the current values as already shown, used when the sidebar is
-    /// re-sent outside the regular refresh loop (for example after a respawn).
-    pub const fn mark_sidebar_sent(&mut self) {
-        self.last_sidebar = Some((self.stats, self.won, self.system_points, self.quest));
+    /// Records `view` as shown and reports what was shown before it.
+    pub fn sidebar_changed(&mut self, view: &SidebarView) -> SidebarChange {
+        if self.last_sidebar.as_ref() == Some(view) {
+            return SidebarChange::Unchanged;
+        }
+        SidebarChange::Changed {
+            previous: self.last_sidebar.replace(view.clone()),
+        }
     }
 
     /// Rolls the quest into today when the hunter joins.
@@ -227,6 +223,18 @@ impl HunterSession {
             ..QuestUpdate::default()
         }
     }
+}
+
+/// Whether the sidebar has to be rewritten.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SidebarChange {
+    /// The client already shows this view.
+    Unchanged,
+    /// The view differs from what the client shows.
+    Changed {
+        /// What was shown before, if anything.
+        previous: Option<SidebarView>,
+    },
 }
 
 /// Observable changes produced by one system-quest update.
@@ -334,6 +342,7 @@ mod tests {
 
     use super::*;
     use crate::quest::{REQUIRED_DISTANCE_BLOCKS, REQUIRED_JUMPS, REQUIRED_SNEAKS};
+    use crate::sidebar::SidebarView;
 
     #[test]
     fn sidebar_throttle_fires_once_per_interval() {
@@ -358,12 +367,28 @@ mod tests {
             SystemQuest::default(),
             ShadowRoster::default(),
         );
-        assert!(session.sidebar_changed());
-        assert!(!session.sidebar_changed());
+        let mut view = SidebarView {
+            stats: session.stats,
+            won: session.won,
+            system_points: session.system_points,
+            quest: session.quest,
+            contracts: Vec::new(),
+        };
+        assert_eq!(
+            session.sidebar_changed(&view),
+            SidebarChange::Changed { previous: None }
+        );
+        assert_eq!(session.sidebar_changed(&view), SidebarChange::Unchanged);
 
-        session.stats.level = 2;
-        assert!(session.sidebar_changed());
-        assert!(!session.sidebar_changed());
+        let shown = view.clone();
+        view.stats.level = 2;
+        assert_eq!(
+            session.sidebar_changed(&view),
+            SidebarChange::Changed {
+                previous: Some(shown)
+            }
+        );
+        assert_eq!(session.sidebar_changed(&view), SidebarChange::Unchanged);
     }
 
     #[test]

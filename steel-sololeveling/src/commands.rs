@@ -1,7 +1,7 @@
 //! Solo Leveling command registrations.
 
-mod auction;
-mod crystal;
+pub(crate) mod auction;
+pub(crate) mod crystal;
 mod organization;
 mod pay;
 mod shop;
@@ -45,7 +45,7 @@ pub fn register(
                     "This command can only be used by a player",
                 ));
             };
-            hunter_stats_menu::open(Arc::clone(player), Arc::clone(&state));
+            hunter_stats_menu::open(player, Arc::clone(&state));
             Ok(1)
         })
     })
@@ -417,19 +417,5 @@ fn party_error(error: PartyError) -> CommandError {
 }
 
 fn guild_error(error: GuildError) -> CommandError {
-    CommandError::from(match error {
-        GuildError::AlreadyInGuild => "Игрок уже состоит в гильдии.",
-        GuildError::AlreadyMember => "Игрок уже состоит в этой гильдии.",
-        GuildError::Full => "В гильдии уже 50 участников.",
-        GuildError::Missing => "Гильдия или её данные не найдены.",
-        GuildError::NameTaken => "Гильдия с таким названием уже существует.",
-        GuildError::InvalidName => "Название: 3–24 символа, латиница, цифры и _.",
-        GuildError::PermissionDenied => "Ваш ранг не даёт этого права.",
-        GuildError::CannotRemoveGuildmaster => "Нельзя исключить гильдмастера.",
-        GuildError::CannotChangeRole => "Менять ранги может только гильдмастер.",
-        GuildError::Storage => "Не удалось сохранить данные гильдии.",
-        GuildError::BankInUse => "Банк гильдии уже открыт другим участником.",
-        GuildError::InsufficientFunds => "Недостаточно Won.",
-        GuildError::TransactionPending => "Дождитесь завершения текущей транзакции.",
-    })
+    CommandError::from(error.message())
 }

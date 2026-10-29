@@ -126,6 +126,28 @@ impl Guild {
     }
 }
 
+impl GuildError {
+    /// Returns how the refusal reads in chat.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::AlreadyInGuild => "Игрок уже состоит в гильдии.",
+            Self::AlreadyMember => "Игрок уже состоит в этой гильдии.",
+            Self::Full => "В гильдии уже 50 участников.",
+            Self::Missing => "Гильдия или её данные не найдены.",
+            Self::NameTaken => "Гильдия с таким названием уже существует.",
+            Self::InvalidName => "Название: 3–24 символа, латиница, цифры и _.",
+            Self::PermissionDenied => "Ваш ранг не даёт этого права.",
+            Self::CannotRemoveGuildmaster => "Нельзя исключить гильдмастера.",
+            Self::CannotChangeRole => "Менять ранги может только гильдмастер.",
+            Self::Storage => "Не удалось сохранить данные гильдии.",
+            Self::BankInUse => "Банк гильдии уже открыт другим участником.",
+            Self::InsufficientFunds => "Недостаточно Won.",
+            Self::TransactionPending => "Дождитесь завершения текущей транзакции.",
+        }
+    }
+}
+
 /// Guild mutation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuildError {

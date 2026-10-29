@@ -243,6 +243,21 @@ pub enum ShopError {
     Storage,
 }
 
+impl ShopError {
+    /// Returns how the refusal reads in chat.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::UnknownSlot => "Такого слота в магазине нет.",
+            Self::NoSession => "Сессия охотника не загружена.",
+            Self::AlreadyBought => "Этот слот уже куплен сегодня.",
+            Self::Busy => "Дождитесь завершения другой финансовой операции.",
+            Self::InsufficientPoints => "Недостаточно очков Системы.",
+            Self::Storage => "Не удалось сохранить покупку. Обратитесь к администратору.",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

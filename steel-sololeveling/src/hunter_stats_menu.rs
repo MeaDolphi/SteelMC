@@ -15,7 +15,6 @@ use text_components::Modifier as _;
 use text_components::TextComponent;
 use text_components::format::Color;
 
-use crate::sidebar;
 use crate::state::SoloLevelingState;
 use crate::stats::{HunterStat, HunterStats};
 
@@ -25,7 +24,7 @@ const AGILITY_SLOT: usize = 2;
 const INTELLIGENCE_SLOT: usize = 3;
 const SENSE_SLOT: usize = 4;
 /// Opens the hunter-stat allocation menu for an online player.
-pub fn open(player: Arc<Player>, state: Arc<SoloLevelingState>) {
+pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
     player.open_menu(
         TextComponent::plain("Hunter Stats").color(Color::Gold),
         move |context| build(context.container_id, context.player, Arc::clone(&state)),
@@ -166,14 +165,8 @@ impl MenuKind for HunterStatsMenuKind {
             return ClickOutcome::Consume;
         };
 
+        // The sidebar picks the new stats up on its next periodic refresh.
         stats.apply_to(&mut player.attributes().lock());
-        let (won, system_points, quest) = self
-            .state
-            .with_session_mut(player.gameprofile.id(), |session| {
-                (session.won, session.system_points, session.quest)
-            })
-            .unwrap_or_default();
-        sidebar::refresh(player, &stats, won, system_points, &quest);
 
         let container_id = ContainerId::from_arc(&self.container);
         let Some(container) = guard.get_typed_mut::<SimpleContainer>(container_id) else {

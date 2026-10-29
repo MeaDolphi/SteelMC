@@ -25,11 +25,13 @@ use text_components::format::Color;
 use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
+use crate::commands;
 use crate::dungeon::instance;
 use crate::dungeon::is_instance_world;
 use crate::dungeon::runtime::TEST_GATE_ON_JOIN;
 use crate::item;
 use crate::item::chest::ChestKind;
+use crate::main_menu;
 use crate::organization::Event;
 use crate::organization_menu;
 use crate::quest::{PENALTY_DELAY_SECONDS, SystemQuest};
@@ -96,14 +98,10 @@ impl GameplayHooks for SoloLevelingHooks {
         match self.state.take_prepared_player(player_uuid) {
             Some(data) => {
                 data.stats.apply_to(&mut player.attributes().lock());
-                sidebar::show(
-                    player,
-                    &data.stats,
-                    data.won,
-                    data.system_points,
-                    &data.quest,
-                );
                 self.state.begin_session(player_uuid, data);
+                if let Some((_, view)) = self.state.sidebar_update(player_uuid) {
+                    sidebar::show(player, &view);
+                }
                 let owed = self.state.collect_guild_payout(player_uuid);
                 if owed > 0 {
                     player.send_message(
@@ -153,6 +151,10 @@ impl GameplayHooks for SoloLevelingHooks {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs());
         self.state.tick_artifacts(player);
+        item::menu_book::keep_in_place(player);
+        if self.state.take_crystal_sale(player_uuid) {
+            commands::crystal::sell(&self.state, player);
+        }
         let window = SystemQuest::window_at(unix_seconds);
         let update = self.state.observe_quest(
             player_uuid,
@@ -170,25 +172,9 @@ impl GameplayHooks for SoloLevelingHooks {
         if due != Some(true) {
             return;
         }
-        let changed = self
-            .state
-            .with_session_mut(player_uuid, HunterSession::sidebar_changed);
-        if changed != Some(true) {
-            return;
+        if let Some((previous, view)) = self.state.sidebar_update(player_uuid) {
+            sidebar::refresh(player, previous.as_ref(), &view);
         }
-        let Some((stats, won, system_points, quest)) =
-            self.state.with_session_mut(player_uuid, |session| {
-                (
-                    session.stats,
-                    session.won,
-                    session.system_points,
-                    session.quest,
-                )
-            })
-        else {
-            return;
-        };
-        sidebar::refresh(player, &stats, won, system_points, &quest);
     }
 
     fn on_player_death(&self, _server: &Arc<Server>, player: &Player) {
@@ -198,16 +184,9 @@ impl GameplayHooks for SoloLevelingHooks {
 
     fn on_player_respawn(&self, _server: &Arc<Server>, player: &Player) {
         let player_uuid = player.gameprofile.id();
-        let Some((stats, won, system_points, quest)) =
-            self.state.with_session_mut(player_uuid, |session| {
-                session.mark_sidebar_sent();
-                (
-                    session.stats,
-                    session.won,
-                    session.system_points,
-                    session.quest,
-                )
-            })
+        let Some(stats) = self
+            .state
+            .with_session_mut(player_uuid, |session| session.stats)
         else {
             return;
         };
@@ -215,7 +194,10 @@ impl GameplayHooks for SoloLevelingHooks {
         // Vanilla respawns at full health; vitality modifiers are re-applied
         // after that, so the replacement is topped up to its new maximum.
         player.set_health(player.get_max_health());
-        sidebar::restore(player, &stats, won, system_points, &quest);
+        if let Some(view) = self.state.sidebar_view(player_uuid) {
+            let _ = self.state.sidebar_update(player_uuid);
+            sidebar::restore(player, &view);
+        }
     }
 
     fn allow_block_break(&self, world: &World, _player: &Player, pos: BlockPos) -> bool {
@@ -264,7 +246,16 @@ impl GameplayHooks for SoloLevelingHooks {
         stack: &ItemStack,
         hand: InteractionHand,
     ) -> Option<InteractionResult> {
+        if item::menu_book::is_menu_book(stack) {
+            main_menu::open(player, Arc::clone(&self.state));
+            return Some(InteractionResult::Success);
+        }
         item::consume::use_item(&self.state, player, stack, hand)
+    }
+
+    fn allow_item_drop(&self, _player: &Player, stack: &ItemStack) -> bool {
+        // The System book is permanent; it is put back in its slot instead.
+        !item::menu_book::is_menu_book(stack)
     }
 
     fn on_player_use_block(
@@ -280,7 +271,7 @@ impl GameplayHooks for SoloLevelingHooks {
         // The client offers the off hand only when the main hand passed, so the
         // board opens once per click.
         if hand == InteractionHand::MainHand {
-            organization_menu::open(Arc::clone(player), Arc::clone(&self.state));
+            organization_menu::open(player, Arc::clone(&self.state));
         }
         Some(InteractionResult::Success)
     }

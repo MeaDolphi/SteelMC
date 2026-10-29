@@ -152,7 +152,7 @@ fn place(
     Ok(1)
 }
 
-fn board(lots: &[LotView]) -> String {
+pub(crate) fn board(lots: &[LotView]) -> String {
     if lots.is_empty() {
         return "Аукцион пуст.".to_owned();
     }

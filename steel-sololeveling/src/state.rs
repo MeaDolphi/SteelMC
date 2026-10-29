@@ -33,10 +33,11 @@ use crate::organization::Event;
 use crate::party::{Party, PartyError, PartyExit, PartyRuntime};
 use crate::player_data::{PlayerDataStorage, SoloLevelingPlayerData};
 use crate::rank::HunterRank;
-use crate::session::{HunterSession, QuestUpdate, SessionRegistry};
+use crate::session::{HunterSession, QuestUpdate, SessionRegistry, SidebarChange};
 use crate::shadow::{RECOVERY_HEALTH_PER_MINUTE, Shadow, ShadowStat, army_limit};
 use crate::shadow_runtime::ShadowRuntime;
 use crate::shop::{Offer, ShopDay, ShopError};
+use crate::sidebar::{ContractScope, SidebarView};
 use crate::stats::{HunterStat, HunterStats, LevelUp};
 
 /// Storage and live sessions shared by Solo Leveling hooks and commands.
@@ -54,6 +55,7 @@ pub struct SoloLevelingState {
     organization_boards: SyncMutex<organization::Boards>,
     organization_events: SyncMutex<Vec<(Vec<Uuid>, Event)>>,
     storms: SyncMutex<Vec<abilities::Storm>>,
+    crystal_sales: SyncMutex<FxHashSet<Uuid>>,
 }
 
 impl SoloLevelingState {
@@ -79,6 +81,7 @@ impl SoloLevelingState {
             organization_boards: SyncMutex::new(boards),
             organization_events: SyncMutex::new(Vec::new()),
             storms: SyncMutex::new(Vec::new()),
+            crystal_sales: SyncMutex::new(FxHashSet::default()),
         })
     }
 
@@ -378,6 +381,15 @@ impl SoloLevelingState {
     /// the buyer so it cannot be resold.
     pub fn buy_shop_offer(&self, player: &Arc<Player>, slot: usize) -> Result<Offer, ShopError> {
         let uuid = player.gameprofile.id();
+        let offer = self.charge_shop_offer(uuid, slot)?;
+        player.add_item_or_drop(offer.stack(uuid), Prediction::ServerOnly);
+        Ok(offer)
+    }
+
+    /// Charges one daily shop offer and marks it bought, without handing out
+    /// the item; the caller delivers [`Offer::stack`] itself, which lets a menu
+    /// deliver it under the inventory lock it already holds.
+    pub fn charge_shop_offer(&self, uuid: Uuid, slot: usize) -> Result<Offer, ShopError> {
         let today = daily::today();
         let offer = self
             .sessions
@@ -400,7 +412,6 @@ impl SoloLevelingState {
             })
             .ok_or(ShopError::NoSession)??;
 
-        player.add_item_or_drop(offer.stack(uuid), Prediction::ServerOnly);
         if let Err(error) = self.save_session(uuid) {
             log::warn!("sololeveling: failed to persist a shop purchase of {uuid}: {error}");
         }
@@ -424,7 +435,7 @@ impl SoloLevelingState {
     /// Crystals leave the inventory before the Won credit is queued, so a failed
     /// account write cannot pay twice; ordinary diamonds carry no rank and are
     /// therefore never bought.
-    pub fn sell_crystals(&self, player: &Arc<Player>) -> Result<CrystalSale, CrystalSaleError> {
+    pub fn sell_crystals(&self, player: &Player) -> Result<CrystalSale, CrystalSaleError> {
         let uuid = player.gameprofile.id();
         if !self.persistence.lock().accepts_writes(uuid) {
             return Err(CrystalSaleError::Storage);
@@ -513,6 +524,68 @@ impl SoloLevelingState {
         self.dungeon_runtime
             .lock()
             .record_boss_damage(world, entity_id, hunter, amount);
+    }
+
+    /// Builds what the sidebar shows `uuid`: session values plus every taken
+    /// contract, personal, party and guild.
+    pub fn sidebar_view(&self, uuid: Uuid) -> Option<SidebarView> {
+        let mut view = self.sessions.with_mut(uuid, |session| SidebarView {
+            stats: session.stats,
+            won: session.won,
+            system_points: session.system_points,
+            quest: session.quest,
+            contracts: session
+                .organization
+                .contracts
+                .iter()
+                .map(|contract| (ContractScope::Personal, *contract))
+                .collect(),
+        })?;
+        if let Some(party) = self.party_of(uuid) {
+            view.contracts.extend(
+                party
+                    .contracts()
+                    .iter()
+                    .filter(|group| group.participants.contains(&uuid))
+                    .map(|group| (ContractScope::Group, group.contract)),
+            );
+        }
+        if let Some(guild) = self.guilds.lock().guild_of(uuid) {
+            view.contracts.extend(
+                guild
+                    .organization
+                    .contracts
+                    .iter()
+                    .map(|group| (ContractScope::Guild, group.contract)),
+            );
+        }
+        Some(view)
+    }
+
+    /// Returns the current sidebar view with the one shown before, or `None`
+    /// when the sidebar is already up to date.
+    pub fn sidebar_update(&self, uuid: Uuid) -> Option<(Option<SidebarView>, SidebarView)> {
+        let view = self.sidebar_view(uuid)?;
+        match self
+            .sessions
+            .with_mut(uuid, |session| session.sidebar_changed(&view))?
+        {
+            SidebarChange::Unchanged => None,
+            SidebarChange::Changed { previous } => Some((previous, view)),
+        }
+    }
+
+    /// Asks for a crystal sale on the hunter's next tick.
+    ///
+    /// A menu click holds the inventory lock the sale needs, so the sale
+    /// cannot run inside it.
+    pub fn request_crystal_sale(&self, uuid: Uuid) {
+        self.crystal_sales.lock().insert(uuid);
+    }
+
+    /// Takes a pending crystal sale request of `uuid`.
+    pub fn take_crystal_sale(&self, uuid: Uuid) -> bool {
+        self.crystal_sales.lock().remove(&uuid)
     }
 
     /// Rewrites a dungeon mob's nameplate after it lost health.
