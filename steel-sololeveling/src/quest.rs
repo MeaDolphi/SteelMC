@@ -1,17 +1,20 @@
-//! Timed system quest progress and penalty-zone eligibility.
+//! Daily system quest progress and penalty-zone eligibility.
+//!
+//! The quest day is the Moscow day of [`crate::daily`], so the quest resets
+//! together with the personal shop at 00:00 Moscow time.
 
 use serde::{Deserialize, Serialize};
 
-/// Duration of one recurring system-quest window.
-pub const QUEST_WINDOW_SECONDS: u64 = 2 * 60 * 60;
+use crate::daily;
+
+/// Delay before a penalty owed from an earlier day starts after login.
+pub const PENALTY_DELAY_SECONDS: u64 = 10 * 60;
 /// Required jump count.
 pub const REQUIRED_JUMPS: u16 = 100;
 /// Required sneak-toggle count.
 pub const REQUIRED_SNEAKS: u16 = 100;
 /// Required horizontal distance in blocks.
 pub const REQUIRED_DISTANCE_BLOCKS: f64 = 3_000.0;
-/// Unspent stat points granted for finishing a system quest.
-pub const QUEST_REWARD_STAT_POINTS: u32 = 2;
 /// Length of the future penalty-zone survival challenge.
 pub const PENALTY_ZONE_DURATION_SECONDS: u64 = 10 * 60;
 /// Number of zombies the future penalty-zone instance spawns every wave.
@@ -19,10 +22,10 @@ pub const PENALTY_ZONE_ZOMBIES_PER_WAVE: u8 = 20;
 /// Interval between future penalty-zone zombie waves.
 pub const PENALTY_ZONE_WAVE_INTERVAL_SECONDS: u64 = 10;
 
-/// Persisted progress for one two-hour system-quest window.
+/// Persisted progress for one daily system quest.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SystemQuest {
-    /// Unix two-hour window that owns this progress.
+    /// Moscow day that owns this progress.
     pub window: u64,
     /// Distinct jump-input presses recorded in this window.
     pub jumps: u16,
@@ -57,23 +60,35 @@ impl SystemQuest {
         }
     }
 
-    /// Returns the globally aligned two-hour window for Unix seconds.
+    /// Returns the quest day containing `unix_seconds`.
     #[must_use]
     pub const fn window_at(unix_seconds: u64) -> u64 {
-        unix_seconds / QUEST_WINDOW_SECONDS
+        daily::day_at(unix_seconds)
     }
 
     /// Rolls this quest into `window`, reporting whether an unfinished quest
     /// became a pending penalty-zone challenge.
+    ///
+    /// A penalty already owed stays owed: finishing a later quest does not
+    /// clear it, and several missed days still owe a single penalty. A stored
+    /// window from the future (the former two-hour counter, or no window at
+    /// all) starts a fresh quest without a penalty.
     pub const fn advance_window(&mut self, window: u64) -> bool {
         if self.window == window {
             return false;
         }
+        if self.window > window {
+            let owed = self.penalty_pending;
+            *self = Self::new(window);
+            self.penalty_pending = owed;
+            return false;
+        }
 
-        let penalty_pending = !self.completed;
+        let missed = !self.completed;
+        let owed = self.penalty_pending;
         *self = Self::new(window);
-        self.penalty_pending = penalty_pending;
-        penalty_pending
+        self.penalty_pending = owed || missed;
+        missed
     }
 
     /// Returns whether every task is complete.
@@ -133,6 +148,23 @@ mod tests {
 
         quest.completed = true;
         assert!(!quest.advance_window(2));
+        assert!(
+            quest.penalty_pending,
+            "a completed day must not clear an owed penalty"
+        );
+
+        quest.penalty_pending = false;
+        quest.completed = true;
+        assert!(!quest.advance_window(3));
         assert!(!quest.penalty_pending);
+    }
+
+    #[test]
+    fn a_legacy_two_hour_window_restarts_without_a_penalty() {
+        let mut quest = SystemQuest::new(250_000);
+        assert!(!quest.advance_window(20_000));
+        assert!(!quest.penalty_pending);
+        assert_eq!(quest.window, 20_000);
+        assert!(!SystemQuest::uninitialized().advance_window(20_000));
     }
 }

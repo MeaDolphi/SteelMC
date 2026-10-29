@@ -11,10 +11,11 @@ use steel_core::player::PlayerInput;
 use steel_utils::locks::SyncRwLock;
 use uuid::Uuid;
 
+use crate::abilities::{AbilityCooldowns, ActiveAbilities};
 use crate::economy::{PaymentError, SystemPoints, Won};
 use crate::organization::OrganizationBook;
 use crate::player_data::{PaymentDurability, PlayerDataStorage, SoloLevelingPlayerData};
-use crate::quest::{QUEST_REWARD_STAT_POINTS, SystemQuest};
+use crate::quest::{PENALTY_DELAY_SECONDS, SystemQuest};
 use crate::shadow::ShadowRoster;
 use crate::shop::ShopDay;
 use crate::stats::HunterStats;
@@ -46,6 +47,13 @@ pub struct HunterSession {
     pub shop: ShopDay,
     /// Personal Adventurer Organization contracts.
     pub organization: OrganizationBook,
+    /// Artifact ability cooldown deadlines.
+    pub cooldowns: AbilityCooldowns,
+    /// Running effects of triggered artifact abilities.
+    pub abilities: ActiveAbilities,
+    /// Unix second from which an owed penalty zone may start; `None` while
+    /// nothing is owed.
+    penalty_ready_at: Option<u64>,
     /// Ticks elapsed since the sidebar was last refreshed for this player.
     ticks_since_sidebar_update: u64,
     /// Values last sent to the sidebar, so unchanged state is not re-sent.
@@ -76,6 +84,9 @@ impl HunterSession {
             shadows,
             shop: ShopDay::unset(),
             organization: OrganizationBook::new(),
+            cooldowns: AbilityCooldowns::new(),
+            abilities: ActiveAbilities::new(),
+            penalty_ready_at: None,
             ticks_since_sidebar_update: 0,
             last_sidebar: None,
             last_quest_position: None,
@@ -96,6 +107,7 @@ impl HunterSession {
             shadows: self.shadows.clone(),
             shop: self.shop,
             organization: self.organization.clone(),
+            cooldowns: self.cooldowns.clone(),
         }
     }
 
@@ -129,6 +141,38 @@ impl HunterSession {
         self.last_sidebar = Some((self.stats, self.won, self.system_points, self.quest));
     }
 
+    /// Rolls the quest into today when the hunter joins.
+    ///
+    /// A penalty owed from an earlier day waits [`PENALTY_DELAY_SECONDS`] after
+    /// every login, so reconnecting restarts the countdown.
+    pub const fn start_day(&mut self, day: u64, now_seconds: u64) {
+        self.quest.advance_window(day);
+        self.penalty_ready_at = if self.quest.penalty_pending {
+            Some(now_seconds.saturating_add(PENALTY_DELAY_SECONDS))
+        } else {
+            None
+        };
+    }
+
+    /// Returns whether an owed penalty zone should start at `now_seconds`.
+    #[must_use]
+    pub fn penalty_due(&self, now_seconds: u64) -> bool {
+        self.quest.penalty_pending
+            && self
+                .penalty_ready_at
+                .is_none_or(|ready_at| ready_at <= now_seconds)
+    }
+
+    /// Takes an owed penalty zone exactly once.
+    pub const fn claim_penalty(&mut self) -> bool {
+        if !self.quest.penalty_pending {
+            return false;
+        }
+        self.quest.penalty_pending = false;
+        self.penalty_ready_at = None;
+        true
+    }
+
     /// Observes vanilla client input and position for this player's active
     /// system quest.
     ///
@@ -144,6 +188,10 @@ impl HunterSession {
             self.quest = SystemQuest::new(window);
         }
         let penalty_pending = self.quest.advance_window(window);
+        if penalty_pending {
+            // The day ended while the hunter was online: the penalty is immediate.
+            self.penalty_ready_at = Some(0);
+        }
         let Some(previous_position) = self.last_quest_position.replace(position) else {
             self.last_jump_pressed = input.jump();
             self.last_sneak_pressed = input.shift();
@@ -165,10 +213,6 @@ impl HunterSession {
             self.quest.record_distance(horizontal_distance);
             if self.quest.tasks_complete() {
                 self.quest.completed = true;
-                self.stats.unspent_points = self
-                    .stats
-                    .unspent_points
-                    .saturating_add(QUEST_REWARD_STAT_POINTS);
                 return QuestUpdate {
                     completed: true,
                     penalty_pending,
@@ -465,8 +509,44 @@ mod tests {
         );
 
         assert!(update.completed);
-        assert_eq!(session.stats.unspent_points, QUEST_REWARD_STAT_POINTS);
+        assert_eq!(
+            session.stats.unspent_points, 0,
+            "the reward is a chest, not stat points"
+        );
         assert!(session.quest.completed);
+    }
+
+    #[test]
+    fn a_penalty_from_an_earlier_day_waits_after_each_login() {
+        let mut session = HunterSession::new(
+            HunterStats::new(),
+            Won::default(),
+            SystemQuest::new(1),
+            ShadowRoster::default(),
+        );
+        session.start_day(3, 1_000);
+        assert!(session.quest.penalty_pending);
+        assert!(!session.penalty_due(1_599));
+        session.start_day(3, 1_500);
+        assert!(!session.penalty_due(2_099));
+        assert!(session.penalty_due(2_100));
+        assert!(session.claim_penalty());
+        assert!(!session.claim_penalty());
+        assert!(!session.penalty_due(10_000));
+    }
+
+    #[test]
+    fn a_day_ending_online_owes_the_penalty_at_once() {
+        let mut session = HunterSession::new(
+            HunterStats::new(),
+            Won::default(),
+            SystemQuest::new(1),
+            ShadowRoster::default(),
+        );
+        session.start_day(1, 0);
+        let update = session.observe_quest(2, DVec3::ZERO, PlayerInput::EMPTY);
+        assert!(update.penalty_pending);
+        assert!(session.penalty_due(0));
     }
 
     #[test]

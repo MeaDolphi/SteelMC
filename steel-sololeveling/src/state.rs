@@ -1,5 +1,6 @@
 //! Shared mutable state for Solo Leveling gameplay systems.
 
+mod abilities;
 mod auction;
 pub use auction::{AuctionRequest, LotView};
 mod organization;
@@ -9,6 +10,7 @@ mod persistence;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use glam::DVec3;
 use rustc_hash::FxHashSet;
@@ -51,6 +53,7 @@ pub struct SoloLevelingState {
     persistence: SyncMutex<persistence::Persistence>,
     organization_boards: SyncMutex<organization::Boards>,
     organization_events: SyncMutex<Vec<(Vec<Uuid>, Event)>>,
+    storms: SyncMutex<Vec<abilities::Storm>>,
 }
 
 impl SoloLevelingState {
@@ -73,6 +76,7 @@ impl SoloLevelingState {
             persistence: SyncMutex::new(persistence::Persistence::default()),
             organization_boards: SyncMutex::new(boards),
             organization_events: SyncMutex::new(Vec::new()),
+            storms: SyncMutex::new(Vec::new()),
         })
     }
 
@@ -82,6 +86,11 @@ impl SoloLevelingState {
         session.system_points = data.system_points;
         session.shop = data.shop;
         session.organization = data.organization;
+        session.cooldowns = data.cooldowns;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        session.start_day(daily::day_at(now), now);
         self.sessions.insert(player_uuid, session);
     }
 
@@ -148,11 +157,7 @@ impl SoloLevelingState {
     /// Claims a pending penalty zone exactly once.
     pub fn claim_penalty(&self, player_uuid: Uuid) -> Option<HunterRank> {
         self.sessions.with_mut(player_uuid, |session| {
-            if !session.quest.penalty_pending {
-                return None;
-            }
-            session.quest.penalty_pending = false;
-            Some(session.stats.rank())
+            session.claim_penalty().then(|| session.stats.rank())
         })?
     }
 
@@ -160,6 +165,19 @@ impl SoloLevelingState {
     pub fn has_pending_penalty(&self, player_uuid: Uuid) -> bool {
         self.sessions
             .with_mut(player_uuid, |session| session.quest.penalty_pending)
+            .unwrap_or(false)
+    }
+
+    /// Returns whether an owed penalty zone should start now.
+    ///
+    /// A penalty from an earlier day waits a few minutes after login; one from
+    /// a day that ended while the hunter was online is due at once.
+    pub fn penalty_due(&self, player_uuid: Uuid) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        self.sessions
+            .with_mut(player_uuid, |session| session.penalty_due(now))
             .unwrap_or(false)
     }
 
@@ -653,6 +671,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::{SoloLevelingPlayerData, SoloLevelingState};
+    use crate::abilities::AbilityCooldowns;
     use crate::economy::{SystemPoints, Won};
     use crate::organization::OrganizationBook;
     use crate::quest::SystemQuest;
@@ -679,6 +698,7 @@ mod tests {
                 shadows: ShadowRoster::default(),
                 shop: ShopDay::unset(),
                 organization: OrganizationBook::new(),
+                cooldowns: AbilityCooldowns::default(),
             },
         );
 

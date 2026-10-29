@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use steel_utils::locks::SyncMutex;
 use uuid::Uuid;
 
+use crate::abilities::AbilityCooldowns;
 use crate::economy::{SystemPoints, Won};
 use crate::organization::OrganizationBook;
 use crate::quest::SystemQuest;
@@ -49,6 +50,9 @@ pub struct SoloLevelingPlayerData {
     /// Personal Adventurer Organization contracts and today's allowance.
     #[serde(default)]
     pub organization: OrganizationBook,
+    /// Artifact ability cooldown deadlines, kept across reconnects.
+    #[serde(default)]
+    pub cooldowns: AbilityCooldowns,
 }
 
 impl SoloLevelingPlayerData {
@@ -64,6 +68,7 @@ impl SoloLevelingPlayerData {
             shadows: ShadowRoster::default(),
             shop: ShopDay::default(),
             organization: OrganizationBook::new(),
+            cooldowns: AbilityCooldowns::default(),
         }
     }
 }

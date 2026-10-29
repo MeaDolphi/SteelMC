@@ -1,0 +1,370 @@
+//! Artifact abilities applied to live entities.
+//!
+//! Only a successful direct melee hit by a player triggers anything; storm
+//! damage is magic caused by the owner but not dealt directly by them, so it
+//! can never trigger another ability.
+
+use std::mem;
+use std::sync::Arc;
+
+use glam::DVec3;
+use steel_core::entity::attribute::{AttributeModifier, AttributeModifierOperation};
+use steel_core::entity::damage::DamageSource;
+use steel_core::entity::{LivingEntity, SharedEntity};
+use steel_core::inventory::equipment::EquipmentSlot;
+use steel_core::player::Player;
+use steel_core::player::player_inventory::Prediction;
+use steel_core::server::Server;
+use steel_registry::item_stack::ItemStack;
+use steel_registry::particle_type::ParticleData;
+use steel_registry::{vanilla_attributes, vanilla_damage_types, vanilla_particle_types};
+use steel_utils::Identifier;
+use steel_utils::geometry::WorldAabb;
+use text_components::format::Color;
+use text_components::{Modifier as _, TextComponent};
+use uuid::Uuid;
+
+use super::SoloLevelingState;
+use crate::abilities::{self, AbilityEffect};
+use crate::dungeon::runtime::find_player;
+use crate::identifier::from_sololeveling;
+use crate::item::artifact::{self, Ability, Category};
+
+/// Milliseconds between two storm damage pulses.
+const STORM_PULSE_MILLIS: u64 = 1_000;
+/// Armor slots whose artifacts are checked against the wearer's rank.
+const ARMOR_SLOTS: [EquipmentSlot; 4] = [
+    EquipmentSlot::Head,
+    EquipmentSlot::Chest,
+    EquipmentSlot::Legs,
+    EquipmentSlot::Feet,
+];
+
+/// A running Demon King's Longsword storm.
+#[derive(Debug)]
+pub(super) struct Storm {
+    owner: Uuid,
+    world: Identifier,
+    center: DVec3,
+    radius: f64,
+    damage: f32,
+    until: u64,
+    next_pulse: u64,
+}
+
+fn equipped(entity: &dyn LivingEntity, slot: EquipmentSlot) -> ItemStack {
+    let mut stack = ItemStack::empty();
+    entity.with_equipment_slot(slot, &mut |item| stack = item.clone());
+    stack
+}
+
+fn speed_id() -> Identifier {
+    from_sololeveling("artifact_speed_on_hit")
+}
+
+fn shield_id(source: &str) -> Identifier {
+    from_sololeveling(format!("artifact_shield_{source}"))
+}
+
+/// Returns the player who dealt `source` with their own hand, if any.
+fn melee_player(source: &DamageSource) -> Option<&Player> {
+    if !source.is_direct() {
+        return None;
+    }
+    source.causing_entity()?.as_player()
+}
+
+impl SoloLevelingState {
+    /// Returns the usable abilities of the artifact in `slot`.
+    ///
+    /// A main-hand slot only counts weapons, so armor held in the hand gives
+    /// nothing; an artifact above the wearer's rank gives nothing either.
+    fn slot_abilities(&self, entity: &Player, slot: EquipmentSlot) -> &'static [Ability] {
+        let stack = equipped(entity, slot);
+        let Some(artifact) = artifact::held(&stack) else {
+            return &[];
+        };
+        let weapon_slot = slot == EquipmentSlot::MainHand;
+        if weapon_slot != (artifact.category == Category::Weapon) {
+            return &[];
+        }
+        let usable = self
+            .hunter_rank(entity.gameprofile.id())
+            .is_some_and(|rank| artifact::usable_by(&stack, rank));
+        if usable { artifact.abilities } else { &[] }
+    }
+
+    /// Adjusts damage before vanilla armor runs, for both sides of a hit.
+    pub fn artifact_damage(
+        &self,
+        victim: &dyn LivingEntity,
+        source: &DamageSource,
+        amount: f32,
+    ) -> f32 {
+        let mut damage = amount;
+        if let Some(attacker) = melee_player(source) {
+            let weapon = equipped(attacker, EquipmentSlot::MainHand);
+            let unusable = artifact::of(&weapon).is_some()
+                && !self
+                    .hunter_rank(attacker.gameprofile.id())
+                    .is_some_and(|rank| artifact::usable_by(&weapon, rank));
+            if unusable {
+                // A weapon above the wielder's rank strikes like a bare hand.
+                damage = damage.min(1.0);
+            } else {
+                let strength = self
+                    .with_session_mut(attacker.gameprofile.id(), |session| session.stats.strength)
+                    .unwrap_or(0);
+                let armored = victim
+                    .attributes()
+                    .lock()
+                    .get_value(vanilla_attributes::ARMOR)
+                    .is_some_and(|armor| armor > 0.0);
+                damage = abilities::outgoing_damage(
+                    self.slot_abilities(attacker, EquipmentSlot::MainHand),
+                    strength,
+                    armored,
+                    damage,
+                );
+            }
+        }
+        if let Some(player) = victim.as_player() {
+            let chest = self.slot_abilities(player, EquipmentSlot::Chest);
+            if !chest.is_empty() {
+                let fraction = victim.get_health() / victim.get_max_health().max(1.0);
+                let now = abilities::now_millis();
+                damage = self
+                    .with_session_mut(player.gameprofile.id(), |session| {
+                        abilities::incoming_damage(
+                            chest,
+                            &mut session.cooldowns,
+                            &mut session.abilities,
+                            fraction,
+                            now,
+                            damage,
+                        )
+                    })
+                    .unwrap_or(damage);
+            }
+        }
+        damage
+    }
+
+    /// Triggers on-hit abilities after a melee hit that took health.
+    pub fn artifact_hit(&self, victim: &dyn LivingEntity, source: &DamageSource) {
+        let Some(attacker) = melee_player(source) else {
+            return;
+        };
+        let uuid = attacker.gameprofile.id();
+        let mut held = self
+            .slot_abilities(attacker, EquipmentSlot::MainHand)
+            .to_vec();
+        held.extend_from_slice(self.slot_abilities(attacker, EquipmentSlot::Chest));
+        if held.is_empty() {
+            return;
+        }
+        let now = abilities::now_millis();
+        let Some(effects) = self.with_session_mut(uuid, |session| {
+            abilities::on_hit(&held, &mut session.cooldowns, &mut session.abilities, now)
+        }) else {
+            return;
+        };
+        if effects.is_empty() {
+            return;
+        }
+        for effect in effects {
+            self.apply_effect(attacker, victim, effect, now);
+        }
+        self.queue_ability_save(uuid);
+    }
+
+    /// Survives a lethal hit with the Red Knight's Helmet.
+    pub fn artifact_prevent_death(&self, victim: &dyn LivingEntity, source: &DamageSource) -> bool {
+        if source.bypasses_invulnerability() {
+            return false;
+        }
+        let Some(player) = victim.as_player() else {
+            return false;
+        };
+        let head = self.slot_abilities(player, EquipmentSlot::Head);
+        if head.is_empty() {
+            return false;
+        }
+        let uuid = player.gameprofile.id();
+        let now = abilities::now_millis();
+        let Some((health, shield)) = self
+            .with_session_mut(uuid, |session| {
+                abilities::on_lethal(head, &mut session.cooldowns, &mut session.abilities, now)
+            })
+            .flatten()
+        else {
+            return false;
+        };
+        player.set_health(health);
+        self.apply_effect(player, victim, shield, now);
+        player.send_message(
+            &TextComponent::plain("Шлем красного рыцаря спас вас от смерти.").color(Color::Red),
+        );
+        self.queue_ability_save(uuid);
+        true
+    }
+
+    fn apply_effect(
+        &self,
+        holder: &Player,
+        target: &dyn LivingEntity,
+        effect: AbilityEffect,
+        now: u64,
+    ) {
+        match effect {
+            AbilityEffect::Speed { percent, .. } => {
+                holder.attributes().lock().set_modifier(
+                    vanilla_attributes::MOVEMENT_SPEED,
+                    AttributeModifier {
+                        id: speed_id(),
+                        amount: percent,
+                        operation: AttributeModifierOperation::AddMultipliedTotal,
+                    },
+                    false,
+                );
+            }
+            AbilityEffect::Shield { source, health, .. } => {
+                holder.attributes().lock().set_modifier(
+                    vanilla_attributes::MAX_ABSORPTION,
+                    AttributeModifier {
+                        id: shield_id(source),
+                        amount: f64::from(health),
+                        operation: AttributeModifierOperation::AddValue,
+                    },
+                    false,
+                );
+                holder.set_absorption_amount(holder.get_absorption_amount() + health);
+            }
+            AbilityEffect::Storm {
+                radius,
+                damage_per_second,
+                until,
+            } => {
+                self.storms.lock().push(Storm {
+                    owner: holder.gameprofile.id(),
+                    world: holder.get_world().key.clone(),
+                    center: target.position(),
+                    radius,
+                    damage: damage_per_second,
+                    until,
+                    next_pulse: now,
+                });
+            }
+        }
+    }
+
+    /// Ends expired effects and unequips armor above the wearer's rank.
+    pub fn tick_artifacts(&self, player: &Player) {
+        let uuid = player.gameprofile.id();
+        let now = abilities::now_millis();
+        if let Some((speed, shields)) =
+            self.with_session_mut(uuid, |session| session.abilities.expire(now))
+        {
+            let mut attributes = player.attributes().lock();
+            if speed {
+                attributes.remove_modifier(vanilla_attributes::MOVEMENT_SPEED, &speed_id());
+            }
+            for source in shields {
+                attributes.remove_modifier(vanilla_attributes::MAX_ABSORPTION, &shield_id(source));
+            }
+        }
+
+        let Some(rank) = self.hunter_rank(uuid) else {
+            return;
+        };
+        for slot in ARMOR_SLOTS {
+            let mut removed = None;
+            player.with_equipment_slot_mut(slot, &mut |stack| {
+                if artifact::of(stack).is_some() && !artifact::usable_by(stack, rank) {
+                    removed = Some(mem::replace(stack, ItemStack::empty()));
+                }
+            });
+            if let Some(stack) = removed {
+                player.send_message(
+                    &TextComponent::plain("Ваш ранг слишком низок для этого артефакта: он снят.")
+                        .color(Color::Red),
+                );
+                player.add_item_or_drop(stack, Prediction::ServerOnly);
+            }
+        }
+    }
+
+    /// Deals storm damage once a second to every mob inside a running storm.
+    ///
+    /// Players and summoned shadows are never hit, and a storm whose owner left
+    /// ends at once.
+    pub fn tick_storms(&self, server: &Server) {
+        let now = abilities::now_millis();
+        let mut storms = self.storms.lock();
+        storms.retain(|storm| storm.until > now);
+        let due: Vec<(Uuid, Identifier, DVec3, f64, f32)> = storms
+            .iter_mut()
+            .filter(|storm| storm.next_pulse <= now)
+            .map(|storm| {
+                storm.next_pulse = storm.next_pulse.saturating_add(STORM_PULSE_MILLIS);
+                (
+                    storm.owner,
+                    storm.world.clone(),
+                    storm.center,
+                    storm.radius,
+                    storm.damage,
+                )
+            })
+            .collect();
+        drop(storms);
+
+        for (owner, world_key, center, radius, damage) in due {
+            let Some(player) = find_player(server, owner) else {
+                continue;
+            };
+            let Some(world) = server.worlds.get(&world_key) else {
+                continue;
+            };
+            world.send_particles(
+                ParticleData::simple(&vanilla_particle_types::SWEEP_ATTACK),
+                center,
+                12,
+                DVec3::new(radius, 0.5, radius),
+                0.0,
+            );
+            let area = WorldAabb::of_size(center, radius * 2.0, radius * 2.0, radius * 2.0);
+            let targets = world.get_entities_in_aabb_matching(&area, |entity| {
+                entity.as_player().is_none()
+                    && entity
+                        .as_living_entity()
+                        .is_some_and(|living| !living.is_dead_or_dying())
+                    && entity
+                        .as_mob()
+                        .is_none_or(|mob| mob.allied_owner().is_none())
+                    && entity.position().distance_squared(center) <= radius * radius
+            });
+            let cause: SharedEntity = Arc::<Player>::clone(&player);
+            let source =
+                DamageSource::environment(&vanilla_damage_types::MAGIC).with_causing_entity(cause);
+            for target in targets {
+                if let Some(living) = target.as_living_entity() {
+                    living.hurt(world, &source, damage);
+                }
+            }
+        }
+    }
+
+    /// Returns the extra crystals the held pickaxe adds to one mined ore.
+    pub fn crystal_bonus(&self, player: &Player) -> i32 {
+        abilities::extra_crystals(
+            self.slot_abilities(player, EquipmentSlot::MainHand),
+            rand::random_range(0..100),
+        )
+    }
+
+    fn queue_ability_save(&self, uuid: Uuid) {
+        if let Err(error) = self.save_session(uuid) {
+            log::warn!("sololeveling: failed to persist ability cooldowns of {uuid}: {error}");
+        }
+    }
+}

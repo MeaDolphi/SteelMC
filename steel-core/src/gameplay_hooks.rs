@@ -111,6 +111,19 @@ pub trait GameplayHooks: Send + Sync {
     ) {
     }
 
+    /// Called when a living entity took lethal damage and no vanilla totem saved it.
+    ///
+    /// Returning `true` cancels the death; the implementation must then have
+    /// restored the entity's health itself, the way a totem sets it to 1.
+    fn prevent_death(
+        &self,
+        _world: &World,
+        _entity: &dyn LivingEntity,
+        _source: &DamageSource,
+    ) -> bool {
+        false
+    }
+
     /// Scales incoming damage before it is applied to a living entity.
     ///
     /// Vanilla health, armor, effects, and the damage cooldown still run on the

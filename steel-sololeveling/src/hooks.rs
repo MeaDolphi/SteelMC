@@ -14,23 +14,27 @@ use steel_core::entity::SharedEntity;
 use steel_core::entity::damage::DamageSource;
 use steel_core::gameplay_hooks::GameplayHooks;
 use steel_core::player::Player;
+use steel_core::player::player_inventory::Prediction;
 use steel_core::server::Server;
 use steel_core::world::World;
 use steel_registry::item_stack::ItemStack;
 use steel_registry::vanilla_entities;
 use steel_utils::BlockPos;
 use steel_utils::types::{BlockStateId, InteractionHand};
-use text_components::TextComponent;
+use text_components::format::Color;
+use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
 use crate::dungeon::instance;
 use crate::dungeon::is_instance_world;
 use crate::dungeon::runtime::TEST_GATE_ON_JOIN;
 use crate::item;
+use crate::item::chest::ChestKind;
 use crate::organization::Event;
 use crate::organization_menu;
-use crate::quest::SystemQuest;
+use crate::quest::{PENALTY_DELAY_SECONDS, SystemQuest};
 use crate::session::HunterSession;
+use crate::session::QuestUpdate;
 use crate::sidebar;
 use crate::state::SoloLevelingState;
 
@@ -84,6 +88,7 @@ impl GameplayHooks for SoloLevelingHooks {
         self.state.tick_auction(server, tick_count);
         self.state.tick_dungeons(server, tick_count);
         self.state.tick_organization(server);
+        self.state.tick_storms(server);
     }
 
     fn on_player_join(&self, _server: &Arc<Server>, player: &Player) {
@@ -99,6 +104,15 @@ impl GameplayHooks for SoloLevelingHooks {
                     &data.quest,
                 );
                 self.state.begin_session(player_uuid, data);
+                if self.state.has_pending_penalty(player_uuid) {
+                    player.send_message(
+                        &TextComponent::plain(format!(
+                            "Система: невыполненное ежедневное задание. Штрафная зона через {} мин.",
+                            PENALTY_DELAY_SECONDS / 60
+                        ))
+                        .color(Color::Red),
+                    );
+                }
                 if let Err(error) = self.state.save_session(player_uuid) {
                     log::error!("sololeveling: could not queue initial player save: {error}");
                 }
@@ -129,13 +143,17 @@ impl GameplayHooks for SoloLevelingHooks {
         let unix_seconds = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs());
+        self.state.tick_artifacts(player);
         let window = SystemQuest::window_at(unix_seconds);
-        let _ = self.state.observe_quest(
+        let update = self.state.observe_quest(
             player_uuid,
             window,
             player.position(),
             player.last_client_input(),
         );
+        if let Some(update) = update {
+            announce_quest(player, update);
+        }
 
         let due = self
             .state
@@ -213,7 +231,7 @@ impl GameplayHooks for SoloLevelingHooks {
     fn on_block_drops(
         &self,
         world: &World,
-        _player: &Player,
+        player: &Player,
         _pos: BlockPos,
         state: BlockStateId,
         drops: &mut Vec<ItemStack>,
@@ -225,7 +243,9 @@ impl GameplayHooks for SoloLevelingHooks {
             return;
         };
         drops.clear();
-        drops.push(item::crystal::stack(rank));
+        let mut crystals = item::crystal::stack(rank);
+        crystals.set_count(1 + self.state.crystal_bonus(player));
+        drops.push(crystals);
     }
 
     fn on_player_use_item(
@@ -263,6 +283,7 @@ impl GameplayHooks for SoloLevelingHooks {
         source: &DamageSource,
         amount: f32,
     ) {
+        self.state.artifact_hit(entity, source);
         let Some(killer) = source.causing_entity() else {
             return;
         };
@@ -271,6 +292,25 @@ impl GameplayHooks for SoloLevelingHooks {
             self.state
                 .observe_raid_boss_damage(world, entity.id(), hunter, amount);
         }
+    }
+
+    fn modify_damage(
+        &self,
+        _world: &World,
+        victim: &dyn LivingEntity,
+        source: &DamageSource,
+        amount: f32,
+    ) -> f32 {
+        self.state.artifact_damage(victim, source, amount)
+    }
+
+    fn prevent_death(
+        &self,
+        _world: &World,
+        entity: &dyn LivingEntity,
+        source: &DamageSource,
+    ) -> bool {
+        self.state.artifact_prevent_death(entity, source)
     }
 
     fn on_living_entity_loot(
@@ -331,4 +371,21 @@ fn credited_hunter(entity: &SharedEntity) -> Option<Uuid> {
         return Some(player.gameprofile.id());
     }
     entity.as_mob()?.allied_owner()
+}
+
+/// Hands out the daily reward and reports a failed day.
+fn announce_quest(player: &Player, update: QuestUpdate) {
+    if update.completed {
+        player.add_item_or_drop(ChestKind::Normal.stack(), Prediction::ServerOnly);
+        player.send_message(
+            &TextComponent::plain("Ежедневное задание выполнено: получен обычный сундук.")
+                .color(Color::Gold),
+        );
+    }
+    if update.penalty_pending {
+        player.send_message(
+            &TextComponent::plain("Система: ежедневное задание провалено. Штрафная зона.")
+                .color(Color::Red),
+        );
+    }
 }

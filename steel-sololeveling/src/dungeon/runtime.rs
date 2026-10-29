@@ -979,7 +979,7 @@ impl DungeonRuntime {
     fn find_penalty_entries(&mut self, state: &SoloLevelingState, server: &Arc<Server>) {
         for player in server.get_players() {
             let uuid = player.gameprofile.id();
-            if self.is_busy(uuid) || !state.has_pending_penalty(uuid) {
+            if self.is_busy(uuid) || !state.penalty_due(uuid) {
                 continue;
             }
             let world = player.get_world();

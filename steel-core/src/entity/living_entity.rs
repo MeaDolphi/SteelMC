@@ -759,7 +759,11 @@ pub trait LivingEntity: Entity {
         }
 
         if self.is_dead_or_dying() {
-            if !self.check_totem_death_protection(source) {
+            let saved = self.check_totem_death_protection(source)
+                || self.as_living_entity().is_some_and(|entity| {
+                    world.gameplay_hooks.prevent_death(world, entity, source)
+                });
+            if !saved {
                 if took_full_damage {
                     self.play_death_sound();
                 }

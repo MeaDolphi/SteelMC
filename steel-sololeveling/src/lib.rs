@@ -12,6 +12,7 @@
 
 #![recursion_limit = "256"]
 
+pub mod abilities;
 pub mod auction;
 pub mod combat_reward;
 pub mod commands;
