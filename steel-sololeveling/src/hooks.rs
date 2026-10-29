@@ -293,6 +293,7 @@ impl GameplayHooks for SoloLevelingHooks {
         amount: f32,
     ) {
         self.state.artifact_hit(entity, source);
+        self.state.refresh_mob_label(world, entity);
         let Some(killer) = source.causing_entity() else {
             return;
         };

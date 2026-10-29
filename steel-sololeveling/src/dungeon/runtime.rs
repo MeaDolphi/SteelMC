@@ -35,6 +35,7 @@ use super::instance::{
     opening_contains, place_gate_frame, remove_gate_frame, spawn_dungeon_boss, spawn_dungeon_wave,
     spawn_penalty_wave,
 };
+use super::mobs::MobLabel;
 use super::{
     DUNGEON_TIME_LIMIT_TICKS, DungeonLayout, DungeonWave, Footprint, GATE_SPAWN_INTERVAL_TICKS,
     GATES_PER_SPAWN_CYCLE, Gate, GateRegistry, INSTANCE_WORLD_PATH, InstanceRegion,
@@ -226,7 +227,7 @@ struct InstanceRun {
 }
 
 enum RunProgress {
-    Dungeon(DungeonProgress),
+    Dungeon(Box<DungeonProgress>),
     Penalty(PenaltyProgress),
 }
 
@@ -253,6 +254,24 @@ struct DungeonProgress {
     boss_chest: Option<ChestKind>,
     /// Survivors captured at completion, in dungeon-entry order.
     survivors: Vec<Uuid>,
+    /// Nameplates of the run's mobs and boss, by entity id.
+    labels: FxHashMap<i32, MobLabel>,
+}
+
+impl DungeonProgress {
+    /// Spawns the wave of the current combat room and remembers its plates.
+    fn spawn_wave(&mut self, world: &Arc<World>, region: InstanceRegion) {
+        let spawned = spawn_dungeon_wave(
+            world,
+            region,
+            &self.layout,
+            self.wave,
+            self.rank,
+            self.combat_room,
+        );
+        self.remaining_mobs = spawned.iter().map(|(id, _)| *id).collect();
+        self.labels.extend(spawned);
+    }
 }
 
 /// Lifecycle of the boss of one dungeon run.
@@ -381,6 +400,20 @@ impl DungeonRuntime {
                 return;
             }
         }
+    }
+
+    /// Returns the nameplate of a dungeon mob or boss in `world`.
+    #[must_use]
+    pub fn mob_label(&self, world: &World, entity_id: i32) -> Option<MobLabel> {
+        self.runs.values().find_map(|run| {
+            if run.instance_world != world.key {
+                return None;
+            }
+            let RunProgress::Dungeon(progress) = &run.progress else {
+                return None;
+            };
+            progress.labels.get(&entity_id).cloned()
+        })
     }
 
     /// Returns whether an entity belongs to an active dungeon, rather than a
@@ -1139,7 +1172,7 @@ impl DungeonRuntime {
             }
             let (progress, gate) = match start {
                 RunStart::Gate { gate, layout } => (
-                    RunProgress::Dungeon(DungeonProgress {
+                    RunProgress::Dungeon(Box::new(DungeonProgress {
                         rank: gate.rank,
                         red: gate.red,
                         wave: wave_for_gate(gate.rank, gate.red),
@@ -1156,7 +1189,8 @@ impl DungeonRuntime {
                             .collect(),
                         boss_chest: None,
                         survivors: Vec::new(),
-                    }),
+                        labels: FxHashMap::default(),
+                    })),
                     Some(gate.id),
                 ),
                 RunStart::Penalty => (
@@ -1193,10 +1227,6 @@ impl DungeonRuntime {
     /// A room counts as cleared when its mobs are gone, not when they die: a mob
     /// can be removed without a death event, so the live entities are what the
     /// room is waiting for.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one dungeon run steps through rooms, boss and exit in a single sequence"
-    )]
     fn tick_dungeon_run(
         progress: &mut DungeonProgress,
         context: &RunContext<'_>,
@@ -1213,8 +1243,7 @@ impl DungeonRuntime {
         } = *context;
         if progress.combat_room == 0 {
             progress.combat_room = 1;
-            progress.remaining_mobs =
-                spawn_dungeon_wave(world, region, &progress.layout, progress.wave, 1);
+            progress.spawn_wave(world, region);
             return None;
         }
         progress
@@ -1225,13 +1254,7 @@ impl DungeonRuntime {
         }
         if progress.combat_room < progress.layout.combat_room_count {
             progress.combat_room += 1;
-            progress.remaining_mobs = spawn_dungeon_wave(
-                world,
-                region,
-                &progress.layout,
-                progress.wave,
-                progress.combat_room,
-            );
+            progress.spawn_wave(world, region);
             return None;
         }
         match progress.boss {
@@ -1255,7 +1278,8 @@ impl DungeonRuntime {
                     });
                 };
                 progress.boss = BossState::Alive(boss.id);
-                let mut fight = BossFight::new(boss.abilities, boss.id, tick);
+                progress.labels.insert(boss.id, boss.label.clone());
+                let mut fight = BossFight::new(&boss.boss, boss.id, tick);
                 if let Some(entity) = world.get_entity_by_id(boss.id) {
                     fight.announce(&entity, player, &boss.name);
                 }

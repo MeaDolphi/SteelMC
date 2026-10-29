@@ -515,6 +515,14 @@ impl SoloLevelingState {
             .record_boss_damage(world, entity_id, hunter, amount);
     }
 
+    /// Rewrites a dungeon mob's nameplate after it lost health.
+    pub fn refresh_mob_label(&self, world: &World, entity: &dyn LivingEntity) {
+        let label = self.dungeon_runtime.lock().mob_label(world, entity.id());
+        if let Some(label) = label {
+            label.show(entity);
+        }
+    }
+
     /// Captures tracked dungeon drops for deferred contribution-based delivery.
     pub fn capture_raid_loot(&self, world: &World, entity_id: i32, drops: &mut Vec<ItemStack>) {
         self.dungeon_runtime

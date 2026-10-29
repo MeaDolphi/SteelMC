@@ -3,9 +3,10 @@
 pub mod boss;
 pub mod generator;
 pub mod instance;
+pub mod mobs;
 pub mod runtime;
 
-pub use boss::{BossAbilitySet, boss_for_gate};
+pub use boss::{BossKind, boss_for_gate};
 
 use std::fs;
 use std::io::{self, ErrorKind};

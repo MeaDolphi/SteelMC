@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 use glam::DVec3;
-use steel_core::entity::spawn_mob;
+use steel_core::entity::{SharedEntity, spawn_mob};
 use steel_core::world::World;
 use steel_registry::blocks::BlockRef;
 use steel_registry::blocks::block_state_ext::BlockStateExt;
@@ -15,10 +15,11 @@ use text_components::Modifier as _;
 use text_components::TextComponent;
 use text_components::format::Color;
 
+use super::boss::{BossKind, DungeonBoss};
 use super::generator::{Blueprint, Room};
+use super::mobs::{MobClass, MobLabel};
 use super::{
-    BossAbilitySet, DungeonLayout, DungeonWave, Footprint, Gate, INSTANCE_FLOOR_Y, InstanceRegion,
-    boss_for_gate,
+    DungeonLayout, DungeonWave, Footprint, Gate, INSTANCE_FLOOR_Y, InstanceRegion, boss_for_gate,
 };
 use crate::rank::HunterRank;
 
@@ -429,28 +430,45 @@ fn build_room(world: &Arc<World>, corner: BlockPos, size: i32, height: i32) {
 ///
 /// The wave is all zombies: Steel has no arrow projectile or ranged-attack goal
 /// yet, so a skeleton could only be a melee mob, which is not what vanilla does.
+///
+/// Each mob rolls a class from the dungeon seed, the room and its place in
+/// the wave, and carries a nameplate with its name, class and health.
 pub fn spawn_dungeon_wave(
     world: &Arc<World>,
     region: InstanceRegion,
     layout: &DungeonLayout,
     wave: DungeonWave,
+    rank: HunterRank,
     room: u8,
-) -> Vec<i32> {
+) -> Vec<(i32, MobLabel)> {
     let Some(plan) = layout.blueprint.combat_room(room) else {
         return Vec::new();
     };
     let mut spawned = Vec::new();
     for index in 0..wave.mob_count {
         let position = spawn_position(region, plan, usize::from(index));
-        if let Some(id) = spawn_scaled_mob(
+        let roll = layout
+            .seed
+            .rotate_left(u32::from(room) * 7)
+            .wrapping_add(u64::from(index).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let class = MobClass::from_roll(roll ^ (roll >> 29));
+        let (health, damage, _) = class.proportions();
+        let Some(entity) = spawn_scaled_mob(
             world,
             &vanilla_entities::ZOMBIE,
             position,
-            wave.health_multiplier,
-            wave.damage_multiplier,
-        ) {
-            spawned.push(id);
-        }
+            wave.health_multiplier * health,
+            wave.damage_multiplier * damage,
+        ) else {
+            continue;
+        };
+        let Some(living) = entity.as_living_entity() else {
+            continue;
+        };
+        class.equip(living, rank);
+        let label = MobLabel::mob(layout.blueprint.theme, class);
+        label.show(living);
+        spawned.push((entity.id(), label));
     }
     let missing = u32::from(wave.mob_count) - u32::try_from(spawned.len()).unwrap_or(u32::MAX);
     if missing > 0 {
@@ -478,8 +496,10 @@ pub struct SpawnedBoss {
     pub id: i32,
     /// Name shown above the boss and on its boss bar.
     pub name: TextComponent,
-    /// Abilities the fight may use.
-    pub abilities: BossAbilitySet,
+    /// Stats and abilities the fight uses.
+    pub boss: DungeonBoss,
+    /// Nameplate kept up to date with the boss's health.
+    pub label: MobLabel,
 }
 
 /// Spawns the boss of a dungeon in its reserved final room.
@@ -497,26 +517,36 @@ pub fn spawn_dungeon_boss(
     let room = layout.blueprint.boss_room();
     // The boss waits at the far side of its room; the exit appears at the centre.
     let position = at(region, (room.center.0, 0, room.center.1 + room.half.1 - 3));
-    let boss = boss_for_gate(rank, red);
+    let kind = BossKind::from_seed(layout.seed);
+    let boss = boss_for_gate(kind, rank, red);
     let entity = spawn_mob(world, &vanilla_entities::ZOMBIE, position).ok()?;
     let living = entity.as_living_entity()?;
     boss.apply_to(living);
-    let name = boss_name(rank, red);
-    entity.set_custom_name(Some(name.clone()));
+    let label = boss_label(kind, rank, red);
+    label.show(living);
     // The boss was spawned at scale 1.0, so its hitbox has to follow the new
     // scale before the fight starts.
     entity.refresh_dimensions();
     Some(SpawnedBoss {
         id: entity.id(),
-        name,
-        abilities: boss.abilities,
+        name: TextComponent::plain(label.name.clone()).color(Color::Red),
+        boss,
+        label,
     })
 }
 
-/// Returns the name shown above a dungeon boss.
-fn boss_name(rank: HunterRank, red: bool) -> TextComponent {
-    let kind = if red { "Red Gate Boss" } else { "Gate Boss" };
-    TextComponent::plain(format!("{}-Rank {kind}", rank.name())).color(Color::Red)
+/// Returns the nameplate of a dungeon boss.
+fn boss_label(kind: BossKind, rank: HunterRank, red: bool) -> MobLabel {
+    let name = if red {
+        format!("Кровавый {}", kind.display_name().to_lowercase())
+    } else {
+        kind.display_name().to_owned()
+    };
+    MobLabel {
+        name,
+        title: format!("Босс, ранг {}", rank.name()),
+        color: Color::Red,
+    }
 }
 
 /// Spawns `count` vanilla zombies spread around the penalty arena and returns
@@ -533,8 +563,9 @@ pub fn spawn_penalty_wave(world: &Arc<World>, region: InstanceRegion, count: u8)
             INSTANCE_FLOOR_Y,
             origin.z() - half + 3 + row * PENALTY_WAVE_SPACING,
         );
-        if let Some(id) = spawn_scaled_mob(world, &vanilla_entities::ZOMBIE, position, 1.0, 1.0) {
-            spawned.push(id);
+        if let Some(entity) = spawn_scaled_mob(world, &vanilla_entities::ZOMBIE, position, 1.0, 1.0)
+        {
+            spawned.push(entity.id());
         }
     }
     let missing = u32::from(count) - u32::try_from(spawned.len()).unwrap_or(u32::MAX);
@@ -553,7 +584,7 @@ fn spawn_scaled_mob(
     position: BlockPos,
     health_multiplier: f64,
     damage_multiplier: f64,
-) -> Option<i32> {
+) -> Option<SharedEntity> {
     let entity = match spawn_mob(world, entity_type, position) {
         Ok(entity) => entity,
         Err(error) => {
@@ -583,7 +614,7 @@ fn spawn_scaled_mob(
         damage * damage_multiplier,
     );
     living.set_health((max_health * health_multiplier) as f32);
-    Some(entity.id())
+    Some(entity)
 }
 
 /// Writes one fixture block and counts the positions the server could not
