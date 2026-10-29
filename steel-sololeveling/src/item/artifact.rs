@@ -13,6 +13,7 @@
 //! slot, so an artifact glove and a chestplate cannot be worn together. This is
 //! a documented adaptation, not a hidden extra equipment slot.
 
+use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 use steel_registry::attribute::AttributeRef;
 use steel_registry::data_components::components::{
@@ -109,7 +110,7 @@ impl Rarity {
 }
 
 /// One catalog artifact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ArtifactId {
     /// Rare dagger: flat attack damage.
     KasakasVenomFang,

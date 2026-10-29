@@ -1,38 +1,53 @@
-//! The personal System shop: ten fixed offers, each buyable once per Moscow day.
+//! The personal System shop: ten slots rolled per hunter per Moscow day.
+//!
+//! Each slot independently rolls a category from the shop table, then a
+//! uniform item from that category's catalog. The roll is saved with the
+//! hunter, so reconnecting or restarting cannot reroll the day's slots.
 //!
 //! Prices are paid in system points, which only personal mob kills, boss pools,
-//! and dungeon rewards produce, so trading cannot fund the shop. Every purchase
-//! is bound to its buyer: the item can be used, upgraded and dropped, but never
-//! handed to another hunter.
+//! and dungeon rewards produce, so trading cannot fund the shop. Every purchase,
+//! food and potions included, is bound to its buyer: the item can be used,
+//! upgraded and dropped, but never handed to another hunter.
+
+use std::array;
 
 use serde::{Deserialize, Serialize};
 use steel_registry::item_stack::ItemStack;
+use steel_registry::vanilla_items;
 use uuid::Uuid;
 
-use crate::item::artifact::{self, ArtifactId};
+use crate::item::artifact::{self, ArtifactId, Rarity};
 use crate::item::binding;
-use crate::item::chest::ChestKind;
-use crate::item::potion::BuffPotion;
+use crate::item::potion::{self, BuffPotion};
 
 /// How many offers the shop has.
 pub const SLOTS: usize = 10;
+/// Items in one food offer.
+pub const FOOD_COUNT: i32 = 8;
+
+/// Food the shop sells in stacks of [`FOOD_COUNT`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Food {
+    /// Baked potatoes.
+    BakedPotato,
+    /// Cooked beef.
+    CookedBeef,
+}
 
 /// The concrete item behind one offer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OfferItem {
+    /// A stack of food.
+    Food(Food),
     /// A themed buff potion.
     Buff(BuffPotion),
-    /// A reward chest; its contents roll when it is opened.
-    Chest(ChestKind),
     /// An artifact that starts personal and stays personal.
     Artifact(ArtifactId),
 }
 
 /// One shop slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Offer {
-    /// Slot index used by the purchase command and the daily counters.
-    pub slot: usize,
     /// Price in system points.
     pub price: u64,
     /// What the hunter receives.
@@ -44,8 +59,15 @@ impl Offer {
     #[must_use]
     pub fn stack(self, owner: Uuid) -> ItemStack {
         match self.item {
+            OfferItem::Food(Food::BakedPotato) => binding::bound(
+                ItemStack::with_count(&vanilla_items::BAKED_POTATO, FOOD_COUNT),
+                owner,
+            ),
+            OfferItem::Food(Food::CookedBeef) => binding::bound(
+                ItemStack::with_count(&vanilla_items::COOKED_BEEF, FOOD_COUNT),
+                owner,
+            ),
             OfferItem::Buff(buff) => binding::bound(buff.stack(), owner),
-            OfferItem::Chest(kind) => binding::bound(kind.stack(), owner),
             OfferItem::Artifact(id) => artifact::stack(id, Some(owner)),
         }
     }
@@ -54,84 +76,90 @@ impl Offer {
     #[must_use]
     pub fn display_name(self) -> String {
         match self.item {
+            OfferItem::Food(Food::BakedPotato) => format!("Печёный картофель ×{FOOD_COUNT}"),
+            OfferItem::Food(Food::CookedBeef) => format!("Жареная говядина ×{FOOD_COUNT}"),
             OfferItem::Buff(buff) => buff.display_name().to_owned(),
-            OfferItem::Chest(kind) => kind.display_name().to_owned(),
-            OfferItem::Artifact(id) => id.artifact().name.to_owned(),
+            OfferItem::Artifact(id) => {
+                let artifact = id.artifact();
+                format!("{} ({})", artifact.name, artifact.rarity.display_name())
+            }
         }
     }
 }
 
-/// The ten offers, in slot order.
-///
-/// The catalog mixes consumables with the three chest kinds and the three Rare
-/// artifacts a hunter cannot otherwise get before finding a dungeon of that
-/// rank, so system points always buy something the player actually wants.
-pub const OFFERS: [Offer; SLOTS] = [
-    Offer {
-        slot: 0,
-        price: 20,
-        item: OfferItem::Buff(BuffPotion::Strength),
-    },
-    Offer {
-        slot: 1,
-        price: 20,
-        item: OfferItem::Buff(BuffPotion::Speed),
-    },
-    Offer {
-        slot: 2,
-        price: 25,
-        item: OfferItem::Buff(BuffPotion::Resistance),
-    },
-    Offer {
-        slot: 3,
-        price: 25,
-        item: OfferItem::Buff(BuffPotion::Regeneration),
-    },
-    Offer {
-        slot: 4,
-        price: 100,
-        item: OfferItem::Chest(ChestKind::Normal),
-    },
-    Offer {
-        slot: 5,
-        price: 250,
-        item: OfferItem::Chest(ChestKind::Sacred),
-    },
-    Offer {
-        slot: 6,
-        price: 500,
-        item: OfferItem::Chest(ChestKind::Choice),
-    },
-    Offer {
-        slot: 7,
-        price: 400,
-        item: OfferItem::Artifact(ArtifactId::KasakasVenomFang),
-    },
-    Offer {
-        slot: 8,
-        price: 400,
-        item: OfferItem::Artifact(ArtifactId::ArchersGloves),
-    },
-    Offer {
-        slot: 9,
-        price: 450,
-        item: OfferItem::Artifact(ArtifactId::AssassinsShoes),
-    },
-];
-
-/// Returns the offer in `slot`.
-#[must_use]
-pub fn offer(slot: usize) -> Option<Offer> {
-    OFFERS.get(slot).copied()
+/// One row of the shop table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Category {
+    Food(Food),
+    Buff,
+    Weapon(Rarity),
+    Armor(Rarity),
 }
 
-/// What one hunter bought during one Moscow day.
+/// The shop table: chance in per mille, category, and price in system points.
+///
+/// The chances add up to exactly 1000.
+const TABLE: [(u32, Category, u64); 9] = [
+    (200, Category::Food(Food::BakedPotato), 10),
+    (200, Category::Food(Food::CookedBeef), 15),
+    (350, Category::Buff, 40),
+    (100, Category::Weapon(Rarity::Rare), 120),
+    (100, Category::Armor(Rarity::Rare), 100),
+    (20, Category::Weapon(Rarity::Epic), 600),
+    (20, Category::Armor(Rarity::Epic), 500),
+    (5, Category::Weapon(Rarity::Legendary), 3_000),
+    (5, Category::Armor(Rarity::Legendary), 2_500),
+];
+
+/// Rolls one slot from a per-mille `chance` roll and an item `pick` roll.
+///
+/// `chance` is taken modulo 1000 and `pick` modulo the category's catalog
+/// size, so any two uniform integers give the table's distribution.
+#[must_use]
+pub fn roll_offer(chance: u32, pick: usize) -> Offer {
+    let mut chance = chance % 1_000;
+    let (category, price) = TABLE
+        .iter()
+        .find_map(|(weight, category, price)| {
+            if chance < *weight {
+                Some((*category, *price))
+            } else {
+                chance -= weight;
+                None
+            }
+        })
+        .unwrap_or((Category::Buff, 40));
+    let item = match category {
+        Category::Food(food) => OfferItem::Food(food),
+        Category::Buff => OfferItem::Buff(potion::ALL[pick % potion::ALL.len()]),
+        Category::Weapon(rarity) => pick_artifact(&artifact::weapons_of(rarity), pick),
+        Category::Armor(rarity) => pick_artifact(&artifact::armors_of(rarity), pick),
+    };
+    Offer { price, item }
+}
+
+fn pick_artifact(catalog: &[ArtifactId], pick: usize) -> OfferItem {
+    catalog
+        .get(pick % catalog.len().max(1))
+        .map_or(OfferItem::Buff(BuffPotion::Strength), |id| {
+            OfferItem::Artifact(*id)
+        })
+}
+
+fn roll_day() -> [Offer; SLOTS] {
+    array::from_fn(|_| roll_offer(rand::random_range(0..1_000), rand::random_range(0..64)))
+}
+
+/// One hunter's shop for one Moscow day.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShopDay {
-    /// Moscow day index the flags below belong to.
+    /// Moscow day index the slots below belong to.
     pub day: u64,
     /// Slots already bought that day.
     pub purchased: [bool; SLOTS],
+    /// The day's rolled offers; `None` until the first roll.
+    #[serde(default)]
+    pub offers: Option<[Offer; SLOTS]>,
 }
 
 impl Default for ShopDay {
@@ -144,23 +172,40 @@ impl ShopDay {
     /// Returns the state of a hunter who has bought nothing yet.
     ///
     /// The day is deliberately not a real day index, so the first observation
-    /// rolls the counters over exactly once.
+    /// rolls the slots exactly once.
     #[must_use]
     pub const fn unset() -> Self {
         Self {
             day: u64::MAX,
             purchased: [false; SLOTS],
+            offers: None,
         }
     }
 
-    /// Clears yesterday's purchases and reports whether anything changed.
-    pub const fn roll_over(&mut self, today: u64) -> bool {
-        if self.day == today {
+    /// Rolls today's slots once and reports whether anything changed.
+    ///
+    /// A day saved before slots were rolled (an older save) gets its slots on
+    /// first use without losing today's purchase flags.
+    pub fn roll_over(&mut self, today: u64) -> bool {
+        self.roll_over_with(today, roll_day)
+    }
+
+    fn roll_over_with(&mut self, today: u64, roll: impl FnOnce() -> [Offer; SLOTS]) -> bool {
+        if self.day == today && self.offers.is_some() {
             return false;
         }
-        self.day = today;
-        self.purchased = [false; SLOTS];
+        if self.day != today {
+            self.day = today;
+            self.purchased = [false; SLOTS];
+        }
+        self.offers = Some(roll());
         true
+    }
+
+    /// Returns today's offer in `slot`, once the day is rolled.
+    #[must_use]
+    pub fn offer(&self, slot: usize) -> Option<Offer> {
+        self.offers?.get(slot).copied()
     }
 
     /// Returns whether `slot` was already bought today.
@@ -203,38 +248,93 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_slot_is_offered_exactly_once_with_a_positive_price() {
-        let mut seen = [false; SLOTS];
-        for offer in OFFERS {
-            assert!(offer.price > 0, "slot {}", offer.slot);
-            assert!(!seen[offer.slot], "slot {} is offered twice", offer.slot);
-            seen[offer.slot] = true;
-        }
-        assert!(seen.iter().all(|slot| *slot));
-        assert!(offer(SLOTS).is_none());
+    fn the_table_covers_exactly_one_thousand_per_mille() {
+        assert_eq!(TABLE.iter().map(|(weight, ..)| weight).sum::<u32>(), 1_000);
     }
 
     #[test]
-    fn a_purchase_is_refused_twice_on_one_day_but_allowed_the_next() {
+    fn chance_rolls_land_in_the_table_rows() {
+        assert_eq!(roll_offer(0, 0).item, OfferItem::Food(Food::BakedPotato));
+        assert_eq!(roll_offer(199, 0).price, 10);
+        assert_eq!(roll_offer(200, 0).item, OfferItem::Food(Food::CookedBeef));
+        assert_eq!(roll_offer(400, 0).price, 40);
+        assert!(matches!(roll_offer(749, 3).item, OfferItem::Buff(_)));
+        assert_eq!(roll_offer(750, 0).price, 120);
+        assert_eq!(roll_offer(850, 0).price, 100);
+        assert_eq!(roll_offer(950, 0).price, 600);
+        assert_eq!(roll_offer(970, 0).price, 500);
+        assert_eq!(roll_offer(990, 0).price, 3_000);
+        assert_eq!(roll_offer(999, 0).price, 2_500);
+    }
+
+    #[test]
+    fn artifact_rolls_match_their_rarity_and_category() {
+        for pick in 0..16 {
+            for (chance, rarity, weapon) in [
+                (750, Rarity::Rare, true),
+                (850, Rarity::Rare, false),
+                (950, Rarity::Epic, true),
+                (970, Rarity::Epic, false),
+                (990, Rarity::Legendary, true),
+                (995, Rarity::Legendary, false),
+            ] {
+                let OfferItem::Artifact(id) = roll_offer(chance, pick).item else {
+                    panic!("chance {chance} must roll an artifact");
+                };
+                let artifact = id.artifact();
+                assert_eq!(artifact.rarity, rarity, "chance {chance}");
+                assert_eq!(
+                    artifact.category == artifact::Category::Weapon,
+                    weapon,
+                    "chance {chance}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_day_is_rolled_once_and_kept_until_the_next_day() {
+        let fixed = [roll_offer(0, 0); SLOTS];
+        let other = [roll_offer(400, 1); SLOTS];
         let mut day = ShopDay::default();
-        assert!(day.roll_over(5));
-        assert!(!day.bought(3));
+        assert!(day.roll_over_with(5, || fixed));
         assert!(day.mark(3));
+        assert!(!day.roll_over_with(5, || other));
+        assert_eq!(day.offer(3), Some(fixed[3]));
         assert!(day.bought(3));
         assert!(!day.mark(3));
 
-        assert!(!day.roll_over(5));
-        assert!(day.bought(3));
-        assert!(day.roll_over(6));
+        assert!(day.roll_over_with(6, || other));
+        assert_eq!(day.offer(3), Some(other[3]));
         assert!(!day.bought(3));
-        assert!(day.mark(3));
     }
 
     #[test]
-    fn unknown_slots_are_never_marked() {
+    fn an_older_save_without_slots_keeps_todays_purchases() {
+        let mut day: ShopDay =
+            serde_json::from_str(&format!(r#"{{"day":5,"purchased":{:?}}}"#, [true; SLOTS]))
+                .expect("legacy shop day");
+        assert_eq!(day.offer(0), None);
+        assert!(day.roll_over_with(5, || [roll_offer(0, 0); SLOTS]));
+        assert!(day.offer(0).is_some());
+        assert!(day.bought(0));
+    }
+
+    #[test]
+    fn a_saved_day_round_trips() {
+        let mut day = ShopDay::default();
+        day.roll_over(9);
+        let json = serde_json::to_string(&day).expect("serialize");
+        let restored: ShopDay = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored, day);
+    }
+
+    #[test]
+    fn unknown_slots_are_never_marked_or_offered() {
         let mut day = ShopDay::default();
         day.roll_over(1);
         assert!(!day.mark(SLOTS));
         assert!(!day.bought(SLOTS));
+        assert!(day.offer(SLOTS).is_none());
     }
 }

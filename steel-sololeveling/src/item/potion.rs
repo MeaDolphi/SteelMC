@@ -4,6 +4,7 @@
 //! potion component: the client is unmodified, so the item is a `minecraft:potion`
 //! carrying a Solo Leveling tag that names one of the fixed buffs below.
 
+use serde::{Deserialize, Serialize};
 use steel_registry::item_stack::ItemStack;
 use steel_registry::mob_effect::MobEffectRef;
 use steel_registry::{vanilla_items, vanilla_mob_effects};
@@ -22,7 +23,7 @@ pub const BUFF_SECONDS: u64 = 180;
 const BUFF_AMPLIFIER: i32 = 0;
 
 /// One of the starter buffs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BuffPotion {
     /// Strength I: more melee damage.
     Strength,

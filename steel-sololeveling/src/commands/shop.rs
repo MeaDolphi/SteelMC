@@ -10,7 +10,6 @@ use steel_core::player::Player;
 use text_components::format::Color;
 use text_components::{Modifier as _, TextComponent};
 
-use crate::daily;
 use crate::identifier::from_sololeveling;
 use crate::shop::{self, ShopError};
 use crate::state::SoloLevelingState;
@@ -45,13 +44,7 @@ pub fn register(
                                 shop::SLOTS - 1
                             ))
                         })?;
-                        let offer = shop::offer(slot).ok_or_else(|| {
-                            CommandError::from(format!(
-                                "Укажите номер слота от 0 до {}.",
-                                shop::SLOTS - 1
-                            ))
-                        })?;
-                        buy_state
+                        let offer = buy_state
                             .buy_shop_offer(player, slot)
                             .map_err(purchase_error)?;
                         player.send_message(
@@ -71,37 +64,33 @@ pub fn register(
 /// Prints every offer with its price and today's purchase state.
 fn show(state: &SoloLevelingState, player: &Arc<Player>) {
     let uuid = player.gameprofile.id();
-    let today = daily::today();
-    let bought = state
-        .with_session_mut(uuid, |session| {
-            let mut day = session.shop;
-            day.roll_over(today);
-            day
-        })
-        .unwrap_or_default();
+    let Some(day) = state.shop_day(uuid) else {
+        player
+            .send_message(&TextComponent::plain("Сессия охотника не загружена.").color(Color::Red));
+        return;
+    };
     let points = state
         .with_session_mut(uuid, |session| session.system_points.amount())
         .unwrap_or(0);
     player.send_message(
         &TextComponent::plain(format!("Магазин Системы. Очков: {points}.")).color(Color::Gold),
     );
-    for offer in shop::OFFERS {
-        let state_text = if bought.bought(offer.slot) {
+    for slot in 0..shop::SLOTS {
+        let Some(offer) = day.offer(slot) else {
+            continue;
+        };
+        let state_text = if day.bought(slot) {
             "куплено сегодня".to_owned()
         } else {
             format!("{} очков", offer.price)
         };
         player.send_message(
-            &TextComponent::plain(format!(
-                "[{}] {} — {state_text}",
-                offer.slot,
-                offer.display_name()
-            ))
-            .color(if bought.bought(offer.slot) {
-                Color::DarkGray
-            } else {
-                Color::Yellow
-            }),
+            &TextComponent::plain(format!("[{slot}] {} — {state_text}", offer.display_name()))
+                .color(if day.bought(slot) {
+                    Color::DarkGray
+                } else {
+                    Color::Yellow
+                }),
         );
     }
     player.send_message(&TextComponent::plain("Покупка: /shop buy <слот>.").color(Color::Gray));

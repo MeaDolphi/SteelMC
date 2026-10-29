@@ -36,7 +36,7 @@ use crate::rank::HunterRank;
 use crate::session::{HunterSession, QuestUpdate, SessionRegistry};
 use crate::shadow::{RECOVERY_HEALTH_PER_MINUTE, Shadow, ShadowStat, army_limit};
 use crate::shadow_runtime::ShadowRuntime;
-use crate::shop::{self, ShopError};
+use crate::shop::{Offer, ShopDay, ShopError};
 use crate::stats::{HunterStat, HunterStats, LevelUp};
 
 /// Storage and live sessions shared by Solo Leveling hooks and commands.
@@ -374,20 +374,17 @@ impl SoloLevelingState {
     /// The debit and the daily counter change together under the session lock;
     /// a refused purchase never charges points, and the granted item is bound to
     /// the buyer so it cannot be resold.
-    pub fn buy_shop_offer(
-        &self,
-        player: &Arc<Player>,
-        slot: usize,
-    ) -> Result<ItemStack, ShopError> {
-        let offer = shop::offer(slot).ok_or(ShopError::UnknownSlot)?;
+    pub fn buy_shop_offer(&self, player: &Arc<Player>, slot: usize) -> Result<Offer, ShopError> {
         let uuid = player.gameprofile.id();
         let today = daily::today();
-        self.sessions
+        let offer = self
+            .sessions
             .with_mut(uuid, |session| {
                 if session.economic_busy {
                     return Err(ShopError::Busy);
                 }
                 session.shop.roll_over(today);
+                let offer = session.shop.offer(slot).ok_or(ShopError::UnknownSlot)?;
                 if session.shop.bought(slot) {
                     return Err(ShopError::AlreadyBought);
                 }
@@ -397,16 +394,27 @@ impl SoloLevelingState {
                 if !session.shop.mark(slot) {
                     return Err(ShopError::UnknownSlot);
                 }
-                Ok(())
+                Ok(offer)
             })
             .ok_or(ShopError::NoSession)??;
 
-        let stack = offer.stack(uuid);
-        player.add_item_or_drop(stack.clone(), Prediction::ServerOnly);
+        player.add_item_or_drop(offer.stack(uuid), Prediction::ServerOnly);
         if let Err(error) = self.save_session(uuid) {
             log::warn!("sololeveling: failed to persist a shop purchase of {uuid}: {error}");
         }
-        Ok(stack)
+        Ok(offer)
+    }
+
+    /// Returns today's shop of a hunter, rolling and saving it on first look.
+    pub fn shop_day(&self, uuid: Uuid) -> Option<ShopDay> {
+        let today = daily::today();
+        let (rolled, day) = self.sessions.with_mut(uuid, |session| {
+            (session.shop.roll_over(today), session.shop)
+        })?;
+        if rolled && let Err(error) = self.save_session(uuid) {
+            log::warn!("sololeveling: failed to persist the shop slots of {uuid}: {error}");
+        }
+        Some(day)
     }
 
     /// Sells every magic crystal in a hunter's inventory to the Organization.
