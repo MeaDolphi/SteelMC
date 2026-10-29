@@ -64,10 +64,12 @@ impl SoloLevelingState {
         let guilds = GuildRegistry::load(storage.base_dir())?;
         let boards =
             organization::Boards::load(storage.base_dir().join("organization_boards.json"))?;
+        let mut dungeon_runtime = DungeonRuntime::default();
+        dungeon_runtime.load_region_records(storage.base_dir().join("instance_regions.json"))?;
         Ok(Self {
             storage,
             sessions: SessionRegistry::new(),
-            dungeon_runtime: SyncMutex::new(DungeonRuntime::default()),
+            dungeon_runtime: SyncMutex::new(dungeon_runtime),
             shadow_runtime: SyncMutex::new(ShadowRuntime::default()),
             party_runtime: SyncMutex::new(PartyRuntime::default()),
             guilds: SyncMutex::new(guilds),

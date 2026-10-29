@@ -1,15 +1,24 @@
 //! Dungeon-instance allocation and rank-scaled combat rules.
 
 pub mod boss;
+pub mod generator;
 pub mod instance;
 pub mod runtime;
 
 pub use boss::{BossAbilitySet, boss_for_gate};
 
+use std::fs;
+use std::io::{self, ErrorKind};
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use glam::DVec3;
 use rustc_hash::FxHashMap;
+use serde::{Deserialize, Serialize};
 use steel_core::world::World;
 use steel_utils::{BlockPos, Identifier};
+
+use self::generator::Blueprint;
 
 use crate::quest::{
     PENALTY_ZONE_DURATION_SECONDS, PENALTY_ZONE_WAVE_INTERVAL_SECONDS,
@@ -234,22 +243,29 @@ impl InstanceRegion {
     }
 }
 
-/// Room progression generated inside one instance region.
+/// The procedurally generated dungeon of one run.
 ///
-/// The final room is deliberately reserved for the Phase 6 boss. In Phase 5,
-/// clearing every combat room unlocks the exit from that reserved room.
+/// Waves fill the combat rooms in order; the final room is reserved for the
+/// boss and, once it falls, the exit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DungeonLayout {
+    /// Seed the whole dungeon is generated from.
+    pub seed: u64,
     /// Number of combat rooms between the entrance and the reserved boss room.
     pub combat_room_count: u8,
+    /// Rooms, corridors and blocks of the dungeon.
+    pub blueprint: Arc<Blueprint>,
 }
 
 impl DungeonLayout {
-    /// Selects two through five combat rooms from a random roll.
+    /// Generates the dungeon of `seed`, with two through five combat rooms.
     #[must_use]
-    pub const fn from_roll(roll: u8) -> Self {
+    pub fn from_seed(seed: u64) -> Self {
+        let combat_room_count = 2 + u8::try_from((seed >> 56) % 4).unwrap_or(0);
         Self {
-            combat_room_count: 2 + roll % 4,
+            seed,
+            combat_room_count,
+            blueprint: Arc::new(Blueprint::generate(seed, combat_room_count)),
         }
     }
 
@@ -267,11 +283,27 @@ impl DungeonLayout {
     }
 }
 
+/// What the last run built in a region, so the next one can erase it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Footprint {
+    /// A generated dungeon; the seed rebuilds the exact blocks to erase.
+    Dungeon {
+        /// Seed of the dungeon.
+        seed: u64,
+    },
+    /// A penalty arena.
+    Arena,
+}
+
 /// Allocates non-overlapping regions and reuses released slots.
 #[derive(Debug, Default)]
 pub struct InstanceRegionAllocator {
     next_slot: u64,
     reusable_slots: Vec<u64>,
+    /// What each region holds; a missing entry may hold a pre-generator build.
+    footprints: FxHashMap<u64, Footprint>,
+    /// Where `footprints` is saved, if anywhere.
+    path: Option<PathBuf>,
 }
 
 impl InstanceRegionAllocator {
@@ -288,6 +320,45 @@ impl InstanceRegionAllocator {
     /// Releases a region after its dungeon was cleaned up.
     pub fn release(&mut self, region: InstanceRegion) {
         self.reusable_slots.push(region.slot);
+    }
+
+    /// Loads the saved region footprints and keeps saving them to `path`.
+    ///
+    /// The instance world keeps its blocks across restarts, so the record of
+    /// what stands in each region has to outlive the process as well.
+    pub fn load_footprints(&mut self, path: PathBuf) -> io::Result<()> {
+        self.footprints = match fs::read_to_string(&path) {
+            Ok(contents) => serde_json::from_str(&contents)
+                .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?,
+            Err(error) if error.kind() == ErrorKind::NotFound => FxHashMap::default(),
+            Err(error) => return Err(error),
+        };
+        self.path = Some(path);
+        Ok(())
+    }
+
+    /// Returns what the region currently holds; `None` is unknown.
+    #[must_use]
+    pub fn footprint(&self, region: InstanceRegion) -> Option<Footprint> {
+        self.footprints.get(&region.slot).copied()
+    }
+
+    /// Records what was just built in a region.
+    pub fn record(&mut self, region: InstanceRegion, footprint: Footprint) {
+        self.footprints.insert(region.slot, footprint);
+        let Some(path) = &self.path else {
+            return;
+        };
+        let result = serde_json::to_vec(&self.footprints)
+            .map_err(io::Error::other)
+            .and_then(|json| {
+                let temporary = path.with_extension("json.tmp");
+                fs::write(&temporary, json)?;
+                fs::rename(temporary, path)
+            });
+        if let Err(error) = result {
+            log::warn!("sololeveling: instance region records were not saved: {error}");
+        }
     }
 }
 
@@ -452,9 +523,10 @@ mod tests {
 
     #[test]
     fn layout_keeps_the_boss_exit_room_after_combat_rooms() {
-        let layout = DungeonLayout::from_roll(3);
+        let layout = DungeonLayout::from_seed(3 << 56);
         assert_eq!(layout.combat_room_count, 5);
         assert_eq!(layout.total_room_count(), 7);
+        assert!(layout.blueprint.combat_room(5).is_some());
     }
 
     #[test]

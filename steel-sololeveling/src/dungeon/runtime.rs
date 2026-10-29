@@ -2,7 +2,9 @@
 
 use std::f64::consts::TAU;
 use std::fmt::{self, Debug, Formatter};
+use std::io;
 use std::mem;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use glam::DVec3;
@@ -28,13 +30,13 @@ use uuid::Uuid;
 
 use super::boss::{BossAbilityAction, BossFight};
 use super::instance::{
-    build_dungeon, build_penalty_arena, dungeon_chunks, gate_frame_chunks, gate_ground_is_dry,
-    gate_space_is_clear, open_dungeon_exit, opening_contains, penalty_arena_chunks,
-    place_gate_frame, remove_gate_frame, spawn_dungeon_boss, spawn_dungeon_wave,
+    arena_chunks, build_dungeon, build_penalty_arena, dungeon_chunks, erase_footprint,
+    gate_frame_chunks, gate_ground_is_dry, gate_space_is_clear, open_dungeon_exit,
+    opening_contains, place_gate_frame, remove_gate_frame, spawn_dungeon_boss, spawn_dungeon_wave,
     spawn_penalty_wave,
 };
 use super::{
-    DUNGEON_TIME_LIMIT_TICKS, DungeonLayout, DungeonWave, GATE_SPAWN_INTERVAL_TICKS,
+    DUNGEON_TIME_LIMIT_TICKS, DungeonLayout, DungeonWave, Footprint, GATE_SPAWN_INTERVAL_TICKS,
     GATES_PER_SPAWN_CYCLE, Gate, GateRegistry, INSTANCE_WORLD_PATH, InstanceRegion,
     InstanceRegionAllocator, PENALTY_ZONE_DURATION_TICKS, PENALTY_ZONE_WAVE_INTERVAL_TICKS,
     penalty_wave_size, wave_for_gate,
@@ -312,6 +314,11 @@ struct RunContext<'a> {
 }
 
 impl DungeonRuntime {
+    /// Loads what each instance region holds, saving later builds to `path`.
+    pub fn load_region_records(&mut self, path: PathBuf) -> io::Result<()> {
+        self.regions.load_footprints(path)
+    }
+
     /// Advances gate scheduling, chunk preparation, entry, and active runs.
     ///
     /// Returns the run transitions that have to be applied outside the runtime
@@ -948,7 +955,7 @@ impl DungeonRuntime {
             };
             let start = RunStart::Gate {
                 gate: gate.clone(),
-                layout: DungeonLayout::from_roll(rand::rng().random()),
+                layout: DungeonLayout::from_seed(rand::rng().random()),
             };
             log::info!(
                 "sololeveling: hunter {} entered {}-rank gate {}",
@@ -1023,10 +1030,12 @@ impl DungeonRuntime {
         start: RunStart,
     ) {
         let region = self.regions.allocate();
-        // The whole build has to be loaded before the first block is written.
+        // The whole build, and the erasure of what the region held before, has
+        // to be loaded before the first block is written.
+        let previous = self.regions.footprint(region);
         let positions = match &start {
-            RunStart::Gate { layout, .. } => dungeon_chunks(region, layout),
-            RunStart::Penalty => penalty_arena_chunks(region),
+            RunStart::Gate { layout, .. } => dungeon_chunks(region, layout, previous),
+            RunStart::Penalty => arena_chunks(region, previous),
         };
         let request = instance_world.chunk_map.request_chunks(ChunkRequest {
             status: ChunkStatus::Full,
@@ -1093,10 +1102,24 @@ impl DungeonRuntime {
                     PENALTY_ZONE_DURATION_TICKS
                 }
             };
-            match &start {
-                RunStart::Gate { layout, .. } => build_dungeon(&instance_world, region, layout),
-                RunStart::Penalty => build_penalty_arena(&instance_world, region),
-            }
+            erase_footprint(&instance_world, region, self.regions.footprint(region));
+            let footprint = match &start {
+                RunStart::Gate { layout, .. } => {
+                    build_dungeon(&instance_world, region, layout);
+                    log::info!(
+                        "sololeveling: built a {} dungeon (seed {}) in instance region {}",
+                        layout.blueprint.theme.display_name(),
+                        layout.seed,
+                        region.slot
+                    );
+                    Footprint::Dungeon { seed: layout.seed }
+                }
+                RunStart::Penalty => {
+                    build_penalty_arena(&instance_world, region);
+                    Footprint::Arena
+                }
+            };
+            self.regions.record(region, footprint);
             let mut members = Vec::with_capacity(players.len());
             for player in players {
                 let player_uuid = player.gameprofile.id();
@@ -1170,6 +1193,10 @@ impl DungeonRuntime {
     /// A room counts as cleared when its mobs are gone, not when they die: a mob
     /// can be removed without a death event, so the live entities are what the
     /// room is waiting for.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one dungeon run steps through rooms, boss and exit in a single sequence"
+    )]
     fn tick_dungeon_run(
         progress: &mut DungeonProgress,
         context: &RunContext<'_>,
@@ -1186,7 +1213,8 @@ impl DungeonRuntime {
         } = *context;
         if progress.combat_room == 0 {
             progress.combat_room = 1;
-            progress.remaining_mobs = spawn_dungeon_wave(world, region, progress.wave, 1);
+            progress.remaining_mobs =
+                spawn_dungeon_wave(world, region, &progress.layout, progress.wave, 1);
             return None;
         }
         progress
@@ -1197,8 +1225,13 @@ impl DungeonRuntime {
         }
         if progress.combat_room < progress.layout.combat_room_count {
             progress.combat_room += 1;
-            progress.remaining_mobs =
-                spawn_dungeon_wave(world, region, progress.wave, progress.combat_room);
+            progress.remaining_mobs = spawn_dungeon_wave(
+                world,
+                region,
+                &progress.layout,
+                progress.wave,
+                progress.combat_room,
+            );
             return None;
         }
         match progress.boss {
@@ -1310,9 +1343,21 @@ impl DungeonRuntime {
             let members = run.members.clone();
             if !run.placed {
                 run.placed = true;
+                let theme = match &run.progress {
+                    RunProgress::Dungeon(progress) => {
+                        Some(progress.layout.blueprint.theme.display_name())
+                    }
+                    RunProgress::Penalty(_) => None,
+                };
                 for member in &run.members {
                     if let Some(member) = players.get(member) {
                         let _ = member.teleport(region.spawn, 0.0, 0.0);
+                        if let Some(theme) = theme {
+                            member.send_message(
+                                &TextComponent::plain(format!("Подземелье: {theme}."))
+                                    .color(Color::DarkPurple),
+                            );
+                        }
                     }
                 }
             }

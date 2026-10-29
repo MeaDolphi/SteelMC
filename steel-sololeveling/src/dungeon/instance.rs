@@ -15,18 +15,17 @@ use text_components::Modifier as _;
 use text_components::TextComponent;
 use text_components::format::Color;
 
+use super::generator::{Blueprint, Room};
 use super::{
-    BossAbilitySet, DungeonLayout, DungeonWave, Gate, INSTANCE_FLOOR_Y, InstanceRegion,
+    BossAbilitySet, DungeonLayout, DungeonWave, Footprint, Gate, INSTANCE_FLOOR_Y, InstanceRegion,
     boss_for_gate,
 };
 use crate::rank::HunterRank;
 
-/// Interior width and depth of one dungeon room.
-const ROOM_SIZE: i32 = 13;
-/// Distance between dungeon room origins.
-const ROOM_STRIDE: i32 = 20;
-/// Interior height of one dungeon room.
-const ROOM_HEIGHT: i32 = 5;
+/// Distance between room origins of the fixed layout used before generation.
+const LEGACY_ROOM_STRIDE: i32 = 20;
+/// Room size, height and count of the fixed layout used before generation.
+const LEGACY_ROOM: (i32, i32, i32) = (13, 5, 7);
 /// Interior width and depth of the penalty arena.
 const PENALTY_ARENA_SIZE: i32 = 31;
 /// Interior height of the penalty arena.
@@ -42,26 +41,10 @@ const PENALTY_WAVE_SPACING: i32 = 6;
 /// hunter the block is worth mining, since the item it drops is themed anyway.
 pub const CRYSTAL_ORE: BlockRef = &vanilla_blocks::AMETHYST_BLOCK;
 
-/// Roughly one wall block in this many is crystal ore.
-const ORE_CHANCE: u64 = 23;
-
 /// Returns whether `state` is the crystal ore dungeon walls are built from.
 #[must_use]
 pub fn is_crystal_ore(state: BlockStateId) -> bool {
     state == CRYSTAL_ORE.default_state()
-}
-
-/// Returns whether the wall block at this offset of a room is ore.
-///
-/// The pattern is hashed from the room corner and the offset instead of drawn
-/// from an RNG, so a reused instance region always offers the same veins and a
-/// dungeon cannot be rerolled by leaving and entering again.
-const fn ore_at(corner: BlockPos, x: i32, y: i32, z: i32) -> bool {
-    let hash = (corner.x() as u64).wrapping_mul(73_856_093)
-        ^ (x as u64).wrapping_mul(19_349_663)
-        ^ (y as u64).wrapping_mul(83_492_791)
-        ^ (z as u64).wrapping_mul(2_654_435_761);
-    hash.is_multiple_of(ORE_CHANCE)
 }
 
 /// Returns the quartz blocks that make up one gate entrance frame.
@@ -120,26 +103,85 @@ pub fn gate_frame_chunks(entrance: BlockPos) -> Vec<ChunkPos> {
     chunks
 }
 
-/// Returns the chunk columns [`build_dungeon`] writes for `layout`.
+/// Returns the chunk columns a dungeon build writes, including the erasure of
+/// whatever `previous` left in the region.
 ///
-/// The layout is longer than the spawn chunk and its last rooms cross the
-/// chunk border, so the whole built box has to be requested before any block is
-/// written: [`World::set_block`] silently drops writes to unloaded chunks, which
-/// would leave holes a hunter and its mobs fall through.
+/// [`World::set_block`] silently drops writes to unloaded chunks, which would
+/// leave holes a hunter and its mobs fall through, so the whole box has to be
+/// requested before any block is written.
 #[must_use]
-pub fn dungeon_chunks(region: InstanceRegion, layout: &DungeonLayout) -> Vec<ChunkPos> {
-    let origin = BlockPos::from(region.spawn);
-    let floor_y = INSTANCE_FLOOR_Y - 1;
-    let last_corner_x = origin.x() + i32::from(layout.total_room_count() - 1) * ROOM_STRIDE;
-    // Corridors run between two rooms and stay inside the same box.
+pub fn dungeon_chunks(
+    region: InstanceRegion,
+    layout: &DungeonLayout,
+    previous: Option<Footprint>,
+) -> Vec<ChunkPos> {
+    let mut chunks = blueprint_chunks(region, &layout.blueprint);
+    for chunk in footprint_chunks(region, previous) {
+        if !chunks.contains(&chunk) {
+            chunks.push(chunk);
+        }
+    }
+    chunks
+}
+
+/// Returns the chunk columns a penalty arena build writes, including the
+/// erasure of whatever `previous` left in the region.
+#[must_use]
+pub fn arena_chunks(region: InstanceRegion, previous: Option<Footprint>) -> Vec<ChunkPos> {
+    let mut chunks = penalty_arena_chunks(region);
+    for chunk in footprint_chunks(region, previous) {
+        if !chunks.contains(&chunk) {
+            chunks.push(chunk);
+        }
+    }
+    chunks
+}
+
+fn blueprint_chunks(region: InstanceRegion, blueprint: &Blueprint) -> Vec<ChunkPos> {
+    let ((min_x, _, min_z), (max_x, _, max_z)) = blueprint.bounds;
     chunks_covering(
-        BlockPos::new(origin.x() - 1, floor_y, origin.z() - 1),
+        at(region, (min_x, -1, min_z)),
+        at(region, (max_x, -1, max_z)),
+    )
+}
+
+fn footprint_chunks(region: InstanceRegion, footprint: Option<Footprint>) -> Vec<ChunkPos> {
+    match footprint {
+        Some(Footprint::Dungeon { seed }) => {
+            blueprint_chunks(region, &DungeonLayout::from_seed(seed).blueprint)
+        }
+        Some(Footprint::Arena) => penalty_arena_chunks(region),
+        None => {
+            let (min, max) = legacy_box(region);
+            let mut chunks = chunks_covering(min, max);
+            for chunk in penalty_arena_chunks(region) {
+                if !chunks.contains(&chunk) {
+                    chunks.push(chunk);
+                }
+            }
+            chunks
+        }
+    }
+}
+
+/// Returns the box the fixed pre-generator layout could occupy.
+fn legacy_box(region: InstanceRegion) -> (BlockPos, BlockPos) {
+    let origin = BlockPos::from(region.spawn);
+    let (size, height, rooms) = LEGACY_ROOM;
+    (
+        BlockPos::new(origin.x() - 1, INSTANCE_FLOOR_Y - 1, origin.z() - 1),
         BlockPos::new(
-            last_corner_x + ROOM_SIZE,
-            floor_y + ROOM_HEIGHT,
-            origin.z() + ROOM_SIZE,
+            origin.x() + (rooms - 1) * LEGACY_ROOM_STRIDE + size,
+            INSTANCE_FLOOR_Y - 1 + height,
+            origin.z() + size,
         ),
     )
+}
+
+/// Returns the world position of a blueprint offset inside `region`.
+fn at(region: InstanceRegion, (x, y, z): (i32, i32, i32)) -> BlockPos {
+    let origin = BlockPos::from(region.spawn);
+    BlockPos::new(origin.x() + x, INSTANCE_FLOOR_Y + y, origin.z() + z)
 }
 
 /// Returns the chunk columns [`build_penalty_arena`] writes.
@@ -244,33 +286,69 @@ pub fn remove_gate_frame(world: &Arc<World>, gate: &Gate) {
     }
 }
 
-/// Builds the entrance, combat, and reserved boss rooms of one dungeon.
+/// Builds every room, corridor and light of one generated dungeon.
 pub fn build_dungeon(world: &Arc<World>, region: InstanceRegion, layout: &DungeonLayout) {
-    let origin = BlockPos::from(region.spawn);
-    let floor_y = INSTANCE_FLOOR_Y - 1;
-    for room in 0..layout.total_room_count() {
-        let corner_x = origin.x() + i32::from(room) * ROOM_STRIDE;
-        build_room(
+    let blueprint = &layout.blueprint;
+    let palette = blueprint.theme.palette();
+    let mut failed = 0;
+    for placement in &blueprint.blocks {
+        let block = palette.block(placement.part, CRYSTAL_ORE);
+        set_fixture(
             world,
-            BlockPos::new(corner_x, floor_y, origin.z()),
-            ROOM_SIZE,
-            ROOM_HEIGHT,
-            true,
+            at(region, placement.offset),
+            block.default_state(),
+            &mut failed,
         );
     }
-    // Doorways are carved only after every room exists, otherwise the next
-    // room's wall would brick up each corridor again.
-    for room in 0..layout.boss_room() {
-        build_corridor(
-            world,
-            origin.x() + i32::from(room) * ROOM_STRIDE,
-            floor_y,
-            origin.z() + ROOM_SIZE / 2,
-        );
+    warn_unwritten("dungeon", at(region, (0, -1, 0)), failed);
+}
+
+/// Removes whatever a previous run built in `region`.
+///
+/// A generated dungeon is rebuilt from its seed and every block of it, plus the
+/// exit frame its boss room may hold, is set back to air. A region with no
+/// record may still hold the fixed layout or the arena from before generation,
+/// so their whole boxes are cleared instead.
+pub fn erase_footprint(world: &Arc<World>, region: InstanceRegion, footprint: Option<Footprint>) {
+    let air = vanilla_blocks::AIR.default_state();
+    let mut failed = 0;
+    match footprint {
+        Some(Footprint::Dungeon { seed }) => {
+            let layout = DungeonLayout::from_seed(seed);
+            for placement in &layout.blueprint.blocks {
+                set_fixture(world, at(region, placement.offset), air, &mut failed);
+            }
+            for pos in gate_frame_positions(exit_entrance(region, &layout)) {
+                set_fixture(world, pos, air, &mut failed);
+            }
+        }
+        Some(Footprint::Arena) => clear_box_of(world, arena_box(region), &mut failed),
+        None => {
+            clear_box_of(world, legacy_box(region), &mut failed);
+            clear_box_of(world, arena_box(region), &mut failed);
+        }
+    }
+    warn_unwritten("previous instance", BlockPos::from(region.spawn), failed);
+}
+
+fn clear_box_of(world: &Arc<World>, (min, max): (BlockPos, BlockPos), failed: &mut u32) {
+    let air = vanilla_blocks::AIR.default_state();
+    for x in min.x()..=max.x() {
+        for z in min.z()..=max.z() {
+            for y in min.y()..=max.y() {
+                set_fixture(world, BlockPos::new(x, y, z), air, failed);
+            }
+        }
     }
 }
 
-/// Opens the exit inside a cleared dungeon's reserved boss room and returns its
+/// Returns the bottom of the exit frame in the boss room.
+fn exit_entrance(region: InstanceRegion, layout: &DungeonLayout) -> BlockPos {
+    let (x, z) = layout.blueprint.boss_room().center;
+    at(region, (x - 1, 0, z))
+}
+
+/// Opens the exit inside a cleared dungeon's boss room and returns its
 /// entrance position.
 ///
 /// The exit reuses the quartz gate frame, so a hunter already knows the shape
@@ -280,13 +358,7 @@ pub fn open_dungeon_exit(
     region: InstanceRegion,
     layout: &DungeonLayout,
 ) -> BlockPos {
-    let origin = BlockPos::from(region.spawn);
-    let corner_x = origin.x() + i32::from(layout.boss_room()) * ROOM_STRIDE;
-    let entrance = BlockPos::new(
-        corner_x + ROOM_SIZE / 2 - 1,
-        INSTANCE_FLOOR_Y,
-        origin.z() + ROOM_SIZE / 2,
-    );
+    let entrance = exit_entrance(region, layout);
     place_gate_frame(world, entrance, false);
     entrance
 }
@@ -294,13 +366,20 @@ pub fn open_dungeon_exit(
 /// Builds the single sealed arena of one penalty-zone instance.
 pub fn build_penalty_arena(world: &Arc<World>, region: InstanceRegion) {
     let corner = penalty_arena_corner(BlockPos::from(region.spawn));
-    build_room(
-        world,
-        corner,
-        PENALTY_ARENA_SIZE,
-        PENALTY_ARENA_HEIGHT,
-        false,
-    );
+    build_room(world, corner, PENALTY_ARENA_SIZE, PENALTY_ARENA_HEIGHT);
+}
+
+/// Returns the box the penalty arena occupies, walls included.
+fn arena_box(region: InstanceRegion) -> (BlockPos, BlockPos) {
+    let corner = penalty_arena_corner(BlockPos::from(region.spawn));
+    (
+        BlockPos::new(corner.x() - 1, corner.y(), corner.z() - 1),
+        BlockPos::new(
+            corner.x() + PENALTY_ARENA_SIZE,
+            corner.y() + PENALTY_ARENA_HEIGHT,
+            corner.z() + PENALTY_ARENA_SIZE,
+        ),
+    )
 }
 
 /// Returns the floor corner of the penalty arena centred on `origin`.
@@ -312,11 +391,9 @@ const fn penalty_arena_corner(origin: BlockPos) -> BlockPos {
 /// Builds one hollow quartz room with a solid floor, starting at the floor
 /// block of the room's north-west wall corner.
 ///
-/// The interior is emptied as well: instance regions are reused, so a room must
-/// not inherit the exit frame or fixtures of the run that used it before.
-///
-/// Only dungeons grow crystal ore walls; a penalty arena is not a place to mine.
-fn build_room(world: &Arc<World>, corner: BlockPos, size: i32, height: i32, ore: bool) {
+/// The interior is emptied as well, in case the region's record was lost.
+/// A penalty arena is not a place to mine, so it has no crystal ore.
+fn build_room(world: &Arc<World>, corner: BlockPos, size: i32, height: i32) {
     let mut failed = 0;
     for x in -1..=size {
         for z in -1..=size {
@@ -326,13 +403,12 @@ fn build_room(world: &Arc<World>, corner: BlockPos, size: i32, height: i32, ore:
                     continue;
                 }
                 let pos = BlockPos::new(corner.x() + x, corner.y() + y, corner.z() + z);
-                let wall = y != 0 && y != height && (x == -1 || x == size || z == -1 || z == size);
-                let state = if ore && wall && ore_at(corner, x, y, z) {
-                    CRYSTAL_ORE.default_state()
-                } else {
-                    vanilla_blocks::QUARTZ_BLOCK.default_state()
-                };
-                set_fixture(world, pos, state, &mut failed);
+                set_fixture(
+                    world,
+                    pos,
+                    vanilla_blocks::QUARTZ_BLOCK.default_state(),
+                    &mut failed,
+                );
             }
         }
     }
@@ -349,26 +425,6 @@ fn build_room(world: &Arc<World>, corner: BlockPos, size: i32, height: i32, ore:
     warn_unwritten("room", corner, failed);
 }
 
-/// Connects the room starting at `corner_x` with the room after it.
-fn build_corridor(world: &Arc<World>, corner_x: i32, floor_y: i32, z: i32) {
-    let mut failed = 0;
-    for x in ROOM_SIZE..ROOM_STRIDE {
-        for y in 0..3 {
-            let pos = BlockPos::new(corner_x + x, floor_y + y, z);
-            let state = if y == 0 {
-                vanilla_blocks::QUARTZ_BLOCK.default_state()
-            } else {
-                vanilla_blocks::AIR.default_state()
-            };
-            set_fixture(world, pos, state, &mut failed);
-        }
-    }
-    warn_unwritten(
-        "corridor",
-        BlockPos::new(corner_x + ROOM_SIZE, floor_y, z),
-        failed,
-    );
-}
 /// Spawns the fixed wave of `room` and returns the spawned entity ids.
 ///
 /// The wave is all zombies: Steel has no arrow projectile or ranged-attack goal
@@ -376,18 +432,16 @@ fn build_corridor(world: &Arc<World>, corner_x: i32, floor_y: i32, z: i32) {
 pub fn spawn_dungeon_wave(
     world: &Arc<World>,
     region: InstanceRegion,
+    layout: &DungeonLayout,
     wave: DungeonWave,
     room: u8,
 ) -> Vec<i32> {
-    let origin = BlockPos::from(region.spawn);
-    let room_x = origin.x() + i32::from(room) * ROOM_STRIDE;
+    let Some(plan) = layout.blueprint.combat_room(room) else {
+        return Vec::new();
+    };
     let mut spawned = Vec::new();
     for index in 0..wave.mob_count {
-        let position = BlockPos::new(
-            room_x + 2 + i32::from(index % 4) * 2,
-            INSTANCE_FLOOR_Y,
-            origin.z() + 2 + i32::from(index / 4) * 2,
-        );
+        let position = spawn_position(region, plan, usize::from(index));
         if let Some(id) = spawn_scaled_mob(
             world,
             &vanilla_entities::ZOMBIE,
@@ -402,10 +456,20 @@ pub fn spawn_dungeon_wave(
     if missing > 0 {
         log::warn!(
             "sololeveling: {missing} mob(s) of the wave in room {room} at {:?} could not be spawned",
-            BlockPos::new(room_x, INSTANCE_FLOOR_Y, origin.z())
+            at(region, (plan.center.0, 0, plan.center.1))
         );
     }
     spawned
+}
+
+/// Returns the `index`-th spawn spot of a room, cycling through its spots.
+fn spawn_position(region: InstanceRegion, room: &Room, index: usize) -> BlockPos {
+    let (x, z) = room
+        .spawns
+        .get(index % room.spawns.len().max(1))
+        .copied()
+        .unwrap_or(room.center);
+    at(region, (x, 0, z))
 }
 
 /// The boss of a dungeon, ready to be announced to the hunter who reaches it.
@@ -430,13 +494,9 @@ pub fn spawn_dungeon_boss(
     rank: HunterRank,
     red: bool,
 ) -> Option<SpawnedBoss> {
-    let origin = BlockPos::from(region.spawn);
-    let corner_x = origin.x() + i32::from(layout.boss_room()) * ROOM_STRIDE;
-    let position = BlockPos::new(
-        corner_x + ROOM_SIZE - 3,
-        INSTANCE_FLOOR_Y,
-        origin.z() + ROOM_SIZE / 2,
-    );
+    let room = layout.blueprint.boss_room();
+    // The boss waits at the far side of its room; the exit appears at the centre.
+    let position = at(region, (room.center.0, 0, room.center.1 + room.half.1 - 3));
     let boss = boss_for_gate(rank, red);
     let entity = spawn_mob(world, &vanilla_entities::ZOMBIE, position).ok()?;
     let living = entity.as_living_entity()?;
@@ -559,10 +619,10 @@ mod tests {
     use steel_utils::{BlockPos, ChunkPos};
 
     use super::{
-        INSTANCE_FLOOR_Y, ROOM_SIZE, ROOM_STRIDE, dungeon_chunks, gate_frame_chunks,
-        gate_is_dry_at, opening_contains, penalty_arena_chunks,
+        INSTANCE_FLOOR_Y, at, dungeon_chunks, gate_frame_chunks, gate_is_dry_at, opening_contains,
+        penalty_arena_chunks,
     };
-    use crate::dungeon::{DungeonLayout, InstanceRegion};
+    use crate::dungeon::{DungeonLayout, Footprint, InstanceRegion};
 
     /// Builds a dry stone shore under `entrance` with air above it.
     fn dry_shore(entrance: BlockPos) -> impl Fn(BlockPos) -> BlockStateId {
@@ -638,37 +698,39 @@ mod tests {
         assert_eq!(gate_frame_chunks(BlockPos::new(4, 64, 0)).len(), 1);
     }
     #[test]
-    fn dungeon_chunks_cover_the_last_room_of_the_longest_layout() {
-        let region = InstanceRegion::from_slot(0);
-        let layout = DungeonLayout::from_roll(3);
-        let chunks = dungeon_chunks(region, &layout);
-        let origin = BlockPos::from(region.spawn);
-        let floor_y = INSTANCE_FLOOR_Y - 1;
-
-        // Every room, including the reserved boss room, has to be loaded before
-        // the build writes its floor and walls.
-        for room in 0..layout.total_room_count() {
-            let corner_x = origin.x() + i32::from(room) * ROOM_STRIDE;
-            for x in [corner_x - 1, corner_x + ROOM_SIZE] {
-                for z in [origin.z() - 1, origin.z() + ROOM_SIZE] {
-                    let chunk = ChunkPos::from_block_pos(BlockPos::new(x, floor_y, z));
-                    assert!(
-                        chunks.contains(&chunk),
-                        "room {room} writes {chunk:?}, which the request leaves unloaded"
-                    );
-                }
+    fn dungeon_chunks_cover_every_block_and_the_previous_footprint() {
+        let region = InstanceRegion::from_slot(3);
+        for seed in [0, 7, 3 << 56, u64::MAX] {
+            let layout = DungeonLayout::from_seed(seed);
+            let previous = DungeonLayout::from_seed(seed ^ 0xABCD);
+            let chunks = dungeon_chunks(
+                region,
+                &layout,
+                Some(Footprint::Dungeon {
+                    seed: previous.seed,
+                }),
+            );
+            // Every block the build writes, and every block the erasure of the
+            // previous dungeon writes, has to be loaded first.
+            for placement in layout
+                .blueprint
+                .blocks
+                .iter()
+                .chain(&previous.blueprint.blocks)
+            {
+                let chunk = ChunkPos::from_block_pos(at(region, placement.offset));
+                assert!(
+                    chunks.contains(&chunk),
+                    "seed {seed}: {chunk:?} is not requested"
+                );
             }
         }
-        // Corridors run past the last room's far wall into the next room.
-        for room in 0..layout.boss_room() {
-            let corner_x = origin.x() + i32::from(room) * ROOM_STRIDE;
-            let chunk = ChunkPos::from_block_pos(BlockPos::new(
-                corner_x + ROOM_STRIDE - 1,
-                floor_y,
-                origin.z() + ROOM_SIZE / 2,
-            ));
-            assert!(chunks.contains(&chunk), "corridor {room} writes {chunk:?}");
-        }
+        // A region without a record also clears the fixed pre-generator layout.
+        let layout = DungeonLayout::from_seed(1);
+        let chunks = dungeon_chunks(region, &layout, None);
+        let origin = BlockPos::from(region.spawn);
+        let far = BlockPos::new(origin.x() + 6 * 20 + 13, INSTANCE_FLOOR_Y, origin.z() + 13);
+        assert!(chunks.contains(&ChunkPos::from_block_pos(far)));
     }
 
     #[test]
