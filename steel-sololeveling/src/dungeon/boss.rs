@@ -629,13 +629,19 @@ impl BossFight {
             }
         }
 
-        let distance = targets
+        // A boss only acts on hunters it can see, so nothing reaches through walls.
+        let eye = boss.position() + DVec3::new(0.0, EYE_HEIGHT, 0.0);
+        let visible: Vec<&SharedEntity> = targets
+            .iter()
+            .filter(|target| line_of_sight(world, eye, eye_of(target)))
+            .collect();
+        let distance = visible
             .iter()
             .map(|target| boss.position().distance(target.position()))
             .min_by(f64::total_cmp)?;
         let ability = self.choose_ability(tick, distance)?;
         let points = if ability == BossAbility::Meteor {
-            let points: Vec<DVec3> = targets
+            let points: Vec<DVec3> = visible
                 .iter()
                 .take(METEOR_COUNT)
                 .map(|target| target.position())
@@ -695,6 +701,31 @@ fn mark_ground(world: &World, point: DVec3) {
     );
 }
 
+/// Height above the feet that sight lines start and end at.
+const EYE_HEIGHT: f64 = 1.5;
+/// Distance between two sampled points of a sight line.
+const SIGHT_STEP: f64 = 0.25;
+
+fn eye_of(entity: &SharedEntity) -> DVec3 {
+    entity.position() + DVec3::new(0.0, EYE_HEIGHT, 0.0)
+}
+
+/// Returns whether nothing but air lies on the straight line between two points.
+///
+/// The blocks holding the end points themselves are not checked, so an eye
+/// pressed against a wall still sees what stands in front of it.
+#[must_use]
+pub fn line_of_sight(world: &World, from: DVec3, to: DVec3) -> bool {
+    let start = BlockPos::from(from);
+    let end = BlockPos::from(to);
+    let steps = (from.distance(to) / SIGHT_STEP).ceil().max(1.0) as i32;
+    (1..steps).all(|step| {
+        let point = from.lerp(to, f64::from(step) / f64::from(steps));
+        let block = BlockPos::from(point);
+        block == start || block == end || world.get_block_state(block).is_air()
+    })
+}
+
 /// Returns whether a body fits standing at `pos`.
 fn standable(world: &World, pos: DVec3) -> bool {
     let feet = BlockPos::from(pos);
@@ -714,6 +745,13 @@ struct Cast<'a> {
 
 impl Cast<'_> {
     fn run(&self, ability: BossAbility, points: &[DVec3]) {
+        // Single-target abilities fizzle silently when every hunter hid
+        // between the choice and the cast.
+        if matches!(ability, BossAbility::ArcaneBolt | BossAbility::ShadowStep)
+            && self.nearest().is_none()
+        {
+            return;
+        }
         let (line, color) = ability.announcement();
         self.viewer
             .send_action_bar(TextComponent::plain(line).color(color));
@@ -745,15 +783,19 @@ impl Cast<'_> {
         self.boss.play_sound(sound, 1.4, pitch);
     }
 
+    /// Returns the hunters within `range` of `center` that it can see.
     fn within(&self, center: DVec3, range: f64) -> impl Iterator<Item = &SharedEntity> {
-        self.targets
-            .iter()
-            .filter(move |target| target.position().distance(center) <= range)
+        let source = center + DVec3::new(0.0, EYE_HEIGHT, 0.0);
+        self.targets.iter().filter(move |target| {
+            target.position().distance(center) <= range
+                && line_of_sight(self.world, source, eye_of(target))
+        })
     }
 
+    /// Returns the nearest hunter the boss can see.
     fn nearest(&self) -> Option<&SharedEntity> {
         let origin = self.boss.position();
-        self.targets.iter().min_by(|a, b| {
+        self.within(origin, f64::INFINITY).min_by(|a, b| {
             a.position()
                 .distance(origin)
                 .total_cmp(&b.position().distance(origin))

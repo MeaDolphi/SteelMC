@@ -67,18 +67,26 @@ impl AccountUpdate {
 
     fn apply(self, state: &SoloLevelingState, committed: bool) {
         let uuid = self.owner();
-        state.sessions.with_mut(uuid, |session| {
-            if committed {
-                match self {
-                    Self::Won { balance, .. } => session.won = balance,
-                    Self::Progress { reward, points, .. } => {
-                        session.stats.grant_experience(reward.experience);
-                        session.system_points = points;
-                    }
+        let progress = state.sessions.with_mut(uuid, |session| {
+            session.economic_busy = false;
+            if !committed {
+                return None;
+            }
+            match self {
+                Self::Won { balance, .. } => {
+                    session.won = balance;
+                    None
+                }
+                Self::Progress { reward, points, .. } => {
+                    let level_up = session.stats.grant_experience(reward.experience);
+                    session.system_points = points;
+                    Some((reward, level_up, session.stats.level))
                 }
             }
-            session.economic_busy = false;
         });
+        if let Some(Some((reward, level_up, level))) = progress {
+            state.notify_progress(uuid, reward, level_up, level);
+        }
     }
 }
 

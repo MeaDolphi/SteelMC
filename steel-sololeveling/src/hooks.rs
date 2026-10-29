@@ -152,6 +152,9 @@ impl GameplayHooks for SoloLevelingHooks {
             .map_or(0, |duration| duration.as_secs());
         self.state.tick_artifacts(player);
         item::menu_book::keep_in_place(player);
+        if let Some(notice) = self.state.take_notice(player_uuid) {
+            notice.show(player);
+        }
         if self.state.take_crystal_sale(player_uuid) {
             commands::crystal::sell(&self.state, player);
         }

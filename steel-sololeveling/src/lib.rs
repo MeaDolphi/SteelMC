@@ -26,6 +26,7 @@ pub mod hunter_stats_menu;
 pub mod identifier;
 pub mod item;
 pub mod main_menu;
+pub mod notice;
 pub mod organization;
 pub mod organization_menu;
 pub mod party;

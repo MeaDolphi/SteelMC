@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use glam::DVec3;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use steel_core::entity::LivingEntity;
 use steel_core::inventory::container::Container as _;
 use steel_core::player::player_inventory::Prediction;
@@ -25,10 +25,12 @@ use steel_utils::Identifier;
 use steel_utils::locks::SyncMutex;
 use uuid::Uuid;
 
+use crate::combat_reward::HunterReward;
 use crate::daily;
 use crate::dungeon::runtime::{self, DungeonRuntime, RunDeath};
 use crate::guild::{Guild, GuildError, GuildRegistry, GuildRole};
 use crate::item::crystal::{self, CrystalSale, CrystalSaleError};
+use crate::notice::Notice;
 use crate::organization::Event;
 use crate::party::{Party, PartyError, PartyExit, PartyRuntime};
 use crate::player_data::{PlayerDataStorage, SoloLevelingPlayerData};
@@ -56,6 +58,7 @@ pub struct SoloLevelingState {
     organization_events: SyncMutex<Vec<(Vec<Uuid>, Event)>>,
     storms: SyncMutex<Vec<abilities::Storm>>,
     crystal_sales: SyncMutex<FxHashSet<Uuid>>,
+    notices: SyncMutex<FxHashMap<Uuid, Notice>>,
 }
 
 impl SoloLevelingState {
@@ -82,6 +85,7 @@ impl SoloLevelingState {
             organization_events: SyncMutex::new(Vec::new()),
             storms: SyncMutex::new(Vec::new()),
             crystal_sales: SyncMutex::new(FxHashSet::default()),
+            notices: SyncMutex::new(FxHashMap::default()),
         })
     }
 
@@ -213,6 +217,7 @@ impl SoloLevelingState {
                 .into_iter()
                 .find(|player| player.gameprofile.id() == recipient)
             {
+                self.notify_loot(recipient, &stack);
                 player.add_item_or_drop(stack, Prediction::ServerOnly);
             }
         }
@@ -573,6 +578,28 @@ impl SoloLevelingState {
             SidebarChange::Unchanged => None,
             SidebarChange::Changed { previous } => Some((previous, view)),
         }
+    }
+
+    /// Records committed experience and system points to show the hunter.
+    pub fn notify_progress(&self, uuid: Uuid, reward: HunterReward, level_up: LevelUp, level: u32) {
+        let mut notices = self.notices.lock();
+        let notice = notices.entry(uuid).or_default();
+        notice.experience = notice.experience.saturating_add(reward.experience);
+        notice.system_points = notice.system_points.saturating_add(reward.system_points);
+        if level_up.levels_gained > 0 {
+            notice.levels = notice.levels.saturating_add(level_up.levels_gained);
+            notice.level = level;
+        }
+    }
+
+    /// Records items handed to the hunter to show them.
+    pub fn notify_loot(&self, uuid: Uuid, stack: &ItemStack) {
+        self.notices.lock().entry(uuid).or_default().add_loot(stack);
+    }
+
+    /// Takes everything collected for the hunter since it was last shown.
+    pub fn take_notice(&self, uuid: Uuid) -> Option<Notice> {
+        self.notices.lock().remove(&uuid)
     }
 
     /// Asks for a crystal sale on the hunter's next tick.
