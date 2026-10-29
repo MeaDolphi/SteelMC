@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::economy::Won;
 use crate::item::nbt;
+use crate::organization::GuildBoard;
 
 /// Maximum online and offline membership of one guild.
 pub const GUILD_MAX_MEMBERS: usize = 50;
@@ -64,6 +65,9 @@ pub struct Guild {
     /// NBT-encoded persistent bank slots.
     #[serde(default)]
     pub bank_items: Vec<Vec<u8>>,
+    /// Adventurer Organization contracts and payments owed to members.
+    #[serde(default)]
+    pub organization: GuildBoard,
 }
 
 impl Guild {
@@ -78,6 +82,7 @@ impl Guild {
             treasury: Won::zero(),
             members,
             bank_items: Vec::new(),
+            organization: GuildBoard::default(),
         }
     }
 
@@ -217,6 +222,17 @@ impl GuildRegistry {
         self.membership
             .get(&player)
             .and_then(|key| self.guilds.get(key))
+    }
+
+    /// Returns the guild of `player` for mutation.
+    pub fn guild_of_mut(&mut self, player: Uuid) -> Option<&mut Guild> {
+        let key = self.membership.get(&player)?;
+        self.guilds.get_mut(key)
+    }
+
+    /// Returns every guild, for counting shared contract progress.
+    pub fn guilds_mut(&mut self) -> impl Iterator<Item = &mut Guild> {
+        self.guilds.values_mut()
     }
 
     /// Creates a guild and assigns its guildmaster.

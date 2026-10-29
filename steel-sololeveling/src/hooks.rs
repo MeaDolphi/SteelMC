@@ -104,6 +104,15 @@ impl GameplayHooks for SoloLevelingHooks {
                     &data.quest,
                 );
                 self.state.begin_session(player_uuid, data);
+                let owed = self.state.collect_guild_payout(player_uuid);
+                if owed > 0 {
+                    player.send_message(
+                        &TextComponent::plain(format!(
+                            "Организация выплатила {owed} Won за гильдийные задания."
+                        ))
+                        .color(Color::Gold),
+                    );
+                }
                 if self.state.has_pending_penalty(player_uuid) {
                     player.send_message(
                         &TextComponent::plain(format!(

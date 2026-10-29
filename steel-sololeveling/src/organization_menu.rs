@@ -1,8 +1,9 @@
 //! The Adventurer Organization board menu.
 //!
 //! The left five columns offer every template by rank and objective. Column
-//! seven lists the hunter's personal contracts and column eight the party's
-//! group contracts. Every click acts on live state and then redraws the menu.
+//! seven lists the hunter's personal contracts, column eight the party's group
+//! contracts and column nine, below the help book, the guild's contracts.
+//! Every click acts on live state and then redraws the menu.
 
 use std::sync::Arc;
 
@@ -17,8 +18,8 @@ use text_components::{Modifier as _, TextComponent};
 
 use crate::item::{named, with_lore};
 use crate::organization::{
-    Contract, GROUP_LIMIT, OBJECTIVES, Objective, OrganizationError, PERSONAL_LIMIT, RANKS,
-    Template,
+    Contract, GROUP_LIMIT, GUILD_LIMIT, GUILD_SCALE, OBJECTIVES, Objective, OrganizationError,
+    PERSONAL_LIMIT, RANKS, Template,
 };
 use crate::state::{BoardView, SoloLevelingState};
 
@@ -26,6 +27,7 @@ const COLUMNS: usize = 9;
 const SLOTS: usize = 54;
 const PERSONAL_COLUMN: usize = 6;
 const GROUP_COLUMN: usize = 7;
+const GUILD_COLUMN: usize = 8;
 const HELP_SLOT: usize = 8;
 
 /// Opens the board for an online hunter.
@@ -55,6 +57,18 @@ enum Button {
     Offer(Template),
     Personal(usize),
     Group(usize),
+    Guild(usize),
+}
+
+/// How a board slot was clicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    /// Left click: take personally, or turn in.
+    Primary,
+    /// Right click: take for the party, or cancel.
+    Secondary,
+    /// Shift-click on an offer: take for the guild.
+    Guild,
 }
 
 fn button_at(slot: usize) -> Option<Button> {
@@ -69,6 +83,7 @@ fn button_at(slot: usize) -> Option<Button> {
     match column {
         PERSONAL_COLUMN if row < PERSONAL_LIMIT => Some(Button::Personal(row)),
         GROUP_COLUMN if row < GROUP_LIMIT => Some(Button::Group(row)),
+        GUILD_COLUMN if (1..=GUILD_LIMIT).contains(&row) => Some(Button::Guild(row - 1)),
         _ => None,
     }
 }
@@ -83,12 +98,19 @@ fn menu_items(view: Option<&BoardView>) -> Vec<ItemStack> {
             Some(Button::Offer(template)) => offer_item(view, template),
             Some(Button::Personal(index)) => view.book.contracts.get(index).map_or_else(
                 || free_slot("Свободный личный слот"),
-                |c| contract_item(*c, false),
+                |c| contract_item(*c, ""),
             ),
             Some(Button::Group(index)) => view.group.get(index).map_or_else(
                 || free_slot("Свободный групповой слот"),
-                |group| contract_item(group.contract, true),
+                |group| contract_item(group.contract, "Группа: "),
             ),
+            Some(Button::Guild(index)) => match &view.guild {
+                Some(guild) => guild.contracts.get(index).map_or_else(
+                    || free_slot("Свободный гильдийный слот"),
+                    |group| contract_item(group.contract, "Гильдия: "),
+                ),
+                None => ItemStack::empty(),
+            },
             None if slot == HELP_SLOT => help_item(view),
             None => ItemStack::empty(),
         };
@@ -125,6 +147,25 @@ fn offer_item(view: &BoardView, template: Template) -> ItemStack {
             lore.push(TextComponent::plain("ПКМ — взять на группу.").color(Color::Yellow));
         }
     }
+    if let Some(guild) = view.guild.as_ref().filter(|guild| guild.officer) {
+        if template.rank > guild.rank {
+            lore.push(
+                TextComponent::plain("Гильдии этот ранг пока недоступен.").color(Color::DarkGray),
+            );
+        } else if guild.used.contains(&template) {
+            lore.push(
+                TextComponent::plain("Гильдия уже брала его сегодня.").color(Color::DarkGray),
+            );
+        } else {
+            lore.push(
+                TextComponent::plain(format!(
+                    "Shift+клик — на гильдию: ×{GUILD_SCALE}, {} Won каждому вкладчику.",
+                    template.payment() * u64::from(GUILD_SCALE)
+                ))
+                .color(Color::Aqua),
+            );
+        }
+    }
     with_lore(
         named(
             ItemStack::new(objective_icon(template.objective)),
@@ -134,25 +175,28 @@ fn offer_item(view: &BoardView, template: Template) -> ItemStack {
     )
 }
 
-fn contract_item(contract: Contract, group: bool) -> ItemStack {
+fn contract_item(contract: Contract, prefix: &str) -> ItemStack {
     let complete = contract.is_complete();
     let icon = if complete {
         &vanilla_items::EMERALD
     } else {
         &vanilla_items::PAPER
     };
-    let prefix = if group { "Группа: " } else { "" };
     let mut lore = vec![
         TextComponent::plain(format!(
             "Прогресс: {}/{}",
             contract.progress,
-            contract.template.objective.target()
+            contract.target()
         ))
         .color(Color::Aqua),
         TextComponent::plain(format!(
             "Оплата: {} Won{}",
-            contract.template.payment(),
-            if group { " каждому" } else { "" }
+            contract.payment(),
+            if prefix.is_empty() {
+                ""
+            } else {
+                " каждому"
+            }
         ))
         .color(Color::Gold),
     ];
@@ -190,6 +234,10 @@ fn help_item(view: &BoardView) -> ItemStack {
             )),
             TextComponent::plain("Каждое задание — раз в день."),
             TextComponent::plain("Групповыми заданиями управляет лидер."),
+            TextComponent::plain(format!(
+                "Гильдии: до {GUILD_LIMIT} заданий, цель и оплата ×{GUILD_SCALE}."
+            )),
+            TextComponent::plain("Гильдийными управляют мастер и офицеры."),
         ],
     )
 }
@@ -209,42 +257,63 @@ impl OrganizationMenuKind {
     fn act(
         &self,
         button: Button,
-        primary: bool,
+        action: Action,
         player: &Player,
     ) -> Result<String, OrganizationError> {
         let uuid = player.gameprofile.id();
         let state = &self.state;
-        Ok(match (button, primary) {
-            (Button::Offer(template), true) => {
+        Ok(match (button, action) {
+            (Button::Offer(template), Action::Guild) => {
+                state.accept_guild_contract(uuid, template)?;
+                format!("Гильдийное задание взято: {}.", template.title())
+            }
+            (Button::Guild(index), Action::Primary) => {
+                let payout = state.turn_in_guild_contract(uuid, index)?;
+                format!(
+                    "Гильдийное задание сдано: {}. По {} Won начислено {} вкладчик(ам).",
+                    payout.contract.template.title(),
+                    payout.contract.payment(),
+                    payout.paid.len()
+                )
+            }
+            (Button::Guild(index), _) => {
+                let contract = state.cancel_guild_contract(uuid, index)?;
+                format!(
+                    "Гильдийное задание отменено: {}.",
+                    contract.template.title()
+                )
+            }
+            (_, Action::Guild) => return Err(OrganizationError::Missing),
+            (Button::Offer(template), Action::Primary) => {
                 state.accept_personal_contract(uuid, template)?;
                 format!("Задание взято: {}.", template.title())
             }
-            (Button::Offer(template), false) => {
+            (Button::Offer(template), Action::Secondary) => {
                 state.accept_group_contract(uuid, template)?;
                 format!("Групповое задание взято: {}.", template.title())
             }
-            (Button::Personal(index), true) => {
+            (Button::Personal(index), Action::Primary) => {
                 let contract = state.turn_in_personal_contract(uuid, index)?;
                 format!(
                     "Задание сдано: {}. Начислено {} Won.",
                     contract.template.title(),
-                    contract.template.payment()
+                    contract.payment()
                 )
             }
-            (Button::Personal(index), false) => {
+            (Button::Personal(index), Action::Secondary) => {
                 let contract = state.cancel_personal_contract(uuid, index)?;
                 format!("Задание отменено: {}.", contract.template.title())
             }
-            (Button::Group(index), true) => {
+            (Button::Group(index), Action::Primary) => {
                 let payout = state.turn_in_group_contract(uuid, index)?;
                 format!(
                     "Групповое задание сдано: {}. По {} Won получили {} участн.",
                     payout.contract.template.title(),
-                    payout.contract.template.payment(),
+                    payout.contract.payment(),
                     payout.paid.len()
                 )
             }
-            (Button::Group(index), false) => {
+            (Button::Group(index), Action::Secondary) => {
                 let contract = state.cancel_group_contract(uuid, index)?;
                 format!("Групповое задание отменено: {}.", contract.template.title())
             }
@@ -260,12 +329,23 @@ impl MenuKind for OrganizationMenuKind {
         click: Click,
         player: &Player,
     ) -> ClickOutcome {
-        let Click::Pickup { slot, button } = click else {
-            return if click.slot().is_some_and(|slot| self.buttons.contains(slot)) {
-                ClickOutcome::Consume
-            } else {
-                ClickOutcome::Fallthrough
-            };
+        let (slot, action) = match click {
+            Click::Pickup { slot, button } => (
+                slot,
+                if button == MouseButton::Left {
+                    Action::Primary
+                } else {
+                    Action::Secondary
+                },
+            ),
+            Click::QuickMove { slot } => (slot, Action::Guild),
+            _ => {
+                return if click.slot().is_some_and(|slot| self.buttons.contains(slot)) {
+                    ClickOutcome::Consume
+                } else {
+                    ClickOutcome::Fallthrough
+                };
+            }
         };
         if !self.buttons.contains(slot) {
             return ClickOutcome::Fallthrough;
@@ -273,8 +353,7 @@ impl MenuKind for OrganizationMenuKind {
         let Some(target) = button_at(slot - self.buttons.start()) else {
             return ClickOutcome::Consume;
         };
-        let primary = button == MouseButton::Left;
-        match self.act(target, primary, player) {
+        match self.act(target, action, player) {
             Ok(message) => {
                 player.send_message(&TextComponent::plain(message).color(Color::Green));
             }
@@ -322,5 +401,9 @@ mod tests {
         assert_eq!(button_at(9 + 7), Some(Button::Group(1)));
         assert_eq!(button_at(2 * 9 + 7), None);
         assert_eq!(button_at(5), None);
+        assert_eq!(button_at(8), None);
+        assert_eq!(button_at(9 + 8), Some(Button::Guild(0)));
+        assert_eq!(button_at(2 * 9 + 8), Some(Button::Guild(1)));
+        assert_eq!(button_at(3 * 9 + 8), None);
     }
 }

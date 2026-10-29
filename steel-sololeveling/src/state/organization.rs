@@ -20,8 +20,10 @@ use uuid::Uuid;
 
 use super::SoloLevelingState;
 use crate::daily;
+use crate::guild::{Guild, GuildRegistry, GuildRole};
 use crate::organization::{
-    Contract, Event, GROUP_LIMIT, GroupContract, OrganizationBook, OrganizationError, Template,
+    Contract, Event, GROUP_LIMIT, GroupContract, GuildContract, OBJECTIVES, OrganizationBook,
+    OrganizationError, RANKS, Template, guild_rank,
 };
 use crate::party::PartyError;
 use crate::rank::HunterRank;
@@ -85,6 +87,21 @@ pub struct BoardView {
     pub group: Vec<GroupContract>,
     /// Whether the hunter leads a party and may manage group contracts.
     pub leader: bool,
+    /// The hunter's guild contracts, if they are in a guild.
+    pub guild: Option<GuildView>,
+}
+
+/// What the board shows about the hunter's guild.
+#[derive(Debug, Clone)]
+pub struct GuildView {
+    /// Highest contract rank the guild may take.
+    pub rank: HunterRank,
+    /// Active guild contracts.
+    pub contracts: Vec<GuildContract>,
+    /// Whether the guild already took a template today.
+    pub used: Vec<Template>,
+    /// Whether the hunter may manage guild contracts.
+    pub officer: bool,
 }
 
 /// A group contract that was paid out.
@@ -157,7 +174,102 @@ impl SoloLevelingState {
             today,
             leader: party.as_ref().is_some_and(|party| party.leader() == uuid),
             group: party.map_or_else(Vec::new, |party| party.contracts().to_vec()),
+            guild: self.guilds.lock().guild_of(uuid).map(|guild| {
+                let board = &guild.organization;
+                GuildView {
+                    rank: guild_rank(guild.level),
+                    contracts: board.contracts.clone(),
+                    used: RANKS
+                        .into_iter()
+                        .flat_map(|rank| {
+                            OBJECTIVES
+                                .into_iter()
+                                .map(move |objective| Template { objective, rank })
+                        })
+                        .filter(|template| board.used_today(*template, today))
+                        .collect(),
+                    officer: guild.role_of(uuid).is_some_and(GuildRole::can_manage_bank),
+                }
+            }),
         })
+    }
+
+    /// Accepts a guild contract; only the guildmaster and officers may.
+    pub fn accept_guild_contract(
+        &self,
+        actor: Uuid,
+        template: Template,
+    ) -> Result<(), OrganizationError> {
+        let mut guilds = self.guilds.lock();
+        let guild = officer_guild(&mut guilds, actor)?;
+        let rank = guild_rank(guild.level);
+        guild.organization.accept(template, rank, daily::today())?;
+        guilds.save().map_err(|_| OrganizationError::Storage)
+    }
+
+    /// Cancels a guild contract; the day's allowance stays spent.
+    pub fn cancel_guild_contract(
+        &self,
+        actor: Uuid,
+        index: usize,
+    ) -> Result<Contract, OrganizationError> {
+        let mut guilds = self.guilds.lock();
+        let contract = officer_guild(&mut guilds, actor)?
+            .organization
+            .cancel(index)?;
+        guilds.save().map_err(|_| OrganizationError::Storage)?;
+        Ok(contract)
+    }
+
+    /// Settles a finished guild contract.
+    ///
+    /// Every contributor still in the guild is owed one full payment; it is
+    /// saved with the guild first and then paid to whoever is online, so an
+    /// offline contributor collects it on the next login.
+    pub fn turn_in_guild_contract(
+        &self,
+        actor: Uuid,
+        index: usize,
+    ) -> Result<GroupPayout, OrganizationError> {
+        let mut guilds = self.guilds.lock();
+        let guild = officer_guild(&mut guilds, actor)?;
+        let members: Vec<Uuid> = guild.members.keys().copied().collect();
+        let (contract, paid) = guild
+            .organization
+            .turn_in(index, |hunter| members.contains(&hunter))?;
+        guilds.save().map_err(|_| OrganizationError::Storage)?;
+        drop(guilds);
+        for hunter in &paid {
+            let _ = self.collect_guild_payout(*hunter);
+        }
+        Ok(GroupPayout { contract, paid })
+    }
+
+    /// Pays an online hunter whatever their guild owes them, returning the amount.
+    pub fn collect_guild_payout(&self, hunter: Uuid) -> u64 {
+        if self.with_session_mut(hunter, |_| ()).is_none()
+            || !self.persistence.lock().accepts_writes(hunter)
+        {
+            return 0;
+        }
+        let mut guilds = self.guilds.lock();
+        let Some(guild) = guilds.guild_of_mut(hunter) else {
+            return 0;
+        };
+        let amount = guild.organization.take_owed(hunter);
+        if amount == 0 {
+            return 0;
+        }
+        if let Err(error) = guilds.save() {
+            log::warn!("sololeveling: guild payout of {hunter} was not saved: {error}");
+            if let Some(guild) = guilds.guild_of_mut(hunter) {
+                guild.organization.owed.insert(hunter, amount);
+            }
+            return 0;
+        }
+        drop(guilds);
+        self.credit_won(hunter, amount);
+        amount
     }
 
     /// Accepts a personal contract.
@@ -207,7 +319,7 @@ impl SoloLevelingState {
             .sessions
             .with_mut(uuid, |session| session.organization.turn_in(index))
             .ok_or(OrganizationError::NoSession)??;
-        self.credit_won(uuid, contract.template.payment());
+        self.credit_won(uuid, contract.payment());
         Ok(contract)
     }
 
@@ -309,7 +421,7 @@ impl SoloLevelingState {
         }
         let group = party.contracts.remove(index);
         drop(parties);
-        let payment = group.contract.template.payment();
+        let payment = group.contract.payment();
         for participant in &group.participants {
             self.credit_won(*participant, payment);
         }
@@ -380,6 +492,28 @@ impl SoloLevelingState {
                     }
                 }
             }
+            drop(parties);
+
+            let mut guilds = self.guilds.lock();
+            let mut changed = false;
+            for guild in guilds.guilds_mut() {
+                let members: Vec<Uuid> = hunters
+                    .iter()
+                    .copied()
+                    .filter(|hunter| guild.members.contains_key(hunter))
+                    .collect();
+                if members.is_empty() {
+                    continue;
+                }
+                let (counted, done) = guild.organization.observe(&members, *event);
+                changed |= counted;
+                for contract in done {
+                    finished.extend(guild.members.keys().map(|member| (*member, contract)));
+                }
+            }
+            if changed && let Err(error) = guilds.save() {
+                log::warn!("sololeveling: guild contract progress was not saved: {error}");
+            }
         }
         finished
     }
@@ -401,6 +535,16 @@ fn announce_finished(player: &Arc<Player>, contract: Contract) {
     );
 }
 
+fn officer_guild(guilds: &mut GuildRegistry, actor: Uuid) -> Result<&mut Guild, OrganizationError> {
+    let guild = guilds
+        .guild_of_mut(actor)
+        .ok_or(OrganizationError::NotInGuild)?;
+    if !guild.role_of(actor).is_some_and(GuildRole::can_manage_bank) {
+        return Err(OrganizationError::NotOfficer);
+    }
+    Ok(guild)
+}
+
 const fn party_error(error: PartyError) -> OrganizationError {
     match error {
         PartyError::NotLeader => OrganizationError::NotLeader,
@@ -416,6 +560,7 @@ mod tests {
 
     use uuid::Uuid;
 
+    use crate::guild::GuildRole;
     use crate::organization::{Event, Objective, OrganizationError, Template};
     use crate::player_data::SoloLevelingPlayerData;
     use crate::rank::HunterRank;
@@ -534,6 +679,73 @@ mod tests {
         assert_eq!(
             state.turn_in_personal_contract(uuid, 0),
             Err(OrganizationError::Missing)
+        );
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn guild_contracts_need_an_officer_and_pay_contributors_even_when_offline() {
+        let (state, directory) = state();
+        let master = hunter(&state, 1);
+        let officer = hunter(&state, 1);
+        let recruit = hunter(&state, 1);
+        state
+            .create_guild("Hunters".to_owned(), master)
+            .expect("create guild");
+        for member in [officer, recruit] {
+            state.add_guild_recruit(master, member).expect("recruit");
+        }
+        state
+            .set_guild_role(master, officer, GuildRole::Officer)
+            .expect("promote");
+
+        assert_eq!(
+            state.accept_guild_contract(recruit, BOSS_E),
+            Err(OrganizationError::NotOfficer)
+        );
+        state
+            .accept_guild_contract(officer, BOSS_E)
+            .expect("officer takes the contract");
+        // A guild contract does not spend anyone's personal allowance.
+        state
+            .accept_personal_contract(recruit, BOSS_E)
+            .expect("personal allowance is separate");
+
+        for hunters in [
+            vec![master, recruit],
+            vec![recruit],
+            vec![recruit],
+            vec![recruit],
+        ] {
+            state.record_organization_event(hunters, Event::Boss);
+        }
+        state.apply_organization_events();
+        assert_eq!(
+            state.turn_in_guild_contract(officer, 0),
+            Err(OrganizationError::NotComplete)
+        );
+        state.record_organization_event(vec![recruit], Event::Boss);
+        state.apply_organization_events();
+
+        // The recruit goes offline before the officer turns the contract in.
+        let _ = state.sessions.remove(recruit);
+        let payout = state
+            .turn_in_guild_contract(officer, 0)
+            .expect("finished contract");
+        assert_eq!(payout.contract.payment(), 750);
+        assert_eq!(payout.paid.len(), 2);
+        assert!(
+            !payout.paid.contains(&officer),
+            "the officer did not contribute"
+        );
+
+        state.begin_session(recruit, SoloLevelingPlayerData::new(recruit));
+        assert_eq!(state.collect_guild_payout(recruit), 750);
+        assert_eq!(state.collect_guild_payout(recruit), 0);
+        assert_eq!(
+            state.collect_guild_payout(master),
+            0,
+            "already paid when online"
         );
         fs::remove_dir_all(directory).expect("cleanup");
     }

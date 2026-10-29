@@ -2,7 +2,10 @@
 //!
 //! A contract counts only what happens after it was accepted. Personal
 //! contracts live in the hunter's saved data; group contracts live on the
-//! party that took them and share its in-memory lifetime.
+//! party that took them and share its in-memory lifetime; guild contracts
+//! are saved with the guild.
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -13,6 +16,10 @@ use crate::rank::HunterRank;
 pub const PERSONAL_LIMIT: usize = 3;
 /// Active group contracts one party may hold.
 pub const GROUP_LIMIT: usize = 2;
+/// Active guild contracts one guild may hold.
+pub const GUILD_LIMIT: usize = 2;
+/// How many times a guild contract multiplies a template's target and pay.
+pub const GUILD_SCALE: u32 = 5;
 
 /// What a contract asks the hunter to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,22 +145,48 @@ pub struct Contract {
     pub template: Template,
     /// Events counted so far, capped at the target.
     pub progress: u32,
+    /// Multiplier of the template's target and payment.
+    #[serde(default = "single")]
+    pub scale: u32,
+}
+
+const fn single() -> u32 {
+    1
 }
 
 impl Contract {
     /// Starts an empty contract.
     #[must_use]
     pub const fn new(template: Template) -> Self {
+        Self::scaled(template, 1)
+    }
+
+    /// Starts an empty contract with `scale` times the target and payment.
+    #[must_use]
+    pub const fn scaled(template: Template, scale: u32) -> Self {
         Self {
             template,
             progress: 0,
+            scale,
         }
+    }
+
+    /// Returns how many events finish the contract.
+    #[must_use]
+    pub const fn target(self) -> u32 {
+        self.template.objective.target().saturating_mul(self.scale)
+    }
+
+    /// Returns the payment one entitled hunter receives.
+    #[must_use]
+    pub const fn payment(self) -> u64 {
+        self.template.payment().saturating_mul(self.scale as u64)
     }
 
     /// Returns whether the contract can be turned in.
     #[must_use]
     pub const fn is_complete(self) -> bool {
-        self.progress >= self.template.objective.target()
+        self.progress >= self.target()
     }
 
     /// Counts `event` and reports whether this event finished the contract.
@@ -200,6 +233,10 @@ pub enum OrganizationError {
     NotInParty,
     /// The account cannot accept writes right now.
     Storage,
+    /// The hunter is not in a guild.
+    NotInGuild,
+    /// Only the guildmaster and officers may manage guild contracts.
+    NotOfficer,
 }
 
 impl OrganizationError {
@@ -217,6 +254,8 @@ impl OrganizationError {
             Self::NotLeader => "Групповыми заданиями управляет лидер группы.",
             Self::NotInParty => "Вы не состоите в группе.",
             Self::Storage => "Организация не может рассчитаться сейчас. Попробуйте позже.",
+            Self::NotInGuild => "Вы не состоите в гильдии.",
+            Self::NotOfficer => "Гильдийными заданиями управляют мастер и офицеры.",
         }
     }
 }
@@ -327,6 +366,150 @@ pub struct GroupContract {
     pub participants: Vec<Uuid>,
 }
 
+/// Returns the highest contract rank a guild of `level` may take.
+#[must_use]
+pub const fn guild_rank(level: u32) -> HunterRank {
+    match level {
+        ..=1 => HunterRank::E,
+        2 => HunterRank::D,
+        3 => HunterRank::C,
+        4 => HunterRank::B,
+        5 => HunterRank::A,
+        6.. => HunterRank::S,
+    }
+}
+
+/// A contract a guild took, with the members who advanced it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuildContract {
+    /// The shared contract, scaled by [`GUILD_SCALE`].
+    pub contract: Contract,
+    /// Members whose actions were counted; each is paid once.
+    #[serde(default)]
+    pub contributors: Vec<Uuid>,
+}
+
+/// A guild's contracts, today's allowance and payments still owed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuildBoard {
+    /// Moscow day the `used` list belongs to.
+    #[serde(default)]
+    day: u64,
+    /// Templates the guild already took today.
+    #[serde(default)]
+    used: Vec<Template>,
+    /// Active guild contracts.
+    #[serde(default)]
+    pub contracts: Vec<GuildContract>,
+    /// Won owed to contributors who were offline when a contract was paid.
+    #[serde(default)]
+    pub owed: BTreeMap<Uuid, u64>,
+}
+
+impl GuildBoard {
+    /// Returns whether the guild took `template` on `today`.
+    #[must_use]
+    pub fn used_today(&self, template: Template, today: u64) -> bool {
+        self.day == today && self.used.contains(&template)
+    }
+
+    /// Accepts a guild contract for a guild allowed up to `rank`.
+    pub fn accept(
+        &mut self,
+        template: Template,
+        rank: HunterRank,
+        today: u64,
+    ) -> Result<(), OrganizationError> {
+        if template.rank > rank {
+            return Err(OrganizationError::RankTooHigh);
+        }
+        if self.contracts.len() >= GUILD_LIMIT {
+            return Err(OrganizationError::TooManyContracts);
+        }
+        if self.used_today(template, today) {
+            return Err(OrganizationError::UsedToday);
+        }
+        if self.day != today {
+            self.day = today;
+            self.used.clear();
+        }
+        self.used.push(template);
+        self.contracts.push(GuildContract {
+            contract: Contract::scaled(template, GUILD_SCALE),
+            contributors: Vec::new(),
+        });
+        Ok(())
+    }
+
+    /// Cancels a contract; the day's allowance stays spent.
+    pub fn cancel(&mut self, index: usize) -> Result<Contract, OrganizationError> {
+        if index >= self.contracts.len() {
+            return Err(OrganizationError::Missing);
+        }
+        Ok(self.contracts.remove(index).contract)
+    }
+
+    /// Settles a finished contract, owing its payment to every contributor
+    /// that `is_member` still accepts, and returns them.
+    pub fn turn_in(
+        &mut self,
+        index: usize,
+        is_member: impl Fn(Uuid) -> bool,
+    ) -> Result<(Contract, Vec<Uuid>), OrganizationError> {
+        let group = self
+            .contracts
+            .get(index)
+            .ok_or(OrganizationError::Missing)?;
+        if !group.contract.is_complete() {
+            return Err(OrganizationError::NotComplete);
+        }
+        let group = self.contracts.remove(index);
+        let payment = group.contract.payment();
+        let paid: Vec<Uuid> = group
+            .contributors
+            .into_iter()
+            .filter(|contributor| is_member(*contributor))
+            .collect();
+        for contributor in &paid {
+            let owed = self.owed.entry(*contributor).or_default();
+            *owed = owed.saturating_add(payment);
+        }
+        Ok((group.contract, paid))
+    }
+
+    /// Counts one event done by `hunters`, all members of this guild.
+    ///
+    /// The event counts once per contract however many members took part,
+    /// and every one of them becomes a contributor. Returns whether anything
+    /// changed and the contracts the event finished.
+    pub fn observe(&mut self, hunters: &[Uuid], event: Event) -> (bool, Vec<Contract>) {
+        let mut changed = false;
+        let mut finished = Vec::new();
+        for group in &mut self.contracts {
+            let before = group.contract.progress;
+            let done = group.contract.observe(event);
+            if group.contract.progress == before {
+                continue;
+            }
+            changed = true;
+            for hunter in hunters {
+                if !group.contributors.contains(hunter) {
+                    group.contributors.push(*hunter);
+                }
+            }
+            if done {
+                finished.push(group.contract);
+            }
+        }
+        (changed, finished)
+    }
+
+    /// Takes everything owed to `hunter`.
+    pub fn take_owed(&mut self, hunter: Uuid) -> u64 {
+        self.owed.remove(&hunter).unwrap_or(0)
+    }
+}
+
 /// Single-letter rank serialization, read case-insensitively.
 mod rank_letter {
     use serde::{Deserialize as _, Deserializer, Serializer, de::Error as _};
@@ -354,9 +537,11 @@ mod rank_letter {
 #[cfg(test)]
 mod tests {
     use super::{
-        Contract, Event, Objective, OrganizationBook, OrganizationError, PERSONAL_LIMIT, Template,
+        Contract, Event, GUILD_LIMIT, GuildBoard, Objective, OrganizationBook, OrganizationError,
+        PERSONAL_LIMIT, Template, guild_rank,
     };
     use crate::rank::HunterRank;
+    use uuid::Uuid;
 
     const fn template(objective: Objective, rank: HunterRank) -> Template {
         Template { objective, rank }
@@ -449,5 +634,51 @@ mod tests {
         let restored: OrganizationBook = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored, book);
         assert!(restored.used_today(template(Objective::RankedDungeon, HunterRank::B), 7));
+    }
+
+    #[test]
+    fn guild_contracts_scale_by_five_and_pay_each_remaining_contributor() {
+        let mut board = GuildBoard::default();
+        let boss = template(Objective::Boss, HunterRank::E);
+        assert_eq!(
+            board.accept(template(Objective::Boss, HunterRank::D), guild_rank(1), 1),
+            Err(OrganizationError::RankTooHigh)
+        );
+        board.accept(boss, guild_rank(1), 1).expect("accept");
+        assert_eq!(
+            board.accept(boss, guild_rank(1), 1),
+            Err(OrganizationError::UsedToday)
+        );
+        board
+            .accept(template(Objective::Mobs, HunterRank::E), guild_rank(1), 1)
+            .expect("second");
+        assert_eq!(board.contracts.len(), GUILD_LIMIT);
+
+        let (first, second, leaver) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(board.contracts[0].contract.target(), 5);
+        board.observe(&[first, second], Event::Boss);
+        for _ in 0..3 {
+            board.observe(&[leaver], Event::Boss);
+        }
+        let (changed, finished) = board.observe(&[first], Event::Boss);
+        assert!(changed);
+        assert_eq!(finished.len(), 1);
+        assert_eq!(board.contracts[0].contract.progress, 5);
+
+        let (contract, paid) = board.turn_in(0, |member| member != leaver).expect("paid");
+        assert_eq!(contract.payment(), 750);
+        assert_eq!(paid, vec![first, second]);
+        assert_eq!(board.take_owed(first), 750);
+        assert_eq!(board.take_owed(first), 0);
+        assert_eq!(board.take_owed(leaver), 0);
+    }
+
+    #[test]
+    fn an_old_contract_without_scale_reads_as_single() {
+        let contract: Contract =
+            serde_json::from_str(r#"{"template":{"objective":"Boss","rank":"E"},"progress":0}"#)
+                .expect("deserialize");
+        assert_eq!(contract.scale, 1);
+        assert_eq!(contract.target(), 1);
     }
 }
