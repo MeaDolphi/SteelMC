@@ -380,14 +380,6 @@ fn generation_settings_for_world(
     )
 }
 
-fn world_config_registries() -> Result<(WorldGeneratorRegistry, WorldStorageRegistry), String> {
-    let generator_registry = WorldGeneratorRegistry::new_with_builtins()
-        .map_err(|e| format!("failed to initialize world generator registry: {e}"))?;
-    let storage_registry = WorldStorageRegistry::new_with_builtins()
-        .map_err(|e| format!("failed to initialize world storage registry: {e}"))?;
-    Ok((generator_registry, storage_registry))
-}
-
 struct DomainPlayerState {
     world: Arc<World>,
     data: DomainPlayerData,
@@ -634,10 +626,6 @@ impl Server {
     }
 
     /// Creates a new server and atomically merges startup command extensions after built-ins.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "server initialization is a single cohesive flow"
-    )]
     pub async fn new_with_commands(
         chunk_runtime: Arc<Runtime>,
         cancel_token: CancellationToken,
@@ -646,6 +634,40 @@ impl Server {
         permission_groups: PermissionGroupManager,
         command_registry: CommandRegistry,
         gameplay_hooks: Arc<dyn GameplayHooks>,
+    ) -> Result<Self, String> {
+        let generator_registry = WorldGeneratorRegistry::new_with_builtins()
+            .map_err(|error| format!("failed to initialize world generator registry: {error}"))?;
+        Self::new_with_commands_and_world_generators(
+            chunk_runtime,
+            cancel_token,
+            config,
+            worlds_config,
+            permission_groups,
+            command_registry,
+            gameplay_hooks,
+            generator_registry,
+        )
+        .await
+    }
+
+    /// Creates a server using the supplied world-generator registry.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "server initialization remains one auditable startup sequence"
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the startup inputs are explicit dependencies of the server"
+    )]
+    pub async fn new_with_commands_and_world_generators(
+        chunk_runtime: Arc<Runtime>,
+        cancel_token: CancellationToken,
+        config: RuntimeConfig,
+        worlds_config: WorldsConfig,
+        permission_groups: PermissionGroupManager,
+        command_registry: CommandRegistry,
+        gameplay_hooks: Arc<dyn GameplayHooks>,
+        generator_registry: WorldGeneratorRegistry,
     ) -> Result<Self, String> {
         validate_login_security(config.online_mode, config.encryption).map_err(str::to_owned)?;
         let config = Arc::new(config);
@@ -665,7 +687,8 @@ impl Server {
 
         let registry_cache = RegistryCache::new(config.compression);
 
-        let (generator_registry, storage_registry) = world_config_registries()?;
+        let storage_registry = WorldStorageRegistry::new_with_builtins()
+            .map_err(|error| format!("failed to initialize world storage registry: {error}"))?;
         let resolved_worlds = worlds_config
             .validate_and_resolve(&generator_registry, &storage_registry)
             .map_err(|e| format!("failed to validate worlds.toml: {e}"))?;

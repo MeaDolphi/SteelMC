@@ -143,6 +143,46 @@ fn swap_locks_player_inventory_when_menu_has_no_inventory_slots() {
     );
 }
 
+/// A hotbar swap into a chest-style menu, which maps the player inventory too,
+/// must not lock that inventory twice while checking the transfer.
+#[test]
+fn swap_with_player_inventory_slots_does_not_relock_the_inventory() {
+    init_vanilla_registry();
+    let world_fixture = fresh_test_world("menu_swap_with_inventory_slots");
+    let world = &world_fixture.world;
+    let player = TestPlayerBuilder::new(Arc::clone(world), "SwapTester", 1).build();
+    player
+        .inventory
+        .lock()
+        .set_item(0, ItemStack::new(&vanilla_items::DIRT));
+    let container = SimpleContainer::new(9).into_shared();
+    container
+        .lock()
+        .set_item(0, ItemStack::new(&vanilla_items::STONE));
+
+    let mut builder = MenuBuilder::new(&vanilla_menu_types::GENERIC_9X1, 1);
+    let menu_slots = builder.section(Arc::clone(&container), 9);
+    let _ = builder.player_inventory(&player.inventory);
+    let mut menu = builder.build(BasicKind {});
+
+    menu.clicked(
+        Click::Swap {
+            slot: menu_slots.start(),
+            with: SwapTarget::Hotbar(0),
+        },
+        &player,
+    );
+
+    assert!(container.lock().get_item(0).is(&vanilla_items::DIRT));
+    assert!(
+        player
+            .inventory
+            .lock()
+            .get_item(0)
+            .is(&vanilla_items::STONE)
+    );
+}
+
 #[test]
 fn draining_a_block_entity_slot_marks_its_chunk_dirty() {
     init_vanilla_registry();

@@ -101,6 +101,7 @@ impl BuffPotion {
         let mut fields = record(KIND);
         fields.insert(BUFF, self.name().to_owned());
         write_tag(&mut stack, fields);
+        super::model::apply(&mut stack, &format!("potion/{}", self.name()));
         stack
     }
 

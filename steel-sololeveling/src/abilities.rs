@@ -406,8 +406,8 @@ mod tests {
             [AbilityEffect::Storm { until: 3_000, .. }]
         ));
         let pickaxe = abilities(ArtifactId::CrystalPickaxe);
-        assert_eq!(extra_crystals(pickaxe, 24), 1);
-        assert_eq!(extra_crystals(pickaxe, 25), 0);
+        assert_eq!(extra_crystals(pickaxe, 49), 1);
+        assert_eq!(extra_crystals(pickaxe, 50), 0);
         assert_eq!(
             extra_crystals(abilities(ArtifactId::KasakasVenomFang), 0),
             0

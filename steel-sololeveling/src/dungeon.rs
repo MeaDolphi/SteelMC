@@ -5,6 +5,8 @@ pub mod generator;
 pub mod instance;
 pub mod mobs;
 pub mod runtime;
+pub mod skills;
+pub mod tower;
 
 pub use boss::{BossKind, boss_for_gate};
 
@@ -57,10 +59,9 @@ pub const PENALTY_ZONE_WAVE_INTERVAL_TICKS: u64 =
     TICKS_PER_SECOND * PENALTY_ZONE_WAVE_INTERVAL_SECONDS;
 /// Zombies one penalty arena keeps alive before pausing further waves.
 ///
-/// A ten-minute challenge at twenty zombies every ten seconds would otherwise
-/// reach well over a thousand live mobs, far past what a vanilla client can be
-/// expected to render and tick.
-pub const PENALTY_ZONE_MAX_LIVE_ZOMBIES: u8 = 40;
+/// A ten-minute climb with a group every ten seconds would otherwise pile up
+/// hundreds of live mobs on a narrow ramp.
+pub const PENALTY_ZONE_MAX_LIVE_ZOMBIES: u8 = 25;
 /// Persistent lifecycle state for a discovered gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Gate {
@@ -201,6 +202,24 @@ impl GateRegistry {
         Some(gate.clone())
     }
 
+    /// Makes a gate usable again when an attempted entry could not be completed.
+    pub fn reopen(&mut self, id: u64) {
+        if let Some(gate) = self.gates.get_mut(&id) {
+            gate.entered = false;
+        }
+    }
+
+    /// Returns the unentered gate whose opening contains `position`, whatever
+    /// the hunter's rank.
+    #[must_use]
+    pub fn at_opening(&self, world: &Identifier, position: DVec3) -> Option<&Gate> {
+        self.gates.values().find(|gate| {
+            gate.world == *world
+                && !gate.entered
+                && instance::opening_contains(gate.entrance, position)
+        })
+    }
+
     /// Iterates all currently discovered gates.
     pub fn values(&self) -> impl Iterator<Item = &Gate> {
         self.gates.values()
@@ -292,8 +311,10 @@ pub enum Footprint {
         /// Seed of the dungeon.
         seed: u64,
     },
-    /// A penalty arena.
+    /// The flat penalty arena used before the tower.
     Arena,
+    /// The spiral penalty tower.
+    Tower,
 }
 
 /// Allocates non-overlapping regions and reuses released slots.
@@ -438,9 +459,9 @@ pub fn wave_for_gate(rank: HunterRank, red: bool) -> DungeonWave {
     }
 }
 
-/// Returns how many zombies the next penalty wave may spawn.
+/// Returns how many mobs the next penalty-tower group may spawn.
 ///
-/// Waves pause while [`PENALTY_ZONE_MAX_LIVE_ZOMBIES`] zombies are still alive,
+/// Groups pause while [`PENALTY_ZONE_MAX_LIVE_ZOMBIES`] mobs are still alive,
 /// so a ten-minute challenge cannot accumulate an unbounded mob count.
 #[must_use]
 pub const fn penalty_wave_size(alive: u8) -> u8 {
@@ -520,6 +541,30 @@ mod tests {
                 .is_some()
         );
         assert_eq!(gates.expire_unused(UNUSED_GATE_LIFETIME_TICKS).len(), 0);
+    }
+
+    #[test]
+    fn a_gate_can_be_reopened_after_entry_preparation_fails() {
+        let mut gates = GateRegistry::default();
+        let gate = gates.create_ranked(
+            Identifier::from_steel("overworld"),
+            BlockPos::new(20, 70, 20),
+            0,
+            HunterRank::E,
+            false,
+        );
+        let position = DVec3::new(20.5, 71.0, 20.5);
+        assert!(
+            gates
+                .enter_at(&gate.world, HunterRank::E, position)
+                .is_some()
+        );
+        gates.reopen(gate.id);
+        assert!(
+            gates
+                .enter_at(&gate.world, HunterRank::E, position)
+                .is_some()
+        );
     }
 
     #[test]

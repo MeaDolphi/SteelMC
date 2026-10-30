@@ -190,6 +190,14 @@ impl ShopDay {
         self.roll_over_with(today, roll_day)
     }
 
+    /// Re-rolls a hunter's assortment for `today` and resets today's purchases.
+    ///
+    /// Reserved for operator maintenance; normal players receive one daily roll.
+    pub fn refresh(&mut self, today: u64) {
+        self.day = u64::MAX;
+        self.roll_over_with(today, roll_day);
+    }
+
     fn roll_over_with(&mut self, today: u64, roll: impl FnOnce() -> [Offer; SLOTS]) -> bool {
         if self.day == today && self.offers.is_some() {
             return false;
@@ -325,6 +333,32 @@ mod tests {
         assert!(day.roll_over_with(6, || other));
         assert_eq!(day.offer(3), Some(other[3]));
         assert!(!day.bought(3));
+    }
+
+    #[test]
+    fn operator_refresh_clears_daily_purchases_and_rolls_a_current_day() {
+        let mut day = ShopDay::default();
+        day.roll_over_with(5, || [roll_offer(0, 0); SLOTS]);
+        assert!(day.mark(3));
+
+        day.refresh(5);
+
+        assert_eq!(day.day, 5);
+        assert!(!day.bought(3));
+        assert!(day.offer(3).is_some());
+    }
+
+    #[test]
+    fn administrative_refresh_clears_purchases_and_sets_the_requested_day() {
+        let mut day = ShopDay::default();
+        day.roll_over_with(5, || [roll_offer(0, 0); SLOTS]);
+        assert!(day.mark(3));
+
+        day.refresh(5);
+
+        assert_eq!(day.day, 5);
+        assert!(!day.bought(3));
+        assert!(day.offer(3).is_some());
     }
 
     #[test]

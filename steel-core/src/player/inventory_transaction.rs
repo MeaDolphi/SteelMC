@@ -59,6 +59,24 @@ impl Player {
     /// Reserves storage, not equipment. Items to sell/consume must be put away
     /// from the active hand before starting a durable operation.
     pub fn reserve_stored_inventory(self: &Arc<Self>) -> io::Result<StoredInventoryReservation> {
+        self.reserve_stored_inventory_inner(None)
+    }
+
+    /// Reserves storage while keeping a specific, transaction-safe menu open.
+    ///
+    /// The caller must own the menu type and ensure its callbacks cannot mutate
+    /// player inventory during a reservation. A nonempty cursor or returnable
+    /// menu input rejects the reservation.
+    pub fn reserve_stored_inventory_with_menu<T: steel_utils::DowncastType>(
+        self: &Arc<Self>,
+    ) -> io::Result<StoredInventoryReservation> {
+        self.reserve_stored_inventory_inner(Some(Self::reserve_with_open_menu::<T>))
+    }
+
+    fn reserve_stored_inventory_inner(
+        self: &Arc<Self>,
+        preserve_menu: Option<fn(&Self) -> io::Result<usize>>,
+    ) -> io::Result<StoredInventoryReservation> {
         if self.inventory_transaction_active()
             || self.is_dead_or_dying()
             || self.is_removed()
@@ -69,28 +87,35 @@ impl Player {
                 "player inventory is unavailable",
             ));
         }
-        if self.remove_all_menus() != MenuRemovalStatus::Complete {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "menu callback still owns the inventory",
-            ));
-        }
+        let selected = if let Some(preserve_menu) = preserve_menu {
+            Some(preserve_menu(self)?)
+        } else {
+            if self.remove_all_menus() != MenuRemovalStatus::Complete {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "menu callback still owns the inventory",
+                ));
+            }
+            None
+        };
         self.stop_using_item();
         self.block_breaking
             .lock()
             .cancel_for_inventory_transaction(self, &self.get_world());
-        if self
-            .session
-            .inventory_transaction_active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "player inventory is reserved",
-            ));
-        }
-        let selected = {
+        let selected = if let Some(selected) = selected {
+            selected
+        } else {
+            if self
+                .session
+                .inventory_transaction_active
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "player inventory is reserved",
+                ));
+            }
             let mut inventory = self.inventory.lock();
             inventory.transaction_reserved = true;
             usize::from(inventory.get_selected_slot())
@@ -114,7 +139,11 @@ impl Player {
 
     pub(super) fn finish_death_inventory(&self, pending: DeferredDeathInventory) {
         if pending.drop_items {
-            let drops = self.inventory.lock().take_death_drops();
+            let hooks = &self.get_world().gameplay_hooks;
+            let drops = self
+                .inventory
+                .lock()
+                .take_death_drops_keeping(|item| hooks.keep_item_on_death(self, item));
             let mut kept = Vec::new();
             for item in drops {
                 if !self.get_world().gameplay_hooks.allow_item_drop(self, &item) {
@@ -150,6 +179,10 @@ impl Player {
                 drop(inventory);
                 self.send_inventory_to_remote();
             }
+            let kept_any = !self.inventory.lock().is_empty();
+            self.session
+                .death_items_kept
+                .store(kept_any, Ordering::Relaxed);
             if pending.experience > 0 {
                 ExperienceOrbEntity::award(
                     &pending.world,

@@ -5,6 +5,7 @@
 //! a base directory supplied at construction time (a sibling of the vanilla
 //! world save directory, not inside it).
 
+use crate::class::ClassChoice;
 use std::fs;
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,7 @@ use uuid::Uuid;
 
 use crate::abilities::AbilityCooldowns;
 use crate::economy::{SystemPoints, Won};
+use crate::gear::SavedGear;
 use crate::organization::OrganizationBook;
 use crate::quest::SystemQuest;
 use crate::shadow::ShadowRoster;
@@ -53,6 +55,12 @@ pub struct SoloLevelingPlayerData {
     /// Artifact ability cooldown deadlines, kept across reconnects.
     #[serde(default)]
     pub cooldowns: AbilityCooldowns,
+    /// Chosen hunter class and when it last changed.
+    #[serde(default)]
+    pub class: ClassChoice,
+    /// Artifacts equipped through the System rather than worn.
+    #[serde(default)]
+    pub gear: SavedGear,
 }
 
 impl SoloLevelingPlayerData {
@@ -69,6 +77,8 @@ impl SoloLevelingPlayerData {
             shop: ShopDay::default(),
             organization: OrganizationBook::new(),
             cooldowns: AbilityCooldowns::default(),
+            class: ClassChoice::default(),
+            gear: SavedGear::default(),
         }
     }
 }

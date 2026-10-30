@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 
 use crate::{entity::LivingEntity as _, world::World};
@@ -92,6 +93,15 @@ impl Player {
             self.set_health(self.get_max_health());
             if transfer_inventory {
                 self.restore_inventory_experience_and_score_from(old_player);
+            } else if old_player
+                .session
+                .death_items_kept
+                .swap(false, Ordering::Relaxed)
+            {
+                // Death dropped everything it could; what is left was kept on
+                // purpose by a gameplay hook and survives the respawn too.
+                let kept = old_player.inventory.lock().replacement_copy();
+                *self.inventory.lock() = kept;
             }
         }
     }
@@ -131,6 +141,7 @@ impl Player {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use glam::DVec3;
     use steel_registry::{
@@ -347,6 +358,34 @@ mod tests {
         assert_eq!(old_player.inventory.lock().get_item(0).count(), 4);
         assert_eq!(old_player.food_data.lock().food_level, 7);
         assert!(old_player.has_mob_effect(vanilla_mob_effects::SPEED));
+    }
+
+    #[test]
+    fn items_a_hook_kept_through_death_survive_the_respawn_once() {
+        init_vanilla_registry();
+        init_behaviors();
+        let world_fixture = fresh_test_world("respawn_restore_kept_items");
+        let world = &world_fixture.world;
+        let old_player = TestPlayerBuilder::new(Arc::clone(world), "Keeper", ENTITY_ID).build();
+        old_player
+            .inventory
+            .lock()
+            .set_item(0, ItemStack::new(&vanilla_items::DIAMOND_SWORD));
+        old_player
+            .session
+            .death_items_kept
+            .store(true, Ordering::Relaxed);
+
+        let kept = old_player.new_respawn_replacement(Arc::clone(world), false, false, false);
+        assert!(
+            kept.inventory
+                .lock()
+                .get_item(0)
+                .is(&vanilla_items::DIAMOND_SWORD)
+        );
+        // The flag is consumed, so a later replacement starts empty again.
+        let fresh = old_player.new_respawn_replacement(Arc::clone(world), false, false, false);
+        assert!(fresh.inventory.lock().get_item(0).is_empty());
     }
 
     #[test]

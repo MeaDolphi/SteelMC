@@ -185,6 +185,16 @@ impl PlayerDataStorage {
         }
     }
 
+    /// Returns whether missing gameplay documents may be seeded from the
+    /// legacy per-player JSON store.
+    ///
+    /// SQLite starts with its own empty dataset and deliberately does not
+    /// import those files; the file and memory backends retain legacy import.
+    #[must_use]
+    pub const fn allows_legacy_player_data_import(&self) -> bool {
+        !matches!(&self.backend, PlayerDataStorageBackend::Sqlite(_))
+    }
+
     /// Creates player data storage backed by files under `save_root`.
     pub async fn on_disk(save_root: PathBuf) -> io::Result<Self> {
         let transactions = FileTransactions::new(save_root.clone());

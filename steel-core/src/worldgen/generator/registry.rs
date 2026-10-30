@@ -46,6 +46,31 @@ struct WorldGeneratorFactory {
     ) -> Result<GeneratorOutput, String>,
 }
 
+type CustomGeneratorValidator =
+    dyn Fn(&toml::Value) -> Result<CustomWorldGeneratorConfig, String> + Send + Sync;
+type CustomGeneratorCreator = dyn Fn(
+        Option<&Path>,
+        &CustomWorldGeneratorConfig,
+        i64,
+        &rayon::ThreadPool,
+    ) -> Result<GeneratorOutput, String>
+    + Send
+    + Sync;
+
+struct CustomWorldGeneratorFactory {
+    validate: Arc<CustomGeneratorValidator>,
+    create: Arc<CustomGeneratorCreator>,
+}
+
+/// Validated input passed to a custom world-generator factory.
+#[derive(Debug, Clone)]
+pub struct CustomWorldGeneratorConfig {
+    /// Generator-specific config with defaults already applied.
+    pub data: toml::Value,
+    /// Dimension type used by the generated world.
+    pub dimension_type: Identifier,
+}
+
 /// Generator config after parsing, validation, and default application.
 #[derive(Debug, Clone)]
 pub struct ValidatedWorldGeneratorConfig {
@@ -71,6 +96,9 @@ impl ValidatedWorldGeneratorConfig {
             WorldGeneratorConfigData::Flat(config) => {
                 validated_dimension_type_by_key(&config.dimension_type)
             }
+            WorldGeneratorConfigData::Custom(config) => {
+                validated_dimension_type_by_key(&config.dimension_type)
+            }
         }
     }
 }
@@ -80,11 +108,13 @@ enum WorldGeneratorConfigData {
     Empty,
     EmptyWorld(DimensionTypeOnlyConfig),
     Flat(FlatGeneratorConfig),
+    Custom(CustomWorldGeneratorConfig),
 }
 
 /// Registry of server-side world generator factories.
 pub struct WorldGeneratorRegistry {
     factories: FxHashMap<Identifier, WorldGeneratorFactory>,
+    custom_factories: FxHashMap<Identifier, CustomWorldGeneratorFactory>,
 }
 
 impl WorldGeneratorRegistry {
@@ -92,6 +122,7 @@ impl WorldGeneratorRegistry {
     pub fn new_with_builtins() -> Result<Self, String> {
         let mut registry = Self {
             factories: FxHashMap::default(),
+            custom_factories: FxHashMap::default(),
         };
 
         registry.register(
@@ -134,9 +165,44 @@ impl WorldGeneratorRegistry {
     }
 
     fn register(&mut self, key: Identifier, factory: WorldGeneratorFactory) -> Result<(), String> {
-        if self.factories.insert(key.clone(), factory).is_some() {
+        if self.custom_factories.contains_key(&key)
+            || self.factories.insert(key.clone(), factory).is_some()
+        {
             return Err(format!("duplicate world generator registration {key}"));
         }
+        Ok(())
+    }
+
+    /// Registers a custom generator owned by the caller.
+    ///
+    /// The key is the value used by `worlds.toml`, such as `sololeveling:city`.
+    pub fn register_custom(
+        &mut self,
+        key: Identifier,
+        validate: impl Fn(&toml::Value) -> Result<CustomWorldGeneratorConfig, String>
+        + Send
+        + Sync
+        + 'static,
+        create: impl Fn(
+            Option<&Path>,
+            &CustomWorldGeneratorConfig,
+            i64,
+            &rayon::ThreadPool,
+        ) -> Result<GeneratorOutput, String>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<(), String> {
+        if self.factories.contains_key(&key) || self.custom_factories.contains_key(&key) {
+            return Err(format!("duplicate world generator registration {key}"));
+        }
+        self.custom_factories.insert(
+            key,
+            CustomWorldGeneratorFactory {
+                validate: Arc::new(validate),
+                create: Arc::new(create),
+            },
+        );
         Ok(())
     }
 
@@ -146,11 +212,17 @@ impl WorldGeneratorRegistry {
         key: &Identifier,
         config: &toml::Value,
     ) -> Result<ValidatedWorldGeneratorConfig, String> {
-        let factory = self
-            .factories
-            .get(key)
-            .ok_or_else(|| format!("unknown world generator {key}"))?;
-        let data = (factory.validate)(config)?;
+        let data = if let Some(factory) = self.custom_factories.get(key) {
+            let config = (factory.validate)(config)?;
+            dimension_type_by_key(&config.dimension_type)?;
+            WorldGeneratorConfigData::Custom(config)
+        } else {
+            let factory = self
+                .factories
+                .get(key)
+                .ok_or_else(|| format!("unknown world generator {key}"))?;
+            (factory.validate)(config)?
+        };
         Ok(ValidatedWorldGeneratorConfig {
             generator: key.clone(),
             data,
@@ -165,6 +237,16 @@ impl WorldGeneratorRegistry {
         seed: i64,
         thread_pool: Arc<rayon::ThreadPool>,
     ) -> Result<GeneratorOutput, String> {
+        if let Some(factory) = self.custom_factories.get(&config.generator) {
+            let WorldGeneratorConfigData::Custom(custom_config) = &config.data else {
+                return Err(format!(
+                    "custom world generator {} has an invalid validated config",
+                    config.generator
+                ));
+            };
+            return (factory.create)(world_path, custom_config, seed, &thread_pool);
+        }
+
         let factory = self
             .factories
             .get(&config.generator)
@@ -526,7 +608,9 @@ fn sea_level_for_dimension_type(dimension_type: DimensionTypeRef) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use steel_registry::init_vanilla_registry;
+    use crate::worldgen::DynamicChunkGenerator;
+    use steel_registry::{init_vanilla_registry, vanilla_blocks, vanilla_dimension_types};
+    use toml::map::Map;
 
     #[test]
     fn default_flat_config_matches_vanilla_superflat() {
@@ -545,6 +629,56 @@ mod tests {
         if let Err(payload) = result {
             panic::resume_unwind(payload);
         }
+    }
+
+    #[test]
+    fn custom_world_generators_validate_and_create_through_the_registry() {
+        init_vanilla_registry();
+        let mut registry =
+            WorldGeneratorRegistry::new_with_builtins().expect("built-ins should initialize");
+        let key = Identifier::new("test", "city");
+        registry
+            .register_custom(
+                key.clone(),
+                |config| {
+                    if config.as_table().is_some_and(Map::is_empty) {
+                        Ok(CustomWorldGeneratorConfig {
+                            data: config.clone(),
+                            dimension_type: Identifier::vanilla_static("overworld"),
+                        })
+                    } else {
+                        Err("city config must be empty".to_owned())
+                    }
+                },
+                |_path, config, _seed, _pool| {
+                    let flat = FlatChunkGenerator::new_layers(vec![
+                        vanilla_blocks::BEDROCK.default_state(),
+                    ]);
+                    Ok(GeneratorOutput {
+                        dimension_type: &vanilla_dimension_types::OVERWORLD,
+                        config: config.data.clone(),
+                        generator: ChunkGeneratorType::Custom(DynamicChunkGenerator::new(flat)),
+                        is_flat: true,
+                        sea_level: 0,
+                    })
+                },
+            )
+            .expect("custom factory should register");
+
+        let config = registry
+            .validate_config(&key, &empty_config())
+            .expect("custom config should validate");
+        assert_eq!(config.dimension_type(), &vanilla_dimension_types::OVERWORLD);
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("generation pool"),
+        );
+        assert!(
+            registry.create(None, &config, 0, pool).is_ok(),
+            "registered custom generator should be creatable"
+        );
     }
 
     fn default_flat_config_matches_vanilla_superflat_inner() {

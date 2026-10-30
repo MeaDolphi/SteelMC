@@ -10,6 +10,7 @@ use text_components::TextComponent;
 
 use crate::economy::PaymentError;
 use crate::identifier::from_sololeveling;
+use crate::pay_menu::payment_message;
 use crate::state::SoloLevelingState;
 
 /// Registers the player-facing payment command.
@@ -44,15 +45,5 @@ pub fn register(
 }
 
 fn payment_error(error: PaymentError) -> CommandError {
-    CommandError::from(match error {
-        PaymentError::Unavailable => "Оба игрока должны быть онлайн с загруженной сессией.",
-        PaymentError::SelfPayment => "Нельзя перевести Won самому себе.",
-        PaymentError::ZeroAmount => "Количество Won должно быть больше нуля.",
-        PaymentError::InsufficientFunds => "Недостаточно Won.",
-        PaymentError::Overflow => "Баланс получателя не вмещает перевод.",
-        PaymentError::Storage => "Не удалось сохранить перевод. Обратитесь к администратору.",
-        PaymentError::CommitUncertain => {
-            "Результат сохранения перевода не подтверждён. Не повторяйте перевод; обратитесь к администратору."
-        }
-    })
+    CommandError::from(payment_message(error))
 }

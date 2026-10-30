@@ -12,7 +12,7 @@ type = "steel:disk"
 
 [player_storage]
 type = "steel:sqlite"
-# The database starts empty; existing file-backed data is not imported.
+# The player database starts empty; legacy account JSON and guilds.json are not imported.
 # [player_storage.config]
 # path = "global/playerdata.sqlite"
 
@@ -24,12 +24,19 @@ default = true
 [[domains.minecraft.worlds]]
 name = "overworld"
 generator = "minecraft:overworld"
-default = true
 
 [[domains.minecraft.worlds]]
 name = "the_nether"
 generator = "minecraft:the_nether"
+nether_portal_target = "sololeveling_city"
 
 [[domains.minecraft.worlds]]
 name = "the_end"
 generator = "minecraft:the_end"
+
+[[domains.minecraft.worlds]]
+name = "sololeveling_city"
+generator = "sololeveling:city"
+default = true
+nether_portal_target = "the_nether"
+end_portal_target = "the_end"

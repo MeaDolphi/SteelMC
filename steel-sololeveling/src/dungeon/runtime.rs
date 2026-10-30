@@ -29,28 +29,31 @@ use text_components::format::Color;
 use uuid::Uuid;
 
 use super::boss::{BossAbilityAction, BossFight};
+use super::generator::{Room, RoomRole};
 use super::instance::{
-    arena_chunks, build_dungeon, build_penalty_arena, dungeon_chunks, erase_footprint,
+    SpawnedMob, build_dungeon, dungeon_chunks, erase_footprint, footprint_chunks,
     gate_frame_chunks, gate_ground_is_dry, gate_space_is_clear, open_dungeon_exit,
     opening_contains, place_gate_frame, remove_gate_frame, spawn_dungeon_boss, spawn_dungeon_wave,
-    spawn_penalty_wave,
+    spawn_room_mobs,
 };
 use super::mobs::MobLabel;
+use super::skills::{MobSkills, SkillAction, refresh_plates};
+use super::tower;
 use super::{
     DUNGEON_TIME_LIMIT_TICKS, DungeonLayout, DungeonWave, Footprint, GATE_SPAWN_INTERVAL_TICKS,
     GATES_PER_SPAWN_CYCLE, Gate, GateRegistry, INSTANCE_WORLD_PATH, InstanceRegion,
     InstanceRegionAllocator, PENALTY_ZONE_DURATION_TICKS, PENALTY_ZONE_WAVE_INTERVAL_TICKS,
-    penalty_wave_size, wave_for_gate,
+    penalty_wave_size, wave_for_gate, wave_for_rank,
 };
+use crate::city;
 use crate::item::chest::{self, ChestKind};
+use crate::item::loot;
 use crate::organization::Event;
 use crate::party::RaidContribution;
 use crate::rank::HunterRank;
 use crate::state::SoloLevelingState;
 
 const GATE_MIN_DISTANCE: f64 = 128.0;
-const GATE_MIN_RADIUS: f64 = 256.0;
-const GATE_MAX_RADIUS: f64 = 1_024.0;
 
 /// Prototype switch: place one gate next to a hunter who joins the overworld,
 /// so a dungeon can be reached without waiting for the automatic cycle.
@@ -74,6 +77,8 @@ const TEST_GATE_MAX_ATTEMPTS: u8 = 8;
 /// Sites one spawn cycle may test before settling for fewer gates, so a crowded
 /// world cannot keep the scheduler busy forever.
 const GATE_MAX_SITE_ATTEMPTS: u8 = 12;
+/// Ticks between repeated explanations of why a gate refuses a hunter.
+const GATE_REFUSAL_INTERVAL_TICKS: u64 = 60;
 
 /// A transition requested by the runtime when a run ends.
 ///
@@ -85,6 +90,8 @@ const GATE_MAX_SITE_ATTEMPTS: u8 = 12;
 pub enum RunAction {
     /// Executes boss damage outside the runtime lock so death hooks can re-enter it.
     BossAbility(BossAbilityAction),
+    /// Executes a mob ability outside the runtime lock for the same reason.
+    MobSkill(SkillAction),
     /// Deal lethal instance damage so the hunter dies inside the dungeon.
     KillPlayer(Uuid),
     /// Send a hunter back to the ordinary world.
@@ -129,12 +136,16 @@ pub struct DungeonRuntime {
     runs: FxHashMap<Uuid, InstanceRun>,
     /// Gate frames to tear down once a [`Server`] handle is available again.
     spent_gates: Vec<u64>,
+    /// Gate frames waiting for their chunks to load before removal.
+    pending_gate_cleanup: Vec<PendingGateCleanup>,
     /// Instance mobs to discard once a [`Server`] handle is available again.
     spent_mobs: Vec<(Identifier, i32)>,
     /// Loot removed from instance entities and delivered after the runtime lock.
     pending_loot: Vec<(Uuid, ItemStack)>,
     /// Hunters waiting for a prototype gate, with the attempts they spent.
     test_gates: FxHashMap<Uuid, u8>,
+    /// Tick each hunter was last told why a gate refused them.
+    gate_refusals: FxHashMap<Uuid, u64>,
 }
 
 impl Debug for DungeonRuntime {
@@ -148,9 +159,11 @@ impl Debug for DungeonRuntime {
             .field("pending_entries", &self.pending_entries.len())
             .field("runs", &self.runs.len())
             .field("spent_gates", &self.spent_gates.len())
+            .field("pending_gate_cleanup", &self.pending_gate_cleanup.len())
             .field("spent_mobs", &self.spent_mobs.len())
             .field("pending_loot", &self.pending_loot.len())
             .field("test_gates", &self.test_gates.len())
+            .field("gate_refusals", &self.gate_refusals.len())
             .finish()
     }
 }
@@ -163,6 +176,12 @@ struct PendingGate {
     tick: u64,
     /// Set for a prototype gate placed next to a hunter instead of rolled.
     test: Option<PendingTestGate>,
+}
+
+struct PendingGateCleanup {
+    world: Arc<World>,
+    gate: Gate,
+    request: ChunkRequestHandle,
 }
 
 /// State of one prototype gate placement.
@@ -256,11 +275,23 @@ struct DungeonProgress {
     survivors: Vec<Uuid>,
     /// Nameplates of the run's mobs and boss, by entity id.
     labels: FxHashMap<i32, MobLabel>,
+    /// Whether the wave of `combat_room` already appeared; a wave waits for a
+    /// hunter to enter its room.
+    wave_spawned: bool,
+    /// Side chambers whose guards already appeared, by room index.
+    guarded_chambers: Vec<usize>,
+    /// Chamber guards and hatched larvae: fought and rewarded like wave mobs,
+    /// but not needed to open the next room.
+    extra_mobs: Vec<i32>,
+    /// Abilities of the run's shamans, bombers and broodmothers.
+    skills: MobSkills,
+    /// Abilities to apply once the runtime lock is released.
+    pending_skills: Vec<SkillAction>,
 }
 
 impl DungeonProgress {
     /// Spawns the wave of the current combat room and remembers its plates.
-    fn spawn_wave(&mut self, world: &Arc<World>, region: InstanceRegion) {
+    fn spawn_wave(&mut self, world: &Arc<World>, region: InstanceRegion, tick: u64) {
         let spawned = spawn_dungeon_wave(
             world,
             region,
@@ -269,9 +300,82 @@ impl DungeonProgress {
             self.rank,
             self.combat_room,
         );
-        self.remaining_mobs = spawned.iter().map(|(id, _)| *id).collect();
-        self.labels.extend(spawned);
+        self.remaining_mobs = spawned.iter().map(|mob| mob.id).collect();
+        self.adopt(spawned, tick);
+        self.wave_spawned = true;
     }
+
+    /// Spawns the guards of side chamber `index`, a third of a wave.
+    fn spawn_guards(
+        &mut self,
+        world: &Arc<World>,
+        region: InstanceRegion,
+        index: usize,
+        tick: u64,
+    ) {
+        self.guarded_chambers.push(index);
+        let Some(room) = self.layout.blueprint.rooms.get(index) else {
+            return;
+        };
+        let count = (self.wave.mob_count / 3).max(2);
+        let salt = self.layout.seed ^ (index as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        let spawned = spawn_room_mobs(
+            world,
+            region,
+            self.layout.blueprint.theme,
+            room,
+            count,
+            self.wave,
+            self.rank,
+            salt,
+        );
+        self.extra_mobs.extend(spawned.iter().map(|mob| mob.id));
+        self.adopt(spawned, tick);
+    }
+
+    fn adopt(&mut self, spawned: Vec<SpawnedMob>, tick: u64) {
+        for mob in spawned {
+            self.skills.track(mob.id, mob.class, tick);
+            self.labels.insert(mob.id, mob.label);
+        }
+    }
+
+    /// Returns whether `id` is one of the run's ordinary mobs.
+    fn tracks(&self, id: i32) -> bool {
+        self.remaining_mobs.contains(&id) || self.extra_mobs.contains(&id)
+    }
+
+    /// Runs the mob abilities and the plate visibility of one tick.
+    fn tick_mobs(&mut self, world: &Arc<World>, hunters: &[DVec3], tick: u64) {
+        self.extra_mobs
+            .retain(|id| world.get_entity_by_id(*id).is_some());
+        let allies = self
+            .remaining_mobs
+            .iter()
+            .chain(&self.extra_mobs)
+            .copied()
+            .collect::<Vec<_>>();
+        let power = (5.0 + 5.0 * self.wave.damage_multiplier) as f32;
+        let out = self.skills.tick(world, hunters, &allies, power, tick);
+        self.pending_skills.extend(out.actions);
+        for (id, label) in out.hatched {
+            self.extra_mobs.push(id);
+            self.labels.insert(id, label);
+        }
+        if tick.is_multiple_of(10) {
+            self.labels
+                .retain(|id, _| world.get_entity_by_id(*id).is_some());
+            refresh_plates(world, hunters, self.labels.keys());
+        }
+    }
+}
+
+/// Returns whether `position` stands inside the bounding rectangle of `room`.
+fn room_contains(region: InstanceRegion, room: &Room, position: DVec3) -> bool {
+    let dx = position.x - region.spawn.x.floor();
+    let dz = position.z - region.spawn.z.floor();
+    (dx - f64::from(room.center.0) - 0.5).abs() <= f64::from(room.half.0) + 0.5
+        && (dz - f64::from(room.center.1) - 0.5).abs() <= f64::from(room.half.1) + 0.5
 }
 
 /// Lifecycle of the boss of one dungeon run.
@@ -288,6 +392,14 @@ enum BossState {
 struct PenaltyProgress {
     next_wave_tick: u64,
     remaining_mobs: Vec<i32>,
+    /// Rank the hunter entered at; scales the tower's mobs.
+    rank: HunterRank,
+    /// Groups spawned so far, which varies the classes they roll.
+    groups: u64,
+    /// Nameplates of the tower's mobs, by entity id.
+    labels: FxHashMap<i32, MobLabel>,
+    skills: MobSkills,
+    pending_skills: Vec<SkillAction>,
 }
 
 impl InstanceRun {
@@ -296,6 +408,7 @@ impl InstanceRun {
         match &mut self.progress {
             RunProgress::Dungeon(progress) => {
                 let mut mobs = mem::take(&mut progress.remaining_mobs);
+                mobs.append(&mut progress.extra_mobs);
                 if let BossState::Alive(id) = progress.boss {
                     mobs.push(id);
                 }
@@ -349,11 +462,12 @@ impl DungeonRuntime {
         tick: u64,
     ) -> Vec<RunAction> {
         self.flush_spent(server);
+        self.finish_gate_cleanup();
         self.expire_gates(server, tick);
         self.schedule_gates(server, tick);
         self.schedule_test_gates(server, tick);
         self.finish_gate_requests(server);
-        self.find_gate_entries(state, server);
+        self.find_gate_entries(state, server, tick);
         self.find_penalty_entries(state, server);
         self.finish_entries(state, server, tick);
 
@@ -399,6 +513,12 @@ impl DungeonRuntime {
                 remaining.swap_remove(index);
                 return;
             }
+            if let RunProgress::Dungeon(progress) = &mut run.progress
+                && let Some(index) = progress.extra_mobs.iter().position(|id| *id == entity_id)
+            {
+                progress.extra_mobs.swap_remove(index);
+                return;
+            }
         }
     }
 
@@ -409,10 +529,28 @@ impl DungeonRuntime {
             if run.instance_world != world.key {
                 return None;
             }
-            let RunProgress::Dungeon(progress) = &run.progress else {
-                return None;
-            };
-            progress.labels.get(&entity_id).cloned()
+            match &run.progress {
+                RunProgress::Dungeon(progress) => progress.labels.get(&entity_id).cloned(),
+                RunProgress::Penalty(progress) => progress.labels.get(&entity_id).cloned(),
+            }
+        })
+    }
+
+    /// Returns whether both entities are tracked by the same active run.
+    #[must_use]
+    pub fn are_in_same_run(&self, world: &World, first: i32, second: i32) -> bool {
+        self.runs.values().any(|run| {
+            if run.instance_world != world.key {
+                return false;
+            }
+            match &run.progress {
+                RunProgress::Dungeon(progress) => {
+                    progress.labels.contains_key(&first) && progress.labels.contains_key(&second)
+                }
+                RunProgress::Penalty(progress) => {
+                    progress.labels.contains_key(&first) && progress.labels.contains_key(&second)
+                }
+            }
         })
     }
 
@@ -426,7 +564,7 @@ impl DungeonRuntime {
                     &run.progress,
                     RunProgress::Dungeon(progress)
                         if progress.boss == BossState::Alive(entity_id)
-                            || progress.remaining_mobs.contains(&entity_id)
+                            || progress.tracks(entity_id)
                 )
         })
     }
@@ -447,10 +585,7 @@ impl DungeonRuntime {
             let RunProgress::Dungeon(progress) = &run.progress else {
                 return None;
             };
-            progress
-                .remaining_mobs
-                .contains(&entity_id)
-                .then_some(progress.rank)
+            progress.tracks(entity_id).then_some(progress.rank)
         })
     }
 
@@ -483,7 +618,7 @@ impl DungeonRuntime {
             let RunProgress::Dungeon(progress) = &mut run.progress else {
                 continue;
             };
-            if progress.remaining_mobs.contains(&entity_id) {
+            if progress.tracks(entity_id) {
                 let contribution = progress.contributions.entry(hunter).or_default();
                 contribution.mob_kills = contribution.mob_kills.saturating_add(1);
                 return;
@@ -500,9 +635,7 @@ impl DungeonRuntime {
             let RunProgress::Dungeon(progress) = &run.progress else {
                 continue;
             };
-            if progress.boss != BossState::Alive(entity_id)
-                && !progress.remaining_mobs.contains(&entity_id)
-            {
+            if progress.boss != BossState::Alive(entity_id) && !progress.tracks(entity_id) {
                 continue;
             }
             let total = run
@@ -517,7 +650,10 @@ impl DungeonRuntime {
                         .score()
                 })
                 .sum::<u64>();
-            for stack in mem::take(drops) {
+            for mut stack in mem::take(drops) {
+                // Delivered straight into inventories, so it is marked here as
+                // what a hunter loses on dying inside the run.
+                loot::mark(&mut stack);
                 let count = stack.count().max(0) as u64;
                 let mut allocated = 0_u64;
                 for (index, member) in run.members.iter().enumerate() {
@@ -659,6 +795,9 @@ impl DungeonRuntime {
         let Some(entry) = self.pending_entries.remove(&player_uuid) else {
             return false;
         };
+        if let RunStart::Gate { gate, .. } = &entry.start {
+            self.gates.reopen(gate.id);
+        }
         self.regions.release(entry.region);
         true
     }
@@ -684,7 +823,7 @@ impl DungeonRuntime {
                 continue;
             };
             if let Some(world) = server.worlds.get(&gate.world) {
-                remove_gate_frame(world, &gate);
+                self.queue_gate_cleanup(Arc::clone(world), gate);
             }
         }
         for (world_key, entity_id) in mem::take(&mut self.spent_mobs) {
@@ -700,8 +839,38 @@ impl DungeonRuntime {
 
     fn expire_gates(&mut self, server: &Server, tick: u64) {
         for gate in self.gates.expire_unused(tick) {
+            announce_gate_expired(server, &gate);
             if let Some(world) = server.worlds.get(&gate.world) {
-                remove_gate_frame(world, &gate);
+                self.queue_gate_cleanup(Arc::clone(world), gate);
+            }
+        }
+    }
+
+    fn queue_gate_cleanup(&mut self, world: Arc<World>, gate: Gate) {
+        let request = world.chunk_map.request_chunks(ChunkRequest {
+            status: ChunkStatus::Full,
+            positions: gate_frame_chunks(gate.entrance),
+            ticket_kind: ChunkTicketKind::Command,
+        });
+        self.pending_gate_cleanup.push(PendingGateCleanup {
+            world,
+            gate,
+            request,
+        });
+    }
+
+    fn finish_gate_cleanup(&mut self) {
+        let mut index = 0;
+        while index < self.pending_gate_cleanup.len() {
+            match self.pending_gate_cleanup[index].request.poll() {
+                ChunkRequestState::Ready => {
+                    let cleanup = self.pending_gate_cleanup.swap_remove(index);
+                    remove_gate_frame(&cleanup.world, &cleanup.gate);
+                }
+                ChunkRequestState::Cancelled => {
+                    self.pending_gate_cleanup.swap_remove(index);
+                }
+                ChunkRequestState::Pending { .. } => index += 1,
             }
         }
     }
@@ -906,6 +1075,7 @@ impl DungeonRuntime {
                 )
             };
             place_gate_frame(&pending.world, surface, gate.red);
+            announce_gate(server, &gate);
             if !test_gate
                 && let Some(cycle) = &mut self.gate_cycle
                 && cycle.world == pending.world.key
@@ -962,28 +1132,53 @@ impl DungeonRuntime {
         })
     }
 
-    fn find_gate_entries(&mut self, state: &SoloLevelingState, server: &Arc<Server>) {
+    fn find_gate_entries(&mut self, state: &SoloLevelingState, server: &Arc<Server>, tick: u64) {
         for player in server.get_players() {
             let uuid = player.gameprofile.id();
-            if self.is_busy(uuid) || state.has_pending_penalty(uuid) {
+            if self.is_busy(uuid) {
                 continue;
             }
             let world = player.get_world();
-            let party = state.party_of(uuid);
-            if party.as_ref().is_some_and(|party| party.leader() != uuid) {
+            let Some(standing) = self.gates.at_opening(&world.key, player.position()) else {
                 continue;
-            }
+            };
+            let minimum = standing.minimum_hunter_rank();
+            let party = state.party_of(uuid);
             let Some(rank) = state.hunter_rank(uuid) else {
                 continue;
             };
-            let Some(gate) = self.gates.enter_at(&world.key, rank, player.position()) else {
-                continue;
+            let refusal = if state.has_pending_penalty(uuid) {
+                Some(penalty_refusal(state.penalty_wait_seconds(uuid)))
+            } else if party.as_ref().is_some_and(|party| party.leader() != uuid) {
+                Some("Войти во врата может только лидер группы.".to_owned())
+            } else if rank < minimum {
+                Some(format!(
+                    "Ранг охотника слишком низок: нужен {} или выше.",
+                    minimum.name()
+                ))
+            } else {
+                None
             };
+            if let Some(reason) = refusal {
+                let last = self.gate_refusals.get(&uuid).copied();
+                if last.is_none_or(|last| tick.saturating_sub(last) >= GATE_REFUSAL_INTERVAL_TICKS)
+                {
+                    self.gate_refusals.insert(uuid, tick);
+                    player.send_message(
+                        &TextComponent::plain(format!("Врата не пускают вас. {reason}"))
+                            .color(Color::Red),
+                    );
+                }
+                continue;
+            }
             let Some(instance_world) = instance_world_of(server, &world) else {
                 log::error!(
                     "sololeveling: instance world is not loaded for {}",
                     world.key
                 );
+                continue;
+            };
+            let Some(gate) = self.gates.enter_at(&world.key, rank, player.position()) else {
                 continue;
             };
             let start = RunStart::Gate {
@@ -1012,6 +1207,15 @@ impl DungeonRuntime {
                         .collect()
                 },
             );
+            for participant in &participants {
+                participant.send_message(
+                    &TextComponent::plain(format!(
+                        "Врата ранга {} активны. Подготавливается подземелье; вход займёт несколько секунд.",
+                        gate.rank.name()
+                    ))
+                    .color(Color::Aqua),
+                );
+            }
             self.begin_entry(participants, world.key.clone(), instance_world, start);
         }
     }
@@ -1068,7 +1272,15 @@ impl DungeonRuntime {
         let previous = self.regions.footprint(region);
         let positions = match &start {
             RunStart::Gate { layout, .. } => dungeon_chunks(region, layout, previous),
-            RunStart::Penalty => arena_chunks(region, previous),
+            RunStart::Penalty => {
+                let mut chunks = tower::tower_chunks(region);
+                for chunk in footprint_chunks(region, previous) {
+                    if !chunks.contains(&chunk) {
+                        chunks.push(chunk);
+                    }
+                }
+                chunks
+            }
         };
         let request = instance_world.chunk_map.request_chunks(ChunkRequest {
             status: ChunkStatus::Full,
@@ -1125,20 +1337,22 @@ impl DungeonRuntime {
                 start,
                 request,
             } = entry;
+            let mut penalty_rank = HunterRank::E;
             let duration_ticks = match &start {
                 RunStart::Gate { .. } => DUNGEON_TIME_LIMIT_TICKS,
                 RunStart::Penalty => {
-                    if state.claim_penalty(uuid).is_none() {
+                    let Some(rank) = state.claim_penalty(uuid) else {
                         self.regions.release(region);
                         continue;
-                    }
+                    };
+                    penalty_rank = rank;
                     PENALTY_ZONE_DURATION_TICKS
                 }
             };
             erase_footprint(&instance_world, region, self.regions.footprint(region));
             let footprint = match &start {
-                RunStart::Gate { layout, .. } => {
-                    build_dungeon(&instance_world, region, layout);
+                RunStart::Gate { gate, layout } => {
+                    build_dungeon(&instance_world, region, layout, gate.rank);
                     log::info!(
                         "sololeveling: built a {} dungeon (seed {}) in instance region {}",
                         layout.blueprint.theme.display_name(),
@@ -1148,8 +1362,8 @@ impl DungeonRuntime {
                     Footprint::Dungeon { seed: layout.seed }
                 }
                 RunStart::Penalty => {
-                    build_penalty_arena(&instance_world, region);
-                    Footprint::Arena
+                    tower::build_tower(&instance_world, region);
+                    Footprint::Tower
                 }
             };
             self.regions.record(region, footprint);
@@ -1168,7 +1382,18 @@ impl DungeonRuntime {
             }
             if members.is_empty() {
                 self.regions.release(region);
+                if let RunStart::Gate { gate, .. } = &start {
+                    self.gates.reopen(gate.id);
+                }
                 continue;
+            }
+            if let RunStart::Gate { gate, .. } = &start
+                && let Some(consumed) = self.gates.remove(gate.id)
+            {
+                announce_gate_consumed(server, &consumed);
+                if let Some(world) = server.worlds.get(&consumed.world) {
+                    self.queue_gate_cleanup(Arc::clone(world), consumed);
+                }
             }
             let (progress, gate) = match start {
                 RunStart::Gate { gate, layout } => (
@@ -1190,6 +1415,11 @@ impl DungeonRuntime {
                         boss_chest: None,
                         survivors: Vec::new(),
                         labels: FxHashMap::default(),
+                        wave_spawned: false,
+                        guarded_chambers: Vec::new(),
+                        extra_mobs: Vec::new(),
+                        skills: MobSkills::default(),
+                        pending_skills: Vec::new(),
                     })),
                     Some(gate.id),
                 ),
@@ -1197,6 +1427,11 @@ impl DungeonRuntime {
                     RunProgress::Penalty(PenaltyProgress {
                         next_wave_tick: tick + PENALTY_ZONE_WAVE_INTERVAL_TICKS,
                         remaining_mobs: Vec::new(),
+                        rank: penalty_rank,
+                        groups: 0,
+                        labels: FxHashMap::default(),
+                        skills: MobSkills::default(),
+                        pending_skills: Vec::new(),
                     }),
                     None,
                 ),
@@ -1227,6 +1462,70 @@ impl DungeonRuntime {
     /// A room counts as cleared when its mobs are gone, not when they die: a mob
     /// can be removed without a death event, so the live entities are what the
     /// room is waiting for.
+    /// Spawns the tower's groups ahead of the highest hunter and runs their
+    /// abilities.
+    fn tick_tower(
+        progress: &mut PenaltyProgress,
+        world: &Arc<World>,
+        region: InstanceRegion,
+        hunters: &[DVec3],
+        tick: u64,
+    ) {
+        progress
+            .remaining_mobs
+            .retain(|id| world.get_entity_by_id(*id).is_some());
+        let power = (5.0 + 5.0 * wave_for_rank(progress.rank).damage_multiplier) as f32;
+        let out = progress
+            .skills
+            .tick(world, hunters, &progress.remaining_mobs, power, tick);
+        progress.pending_skills.extend(out.actions);
+        for (id, label) in out.hatched {
+            progress.remaining_mobs.push(id);
+            progress.labels.insert(id, label);
+        }
+        if tick.is_multiple_of(10) {
+            progress
+                .labels
+                .retain(|id, _| world.get_entity_by_id(*id).is_some());
+            refresh_plates(world, hunters, progress.labels.keys());
+        }
+        if tick < progress.next_wave_tick {
+            return;
+        }
+        progress.next_wave_tick = tick + PENALTY_ZONE_WAVE_INTERVAL_TICKS;
+        let alive = u8::try_from(progress.remaining_mobs.len()).unwrap_or(u8::MAX);
+        let count = penalty_wave_size(alive);
+        let Some(climb) = hunters
+            .iter()
+            .map(|hunter| tower::climb_of(region, *hunter))
+            .reduce(f64::max)
+        else {
+            return;
+        };
+        if count == 0 {
+            return;
+        }
+        progress.groups += 1;
+        let spawned = tower::spawn_tower_group(
+            world,
+            region,
+            climb,
+            count,
+            wave_for_rank(progress.rank),
+            progress.rank,
+            tick ^ progress.groups.wrapping_mul(0xA24B_AED4_963E_E407),
+        );
+        for mob in spawned {
+            progress.remaining_mobs.push(mob.id);
+            progress.skills.track(mob.id, mob.class, tick);
+            progress.labels.insert(mob.id, mob.label);
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "a dungeon run advances room by room; the stages read best in order"
+    )]
     fn tick_dungeon_run(
         progress: &mut DungeonProgress,
         context: &RunContext<'_>,
@@ -1241,9 +1540,49 @@ impl DungeonRuntime {
             region,
             source_world,
         } = *context;
+        let hunters = members
+            .iter()
+            .filter_map(|member| world.players.get_by_uuid(member))
+            .filter(|hunter| !hunter.is_dead_or_dying())
+            .map(|hunter| hunter.position())
+            .collect::<Vec<_>>();
+        let inside = |room: &Room| {
+            hunters
+                .iter()
+                .any(|hunter| room_contains(region, room, *hunter))
+        };
+        progress.tick_mobs(world, &hunters, tick);
+        // Side chambers wake up when a hunter walks in.
+        let waking = progress
+            .layout
+            .blueprint
+            .rooms
+            .iter()
+            .enumerate()
+            .filter(|(index, room)| {
+                room.role == RoomRole::Chamber
+                    && !progress.guarded_chambers.contains(index)
+                    && inside(room)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for index in waking {
+            progress.spawn_guards(world, region, index, tick);
+        }
         if progress.combat_room == 0 {
             progress.combat_room = 1;
-            progress.spawn_wave(world, region);
+            progress.wave_spawned = false;
+        }
+        if !progress.wave_spawned {
+            // A wave waits in its room, unseen, until a hunter walks in.
+            if progress
+                .layout
+                .blueprint
+                .combat_room(progress.combat_room)
+                .is_some_and(inside)
+            {
+                progress.spawn_wave(world, region, tick);
+            }
             return None;
         }
         progress
@@ -1254,10 +1593,25 @@ impl DungeonRuntime {
         }
         if progress.combat_room < progress.layout.combat_room_count {
             progress.combat_room += 1;
-            progress.spawn_wave(world, region);
+            progress.wave_spawned = false;
+            for member in members {
+                if let Some(hunter) = world.players.get_by_uuid(member) {
+                    hunter.send_message(
+                        &TextComponent::plain(format!(
+                            "Комната зачищена ({}/{}). Ищите следующую.",
+                            progress.combat_room - 1,
+                            progress.layout.combat_room_count
+                        ))
+                        .color(Color::Gray),
+                    );
+                }
+            }
             return None;
         }
         match progress.boss {
+            BossState::Waiting if !inside(progress.layout.blueprint.boss_room()) => {
+                return None;
+            }
             BossState::Waiting => {
                 let Some(boss) = spawn_dungeon_boss(
                     world,
@@ -1381,6 +1735,13 @@ impl DungeonRuntime {
                                 &TextComponent::plain(format!("Подземелье: {theme}."))
                                     .color(Color::DarkPurple),
                             );
+                        } else {
+                            member.send_message(
+                                &TextComponent::plain(
+                                    "Штрафная зона: поднимитесь на вершину башни или продержитесь до конца отсчёта.",
+                                )
+                                .color(Color::Red),
+                            );
                         }
                     }
                 }
@@ -1416,6 +1777,7 @@ impl DungeonRuntime {
                         source_world: &source_world,
                     };
                     let action = Self::tick_dungeon_run(progress, &context, tick);
+                    actions.extend(progress.pending_skills.drain(..).map(RunAction::MobSkill));
                     if let Some(kind) = progress.boss_chest.take() {
                         for survivor in progress.survivors.drain(..) {
                             self.pending_loot.push((survivor, kind.stack()));
@@ -1441,20 +1803,37 @@ impl DungeonRuntime {
                     }
                 }
                 RunProgress::Penalty(progress) => {
-                    if tick < progress.next_wave_tick {
+                    let hunters = members
+                        .iter()
+                        .filter_map(|member| world.players.get_by_uuid(member))
+                        .filter(|hunter| !hunter.is_dead_or_dying())
+                        .map(|hunter| hunter.position())
+                        .collect::<Vec<_>>();
+                    if hunters
+                        .iter()
+                        .any(|hunter| tower::reached_top(region, *hunter))
+                    {
+                        run.finishing = true;
+                        for member in &members {
+                            if let Some(hunter) = players.get(member) {
+                                hunter.send_message(
+                                    &TextComponent::plain(
+                                        "Система: вершина башни достигнута. Штраф снят.",
+                                    )
+                                    .color(Color::Gold),
+                                );
+                            }
+                        }
+                        actions.extend(members.iter().copied().map(|uuid| {
+                            RunAction::ReturnPlayer {
+                                uuid,
+                                world: source_world.clone(),
+                            }
+                        }));
                         continue;
                     }
-                    progress.next_wave_tick = tick + PENALTY_ZONE_WAVE_INTERVAL_TICKS;
-                    progress
-                        .remaining_mobs
-                        .retain(|id| world.get_entity_by_id(*id).is_some());
-                    let alive = u8::try_from(progress.remaining_mobs.len()).unwrap_or(u8::MAX);
-                    let count = penalty_wave_size(alive);
-                    if count > 0 {
-                        progress
-                            .remaining_mobs
-                            .extend(spawn_penalty_wave(&world, region, count));
-                    }
+                    Self::tick_tower(progress, &world, region, &hunters, tick);
+                    actions.extend(progress.pending_skills.drain(..).map(RunAction::MobSkill));
                 }
             }
         }
@@ -1467,7 +1846,8 @@ impl DungeonRuntime {
         let mut actions = Vec::new();
         for player in server.get_players() {
             let uuid = player.gameprofile.id();
-            if self.is_busy(uuid) || player.is_world_change_pending() {
+            // A dead hunter cannot change worlds; the respawn returns them.
+            if self.is_busy(uuid) || player.is_world_change_pending() || player.is_dead_or_dying() {
                 continue;
             }
             let world = player.get_world();
@@ -1494,6 +1874,7 @@ impl DungeonRuntime {
 pub fn apply_action(state: &SoloLevelingState, server: &Arc<Server>, action: &RunAction) {
     match action {
         RunAction::BossAbility(action) => action.apply(server),
+        RunAction::MobSkill(action) => action.apply(server),
         RunAction::KillPlayer(uuid) => {
             let Some(player) = find_player(server, *uuid) else {
                 state.complete_offline_run(*uuid);
@@ -1562,17 +1943,9 @@ fn instance_world_of(server: &Arc<Server>, world: &World) -> Option<Arc<World>> 
         .cloned()
 }
 
-/// Picks a site in the [`GATE_MIN_RADIUS`]..=[`GATE_MAX_RADIUS`] ring around
-/// the world spawn.
+/// Picks a site in one of the city gate plazas.
 fn random_gate_candidate(center: BlockPos) -> BlockPos {
-    let mut random = rand::rng();
-    let radius = random.random_range(GATE_MIN_RADIUS..=GATE_MAX_RADIUS);
-    let angle = random.random_range(0.0..TAU);
-    BlockPos::new(
-        center.x() + (radius * angle.cos()) as i32,
-        0,
-        center.z() + (radius * angle.sin()) as i32,
-    )
+    city::gate_candidate(center)
 }
 
 /// Picks the column a prototype gate is requested at, roughly
@@ -1602,4 +1975,73 @@ fn players_too_close(world: &World, position: BlockPos, server: &Server) -> bool
         let dz = player_position.z - f64::from(position.z());
         dx * dx + dz * dz < GATE_MIN_DISTANCE.powi(2)
     })
+}
+
+/// Explains that an owed penalty zone keeps a hunter out of gates.
+fn penalty_refusal(wait_seconds: Option<u64>) -> String {
+    match wait_seconds {
+        Some(wait) => format!(
+            "Сначала пройдите штрафную зону за невыполненное задание: она начнётся через {} мин. {} с.",
+            wait / 60,
+            wait % 60
+        ),
+        None => "Сначала пройдите штрафную зону за невыполненное задание: она начнётся сейчас."
+            .to_owned(),
+    }
+}
+
+fn announce_gate(server: &Server, gate: &Gate) {
+    let color = if gate.red { Color::Red } else { Color::Aqua };
+    let kind = if gate.red {
+        "красные врата"
+    } else {
+        "врата"
+    };
+    let message = TextComponent::plain(format!(
+        "Открыты {kind} ранга {}. Минимальный ранг охотника: {}. Врата активны {} минут.",
+        gate.rank.name(),
+        gate.minimum_hunter_rank().name(),
+        super::UNUSED_GATE_LIFETIME_TICKS / (20 * 60)
+    ))
+    .color(color);
+    notify_near_gate(server, gate, message);
+}
+
+fn announce_gate_expired(server: &Server, gate: &Gate) {
+    notify_near_gate(
+        server,
+        gate,
+        TextComponent::plain(format!(
+            "Врата ранга {} закрылись и больше не активны.",
+            gate.rank.name()
+        ))
+        .color(Color::Gray),
+    );
+}
+
+fn announce_gate_consumed(server: &Server, gate: &Gate) {
+    notify_near_gate(
+        server,
+        gate,
+        TextComponent::plain(format!(
+            "Врата ранга {} использованы и закрываются.",
+            gate.rank.name()
+        ))
+        .color(Color::Gold),
+    );
+}
+
+fn notify_near_gate(server: &Server, gate: &Gate, message: TextComponent) {
+    let center = DVec3::new(
+        f64::from(gate.entrance.x()),
+        f64::from(gate.entrance.y()),
+        f64::from(gate.entrance.z()),
+    );
+    for player in server.get_players() {
+        let world = player.get_world();
+        if world.key == gate.world && player.position().distance_squared(center) <= 96.0_f64.powi(2)
+        {
+            player.send_message(&message);
+        }
+    }
 }

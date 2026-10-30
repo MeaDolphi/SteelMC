@@ -15,15 +15,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use steel_crypto::{SignatureValidator, public_key_from_bytes};
 use steel_protocol::packets::game::{
-    CPlayerChat, CPlayerInfoUpdate, CSystemChat, ChatTypeBound, FilterType, SChat, SChatAck,
-    SChatSessionUpdate,
+    CPlayerChat, CPlayerInfoUpdate, CResourcePackPush, CSound, CSystemChat, ChatTypeBound,
+    FilterType, SChat, SChatAck, SChatSessionUpdate, SoundSource,
 };
+use steel_registry::sound_event::SoundEventHolder;
 use steel_registry::{RegistryEntry, vanilla_chat_types};
+use steel_utils::Identifier;
 use steel_utils::translations;
 use text_components::Modifier;
 use text_components::TextComponent;
 use text_components::format::Color;
 use text_components::interactivity::{ClickEvent, HoverEvent};
+use uuid::Uuid;
 
 use crate::entity::Entity;
 use crate::player::Player;
@@ -348,6 +351,46 @@ impl Player {
     /// Sends an overlay system message to the player
     pub fn send_overlay_message(&self, text: &TextComponent) {
         self.send_packet(CSystemChat::new(text, true, self));
+    }
+
+    /// Offers a server resource pack to the client.
+    ///
+    /// `hash` is the lowercase hex SHA-1 of the zip at `url`; a changed hash
+    /// makes the client download the pack again. `id` names the pack, so a
+    /// later offer with the same id replaces it instead of stacking a copy.
+    pub fn send_resource_pack(
+        &self,
+        id: Uuid,
+        url: &str,
+        hash: &str,
+        required: bool,
+        prompt: Option<&TextComponent>,
+    ) {
+        self.send_packet(CResourcePackPush {
+            id,
+            url: url.to_owned(),
+            hash: hash.to_owned(),
+            required,
+            prompt: prompt.map(|prompt| prompt.resolve(self)),
+        });
+    }
+
+    /// Plays a sound by id to this player alone, at their position.
+    ///
+    /// The id need not be registered: the client looks it up in its
+    /// resource packs, so server packs can add sounds of their own.
+    pub fn play_sound_to_self(&self, sound_id: Identifier, volume: f32, pitch: f32) {
+        self.send_packet(CSound::new_holder(
+            SoundEventHolder::Direct {
+                sound_id,
+                fixed_range: None,
+            },
+            SoundSource::Master,
+            self.position(),
+            volume,
+            pitch,
+            rand::random(),
+        ));
     }
 
     /// Sends vanilla's red upper build-height limit overlay.

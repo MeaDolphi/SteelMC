@@ -82,6 +82,19 @@ impl HunterRank {
             Self::S => 32,
         }
     }
+
+    /// Crystal veins generated in a dungeon of this rank.
+    #[must_use]
+    pub const fn crystal_vein_count(self) -> usize {
+        match self {
+            Self::E => 0,
+            Self::D => 1,
+            Self::C => 3,
+            Self::B => 5,
+            Self::A => 7,
+            Self::S => 9,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -93,6 +106,22 @@ mod tests {
         assert_eq!(HunterRank::E.promoted(), HunterRank::D);
         assert_eq!(HunterRank::A.promoted(), HunterRank::S);
         assert_eq!(HunterRank::S.promoted(), HunterRank::S);
+    }
+
+    #[test]
+    fn crystal_veins_follow_the_confirmed_odd_count_progression() {
+        assert_eq!(
+            [
+                HunterRank::E,
+                HunterRank::D,
+                HunterRank::C,
+                HunterRank::B,
+                HunterRank::A,
+                HunterRank::S,
+            ]
+            .map(HunterRank::crystal_vein_count),
+            [0, 1, 3, 5, 7, 9]
+        );
     }
 
     #[test]

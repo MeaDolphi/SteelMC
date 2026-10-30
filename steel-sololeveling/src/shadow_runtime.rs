@@ -4,22 +4,38 @@ use std::fmt;
 
 use glam::DVec3;
 use rustc_hash::FxHashMap;
-use steel_core::entity::{Entity, LivingEntity, RemovalReason, SharedEntity, spawn_mob};
+use steel_core::entity::{
+    AlliedMode, Entity, LivingEntity, RemovalReason, SharedEntity, spawn_mob,
+};
 use steel_core::player::Player;
 use steel_core::world::World;
 use steel_registry::particle_type::ParticleData;
 use steel_registry::{REGISTRY, RegistryExt, vanilla_attributes, vanilla_particle_types};
-use steel_utils::BlockPos;
+use steel_utils::{BlockPos, Identifier};
 use text_components::Modifier as _;
 use text_components::TextComponent;
 use text_components::format::Color;
 use uuid::Uuid;
 
+use crate::dungeon::mobs::{MobLabel, MobRarity};
+use crate::item::nbt;
 use crate::session::HunterSession;
 use crate::shadow::{
-    ARISE_RANGE, ATTACK_PER_POINT, HEALTH_PER_POINT, SPEED_PER_POINT, Shadow, ShadowStat,
-    army_limit,
+    ARISE_RANGE, ATTACK_PER_POINT, HEALTH_PER_POINT, SPEED_PER_POINT, Shadow, ShadowGear,
+    ShadowOrigin, ShadowStat, army_limit,
 };
+use steel_core::inventory::equipment::EquipmentSlot;
+use steel_registry::item_stack::ItemStack;
+
+/// Slots whose equipment a shadow inherits.
+const GEAR_SLOTS: [EquipmentSlot; 6] = [
+    EquipmentSlot::MainHand,
+    EquipmentSlot::OffHand,
+    EquipmentSlot::Head,
+    EquipmentSlot::Chest,
+    EquipmentSlot::Legs,
+    EquipmentSlot::Feet,
+];
 
 struct ActiveShadow {
     owner: Uuid,
@@ -31,6 +47,8 @@ struct ActiveShadow {
 #[derive(Default)]
 pub struct ShadowRuntime {
     active: FxHashMap<Uuid, ActiveShadow>,
+    /// Army-wide orders per owner; runtime-only, so a restart resets to follow.
+    modes: FxHashMap<Uuid, AlliedMode>,
 }
 
 impl fmt::Debug for ShadowRuntime {
@@ -38,6 +56,7 @@ impl fmt::Debug for ShadowRuntime {
         formatter
             .debug_struct("ShadowRuntime")
             .field("active_count", &self.active.len())
+            .field("modes", &self.modes)
             .finish()
     }
 }
@@ -53,6 +72,7 @@ impl ShadowRuntime {
         hunter: &Player,
         world: &World,
         entity: &dyn LivingEntity,
+        label: Option<&MobLabel>,
         session: &mut HunterSession,
     ) -> Option<Shadow> {
         if entity.as_mob().is_none() || hunter.get_world().key != world.key {
@@ -61,9 +81,17 @@ impl ShadowRuntime {
         if hunter.position().distance(entity.position()) > ARISE_RANGE {
             return None;
         }
+        // Most kills leave nothing behind; rare mobs and bosses even less often.
+        let chance = label.map_or(MobRarity::Common, |label| label.rarity);
+        if rand::random_range(0..100) >= chance.arise_chance_percent() {
+            return None;
+        }
         let shadow = session
             .shadows
-            .arise(entity.entity_type().key.clone())
+            .arise_from(
+                entity.entity_type().key.clone(),
+                Some(capture_origin(entity, label)),
+            )
             .clone();
         world.send_particles(
             ParticleData::simple(&vanilla_particle_types::SOUL),
@@ -151,6 +179,69 @@ impl ShadowRuntime {
         ids.len()
     }
 
+    /// Returns the army-wide mode a hunter gave their shadows.
+    #[must_use]
+    pub fn mode(&self, owner: Uuid) -> AlliedMode {
+        self.modes.get(&owner).copied().unwrap_or_default()
+    }
+
+    /// Orders every summoned shadow of one hunter into `mode`.
+    pub fn set_mode(&mut self, owner: Uuid, mode: AlliedMode) {
+        self.modes.insert(owner, mode);
+        for active in self.active.values().filter(|active| active.owner == owner) {
+            if let Some(mob) = active.entity.as_mob() {
+                mob.set_allied_mode(mode);
+            }
+        }
+    }
+
+    /// Points every summoned shadow of one hunter at `target`.
+    pub fn focus(&self, owner: Uuid, target: &SharedEntity) {
+        for active in self.active.values().filter(|active| active.owner == owner) {
+            if let Some(mob) = active.entity.as_mob() {
+                mob.set_allied_focus(Some(target));
+            }
+        }
+    }
+
+    /// Returns summoned shadows left in another world than their owner.
+    ///
+    /// Teleporting inside one world is the ally AI's job; crossing worlds is
+    /// done by summoning the body again next to the owner.
+    pub fn displaced(&self, owner_world: impl Fn(Uuid) -> Option<Identifier>) -> Vec<(Uuid, Uuid)> {
+        self.active
+            .values()
+            .filter(|active| {
+                let shadow_world = active.entity.level().map(|world| world.key.clone());
+                owner_world(active.owner).is_some_and(|world| Some(world) != shadow_world)
+            })
+            .map(|active| (active.owner, active.shadow_id))
+            .collect()
+    }
+
+    /// Returns the roster ids of the shadows one hunter has summoned.
+    #[must_use]
+    pub fn active_shadows(&self, owner: Uuid) -> Vec<Uuid> {
+        self.active
+            .values()
+            .filter(|active| active.owner == owner && !active.entity.is_removed())
+            .map(|active| active.shadow_id)
+            .collect()
+    }
+
+    /// Removes one summoned shadow, returning whether it was out.
+    pub fn dismiss(&mut self, owner: Uuid, shadow_id: Uuid) -> bool {
+        let Some(entity_id) = self.active.iter().find_map(|(id, active)| {
+            (active.owner == owner && active.shadow_id == shadow_id).then_some(*id)
+        }) else {
+            return false;
+        };
+        if let Some(active) = self.active.remove(&entity_id) {
+            active.entity.set_removed(RemovalReason::Discarded);
+        }
+        true
+    }
+
     /// Removes a dead body and returns the persistent shadow that must rebuild.
     pub fn observe_death(&mut self, entity_uuid: Uuid) -> Option<(Uuid, Uuid, u16)> {
         let active = self.active.remove(&entity_uuid)?;
@@ -212,10 +303,18 @@ impl ShadowRuntime {
             return Err("Тип сохранённой тени не является мобом.");
         }
         entity.set_runtime_allied_owner(Some(hunter.gameprofile.id()));
+        if let Some(mob) = entity.as_mob() {
+            mob.set_allied_mode(self.mode(hunter.gameprofile.id()));
+            mob.set_allied_tank(shadow.origin.as_ref().is_some_and(|origin| origin.is_tank));
+        }
         entity.set_custom_name(Some(
-            TextComponent::plain(format!("[Тень] {}", shadow.name)).color(Color::DarkGray),
+            TextComponent::plain(format!("[Тень] {} · ур. {}", shadow.name, shadow.level))
+                .color(Color::DarkPurple),
         ));
         entity.set_custom_name_visible(true);
+        if let Some(origin) = &shadow.origin {
+            apply_origin(entity.as_ref(), origin);
+        }
         apply_stats(entity.as_ref(), shadow);
         world.send_particles(
             ParticleData::simple(&vanilla_particle_types::SMOKE),
@@ -236,14 +335,118 @@ impl ShadowRuntime {
     }
 }
 
+/// Records what a dying mob was: its nameplate, base attributes and gear.
+fn capture_origin(entity: &dyn LivingEntity, label: Option<&MobLabel>) -> ShadowOrigin {
+    let title = label.map_or_else(
+        || mob_name(&entity.entity_type().key.path).to_owned(),
+        |label| format!("{} {}", label.name, label.title),
+    );
+    let attributes = entity.attributes().lock();
+    let base = |attribute| ShadowOrigin::scale(attributes.get_base_value(attribute).unwrap_or(0.0));
+    let origin_stats = (
+        base(vanilla_attributes::MAX_HEALTH),
+        base(vanilla_attributes::ATTACK_DAMAGE),
+        base(vanilla_attributes::MOVEMENT_SPEED),
+        base(vanilla_attributes::ARMOR),
+    );
+    drop(attributes);
+    let mut equipment = Vec::new();
+    for slot in GEAR_SLOTS {
+        let mut stack = ItemStack::empty();
+        entity.with_equipment_slot(slot, &mut |item| stack = item.clone());
+        if stack.is_empty() {
+            continue;
+        }
+        match nbt::encode(&stack) {
+            Ok(item) => equipment.push(ShadowGear {
+                slot: slot.index() as u8,
+                item,
+            }),
+            Err(error) => log::warn!("sololeveling: shadow gear was not kept: {error}"),
+        }
+    }
+    ShadowOrigin {
+        title,
+        max_health: origin_stats.0,
+        attack_damage: origin_stats.1,
+        movement_speed: origin_stats.2,
+        armor: origin_stats.3,
+        equipment,
+        is_tank: label.is_some_and(|label| label.is_tank),
+    }
+}
+
+/// Russian names of the vanilla mobs a shadow may arise from outside a dungeon label.
+fn mob_name(path: &str) -> &str {
+    match path {
+        "zombie" => "Зомби",
+        "husk" => "Кадавр",
+        "drowned" => "Утопленник",
+        "zombie_villager" => "Зомби-житель",
+        "skeleton" => "Скелет",
+        "stray" => "Зимогор",
+        "bogged" => "Болотник",
+        "wither_skeleton" => "Скелет-иссушитель",
+        "spider" => "Паук",
+        "cave_spider" => "Пещерный паук",
+        "creeper" => "Крипер",
+        "enderman" => "Эндермен",
+        "piglin" => "Пиглин",
+        "piglin_brute" => "Пиглин-громила",
+        "zombified_piglin" => "Зомбифицированный пиглин",
+        "vindicator" => "Поборник",
+        "pillager" => "Разбойник",
+        "witch" => "Ведьма",
+        other => other,
+    }
+}
+
+/// Gives a summoned body the stats and gear its shadow inherited.
+///
+/// The gear never drops: a shadow body is allied, and allied mobs drop no
+/// death loot, so summoning cannot duplicate items.
+fn apply_origin(entity: &dyn Entity, origin: &ShadowOrigin) {
+    let Some(living) = entity.as_living_entity() else {
+        return;
+    };
+    for (attribute, value) in [
+        (vanilla_attributes::MAX_HEALTH, origin.max_health),
+        (vanilla_attributes::ATTACK_DAMAGE, origin.attack_damage),
+        (vanilla_attributes::MOVEMENT_SPEED, origin.movement_speed),
+        (vanilla_attributes::ARMOR, origin.armor),
+    ] {
+        if value > 0 && living.attributes().lock().has_attribute(attribute) {
+            living.set_base_attribute_value(attribute, ShadowOrigin::unscale(value));
+        }
+    }
+    for gear in &origin.equipment {
+        let Some(slot) = EquipmentSlot::ALL
+            .into_iter()
+            .find(|slot| slot.index() == usize::from(gear.slot))
+        else {
+            continue;
+        };
+        match nbt::decode(&gear.item) {
+            Ok(stack) => living.with_equipment_slot_mut(slot, &mut |item| *item = stack.clone()),
+            Err(error) => log::warn!("sololeveling: shadow gear could not be restored: {error}"),
+        }
+        if let Some(mob) = entity.as_mob() {
+            mob.set_equipment_drop_chance(slot, 0.0);
+        }
+    }
+}
+
 fn apply_stats(entity: &dyn Entity, shadow: &Shadow) {
     let Some(living) = entity.as_living_entity() else {
         return;
     };
+    // Base values, so the inherited weapon's and armor's own modifiers are
+    // not folded into the upgrade arithmetic.
     let attributes = living.attributes().lock();
-    let health = attributes.required_value(vanilla_attributes::MAX_HEALTH);
-    let attack = attributes.required_value(vanilla_attributes::ATTACK_DAMAGE);
-    let speed = attributes.required_value(vanilla_attributes::MOVEMENT_SPEED);
+    let base = |attribute| attributes.get_base_value(attribute).unwrap_or(0.0);
+    let health = base(vanilla_attributes::MAX_HEALTH);
+    let attack = base(vanilla_attributes::ATTACK_DAMAGE);
+    let speed = base(vanilla_attributes::MOVEMENT_SPEED);
     drop(attributes);
     let max_health = health + f64::from(shadow.health) * HEALTH_PER_POINT;
     living.set_base_attribute_value(vanilla_attributes::MAX_HEALTH, max_health);
@@ -255,7 +458,7 @@ fn apply_stats(entity: &dyn Entity, shadow: &Shadow) {
         vanilla_attributes::MOVEMENT_SPEED,
         speed + f64::from(shadow.speed) * SPEED_PER_POINT,
     );
-    living.set_health(max_health as f32);
+    living.set_health(living.get_max_health());
 }
 
 fn apply_upgrade(entity: &dyn Entity, stat: ShadowStat) {
@@ -272,7 +475,11 @@ fn apply_upgrade(entity: &dyn Entity, stat: ShadowStat) {
         ShadowStat::Attack => ATTACK_PER_POINT,
         ShadowStat::Speed => SPEED_PER_POINT,
     };
-    let current = living.attributes().lock().required_value(attribute);
+    let current = living
+        .attributes()
+        .lock()
+        .get_base_value(attribute)
+        .unwrap_or(0.0);
     living.set_base_attribute_value(attribute, current + increment);
     if stat == ShadowStat::Health {
         living.set_health(living.get_max_health());

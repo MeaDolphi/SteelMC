@@ -23,7 +23,9 @@ use steel_utils::random::{
 };
 use steel_utils::{BlockPos, ChunkPos};
 
-use self::context::{ChunkGeneratorType, EndGenerator, NetherGenerator, OverworldGenerator};
+pub use self::context::{
+    ChunkGeneratorType, DynamicChunkGenerator, EndGenerator, NetherGenerator, OverworldGenerator,
+};
 use crate::chunk::Chunk;
 use crate::worldgen::region::WorldGenRegion;
 use crate::worldgen::structure::StructureGenerator;

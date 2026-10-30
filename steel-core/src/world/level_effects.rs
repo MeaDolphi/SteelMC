@@ -1,12 +1,12 @@
 use std::ptr;
 
 use super::{
-    Arc, BLOCK_BEHAVIORS, BlockLootContext, BlockPos, BlockStateExt, BlockStateId, CLevelEvent,
-    CLevelParticles, CSound, ChunkPos, ConnectionProtocol, DVec3, EncodedPacket, Entity,
-    GLOBAL_SOUND_EVENTS, GameEventContext, ItemStack, LevelReader, LootContext, NetworkConnection,
-    ParticleData, Player, REGISTRY, RandomizationType, RegistryExt, SectionPos, SoundEventRef,
-    SoundSource, UpdateFlags, World, WorldEntityManager, entity_loot_ref, fluid_state_to_block,
-    level_events, vanilla_blocks, vanilla_game_events,
+    Arc, BLOCK_BEHAVIORS, BlockLootContext, BlockMutationCause, BlockPos, BlockStateExt,
+    BlockStateId, CLevelEvent, CLevelParticles, CSound, ChunkPos, ConnectionProtocol, DVec3,
+    EncodedPacket, Entity, GLOBAL_SOUND_EVENTS, GameEventContext, ItemStack, LevelReader,
+    LootContext, NetworkConnection, ParticleData, Player, REGISTRY, RandomizationType, RegistryExt,
+    SectionPos, SoundEventRef, SoundSource, UpdateFlags, World, WorldEntityManager,
+    entity_loot_ref, fluid_state_to_block, level_events, vanilla_blocks, vanilla_game_events,
 };
 use crate::entity::loot_equipment;
 use crate::inventory::lock::{ContainerLockGuard, ContainerRef};
@@ -361,8 +361,22 @@ impl World {
         // Vanilla parity: fluidState.createLegacyBlock() — breaking a waterlogged
         // block leaves water behind instead of air.
         let replacement = fluid_state_to_block(state.get_fluid_state());
-        let destroyed =
-            self.set_block_with_limit(pos, replacement, UpdateFlags::UPDATE_ALL, recursion_left);
+        if !self.gameplay_hooks.allow_block_mutation(
+            self,
+            pos,
+            state,
+            replacement,
+            BlockMutationCause::Gameplay,
+        ) {
+            return false;
+        }
+        let destroyed = self.set_block_with_limit_and_cause(
+            pos,
+            replacement,
+            UpdateFlags::UPDATE_ALL,
+            recursion_left,
+            BlockMutationCause::Gameplay,
+        );
         if destroyed {
             self.game_event(
                 &vanilla_game_events::BLOCK_DESTROY,

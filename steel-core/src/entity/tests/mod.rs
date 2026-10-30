@@ -90,6 +90,46 @@ fn runtime_owned_mobs_are_allied_to_each_other() {
     assert!(!second.should_save());
 }
 
+#[test]
+fn allied_orders_skip_allies_and_follow_the_chosen_mode() {
+    init_vanilla_registry();
+    let world_fixture = fresh_test_world("runtime_owned_mob_orders");
+    let world = &world_fixture.world;
+    let owner = Uuid::new_v4();
+    let spawn = |id, x| {
+        PigEntity::new(
+            &vanilla_entities::PIG,
+            id,
+            DVec3::new(x, 64.0, 0.5),
+            Arc::downgrade(world),
+        )
+    };
+    let shadow = spawn(1, 0.5);
+    let ally = Arc::new(spawn(2, 1.5));
+    let stranger = Arc::new(spawn(3, 2.5));
+    shadow.set_allied_owner(Some(owner));
+    ally.set_allied_owner(Some(owner));
+
+    let ally_entity: SharedEntity = Arc::clone(&ally) as SharedEntity;
+    shadow.set_allied_focus(Some(&ally_entity));
+    assert!(shadow.allied_focus().is_none(), "an ally is never a target");
+
+    let stranger_entity: SharedEntity = stranger;
+    shadow.set_allied_focus(Some(&stranger_entity));
+    assert!(shadow.allied_focus().is_some());
+
+    shadow.set_allied_mode(super::AlliedMode::Hold);
+    assert_eq!(shadow.allied_mode(), super::AlliedMode::Hold);
+    shadow.set_allied_mode(super::AlliedMode::Passive);
+    assert!(
+        shadow.allied_focus().is_none(),
+        "a passive ally drops its order"
+    );
+
+    shadow.set_allied_owner(None);
+    assert_eq!(shadow.allied_mode(), super::AlliedMode::Follow);
+}
+
 struct PushableTestEntity {
     base: EntityBase,
 }

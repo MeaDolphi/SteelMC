@@ -14,7 +14,10 @@ use crate::{
         container::{Container, SimpleContainer},
         equipment::{EntityEquipment, EquipmentSlot},
         lock::ContainerLockGuard,
-        menu::{Menu, MenuBehavior, MenuBuilder, MenuKind, kinds::BasicKind},
+        menu::{
+            Menu, MenuBehavior, MenuBuilder, MenuKind,
+            kinds::{BasicKind, InventoryKind},
+        },
     },
     player::{Player, PlayerConnection, ResetReason, connection::NetworkConnection},
     test_support::{TestPlayerBuilder, fresh_test_world, insert_ready_full_chunk, test_world},
@@ -54,6 +57,29 @@ fn death_drops_destroy_vanishing_items() {
 
     assert!(inventory.is_empty());
     assert_eq!(drops, [ItemStack::new(&vanilla_items::STONE)]);
+}
+
+#[test]
+fn kept_death_items_stay_in_their_slots() {
+    init_vanilla_registry();
+    let mut inventory = PlayerInventory::new();
+    inventory.set_item(0, ItemStack::new(&vanilla_items::DIAMOND_SWORD));
+    inventory.set_item(1, ItemStack::new(&vanilla_items::ROTTEN_FLESH));
+    inventory.set(
+        EquipmentSlot::Head,
+        ItemStack::new(&vanilla_items::IRON_HELMET),
+    );
+
+    let drops = inventory.take_death_drops_keeping(|item| !item.is(&vanilla_items::ROTTEN_FLESH));
+
+    assert_eq!(drops, [ItemStack::new(&vanilla_items::ROTTEN_FLESH)]);
+    assert!(inventory.get_item(0).is(&vanilla_items::DIAMOND_SWORD));
+    assert!(inventory.get_item(1).is_empty());
+    assert!(
+        inventory
+            .get_item(PlayerInventory::ARMOR_TOP_DOWN[0])
+            .is(&vanilla_items::IRON_HELMET)
+    );
 }
 
 #[test]
@@ -1644,6 +1670,136 @@ fn terminal_menu_removal_returns_carried_item_and_rejects_replacement() {
         .map(ItemStack::count)
         .sum();
     assert_eq!(stone_count, 3);
+}
+
+#[test]
+fn reservation_preserves_only_the_expected_safe_menu() {
+    init_vanilla_registry();
+    let player = test_player(Arc::clone(test_world()));
+    player.open_menu("Shop", |context| {
+        empty_test_menu(context.player, context.container_id, BasicKind {})
+    });
+    player
+        .inventory
+        .lock()
+        .set_item(9, ItemStack::new(&vanilla_items::STONE));
+    let container_id = player
+        .open_menu
+        .lock()
+        .menu
+        .as_ref()
+        .expect("menu")
+        .container_id();
+    assert!(
+        player
+            .reserve_stored_inventory_with_menu::<InventoryKind>()
+            .is_err()
+    );
+    let mut reservation = player
+        .reserve_stored_inventory_with_menu::<BasicKind>()
+        .expect("reserve with menu");
+    reservation
+        .set_item(9, ItemStack::new(&vanilla_items::DIAMOND))
+        .expect("stage");
+    assert!(player.has_container_open());
+    player.handle_container_click(SContainerClick {
+        container_id: i32::from(container_id),
+        state_id: 0,
+        slot_num: 9,
+        button_num: 0,
+        click_type: ClickType::Pickup,
+        changed_slots: FxHashMap::default(),
+        carried_item: HashedStack::Empty,
+    });
+    assert!(
+        player
+            .inventory
+            .lock()
+            .get_item(9)
+            .is(&vanilla_items::STONE)
+    );
+    assert!(
+        player
+            .open_menu
+            .lock()
+            .menu
+            .as_ref()
+            .expect("menu")
+            .behavior()
+            .carried()
+            .is_empty()
+    );
+    player.open_menu("Replacement", |context| {
+        empty_test_menu(context.player, context.container_id, BasicKind {})
+    });
+    assert_eq!(
+        player
+            .open_menu
+            .lock()
+            .menu
+            .as_ref()
+            .expect("menu")
+            .container_id(),
+        container_id
+    );
+    reservation.install();
+    drop(reservation);
+    assert!(player.has_container_open());
+    assert!(
+        player
+            .inventory
+            .lock()
+            .get_item(9)
+            .is(&vanilla_items::DIAMOND)
+    );
+    let second = player
+        .reserve_stored_inventory_with_menu::<BasicKind>()
+        .expect("second reservation");
+    player.do_close_container();
+    assert!(!player.has_container_open());
+    drop(second);
+}
+
+#[test]
+fn reservation_rejects_cursor_and_base_crafting_items_without_losing_them() {
+    init_vanilla_registry();
+    let player = test_player(Arc::clone(test_world()));
+    player.open_menu("Shop", |context| {
+        empty_test_menu(context.player, context.container_id, BasicKind {})
+    });
+    {
+        let mut open = player.open_menu.lock();
+        let menu = open.menu.as_mut().expect("open menu");
+        *menu.behavior_mut().carried_mut() = ItemStack::new(&vanilla_items::DIAMOND);
+    }
+    assert!(
+        player
+            .reserve_stored_inventory_with_menu::<BasicKind>()
+            .is_err()
+    );
+    {
+        let mut open = player.open_menu.lock();
+        let menu = open.menu.as_mut().expect("open menu");
+        assert!(menu.behavior().carried().is(&vanilla_items::DIAMOND));
+        *menu.behavior_mut().carried_mut() = ItemStack::empty();
+    }
+    player
+        .crafting_container()
+        .lock()
+        .set_item(0, ItemStack::new(&vanilla_items::STONE));
+    assert!(
+        player
+            .reserve_stored_inventory_with_menu::<BasicKind>()
+            .is_err()
+    );
+    assert!(
+        player
+            .crafting_container()
+            .lock()
+            .get_item(0)
+            .is(&vanilla_items::STONE)
+    );
+    assert!(player.has_container_open());
 }
 
 #[test]

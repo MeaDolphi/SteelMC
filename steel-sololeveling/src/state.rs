@@ -2,6 +2,7 @@
 
 mod abilities;
 mod auction;
+mod class;
 pub use auction::{AuctionRequest, LotView};
 mod organization;
 pub use organization::{BoardView, GroupPayout};
@@ -9,7 +10,8 @@ mod persistence;
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use glam::DVec3;
@@ -26,20 +28,42 @@ use uuid::Uuid;
 
 use crate::combat_reward::HunterReward;
 use crate::daily;
+use crate::dungeon::mobs::MobLabel;
 use crate::dungeon::runtime::{self, DungeonRuntime, RunDeath};
 use crate::guild::{Guild, GuildError, GuildRegistry, GuildRole};
 use crate::item::crystal::CrystalSaleError;
+use crate::item::enchantment::Enchantment;
 use crate::notice::Notice;
 use crate::organization::Event;
 use crate::party::{Party, PartyError, PartyExit, PartyRuntime};
 use crate::player_data::{PlayerDataStorage, SoloLevelingPlayerData};
 use crate::rank::HunterRank;
+use crate::resource_pack::{self, ServedPack};
 use crate::session::{HunterSession, QuestUpdate, SessionRegistry, SidebarChange};
 use crate::shadow::{RECOVERY_HEALTH_PER_MINUTE, Shadow, ShadowStat, army_limit};
 use crate::shadow_runtime::ShadowRuntime;
 use crate::shop::ShopDay;
 use crate::sidebar::{ContractScope, SidebarView};
 use crate::stats::{HunterStat, HunterStats, LevelUp};
+use steel_core::entity::{AlliedMode, SharedEntity};
+
+/// Where the artifact being enchanted lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnchantTarget {
+    /// A slot of the player inventory.
+    Inventory(usize),
+    /// A slot of the System gear.
+    Gear(usize),
+}
+
+/// An item maker action requested from inside a menu callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnchantAction {
+    /// Open the artifact picker of the item maker.
+    OpenMenu,
+    /// Lay one enchantment on the chosen artifact.
+    Apply(Enchantment, EnchantTarget),
+}
 
 /// Storage and live sessions shared by Solo Leveling hooks and commands.
 #[derive(Debug)]
@@ -57,6 +81,14 @@ pub struct SoloLevelingState {
     organization_events: SyncMutex<Vec<(Vec<Uuid>, Event)>>,
     storms: SyncMutex<Vec<abilities::Storm>>,
     crystal_sales: SyncMutex<FxHashSet<Uuid>>,
+    enchant_actions: SyncMutex<FxHashMap<Uuid, EnchantAction>>,
+    gear_menus: SyncMutex<FxHashSet<Uuid>>,
+    /// The running server, for menus that list online hunters.
+    server: SyncMutex<Weak<Server>>,
+    /// Latest server tick, for menus that act on tick-stamped state.
+    current_tick: AtomicU64,
+    /// The served resource pack, once startup found one.
+    resource_pack: SyncMutex<Option<ServedPack>>,
     notices: SyncMutex<FxHashMap<Uuid, Notice>>,
 }
 
@@ -65,7 +97,7 @@ impl SoloLevelingState {
     pub fn new(base_dir: PathBuf) -> io::Result<Self> {
         let storage = PlayerDataStorage::new(base_dir);
         storage.init()?;
-        let guilds = GuildRegistry::load(storage.base_dir())?;
+        let guilds = GuildRegistry::empty();
         let boards =
             organization::Boards::load(storage.base_dir().join("organization_boards.json"))?;
         let mut dungeon_runtime = DungeonRuntime::default();
@@ -84,6 +116,11 @@ impl SoloLevelingState {
             organization_events: SyncMutex::new(Vec::new()),
             storms: SyncMutex::new(Vec::new()),
             crystal_sales: SyncMutex::new(FxHashSet::default()),
+            enchant_actions: SyncMutex::new(FxHashMap::default()),
+            gear_menus: SyncMutex::new(FxHashSet::default()),
+            server: SyncMutex::new(Weak::new()),
+            current_tick: AtomicU64::new(0),
+            resource_pack: SyncMutex::new(None),
             notices: SyncMutex::new(FxHashMap::default()),
         })
     }
@@ -95,6 +132,9 @@ impl SoloLevelingState {
         session.shop = data.shop;
         session.organization = data.organization;
         session.cooldowns = data.cooldowns;
+        session.class = data.class;
+        session.saved_gear = data.gear.clone();
+        session.gear = data.gear.items();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
@@ -176,6 +216,19 @@ impl SoloLevelingState {
             .unwrap_or(false)
     }
 
+    /// Returns how many seconds remain until an owed penalty zone starts, or
+    /// `None` when it is already due or nothing is owed.
+    pub fn penalty_wait_seconds(&self, player_uuid: Uuid) -> Option<u64> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        self.sessions
+            .with_mut(player_uuid, |session| session.penalty_ready_at())
+            .flatten()
+            .map(|ready_at| ready_at.saturating_sub(now))
+            .filter(|wait| *wait > 0)
+    }
+
     /// Returns whether an owed penalty zone should start now.
     ///
     /// A penalty from an earlier day waits a few minutes after login; one from
@@ -221,6 +274,9 @@ impl SoloLevelingState {
             }
         }
         self.shadow_runtime.lock().tick();
+        if tick.is_multiple_of(20) {
+            self.follow_owners_across_worlds(server);
+        }
         if tick.is_multiple_of(20 * 6) {
             for owner in self
                 .sessions
@@ -244,6 +300,13 @@ impl SoloLevelingState {
         tick: u64,
     ) -> Result<(), PartyError> {
         self.party_runtime.lock().invite(inviter, target, tick)
+    }
+
+    /// Returns the leader whose party currently invites `player`.
+    pub fn party_invitation(&self, player: Uuid) -> Option<Uuid> {
+        self.party_runtime
+            .lock()
+            .invitation_for(player, self.current_tick())
     }
 
     /// Accepts the caller's current party invitation.
@@ -274,23 +337,32 @@ impl SoloLevelingState {
 
     /// Creates a persistent guild with `guildmaster` as its first member.
     pub fn create_guild(&self, name: String, guildmaster: Uuid) -> Result<(), GuildError> {
+        self.ensure_guild_mutation_available()?;
         let mut guilds = self.guilds.lock();
         guilds.create(name, guildmaster)?;
-        guilds.save().map_err(|_| GuildError::Storage)
+        drop(guilds);
+        self.queue_guild_save(Some(guildmaster))
+            .map_err(|_| GuildError::Storage)
     }
 
     /// Adds a recruit to the guild of `inviter`.
     pub fn add_guild_recruit(&self, inviter: Uuid, recruit: Uuid) -> Result<(), GuildError> {
+        self.ensure_guild_mutation_available()?;
         let mut guilds = self.guilds.lock();
         guilds.add_recruit(inviter, recruit)?;
-        guilds.save().map_err(|_| GuildError::Storage)
+        drop(guilds);
+        self.queue_guild_save(Some(inviter))
+            .map_err(|_| GuildError::Storage)
     }
 
     /// Removes a lower-ranked guild member.
     pub fn remove_guild_member(&self, actor: Uuid, target: Uuid) -> Result<(), GuildError> {
+        self.ensure_guild_mutation_available()?;
         let mut guilds = self.guilds.lock();
         guilds.remove(actor, target)?;
-        guilds.save().map_err(|_| GuildError::Storage)
+        drop(guilds);
+        self.queue_guild_save(Some(actor))
+            .map_err(|_| GuildError::Storage)
     }
 
     /// Changes a non-guildmaster member's rank.
@@ -300,16 +372,22 @@ impl SoloLevelingState {
         target: Uuid,
         role: GuildRole,
     ) -> Result<(), GuildError> {
+        self.ensure_guild_mutation_available()?;
         let mut guilds = self.guilds.lock();
         guilds.set_role(actor, target, role)?;
-        guilds.save().map_err(|_| GuildError::Storage)
+        drop(guilds);
+        self.queue_guild_save(Some(actor))
+            .map_err(|_| GuildError::Storage)
     }
 
     /// Leaves the caller's guild unless they are its guildmaster.
     pub fn leave_guild(&self, player: Uuid) -> Result<(), GuildError> {
+        self.ensure_guild_mutation_available()?;
         let mut guilds = self.guilds.lock();
         guilds.leave(player)?;
-        guilds.save().map_err(|_| GuildError::Storage)
+        drop(guilds);
+        self.queue_guild_save(Some(player))
+            .map_err(|_| GuildError::Storage)
     }
 
     /// Reserves an authorized guild bank and returns its saved inventory.
@@ -318,6 +396,7 @@ impl SoloLevelingState {
         player: Uuid,
         slots: usize,
     ) -> Result<(String, Vec<ItemStack>), GuildError> {
+        self.ensure_guild_mutation_available()?;
         let (key, items) = self.guilds.lock().bank_contents_for(player, slots)?;
         let mut active = self.active_guild_banks.lock();
         if !active.insert(key.clone()) {
@@ -329,9 +408,12 @@ impl SoloLevelingState {
     /// Persists and releases a bank reservation after its menu closes.
     pub fn close_guild_bank(&self, player: Uuid, key: &str, items: &[ItemStack]) {
         let result = (|| {
+            self.ensure_guild_mutation_available()?;
             let mut guilds = self.guilds.lock();
             guilds.set_bank_items(player, items)?;
-            guilds.save().map_err(|_| GuildError::Storage)
+            drop(guilds);
+            self.queue_guild_save(Some(player))
+                .map_err(|_| GuildError::Storage)
         })();
         self.active_guild_banks.lock().remove(key);
         if let Err(error) = result {
@@ -341,30 +423,32 @@ impl SoloLevelingState {
 
     /// Moves a hunter's Won into an authorized guild treasury.
     pub fn deposit_guild_treasury(&self, player: Uuid, amount: u64) -> Result<(), GuildError> {
+        self.ensure_guild_mutation_available()?;
         if amount == 0 {
             return Ok(());
         }
-        let debited = self
-            .sessions
+        self.guilds
+            .lock()
+            .clone()
+            .deposit_treasury(player, amount)?;
+        self.sessions
             .with_mut(player, |session| {
                 if session.economic_busy {
                     return Err(GuildError::TransactionPending);
                 }
-                Ok(session.won.debit(amount))
+                if session.won.amount() < amount {
+                    return Err(GuildError::InsufficientFunds);
+                }
+                session.economic_busy = true;
+                Ok(())
             })
-            .transpose()?;
-        if debited != Some(true) {
-            return Err(GuildError::InsufficientFunds);
+            .ok_or(GuildError::Storage)??;
+        if self.queue_guild_deposit(player, amount).is_err() {
+            self.sessions
+                .with_mut(player, |session| session.economic_busy = false);
+            return Err(GuildError::Storage);
         }
-        let result = (|| {
-            let mut guilds = self.guilds.lock();
-            guilds.deposit_treasury(player, amount)?;
-            guilds.save().map_err(|_| GuildError::Storage)
-        })();
-        if result.is_err() {
-            self.credit_won(player, amount);
-        }
-        result
+        Ok(())
     }
 
     /// Returns the caller's guild snapshot.
@@ -533,16 +617,92 @@ impl SoloLevelingState {
         self.crystal_sales.lock().insert(uuid);
     }
 
+    /// Starts serving the resource pack from the Solo Leveling data directory.
+    pub async fn start_resource_pack(&self) {
+        let pack = resource_pack::start(self.storage.base_dir()).await;
+        *self.resource_pack.lock() = pack;
+    }
+
+    /// Offers the resource pack to a hunter who just joined.
+    pub fn offer_resource_pack(&self, player: &Player) {
+        if let Some(pack) = self.resource_pack.lock().as_ref() {
+            pack.offer(player);
+        }
+    }
+
+    /// Records the running server and its tick for menus.
+    pub fn observe_server(&self, server: &Arc<Server>, tick: u64) {
+        self.current_tick.store(tick, Ordering::Relaxed);
+        let mut stored = self.server.lock();
+        if stored.strong_count() == 0 {
+            *stored = Arc::downgrade(server);
+        }
+    }
+
+    /// Returns the latest server tick seen by the tick hook.
+    pub fn current_tick(&self) -> u64 {
+        self.current_tick.load(Ordering::Relaxed)
+    }
+
+    /// Returns every online player, across all worlds.
+    pub fn online_players(&self) -> Vec<Arc<Player>> {
+        self.server
+            .lock()
+            .upgrade()
+            .map_or_else(Vec::new, |server| server.get_players())
+    }
+
+    /// Defers opening the item maker until the menu callback's locks are released.
+    pub fn defer_enchant_menu(&self, uuid: Uuid) {
+        self.enchant_actions
+            .lock()
+            .insert(uuid, EnchantAction::OpenMenu);
+    }
+
+    /// Defers one enchantment chosen in the item maker menu.
+    pub fn defer_enchantment(&self, uuid: Uuid, enchantment: Enchantment, target: EnchantTarget) {
+        self.enchant_actions
+            .lock()
+            .insert(uuid, EnchantAction::Apply(enchantment, target));
+    }
+
+    /// Takes a pending item maker action.
+    pub fn take_enchant_action(&self, uuid: Uuid) -> Option<EnchantAction> {
+        self.enchant_actions.lock().remove(&uuid)
+    }
+
+    /// Opens equipment after the current menu callback releases inventory locks.
+    pub fn defer_gear_menu(&self, uuid: Uuid) {
+        self.gear_menus.lock().insert(uuid);
+    }
+
+    /// Takes a pending equipment menu request.
+    pub fn take_gear_menu(&self, uuid: Uuid) -> bool {
+        self.gear_menus.lock().remove(&uuid)
+    }
+
     /// Takes a pending menu-triggered crystal sale request.
     pub fn take_crystal_sale(&self, uuid: Uuid) -> bool {
         self.crystal_sales.lock().remove(&uuid)
+    }
+
+    /// Returns the nameplate of a dungeon mob, while its run still knows it.
+    pub fn dungeon_mob_label(&self, world: &World, entity_id: i32) -> Option<MobLabel> {
+        self.dungeon_runtime.lock().mob_label(world, entity_id)
+    }
+
+    /// Returns whether two tracked mobs belong to the same dungeon or penalty run.
+    pub fn are_dungeon_mobs_allied(&self, world: &World, first: i32, second: i32) -> bool {
+        self.dungeon_runtime
+            .lock()
+            .are_in_same_run(world, first, second)
     }
 
     /// Rewrites a dungeon mob's nameplate after it lost health.
     pub fn refresh_mob_label(&self, world: &World, entity: &dyn LivingEntity) {
         let label = self.dungeon_runtime.lock().mob_label(world, entity.id());
         if let Some(label) = label {
-            label.show(entity);
+            label.show(world, entity);
         }
     }
 
@@ -559,11 +719,12 @@ impl SoloLevelingState {
         hunter: &Player,
         world: &World,
         entity: &dyn LivingEntity,
+        label: Option<&MobLabel>,
     ) -> Option<Shadow> {
         let shadow = self
             .sessions
             .with_mut(hunter.gameprofile.id(), |session| {
-                ShadowRuntime::arise_from_player_kill(hunter, world, entity, session)
+                ShadowRuntime::arise_from_player_kill(hunter, world, entity, label, session)
             })??;
         if let Err(error) = self.save_session(hunter.gameprofile.id()) {
             log::warn!(
@@ -595,6 +756,69 @@ impl SoloLevelingState {
     /// Recalls every shadow currently summoned by this player.
     pub fn recall_shadows(&self, player_uuid: Uuid) -> usize {
         self.shadow_runtime.lock().recall(player_uuid)
+    }
+
+    /// Returns the roster ids of the player's currently summoned shadows.
+    pub fn active_shadows(&self, player_uuid: Uuid) -> Vec<Uuid> {
+        self.shadow_runtime.lock().active_shadows(player_uuid)
+    }
+
+    /// Recalls one summoned shadow, returning whether it was out.
+    pub fn dismiss_shadow(&self, player_uuid: Uuid, shadow_id: Uuid) -> bool {
+        self.shadow_runtime.lock().dismiss(player_uuid, shadow_id)
+    }
+
+    /// Returns the army-wide mode of a hunter's shadows.
+    pub fn shadow_mode(&self, player_uuid: Uuid) -> AlliedMode {
+        self.shadow_runtime.lock().mode(player_uuid)
+    }
+
+    /// Orders every summoned shadow of a hunter into `mode`.
+    pub fn set_shadow_mode(&self, player_uuid: Uuid, mode: AlliedMode) {
+        self.shadow_runtime.lock().set_mode(player_uuid, mode);
+    }
+
+    /// Sends a hunter's summoned shadows after `target`.
+    pub fn focus_shadows(&self, owner: Uuid, target: &SharedEntity) {
+        self.shadow_runtime.lock().focus(owner, target);
+    }
+
+    /// Summons again, next to their owner, shadows left behind in another world.
+    pub fn follow_owners_across_worlds(&self, server: &Server) {
+        let players = server.get_players();
+        let world_of = |owner: Uuid| {
+            players
+                .iter()
+                .find(|player| player.gameprofile.id() == owner)
+                .map(|player| player.get_world().key.clone())
+        };
+        let displaced = self.shadow_runtime.lock().displaced(world_of);
+        for (owner, shadow_id) in displaced {
+            let Some(hunter) = players
+                .iter()
+                .find(|player| player.gameprofile.id() == owner)
+            else {
+                continue;
+            };
+            let Some(name) = self
+                .shadows(owner)
+                .and_then(|roster| roster.into_iter().find(|shadow| shadow.id == shadow_id))
+                .map(|shadow| shadow.name)
+            else {
+                continue;
+            };
+            self.dismiss_shadow(owner, shadow_id);
+            if let Err(error) = self.summon_shadow(hunter, &name) {
+                log::debug!("sololeveling: shadow {name} could not follow {owner}: {error}");
+            }
+        }
+    }
+
+    /// Returns how many shadows the player may have summoned at once.
+    pub fn shadow_army_limit(&self, player_uuid: Uuid) -> usize {
+        self.sessions
+            .with_mut(player_uuid, |session| army_limit(session.stats.level))
+            .unwrap_or(0)
     }
 
     /// Returns a snapshot of the player's persistent roster.
@@ -713,7 +937,9 @@ mod tests {
 
     use super::{SoloLevelingPlayerData, SoloLevelingState};
     use crate::abilities::AbilityCooldowns;
+    use crate::class::ClassChoice;
     use crate::economy::{SystemPoints, Won};
+    use crate::gear::SavedGear;
     use crate::organization::OrganizationBook;
     use crate::quest::SystemQuest;
     use crate::shadow::ShadowRoster;
@@ -740,6 +966,8 @@ mod tests {
                 shop: ShopDay::unset(),
                 organization: OrganizationBook::new(),
                 cooldowns: AbilityCooldowns::default(),
+                class: ClassChoice::default(),
+                gear: SavedGear::default(),
             },
         );
 

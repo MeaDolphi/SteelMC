@@ -1,4 +1,8 @@
-use std::{f32::consts::TAU, mem, sync::Arc};
+use std::{
+    f32::consts::TAU,
+    io, mem,
+    sync::{Arc, atomic::Ordering},
+};
 
 use crate::{
     entity::{Entity, LivingEntity as _, RemovalReason, entities::ItemEntity},
@@ -150,11 +154,42 @@ impl Player {
 
     fn begin_menu_open_operation(&self) -> bool {
         let mut open_menu = self.open_menu.lock();
-        if open_menu.terminal_removal.is_some() {
+        if open_menu.terminal_removal.is_some() || self.inventory_transaction_active() {
             return false;
         }
         open_menu.active_open_operations += 1;
         true
+    }
+
+    pub(in crate::player) fn reserve_with_open_menu<T: steel_utils::DowncastType>(
+        &self,
+    ) -> io::Result<usize> {
+        let inventory_menu = self.inventory_menu.lock();
+        let open_menu = self.open_menu.lock();
+        let unavailable =
+            || io::Error::new(io::ErrorKind::WouldBlock, "menu or cursor is unavailable");
+        if open_menu.dispatch.is_some()
+            || open_menu.terminal_removal.is_some()
+            || open_menu.active_open_operations != 0
+        {
+            return Err(unavailable());
+        }
+        let Some(menu) = open_menu.menu.as_ref() else {
+            return Err(unavailable());
+        };
+        if !menu.kind().is::<T>()
+            || inventory_menu.has_pending_returned_items()
+            || menu.has_pending_returned_items()
+        {
+            return Err(unavailable());
+        }
+        self.session
+            .inventory_transaction_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| unavailable())?;
+        let mut inventory = self.inventory.lock();
+        inventory.transaction_reserved = true;
+        Ok(usize::from(inventory.get_selected_slot()))
     }
 
     fn finish_menu_open_operation(&self) {

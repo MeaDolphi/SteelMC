@@ -10,6 +10,7 @@ use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use steel_core::player::Player;
 use steel_core::server::Server;
@@ -200,11 +201,15 @@ impl SoloLevelingState {
         actor: Uuid,
         template: Template,
     ) -> Result<(), OrganizationError> {
+        self.ensure_guild_mutation_available()
+            .map_err(|_| OrganizationError::Storage)?;
         let mut guilds = self.guilds.lock();
         let guild = officer_guild(&mut guilds, actor)?;
         let rank = guild_rank(guild.level);
         guild.organization.accept(template, rank, daily::today())?;
-        guilds.save().map_err(|_| OrganizationError::Storage)
+        drop(guilds);
+        self.queue_guild_save(Some(actor))
+            .map_err(|_| OrganizationError::Storage)
     }
 
     /// Cancels a guild contract; the day's allowance stays spent.
@@ -213,11 +218,15 @@ impl SoloLevelingState {
         actor: Uuid,
         index: usize,
     ) -> Result<Contract, OrganizationError> {
+        self.ensure_guild_mutation_available()
+            .map_err(|_| OrganizationError::Storage)?;
         let mut guilds = self.guilds.lock();
         let contract = officer_guild(&mut guilds, actor)?
             .organization
             .cancel(index)?;
-        guilds.save().map_err(|_| OrganizationError::Storage)?;
+        drop(guilds);
+        self.queue_guild_save(Some(actor))
+            .map_err(|_| OrganizationError::Storage)?;
         Ok(contract)
     }
 
@@ -231,45 +240,84 @@ impl SoloLevelingState {
         actor: Uuid,
         index: usize,
     ) -> Result<GroupPayout, OrganizationError> {
-        let mut guilds = self.guilds.lock();
-        let guild = officer_guild(&mut guilds, actor)?;
-        let members: Vec<Uuid> = guild.members.keys().copied().collect();
-        let (contract, paid) = guild
-            .organization
-            .turn_in(index, |hunter| members.contains(&hunter))?;
-        guilds.save().map_err(|_| OrganizationError::Storage)?;
-        drop(guilds);
-        for hunter in &paid {
-            let _ = self.collect_guild_payout(*hunter);
+        self.ensure_guild_mutation_available()
+            .map_err(|_| OrganizationError::Storage)?;
+        let payout = {
+            let mut guilds = self.guilds.lock();
+            let guild = officer_guild(&mut guilds, actor)?;
+            let members: FxHashSet<_> = guild.members.keys().copied().collect();
+            let group = guild
+                .organization
+                .contracts
+                .get_mut(index)
+                .ok_or(OrganizationError::Missing)?;
+            if !group.contract.is_complete() {
+                return Err(OrganizationError::NotComplete);
+            }
+            if group.pending_turn_in {
+                return Err(OrganizationError::Storage);
+            }
+            group.pending_turn_in = true;
+            GroupPayout {
+                contract: group.contract,
+                paid: group
+                    .contributors
+                    .iter()
+                    .copied()
+                    .filter(|hunter| members.contains(hunter))
+                    .collect(),
+            }
+        };
+        if self.queue_guild_turn_in(actor, index).is_err() {
+            self.clear_guild_turn_in_pending(actor, index);
+            return Err(OrganizationError::Storage);
         }
-        Ok(GroupPayout { contract, paid })
+        Ok(payout)
     }
 
-    /// Pays an online hunter whatever their guild owes them, returning the amount.
-    pub fn collect_guild_payout(&self, hunter: Uuid) -> u64 {
-        if self.with_session_mut(hunter, |_| ()).is_none()
+    /// Queues an atomic collection of a hunter's stored guild payouts.
+    pub fn collect_guild_payout(&self, hunter: Uuid) -> bool {
+        if self.ensure_guild_mutation_available().is_err()
             || !self.persistence.lock().accepts_writes(hunter)
+            || !self.guilds.lock().guild_of(hunter).is_some_and(|guild| {
+                guild
+                    .organization
+                    .owed
+                    .get(&hunter)
+                    .is_some_and(|amount| *amount > 0)
+            })
         {
-            return 0;
+            return false;
         }
-        let mut guilds = self.guilds.lock();
-        let Some(guild) = guilds.guild_of_mut(hunter) else {
-            return 0;
-        };
-        let amount = guild.organization.take_owed(hunter);
-        if amount == 0 {
-            return 0;
-        }
-        if let Err(error) = guilds.save() {
-            log::warn!("sololeveling: guild payout of {hunter} was not saved: {error}");
-            if let Some(guild) = guilds.guild_of_mut(hunter) {
-                guild.organization.owed.insert(hunter, amount);
+        let Some(accepted) = self.sessions.with_mut(hunter, |session| {
+            if session.economic_busy {
+                return false;
             }
-            return 0;
+            session.economic_busy = true;
+            true
+        }) else {
+            return false;
+        };
+        if !accepted {
+            return false;
         }
-        drop(guilds);
-        self.credit_won(hunter, amount);
-        amount
+        if let Err(error) = self.queue_guild_collection(hunter) {
+            self.sessions
+                .with_mut(hunter, |session| session.economic_busy = false);
+            log::warn!("sololeveling: could not queue guild payout for {hunter}: {error}");
+            return false;
+        }
+        true
+    }
+
+    /// Retries due online guild payouts that could not queue on join.
+    pub fn tick_guild_payouts(&self) {
+        if self.ensure_guild_mutation_available().is_err() {
+            return;
+        }
+        for hunter in self.sessions.player_ids() {
+            let _ = self.collect_guild_payout(hunter);
+        }
     }
 
     /// Accepts a personal contract.
@@ -386,6 +434,9 @@ impl SoloLevelingState {
 
     /// Applies queued contract events and tells hunters what they finished.
     pub fn tick_organization(&self, server: &Server) {
+        if self.ensure_guild_mutation_available().is_err() {
+            return;
+        }
         let finished = self.apply_organization_events();
         if finished.is_empty() {
             return;
@@ -402,6 +453,7 @@ impl SoloLevelingState {
     fn apply_organization_events(&self) -> Vec<(Uuid, Contract)> {
         let events = mem::take(&mut *self.organization_events.lock());
         let mut finished: Vec<(Uuid, Contract)> = Vec::new();
+        let mut guild_notices = FxHashSet::default();
         for (hunters, event) in &events {
             for hunter in hunters {
                 let observed = self.sessions.with_mut(*hunter, |session| {
@@ -455,12 +507,25 @@ impl SoloLevelingState {
                 }
                 let (counted, done) = guild.organization.observe(&members, *event);
                 changed |= counted;
+                if counted {
+                    guild_notices.extend(members);
+                }
                 for contract in done {
                     finished.extend(guild.members.keys().map(|member| (*member, contract)));
                 }
             }
-            if changed && let Err(error) = guilds.save() {
+            drop(guilds);
+            if changed
+                && guild_notices.is_empty()
+                && let Some(player) = hunters.first()
+            {
+                guild_notices.insert(*player);
+            }
+        }
+        for player in guild_notices {
+            if let Err(error) = self.queue_guild_save(Some(player)) {
                 log::warn!("sololeveling: guild contract progress was not saved: {error}");
+                break;
             }
         }
         finished
@@ -646,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn guild_contracts_need_an_officer_and_pay_contributors_even_when_offline() {
+    fn guild_contract_settlement_stages_offline_and_online_payouts_without_early_mutation() {
         let (state, directory) = state();
         let master = hunter(&state, 1);
         let officer = hunter(&state, 1);
@@ -701,13 +766,46 @@ mod tests {
             "the officer did not contribute"
         );
 
-        state.begin_session(recruit, SoloLevelingPlayerData::new(recruit));
-        assert_eq!(state.collect_guild_payout(recruit), 750);
-        assert_eq!(state.collect_guild_payout(recruit), 0);
+        assert!(
+            state
+                .guilds
+                .lock()
+                .guild_of(officer)
+                .expect("guild")
+                .organization
+                .contracts[0]
+                .pending_turn_in
+        );
         assert_eq!(
-            state.collect_guild_payout(master),
-            0,
-            "already paid when online"
+            state.with_session_mut(master, |session| session.won.amount()),
+            Some(0),
+            "online balances wait for the durable transaction"
+        );
+        let mut staged = state.guilds.lock().clone();
+        let (_, contributors) = staged
+            .settle_contract(officer, 0)
+            .expect("stage guild settlement");
+        assert_eq!(contributors, vec![master, recruit]);
+        for contributor in contributors {
+            assert_eq!(
+                staged
+                    .guild_of(contributor)
+                    .and_then(|guild| guild.organization.owed.get(&contributor))
+                    .copied(),
+                Some(750)
+            );
+        }
+        assert_eq!(
+            state
+                .guilds
+                .lock()
+                .guild_of(officer)
+                .expect("unchanged live guild")
+                .organization
+                .contracts
+                .len(),
+            1,
+            "candidate settlement does not mutate the live registry"
         );
         fs::remove_dir_all(directory).expect("cleanup");
     }

@@ -15,6 +15,7 @@ use text_components::TextComponent;
 
 use super::SoloLevelingState;
 use crate::auction::{LotKind, MAX_ACTIVE_LOTS, MAX_DURATION_HOURS, MIN_DURATION_HOURS};
+use crate::auction_menu;
 use crate::identifier::from_sololeveling;
 use crate::state::{AuctionRequest, LotView};
 
@@ -28,6 +29,14 @@ pub(super) fn register(
     let root = CommandRegistration::new(from_sololeveling("auction"), move || {
         let state = Arc::clone(&state);
         literal("auction")
+            .executes({
+                let state = Arc::clone(&state);
+                move |context| {
+                    let player = player_of(*context)?;
+                    auction_menu::open(&player, Arc::clone(&state));
+                    Ok(1)
+                }
+            })
             .then({
                 let state = Arc::clone(&state);
                 literal("list").executes(move |context| {

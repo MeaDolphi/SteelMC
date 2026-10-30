@@ -1,7 +1,10 @@
 //! Solo Leveling command registrations.
 
+mod admin;
 pub(crate) mod auction;
+pub(crate) mod class;
 pub(crate) mod crystal;
+mod enchant;
 mod organization;
 mod pay;
 mod shop;
@@ -19,7 +22,7 @@ use crate::guild_bank;
 use crate::hunter_stats_menu;
 use crate::identifier::from_sololeveling;
 use crate::party::PartyError;
-use crate::shadow::ShadowStat;
+use crate::shadow::{ATTACK_PER_POINT, HEALTH_PER_POINT, ShadowOrigin, ShadowStat};
 use crate::state::SoloLevelingState;
 
 /// Registers every Solo Leveling command required at server startup.
@@ -32,9 +35,12 @@ pub fn register(
     state: Arc<SoloLevelingState>,
 ) -> Result<(), CommandRegistrationError> {
     pay::register(registry, Arc::clone(&state))?;
+    admin::register(registry, Arc::clone(&state))?;
     shop::register(registry, Arc::clone(&state))?;
     crystal::register(registry, Arc::clone(&state))?;
     auction::register(registry, Arc::clone(&state))?;
+    enchant::register(registry, Arc::clone(&state))?;
+    class::register(registry, Arc::clone(&state))?;
     organization::register(registry, Arc::clone(&state))?;
     let hunter_stats_state = Arc::clone(&state);
     let command = CommandRegistration::new(from_sololeveling("hunterstats"), move || {
@@ -74,9 +80,19 @@ pub fn register(
                             .iter()
                             .map(|shadow| {
                                 format!(
-                                    "{}: ур. {}, XP {}/{}, очки {}",
+                                    "{}: ур. {}{}, XP {}/{}, очки {}",
                                     shadow.name,
                                     shadow.level,
+                                    shadow.origin.as_ref().map_or_else(String::new, |origin| {
+                                        format!(
+                                            ", ❤ {:.0}, урон {:.1}, снаряжение {}",
+                                            ShadowOrigin::unscale(origin.max_health)
+                                                + f64::from(shadow.health) * HEALTH_PER_POINT,
+                                            ShadowOrigin::unscale(origin.attack_damage)
+                                                + f64::from(shadow.attack) * ATTACK_PER_POINT,
+                                            origin.equipment.len()
+                                        )
+                                    }),
                                     shadow.experience,
                                     shadow.experience_to_next_level(),
                                     shadow.unspent_points
@@ -271,7 +287,7 @@ pub fn register(
                             .create_guild(name.clone(), player.gameprofile.id())
                             .map_err(guild_error)?;
                         player.send_message(&TextComponent::plain(format!(
-                            "Гильдия {name} создана."
+                            "Создание гильдии {name} поставлено в очередь сохранения."
                         )));
                         Ok(1)
                     },
@@ -289,7 +305,7 @@ pub fn register(
                             .add_guild_recruit(player.gameprofile.id(), target.gameprofile.id())
                             .map_err(guild_error)?;
                         target.send_message(&TextComponent::plain(
-                            "Вы приняты в гильдию в ранге новобранца.",
+                            "Ваше вступление в гильдию поставлено в очередь сохранения.",
                         ));
                         Ok(1)
                     },
@@ -306,7 +322,9 @@ pub fn register(
                         state
                             .remove_guild_member(player.gameprofile.id(), target.gameprofile.id())
                             .map_err(guild_error)?;
-                        target.send_message(&TextComponent::plain("Вы исключены из гильдии."));
+                        target.send_message(&TextComponent::plain(
+                            "Исключение участника поставлено в очередь сохранения.",
+                        ));
                         Ok(1)
                     },
                 ))
@@ -354,9 +372,7 @@ pub fn register(
                         state
                             .deposit_guild_treasury(player.gameprofile.id(), amount)
                             .map_err(guild_error)?;
-                        player.send_message(&TextComponent::plain(format!(
-                            "В казну внесено {amount} Won."
-                        )));
+                        player.send_message(&TextComponent::plain("Взнос в казну обрабатывается."));
                         Ok(1)
                     },
                 ))
@@ -370,7 +386,9 @@ pub fn register(
                     state
                         .leave_guild(player.gameprofile.id())
                         .map_err(guild_error)?;
-                    player.send_message(&TextComponent::plain("Вы покинули гильдию."));
+                    player.send_message(&TextComponent::plain(
+                        "Выход из гильдии поставлен в очередь сохранения.",
+                    ));
                     Ok(1)
                 })
             })
@@ -395,7 +413,9 @@ pub fn register(
                         state
                             .set_guild_role(player.gameprofile.id(), target.gameprofile.id(), role)
                             .map_err(guild_error)?;
-                        target.send_message(&TextComponent::plain("Ваш ранг в гильдии изменён."));
+                        target.send_message(&TextComponent::plain(
+                            "Изменение ранга поставлено в очередь сохранения.",
+                        ));
                         Ok(1)
                     }),
                 ))
@@ -407,13 +427,7 @@ pub fn register(
 }
 
 fn party_error(error: PartyError) -> CommandError {
-    CommandError::from(match error {
-        PartyError::NotInParty => "Игрок не состоит в этой группе.",
-        PartyError::NotLeader => "Исключать участников может только создатель группы.",
-        PartyError::Full => "В группе уже четыре участника.",
-        PartyError::AlreadyMember => "Игрок уже состоит в этой группе.",
-        PartyError::NoInvitation => "Активного приглашения в группу нет.",
-    })
+    CommandError::from(error.message())
 }
 
 fn guild_error(error: GuildError) -> CommandError {

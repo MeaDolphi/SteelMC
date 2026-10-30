@@ -27,6 +27,9 @@ pub struct PlayerSession {
     pub(super) inventory_transaction_active: AtomicBool,
     pub(super) deferred_death_inventory:
         SyncMutex<Option<super::inventory_transaction::DeferredDeathInventory>>,
+    /// Set when a gameplay hook kept items through the last death, so the
+    /// respawned player inherits them.
+    pub(super) death_items_kept: AtomicBool,
 }
 
 enum CurrentPlayerSlot {
@@ -55,6 +58,7 @@ impl PlayerSession {
             id: PlayerSessionId(previous + 1),
             inventory_transaction_active: AtomicBool::new(false),
             deferred_death_inventory: SyncMutex::new(None),
+            death_items_kept: AtomicBool::new(false),
             current_player: SyncRwLock::new(CurrentPlayerSlot::Unbound),
             chunk_sender: SyncMutex::new(ChunkSender::default()),
             chat: SyncMutex::new(ChatState::new(

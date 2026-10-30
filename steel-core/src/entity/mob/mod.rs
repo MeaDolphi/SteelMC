@@ -184,6 +184,43 @@ pub struct MobBase {
     /// This is deliberately not serialized: gameplay layers persist the
     /// durable companion roster and recreate live allies after a restart.
     allied_owner: SyncMutex<Option<Uuid>>,
+    /// Orders the gameplay layer gives a runtime-owned ally.
+    allied_orders: SyncMutex<AlliedOrders>,
+}
+
+/// How a runtime-owned ally behaves when no order names a target.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AlliedMode {
+    /// Stay near the owner, defend them and fight monsters around them.
+    #[default]
+    Follow,
+    /// Hold a position and fight only monsters that come close to it.
+    Hold,
+    /// Stay near the owner and never start a fight.
+    Passive,
+}
+
+/// Distance from the owner at which a following ally starts walking back.
+pub const ALLIED_FOLLOW_DISTANCE: f64 = 3.0;
+/// Distance from the owner at which a following ally teleports back.
+pub const ALLIED_TELEPORT_DISTANCE: f64 = 24.0;
+/// Radius around the owner in which a following ally looks for monsters.
+pub const ALLIED_GUARD_RADIUS: f64 = 12.0;
+/// Radius around its post in which a holding ally looks for monsters.
+pub const ALLIED_HOLD_RADIUS: f64 = 10.0;
+/// Farthest an ordered target may be from the owner before it is dropped.
+pub const ALLIED_FOCUS_RANGE: f64 = 32.0;
+
+/// Orders for one runtime-owned ally. Runtime-only, like the owner itself.
+#[derive(Debug, Clone, Default)]
+struct AlliedOrders {
+    mode: AlliedMode,
+    /// Where a holding ally stands guard.
+    post: Option<DVec3>,
+    /// A target the owner chose by attacking it or by being attacked.
+    focus: Option<WeakEntity>,
+    /// Whether this ally presents a tank profile to hostile targeting goals.
+    tank: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +258,7 @@ impl MobBase {
             ambient_sound_time: SyncMutex::new(0),
             xp_reward: SyncMutex::new(0),
             allied_owner: SyncMutex::new(None),
+            allied_orders: SyncMutex::new(AlliedOrders::default()),
         }
     }
 
@@ -243,6 +281,9 @@ impl MobBase {
     /// Assigns or clears the player that owns this runtime-only allied mob.
     pub fn set_allied_owner(&self, owner: Option<Uuid>) {
         *self.allied_owner.lock() = owner;
+        if owner.is_none() {
+            *self.allied_orders.lock() = AlliedOrders::default();
+        }
     }
 
     #[must_use]
@@ -437,9 +478,73 @@ pub trait Mob: LivingEntity + Leashable {
                 .is_some_and(|other_mob| other_mob.allied_owner() == Some(owner))
     }
 
-    /// Directs a runtime-owned ally toward hostile mobs and otherwise back to
-    /// its owner. This runs after vanilla target goals so an owner is never
-    /// left as their target by a hostile mob's normal player-targeting goal.
+    /// Returns how this runtime-owned ally currently behaves.
+    #[must_use]
+    fn allied_mode(&self) -> AlliedMode {
+        self.mob_base().allied_orders.lock().mode
+    }
+
+    /// Returns whether this runtime-owned ally should draw hostile aggro.
+    #[must_use]
+    fn is_allied_tank(&self) -> bool {
+        self.mob_base().allied_orders.lock().tank
+    }
+
+    /// Sets whether this runtime-owned ally draws hostile aggro.
+    fn set_allied_tank(&self, tank: bool) {
+        self.mob_base().allied_orders.lock().tank = tank;
+    }
+
+    /// Changes how this ally behaves; holding guards the current position.
+    fn set_allied_mode(&self, mode: AlliedMode) {
+        let mut orders = self.mob_base().allied_orders.lock();
+        orders.mode = mode;
+        orders.post = (mode == AlliedMode::Hold).then(|| self.position());
+        if mode == AlliedMode::Passive {
+            orders.focus = None;
+        }
+        drop(orders);
+        if mode == AlliedMode::Passive {
+            self.set_target(None);
+        }
+    }
+
+    /// Orders this ally to fight `target`, which its owner attacked or was
+    /// attacked by. Players and other allies of the same owner are ignored.
+    fn set_allied_focus(&self, target: Option<&SharedEntity>) {
+        let focus = target
+            .filter(|target| target.as_player().is_none() && !self.is_allied_with(target.as_ref()))
+            .map(Arc::downgrade);
+        self.mob_base().allied_orders.lock().focus = focus;
+    }
+
+    /// Returns the target the owner ordered, while it still exists.
+    #[must_use]
+    fn allied_focus(&self) -> Option<SharedEntity> {
+        self.mob_base()
+            .allied_orders
+            .lock()
+            .focus
+            .as_ref()
+            .and_then(WeakEntity::upgrade)
+    }
+
+    /// Returns whether a runtime-owned ally may fight `candidate`.
+    ///
+    /// Allies never fight players: player combat is not part of the companion rules.
+    fn allied_may_fight(&self, candidate: &dyn Entity) -> bool {
+        candidate.uuid() != self.uuid()
+            && candidate.as_player().is_none()
+            && !self.is_allied_with(candidate)
+            && candidate
+                .as_living_entity()
+                .is_some_and(|living| !living.is_dead_or_dying() && Mob::can_attack(self, living))
+    }
+
+    /// Directs a runtime-owned ally by its orders, then toward hostile mobs
+    /// and otherwise back to its owner. This runs after vanilla target goals
+    /// so an owner is never left as their target by a hostile mob's normal
+    /// player-targeting goal.
     fn tick_allied_owner_ai(&self) {
         let Some(owner_uuid) = self.allied_owner() else {
             return;
@@ -456,35 +561,78 @@ pub trait Mob: LivingEntity + Leashable {
             return;
         }
 
-        let target = self.target().filter(|target| {
-            target.as_monster().is_some()
-                && target.as_living_entity().is_some_and(|living| {
-                    Mob::can_attack(self, living) && !self.is_allied_with(target.as_ref())
-                })
-        });
-        let target = target.or_else(|| {
-            let search = self.bounding_box().inflate(32.0);
-            world.nearest_entity_in_aabb_matching(&search, self.position(), |candidate| {
-                candidate.uuid() != self.uuid()
-                    && candidate.as_monster().is_some()
-                    && candidate.as_living_entity().is_some_and(|living| {
-                        Mob::can_attack(self, living) && !self.is_allied_with(candidate)
+        let (mode, post, focus) = {
+            let orders = self.mob_base().allied_orders.lock();
+            (
+                orders.mode,
+                orders.post,
+                orders.focus.as_ref().and_then(WeakEntity::upgrade),
+            )
+        };
+        let owner_position = owner.position();
+        // Holding allies guard their post; everyone else guards the owner.
+        let (center, radius) = match (mode, post) {
+            (AlliedMode::Hold, Some(post)) => (post, ALLIED_HOLD_RADIUS),
+            _ => (owner_position, ALLIED_GUARD_RADIUS),
+        };
+        let within = |entity: &SharedEntity, center: DVec3, radius: f64| {
+            entity.position().distance_squared(center) <= radius * radius
+        };
+
+        let target = if mode == AlliedMode::Passive {
+            None
+        } else {
+            // An order from the owner wins over anything the ally chose itself.
+            let ordered = focus.filter(|focus| {
+                self.allied_may_fight(focus.as_ref())
+                    && within(focus, owner_position, ALLIED_FOCUS_RANGE)
+            });
+            if ordered.is_none() {
+                self.mob_base().allied_orders.lock().focus = None;
+            }
+            ordered
+                .or_else(|| {
+                    self.target().filter(|target| {
+                        target.as_monster().is_some()
+                            && self.allied_may_fight(target.as_ref())
+                            && within(target, center, radius + 4.0)
                     })
-            })
-        });
+                })
+                .or_else(|| {
+                    let search = WorldAabb::of_size(center, radius * 2.0, radius, radius * 2.0);
+                    world.nearest_entity_in_aabb_matching(&search, center, |candidate| {
+                        candidate.as_monster().is_some() && self.allied_may_fight(candidate)
+                    })
+                })
+        };
         if let Some(target) = target {
             let _ = self.set_target(Some(&target));
             return;
         }
         self.set_target(None);
 
-        if self.tick_count() % 10 != 0
-            || self.position().distance_squared(owner.position()) <= 4.0 * 4.0
+        if self.tick_count() % 10 != 0 {
+            return;
+        }
+        let home = match (mode, post) {
+            (AlliedMode::Hold, Some(post)) => post,
+            _ => owner_position,
+        };
+        let distance = self.position().distance_squared(home);
+        if mode != AlliedMode::Hold
+            && distance > ALLIED_TELEPORT_DISTANCE * ALLIED_TELEPORT_DISTANCE
         {
+            if let Some(pathfinder) = self.as_pathfinder_mob() {
+                pathfinder.mob_base().navigation().lock().stop();
+            }
+            let _ = self.teleport_to(owner_position);
+            return;
+        }
+        if distance <= ALLIED_FOLLOW_DISTANCE * ALLIED_FOLLOW_DISTANCE {
             return;
         }
         if let Some(pathfinder) = self.as_pathfinder_mob() {
-            pathfinder.move_to_pos(owner.position(), 1.2);
+            pathfinder.move_to_pos(home, 1.2);
         }
     }
 
@@ -506,6 +654,14 @@ pub trait Mob: LivingEntity + Leashable {
         if target
             .as_player()
             .is_some_and(|player| player.has_infinite_materials() || player.is_spectator())
+        {
+            return false;
+        }
+
+        if let Some(world) = self.level()
+            && world
+                .gameplay_hooks
+                .are_mobs_allied(&world, self.id(), target.id())
         {
             return false;
         }
@@ -1711,6 +1867,10 @@ pub trait Mob: LivingEntity + Leashable {
     /// Damages sun-protective gear on a successful burn roll, or ignites
     /// the mob if the slot is empty.
     fn tick_daylight_burning(&self) {
+        // Runtime-owned allies are summoned bodies, not undead under the sun.
+        if self.allied_owner().is_some() {
+            return;
+        }
         if !LivingEntity::is_alive(self) || !self.is_sun_burn_tick() {
             return;
         }

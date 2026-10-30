@@ -3,14 +3,23 @@
 use std::sync::{Arc, Weak};
 
 use enum_dispatch::enum_dispatch;
+use glam::IVec3;
+use steel_registry::biome::BiomeRef;
+use steel_utils::random::RandomSource;
+use steel_utils::{BlockPos, ChunkPos};
 use steel_worldgen::density_functions::{
     end::EndNoises, nether::NetherNoises, overworld::OverworldNoises,
 };
+use steel_worldgen::noise::Beardifier;
 
+use crate::chunk::Chunk;
 use crate::world::World;
 use crate::worldgen::generator::{
-    ChunkGenerator, EmptyChunkGenerator, FlatChunkGenerator, VanillaGenerator,
+    ChunkGenerator, EmptyChunkGenerator, FlatChunkGenerator, GenerationChunk, TerrainPhase,
+    VanillaGenerator,
 };
+use crate::worldgen::region::WorldGenRegion;
+use crate::worldgen::structure::StructureGenerator;
 
 /// Type alias for overworld generator.
 pub type OverworldGenerator = VanillaGenerator<OverworldNoises>;
@@ -20,6 +29,88 @@ pub type NetherGenerator = VanillaGenerator<NetherNoises>;
 
 /// Type alias for end generator.
 pub type EndGenerator = VanillaGenerator<EndNoises>;
+
+/// Owned trait-object adapter used by custom world generators.
+pub struct DynamicChunkGenerator(Box<dyn ChunkGenerator>);
+
+impl DynamicChunkGenerator {
+    /// Wraps a custom generator for use in [`ChunkGeneratorType`].
+    #[must_use]
+    pub fn new(generator: impl ChunkGenerator + 'static) -> Self {
+        Self(Box::new(generator))
+    }
+}
+
+impl ChunkGenerator for DynamicChunkGenerator {
+    fn min_y(&self) -> i32 {
+        self.0.min_y()
+    }
+
+    fn gen_depth(&self) -> i32 {
+        self.0.gen_depth()
+    }
+
+    fn noise_biome(&self, quart_x: i32, quart_y: i32, quart_z: i32) -> BiomeRef {
+        self.0.noise_biome(quart_x, quart_y, quart_z)
+    }
+
+    fn initial_spawn_search_origin(&self) -> BlockPos {
+        self.0.initial_spawn_search_origin()
+    }
+
+    fn spawn_height(&self, min_y: i32, height: i32) -> i32 {
+        self.0.spawn_height(min_y, height)
+    }
+
+    fn structure_generator(&self) -> Option<&StructureGenerator> {
+        self.0.structure_generator()
+    }
+
+    fn create_structures(&self, chunk: &Chunk) {
+        self.0.create_structures(chunk);
+    }
+
+    fn create_biomes(&self, chunk: &Chunk) {
+        self.0.create_biomes(chunk);
+    }
+
+    fn build_terrain(
+        &self,
+        chunk: GenerationChunk<'_, TerrainPhase>,
+        beardifier: Option<&Beardifier>,
+        neighbor_biomes: &dyn Fn(IVec3) -> u16,
+    ) {
+        self.0.build_terrain(chunk, beardifier, neighbor_biomes);
+    }
+
+    fn fill_from_noise(
+        &self,
+        chunk: GenerationChunk<'_, TerrainPhase>,
+        beardifier: Option<&Beardifier>,
+    ) {
+        self.0.fill_from_noise(chunk, beardifier);
+    }
+
+    fn build_surface(
+        &self,
+        chunk: GenerationChunk<'_, TerrainPhase>,
+        neighbor_biomes: &dyn Fn(IVec3) -> u16,
+    ) {
+        self.0.build_surface(chunk, neighbor_biomes);
+    }
+
+    fn apply_carvers(&self, chunk: GenerationChunk<'_, TerrainPhase>) {
+        self.0.apply_carvers(chunk);
+    }
+
+    fn create_worldgen_region_random(&self, world_seed: i64, center: ChunkPos) -> RandomSource {
+        self.0.create_worldgen_region_random(world_seed, center)
+    }
+
+    fn apply_biome_decorations(&self, region: &mut WorldGenRegion<'_>) {
+        self.0.apply_biome_decorations(region);
+    }
+}
 
 #[expect(
     missing_docs,
@@ -32,7 +123,7 @@ pub enum ChunkGeneratorType {
     Overworld(OverworldGenerator),
     Nether(NetherGenerator),
     End(EndGenerator),
-    //Custom(Box<dyn ChunkGenerator>),
+    Custom(DynamicChunkGenerator),
 }
 
 /// Context for world generation.

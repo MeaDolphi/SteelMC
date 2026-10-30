@@ -23,6 +23,7 @@ use crate::behavior::{BLOCK_BEHAVIORS, BlockLootContext};
 use crate::block_entity::BlockEntity;
 use crate::entity::{Entity, LivingEntity};
 use crate::fluid::fluid_state_to_block;
+use crate::gameplay_hooks::BlockMutationCause;
 use crate::player::Player;
 use crate::player::food_data::food_constants;
 use crate::world::{ConditionalBlockSetResult, World, game_event::GameEventContext};
@@ -404,11 +405,12 @@ impl BlockBreakingManager {
         // Vanilla removes the live state after `playerWillDestroy`; tripwire uses
         // that callback to set DISARMED before the same block is removed.
         let removed_by_player_break = !state_after_player_will_destroy.is_air()
-            && world.set_block_if_unchanged(
+            && world.set_block_if_unchanged_with_cause(
                 pos,
                 state_after_player_will_destroy,
                 replacement,
                 UpdateFlags::UPDATE_ALL,
+                BlockMutationCause::PlayerBreak,
             ) == ConditionalBlockSetResult::Changed;
         let changed_by_player_will_destroy = state_after_player_will_destroy != state;
         let changed = changed_by_player_will_destroy || removed_by_player_break;

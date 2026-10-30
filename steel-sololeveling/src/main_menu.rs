@@ -15,12 +15,17 @@ use text_components::format::Color;
 use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
-use crate::commands::auction::board;
-use crate::guild_bank;
+use crate::auction_menu;
+use crate::class_menu;
+use crate::guild_menu;
 use crate::hunter_stats_menu;
 use crate::item::{named, with_lore};
 use crate::organization_menu;
+use crate::party_menu;
+use crate::pay_menu;
+use crate::shadow_menu;
 use crate::shop_menu;
+use crate::sound::SystemSound;
 use crate::state::SoloLevelingState;
 
 const MENU_SLOTS: usize = 27;
@@ -37,10 +42,14 @@ enum Category {
     Shadows,
     Auction,
     Crystals,
+    Enchanting,
+    Class,
+    Pay,
+    Gear,
 }
 
 /// Categories and the menu slot each one sits in.
-const CATEGORIES: [(usize, Category); 8] = [
+const CATEGORIES: [(usize, Category); 12] = [
     (10, Category::Hunter),
     (11, Category::Shop),
     (12, Category::Contracts),
@@ -49,6 +58,10 @@ const CATEGORIES: [(usize, Category); 8] = [
     (15, Category::Shadows),
     (16, Category::Auction),
     (22, Category::Crystals),
+    (23, Category::Enchanting),
+    (21, Category::Class),
+    (20, Category::Pay),
+    (24, Category::Gear),
 ];
 
 fn category_at(slot: usize) -> Option<Category> {
@@ -68,6 +81,10 @@ impl Category {
             Self::Shadows => &vanilla_items::WITHER_SKELETON_SKULL,
             Self::Auction => &vanilla_items::GOLD_INGOT,
             Self::Crystals => &vanilla_items::AMETHYST_SHARD,
+            Self::Enchanting => &vanilla_items::ENCHANTING_TABLE,
+            Self::Class => &vanilla_items::IRON_SWORD,
+            Self::Pay => &vanilla_items::GOLD_NUGGET,
+            Self::Gear => &vanilla_items::ARMOR_STAND,
         }
     }
 
@@ -81,6 +98,10 @@ impl Category {
             Self::Shadows => "Армия теней",
             Self::Auction => "Аукцион",
             Self::Crystals => "Продать кристаллы",
+            Self::Enchanting => "Зачарование",
+            Self::Class => "Класс",
+            Self::Pay => "Перевод Won",
+            Self::Gear => "Снаряжение",
         }
     }
 
@@ -92,11 +113,24 @@ impl Category {
                 "Взятые задания Организации и прогресс.",
                 "Брать и сдавать — у доски Организации.",
             ],
-            Self::Guild => &["ЛКМ — сведения о гильдии.", "ПКМ — банк гильдии."],
-            Self::Party => &["Состав группы.", "/party invite <ник> — пригласить."],
-            Self::Shadows => &["ЛКМ — призвать всех теней.", "ПКМ — отозвать теней."],
-            Self::Auction => &["Лоты в чат.", "/auction — торговля и ставки."],
+            Self::Guild => &[
+                "Основать гильдию, участники и ранги,",
+                "банк и взносы в казну.",
+            ],
+            Self::Party => &["Состав группы, приглашения", "и выход из группы."],
+            Self::Shadows => &["Армия, призыв, отзыв", "и прокачка теней."],
+            Self::Auction => &["Покупка, ставки и продажа", "предмета из руки."],
             Self::Crystals => &["Продать все магические кристаллы", "Организации за Won."],
+            Self::Enchanting => &[
+                "Выбрать артефакт и зачаровать его.",
+                "Недостатки дают очки, силы стоят Won.",
+            ],
+            Self::Class => &["Выбрать класс охотника.", "Бонусы классов и правила смены."],
+            Self::Pay => &["Перевести Won охотнику онлайн."],
+            Self::Gear => &[
+                "Шлем, броня, перчатки, кольца, амулет:",
+                "бонусы артефактов без надевания.",
+            ],
         }
     }
 
@@ -116,6 +150,7 @@ impl Category {
 
 /// Opens the main menu for an online hunter.
 pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
+    SystemSound::Open.play(player);
     player.open_menu(
         TextComponent::plain("Система").color(Color::Aqua),
         move |context| build(context.container_id, context.player, state),
@@ -179,99 +214,34 @@ unsafe impl DowncastType for MainMenuKind {
 }
 
 impl MainMenuKind {
-    fn act(&self, category: Category, secondary: bool, player: &Player) {
+    fn act(&self, category: Category, player: &Player) {
         let state = &self.state;
         let uuid = player.gameprofile.id();
         match category {
             Category::Hunter => hunter_stats_menu::open(player, Arc::clone(state)),
             Category::Shop => shop_menu::open(player, Arc::clone(state)),
             Category::Contracts => organization_menu::open_view(player, Arc::clone(state)),
-            Category::Guild if secondary => {
-                if let Err(error) = guild_bank::open(player, Arc::clone(state)) {
-                    tell(player, error.message(), Color::Red);
-                }
-            }
-            Category::Guild => match state.guild_of(uuid) {
-                Some(guild) => tell(
-                    player,
-                    &format!(
-                        "{}: уровень {}, участников {}/50, казна {} Won.",
-                        guild.name,
-                        guild.level,
-                        guild.members.len(),
-                        guild.treasury.amount()
-                    ),
-                    Color::Gold,
-                ),
-                None => tell(
-                    player,
-                    "Вы не состоите в гильдии. /guild create <название> — основать.",
-                    Color::Gray,
-                ),
-            },
-            Category::Party => match state.party_of(uuid) {
-                Some(party) => {
-                    let names: Vec<String> = party
-                        .members()
-                        .iter()
-                        .map(|member| {
-                            let name = player_name(player, *member);
-                            if *member == party.leader() {
-                                format!("{name} (лидер)")
-                            } else {
-                                name
-                            }
-                        })
-                        .collect();
-                    tell(
-                        player,
-                        &format!("Группа: {}.", names.join(", ")),
-                        Color::Gold,
-                    );
-                }
-                None => tell(
-                    player,
-                    "Вы не в группе. /party invite <ник> — собрать группу.",
-                    Color::Gray,
-                ),
-            },
-            Category::Shadows if secondary => {
-                let recalled = state.recall_shadows(uuid);
-                tell(
-                    player,
-                    &format!("Отозвано теней: {recalled}."),
-                    Color::DarkPurple,
-                );
-            }
-            Category::Shadows => match state.summon_all_shadows(player) {
-                Some(count) => tell(
-                    player,
-                    &format!("Призвано теней: {count}."),
-                    Color::DarkPurple,
-                ),
-                None => tell(player, "Призвать теней сейчас нельзя.", Color::Red),
-            },
-            Category::Auction => tell(player, &board(&state.auction_lots()), Color::Yellow),
+            Category::Guild => guild_menu::open(player, Arc::clone(state)),
+            Category::Party => party_menu::open(player, Arc::clone(state)),
+            Category::Shadows => shadow_menu::open(player, Arc::clone(state)),
+            Category::Auction => auction_menu::open(player, Arc::clone(state)),
             // The menu callback owns the inventory lock, so request the sale
             // for the next player tick instead of scanning the inventory here.
             Category::Crystals => {
                 state.defer_crystal_sale(uuid);
                 tell(player, "Продажа кристаллов запрошена.", Color::Gold);
             }
+            // The item maker reads the main hand, which this callback has locked.
+            Category::Enchanting => state.defer_enchant_menu(uuid),
+            Category::Class => class_menu::open(player, Arc::clone(state)),
+            Category::Pay => pay_menu::open(player, Arc::clone(state)),
+            Category::Gear => state.defer_gear_menu(uuid),
         }
     }
 }
 
 fn tell(player: &Player, text: &str, color: Color) {
     player.send_message(&TextComponent::plain(text.to_owned()).color(color));
-}
-
-/// Returns the name of an online member, or a short id for anyone else.
-fn player_name(viewer: &Player, member: Uuid) -> String {
-    viewer.get_world().players.get_by_uuid(&member).map_or_else(
-        || member.to_string().chars().take(8).collect(),
-        |player| player.gameprofile.name().to_owned(),
-    )
 }
 
 impl MenuKind for MainMenuKind {
@@ -282,7 +252,7 @@ impl MenuKind for MainMenuKind {
         click: Click,
         player: &Player,
     ) -> ClickOutcome {
-        let Click::Pickup { slot, button } = click else {
+        let Click::Pickup { slot, .. } = click else {
             return if click.slot().is_some_and(|slot| self.buttons.contains(slot)) {
                 ClickOutcome::Consume
             } else {
@@ -293,7 +263,7 @@ impl MenuKind for MainMenuKind {
             return ClickOutcome::Fallthrough;
         }
         if let Some(category) = category_at(slot - self.buttons.start()) {
-            self.act(category, button != MouseButton::Left, player);
+            self.act(category, player);
         }
         ClickOutcome::Consume
     }

@@ -687,6 +687,13 @@ pub trait LivingEntity: Entity {
         if self.is_invulnerable_to(world, source) {
             return false;
         }
+        if let Some(victim) = self.as_living_entity()
+            && !world
+                .gameplay_hooks
+                .allow_living_entity_damage(world, victim, source)
+        {
+            return false;
+        }
         if self.is_dead_or_dying() {
             return false;
         }

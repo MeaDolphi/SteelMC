@@ -163,7 +163,16 @@ impl SqlitePlayerDataStorage {
         &self,
         transaction: &PlayerStorageTransaction,
     ) -> io::Result<TransactionCommit> {
-        let mut tx = self.pool.begin().await.map_err(storage_error)?;
+        // The compare-and-swap reads before it writes. A deferred transaction
+        // would take only a read lock first, and SQLite refuses to upgrade it
+        // with SQLITE_BUSY as soon as another connection has written, without
+        // waiting for the busy timeout. Taking the write lock up front makes
+        // concurrent commits queue on the busy timeout instead.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(storage_error)?;
         for extension in &transaction.extensions {
             let current = sqlx::query(
                 "SELECT payload FROM gameplay_documents WHERE namespace = ? AND path = ?",
@@ -321,24 +330,67 @@ fn storage_error(error: sqlx::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use std::env;
+    use std::sync::Arc;
+
+    use futures::future::join_all;
 
     use super::*;
     use crate::player::player_data_storage::transaction::ExtensionStorageWrite;
 
-    #[tokio::test]
-    async fn extension_compare_and_swap_survives_reopening_the_database() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_commits_wait_for_the_write_lock_instead_of_failing() {
         let path = env::temp_dir().join(format!("steel-player-data-{}.sqlite", Uuid::new_v4()));
-        let key = Identifier::new_static("test", "document");
+        let storage = Arc::new(
+            SqlitePlayerDataStorage::open(path.clone())
+                .await
+                .expect("open SQLite storage"),
+        );
+        let commits = (0..32).map(|index| {
+            let storage = Arc::clone(&storage);
+            tokio::spawn(async move {
+                let transaction = PlayerStorageTransaction {
+                    players: Vec::new(),
+                    extensions: vec![ExtensionStorageWrite {
+                        key: Identifier::new("test", format!("document_{index}")),
+                        expected: None,
+                        replacement: vec![1],
+                    }],
+                };
+                storage.commit_transaction(&transaction).await
+            })
+        });
+        for commit in join_all(commits).await {
+            assert_eq!(
+                commit.expect("task").expect("commit"),
+                TransactionCommit::Committed
+            );
+        }
+        drop(storage);
+        fs::remove_file(path).await.expect("remove test database");
+    }
+
+    #[tokio::test]
+    async fn document_batch_is_atomic_and_survives_reopening_the_database() {
+        let path = env::temp_dir().join(format!("steel-player-data-{}.sqlite", Uuid::new_v4()));
+        let account = Identifier::new_static("test", "account");
+        let registry = Identifier::new_static("test", "registry");
         let storage = SqlitePlayerDataStorage::open(path.clone())
             .await
             .expect("open SQLite storage");
         let transaction = PlayerStorageTransaction {
             players: Vec::new(),
-            extensions: vec![ExtensionStorageWrite {
-                key: key.clone(),
-                expected: None,
-                replacement: b"first".to_vec(),
-            }],
+            extensions: vec![
+                ExtensionStorageWrite {
+                    key: account.clone(),
+                    expected: None,
+                    replacement: b"account-v1".to_vec(),
+                },
+                ExtensionStorageWrite {
+                    key: registry.clone(),
+                    expected: None,
+                    replacement: b"registry-v1".to_vec(),
+                },
+            ],
         };
         assert_eq!(
             storage
@@ -353,16 +405,33 @@ mod tests {
             .await
             .expect("reopen SQLite storage");
         assert_eq!(
-            storage.load_extension(&key).await.expect("load document"),
-            Some(b"first".to_vec())
+            storage
+                .load_extension(&account)
+                .await
+                .expect("load account"),
+            Some(b"account-v1".to_vec())
+        );
+        assert_eq!(
+            storage
+                .load_extension(&registry)
+                .await
+                .expect("load registry"),
+            Some(b"registry-v1".to_vec())
         );
         let conflict = PlayerStorageTransaction {
             players: Vec::new(),
-            extensions: vec![ExtensionStorageWrite {
-                key: key.clone(),
-                expected: Some(b"stale".to_vec()),
-                replacement: b"second".to_vec(),
-            }],
+            extensions: vec![
+                ExtensionStorageWrite {
+                    key: account.clone(),
+                    expected: Some(b"account-v1".to_vec()),
+                    replacement: b"account-v2".to_vec(),
+                },
+                ExtensionStorageWrite {
+                    key: registry.clone(),
+                    expected: Some(b"stale".to_vec()),
+                    replacement: b"registry-v2".to_vec(),
+                },
+            ],
         };
         assert_eq!(
             storage
@@ -373,8 +442,18 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
         assert_eq!(
-            storage.load_extension(&key).await.expect("load document"),
-            Some(b"first".to_vec())
+            storage
+                .load_extension(&account)
+                .await
+                .expect("load account"),
+            Some(b"account-v1".to_vec())
+        );
+        assert_eq!(
+            storage
+                .load_extension(&registry)
+                .await
+                .expect("load registry"),
+            Some(b"registry-v1".to_vec())
         );
         drop(storage);
         fs::remove_file(path).await.expect("remove test database");

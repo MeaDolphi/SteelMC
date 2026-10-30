@@ -108,10 +108,14 @@ pub enum AuctionRequest {
 pub struct LotView {
     /// Identifier used by `/auction buy`, `bid`, and `cancel`.
     pub id: u64,
+    /// Seller, so a menu can tell a hunter's own lots apart.
+    pub seller: Uuid,
     /// Seller name captured at listing time.
     pub seller_name: String,
     /// Display name of the escrowed stack.
     pub item_name: String,
+    /// Decoded escrowed item for the auction menu.
+    pub item: Option<ItemStack>,
     /// Stack size.
     pub count: i32,
     /// How the lot accepts buyers.
@@ -136,11 +140,13 @@ fn view(lot: &Lot, now: u64) -> LotView {
     let stack = nbt::decode(&lot.item).ok();
     LotView {
         id: lot.id,
+        seller: lot.seller,
         seller_name: lot.seller_name.clone(),
         item_name: stack
             .as_ref()
             .map_or_else(|| "неизвестный предмет".to_owned(), item_name),
         count: stack.as_ref().map_or(1, |stack| stack.count),
+        item: stack,
         kind: lot.kind,
         price: lot.price,
         bid: lot.bid.map(|bid| bid.amount),

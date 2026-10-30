@@ -12,6 +12,7 @@ const DEFAULT_RANDOM_INTERVAL: i32 = 10;
 enum TargetSearch {
     Players,
     Entities,
+    TankTaunt,
 }
 
 pub(crate) struct NearestAttackableTargetGoal {
@@ -71,6 +72,17 @@ impl NearestAttackableTargetGoal {
         )
     }
 
+    #[must_use]
+    pub(crate) fn new_for_tank_taunt() -> Self {
+        Self::new_with_options(
+            DEFAULT_RANDOM_INTERVAL,
+            true,
+            false,
+            |candidate, world| world.gameplay_hooks.is_tank_taunt_target(world, candidate),
+            TargetSearch::TankTaunt,
+        )
+    }
+
     fn new_with_options(
         random_interval: i32,
         must_see: bool,
@@ -113,6 +125,15 @@ impl NearestAttackableTargetGoal {
                         .is_some_and(|target| target_conditions.test(level, Some(mob), target))
                 })
             }
+            TargetSearch::TankTaunt if mob.allied_owner().is_none() => {
+                let search_box = mob.bounding_box().inflate_xyz(follow, follow, follow);
+                level.nearest_entity_in_aabb_matching(&search_box, origin, |entity| {
+                    entity
+                        .as_living_entity()
+                        .is_some_and(|target| target_conditions.test(level, Some(mob), target))
+                })
+            }
+            TargetSearch::TankTaunt => None,
         };
     }
 

@@ -405,6 +405,9 @@ pub struct GuildContract {
     /// Members whose actions were counted; each is paid once.
     #[serde(default)]
     pub contributors: Vec<Uuid>,
+    /// Runtime guard against duplicate settlements while the storage job runs.
+    #[serde(skip)]
+    pub pending_turn_in: bool,
 }
 
 /// A guild's contracts, today's allowance and payments still owed.
@@ -455,6 +458,7 @@ impl GuildBoard {
         self.contracts.push(GuildContract {
             contract: Contract::scaled(template, GUILD_SCALE),
             contributors: Vec::new(),
+            pending_turn_in: false,
         });
         Ok(())
     }
@@ -480,6 +484,9 @@ impl GuildBoard {
             .ok_or(OrganizationError::Missing)?;
         if !group.contract.is_complete() {
             return Err(OrganizationError::NotComplete);
+        }
+        if group.pending_turn_in {
+            return Err(OrganizationError::Storage);
         }
         let group = self.contracts.remove(index);
         let payment = group.contract.payment();

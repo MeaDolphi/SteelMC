@@ -879,6 +879,31 @@ mod tests {
         assert_eq!(validate_login_security(false, false), Ok(()));
     }
 
+    #[test]
+    fn sqlite_player_storage_accepts_only_a_clean_relative_database_path() {
+        let valid: StorageSelection = toml::from_str(
+            r#"
+type = "steel:sqlite"
+
+[config]
+path = "global/playerdata.sqlite"
+"#,
+        )
+        .expect("SQLite storage config");
+        assert_eq!(validate_player_storage_selection(&valid), Ok(()));
+
+        let invalid: StorageSelection = toml::from_str(
+            r#"
+type = "steel:sqlite"
+
+[config]
+path = "../playerdata.sqlite"
+"#,
+        )
+        .expect("parse SQLite storage config");
+        assert!(validate_player_storage_selection(&invalid).is_err());
+    }
+
     fn registries() -> (WorldGeneratorRegistry, WorldStorageRegistry) {
         init_vanilla_registry();
         let generators = WorldGeneratorRegistry::new_with_builtins()

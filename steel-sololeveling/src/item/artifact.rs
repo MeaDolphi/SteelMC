@@ -32,7 +32,9 @@ use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
 use super::binding;
+use super::enchantment::{self, Effect, Enchantment};
 use super::{named, read_kind, record, tag_string, with_lore, write_tag};
+use crate::gear::GearKind;
 use crate::identifier::from_sololeveling;
 use crate::rank::HunterRank;
 
@@ -40,6 +42,8 @@ use crate::rank::HunterRank;
 const KIND: &str = "artifact";
 /// Tag field holding the artifact id.
 const ID: &str = "id";
+/// Tag field holding the comma-separated enchantment list.
+const ENCHANTMENTS: &str = "enchantments";
 
 /// Artifact rarity, from the cheapest transferable to the strongest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -159,6 +163,24 @@ impl ArtifactId {
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
         ALL.into_iter().find(|artifact| artifact.name() == name)
+    }
+
+    /// Returns the System equipment slot this artifact goes into, or `None`
+    /// for weapons and tools, which are held instead.
+    #[must_use]
+    pub const fn gear_kind(self) -> Option<GearKind> {
+        match self {
+            Self::RedKnightsHelmet => Some(GearKind::Head),
+            Self::HighKnightsChestplate => Some(GearKind::Chest),
+            Self::AssassinsShoes => Some(GearKind::Feet),
+            Self::ArchersGloves | Self::HighKnightsGauntlet => Some(GearKind::Gloves),
+            Self::KasakasVenomFang
+            | Self::KnightsKiller
+            | Self::BarukasDagger
+            | Self::DemonKingsDaggers
+            | Self::DemonKingsLongsword
+            | Self::CrystalPickaxe => None,
+        }
     }
 
     /// Returns the catalog entry of this artifact.
@@ -563,7 +585,7 @@ static CRYSTAL_PICKAXE: Artifact = Artifact {
     category: Category::Weapon,
     holder: &vanilla_items::NETHERITE_PICKAXE,
     modifiers: &CRYSTAL_PICKAXE_MODIFIERS,
-    abilities: &[Ability::CrystalLuck { percent: 25 }],
+    abilities: &[Ability::CrystalLuck { percent: 50 }],
 };
 
 /// Returns every weapon artifact of `rarity`.
@@ -594,6 +616,19 @@ pub fn armors_of(rarity: Rarity) -> Vec<ArtifactId> {
 /// transferable instance.
 #[must_use]
 pub fn stack(id: ArtifactId, owner: Option<Uuid>) -> ItemStack {
+    enchanted_stack(id, owner, &[])
+}
+
+/// Builds the item stack of one artifact carrying `enchantments`.
+///
+/// Enchanting rebuilds the stack from the catalog, so the binding is passed
+/// back in and survives.
+#[must_use]
+pub fn enchanted_stack(
+    id: ArtifactId,
+    owner: Option<Uuid>,
+    enchantments: &[Enchantment],
+) -> ItemStack {
     let artifact = id.artifact();
     let lines = artifact
         .modifiers
@@ -609,10 +644,40 @@ pub fn stack(id: ArtifactId, owner: Option<Uuid>) -> ItemStack {
         .chain(artifact.abilities.iter().map(|ability| {
             TextComponent::plain(describe_ability(*ability)).color(Color::LightPurple)
         }))
+        .chain(enchantments.iter().map(|enchantment| {
+            TextComponent::plain(format!(
+                "{}: {}",
+                enchantment.display_name(),
+                enchantment.describe()
+            ))
+            .color(if enchantment.is_side_effect() {
+                Color::Red
+            } else {
+                Color::Blue
+            })
+        }))
         .chain([
             TextComponent::plain(format!("Редкость: {}", artifact.rarity.display_name()))
                 .color(artifact.rarity.color()),
         ])
+        .chain(
+            owner
+                .is_none()
+                .then(|| artifact.rarity.transferable_minimum_rank())
+                .flatten()
+                .map(|rank| {
+                    TextComponent::plain(format!("Без привязки работает с ранга {}", rank.name()))
+                        .color(Color::Yellow)
+                }),
+        )
+        .chain((!enchantments.is_empty()).then(|| {
+            TextComponent::plain(format!(
+                "Очки зачарования: {} / {}",
+                enchantment::points_used(enchantments),
+                enchantment::budget(artifact.rarity)
+            ))
+            .color(Color::DarkAqua)
+        }))
         .collect::<Vec<_>>();
 
     let mut stack = named(
@@ -620,12 +685,20 @@ pub fn stack(id: ArtifactId, owner: Option<Uuid>) -> ItemStack {
         TextComponent::plain(artifact.name.to_owned()).color(artifact.rarity.color()),
     );
     stack = with_lore(stack, lines);
-    if !artifact.modifiers.is_empty() {
-        stack.set(ATTRIBUTE_MODIFIERS, modifiers_component(artifact));
+    let modifiers = modifiers_component(artifact, enchantments);
+    if !modifiers.modifiers.is_empty() {
+        stack.set(ATTRIBUTE_MODIFIERS, modifiers);
+    }
+    super::model::apply(&mut stack, &format!("artifact/{}", id.name()));
+    if artifact.category == Category::Armor {
+        super::model::apply_equipment(&mut stack, id.name());
     }
     let mut fields = record(KIND);
     fields.insert(ID, id.name().to_owned());
     fields.insert("rarity", artifact.rarity.name().to_owned());
+    if !enchantments.is_empty() {
+        fields.insert(ENCHANTMENTS, enchantment::encode(enchantments));
+    }
     write_tag(&mut stack, fields);
     if let Some(owner) = owner {
         binding::bind(&mut stack, owner);
@@ -640,6 +713,14 @@ pub fn of(stack: &ItemStack) -> Option<ArtifactId> {
     ArtifactId::from_name(&tag_string(&tag, ID)?)
 }
 
+/// Returns the enchantments laid on an artifact stack.
+#[must_use]
+pub fn enchantments_of(stack: &ItemStack) -> Vec<Enchantment> {
+    read_kind(stack, KIND)
+        .and_then(|tag| tag_string(&tag, ENCHANTMENTS))
+        .map_or_else(Vec::new, |stored| enchantment::decode(&stored))
+}
+
 /// Returns the rarity of an artifact stack, falling back to the catalog.
 #[must_use]
 pub fn rarity_of(stack: &ItemStack) -> Option<Rarity> {
@@ -648,6 +729,16 @@ pub fn rarity_of(stack: &ItemStack) -> Option<Rarity> {
     tag_string(&tag, "rarity")
         .and_then(|name| Rarity::from_name(&name))
         .or(Some(id.artifact().rarity))
+}
+
+/// Returns the rank a hunter needs to use `stack`, or `None` when anyone can.
+#[must_use]
+pub fn required_rank(stack: &ItemStack) -> Option<HunterRank> {
+    let id = of(stack)?;
+    if binding::bound_owner(stack).is_some() {
+        return None;
+    }
+    id.artifact().rarity.transferable_minimum_rank()
 }
 
 /// Returns whether a hunter of `rank` may use `stack`.
@@ -697,7 +788,33 @@ pub fn ability_of(stack: &ItemStack, key: &str) -> Option<Ability> {
         .find(|ability| ability.cooldown_key() == key)
 }
 
-fn modifiers_component(artifact: &'static Artifact) -> ItemAttributeModifiers {
+fn modifiers_component(
+    artifact: &'static Artifact,
+    enchantments: &[Enchantment],
+) -> ItemAttributeModifiers {
+    let slot = enchantment_slot(artifact);
+    let enchanted = enchantments.iter().filter_map(|enchantment| {
+        let Effect::Attribute {
+            attribute,
+            amount,
+            operation,
+        } = enchantment.effect()
+        else {
+            return None;
+        };
+        Some(ItemAttributeModifierEntry {
+            attribute,
+            id: from_sololeveling(format!(
+                "artifact/{}/enchantment/{}",
+                artifact.id.name(),
+                enchantment.name()
+            )),
+            amount,
+            operation,
+            slot,
+            display: ItemAttributeModifierDisplay::Default,
+        })
+    });
     ItemAttributeModifiers {
         modifiers: artifact
             .modifiers
@@ -710,7 +827,21 @@ fn modifiers_component(artifact: &'static Artifact) -> ItemAttributeModifiers {
                 slot: modifier.slot,
                 display: ItemAttributeModifierDisplay::Default,
             })
+            .chain(enchanted)
             .collect(),
+    }
+}
+
+/// Weapons enchant the main hand; armor enchants the slot it is worn in.
+fn enchantment_slot(artifact: &Artifact) -> EquipmentSlotGroup {
+    match artifact.category {
+        Category::Weapon => ATTACK,
+        Category::Armor => artifact
+            .modifiers
+            .iter()
+            .map(|modifier| modifier.slot)
+            .next()
+            .unwrap_or(EquipmentSlotGroup::Armor),
     }
 }
 
@@ -804,6 +935,7 @@ pub fn describe_ability(ability: Ability) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use steel_registry::data_components::vanilla_components::LORE;
 
     #[test]
     fn only_epic_and_above_artifacts_have_abilities() {
@@ -838,6 +970,33 @@ mod tests {
         assert!(usable_by(&personal, HunterRank::E));
         assert!(!usable_by(&transferable, HunterRank::E));
         assert!(usable_by(&transferable, HunterRank::A));
+        assert_eq!(required_rank(&transferable), Some(HunterRank::A));
+        assert_eq!(required_rank(&personal), None);
+        let lore = format!("{:?}", transferable.get(LORE));
+        assert!(lore.contains("Без привязки работает с ранга A"), "{lore}");
+        let lore = format!("{:?}", personal.get(LORE));
+        assert!(!lore.contains("Без привязки"), "{lore}");
+    }
+
+    #[test]
+    fn enchanting_keeps_the_binding_and_adds_its_modifiers() {
+        let owner = Uuid::new_v4();
+        let applied = [Enchantment::Protection, Enchantment::Frail];
+        let stack = enchanted_stack(ArtifactId::AssassinsShoes, Some(owner), &applied);
+        assert_eq!(of(&stack), Some(ArtifactId::AssassinsShoes));
+        assert_eq!(binding::bound_owner(&stack), Some(owner));
+        assert_eq!(enchantments_of(&stack), applied);
+        let modifiers = stack.get(ATTRIBUTE_MODIFIERS).expect("modifiers");
+        assert_eq!(
+            modifiers.modifiers.len(),
+            ASSASSIN_SHOES_MODIFIERS.len() + applied.len()
+        );
+        assert!(
+            modifiers
+                .modifiers
+                .iter()
+                .all(|modifier| modifier.slot == FEET)
+        );
     }
 
     #[test]

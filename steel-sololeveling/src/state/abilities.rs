@@ -27,8 +27,10 @@ use uuid::Uuid;
 use super::SoloLevelingState;
 use crate::abilities::{self, AbilityEffect};
 use crate::dungeon::runtime::find_player;
+use crate::gear;
 use crate::identifier::from_sololeveling;
 use crate::item::artifact::{self, Ability, Category};
+use crate::item::enchantment::{self, Effect};
 
 /// Milliseconds between two storm damage pulses.
 const STORM_PULSE_MILLIS: u64 = 1_000;
@@ -94,6 +96,70 @@ impl SoloLevelingState {
         if usable { artifact.abilities } else { &[] }
     }
 
+    /// Returns the abilities of the System gear `player` can use.
+    fn gear_abilities(&self, player: &Player) -> Vec<Ability> {
+        self.with_session_mut(player.gameprofile.id(), |session| {
+            gear::abilities(&session.gear, session.stats.rank())
+        })
+        .unwrap_or_default()
+    }
+
+    /// Forgets the bonuses applied to a player entity that was replaced, as
+    /// after a respawn, so the next tick applies them to the new one.
+    pub fn reset_gear_bonuses(&self, uuid: Uuid) {
+        self.with_session_mut(uuid, |session| {
+            session.gear_applied.clear();
+            session.gear_dirty = true;
+        });
+    }
+
+    /// Applies the attribute bonuses of the System gear, replacing the last
+    /// ones; runs when the gear changed and now and then for rank changes.
+    fn refresh_gear(&self, player: &Player) {
+        let uuid = player.gameprofile.id();
+        let periodic = player.tick_count() % 100 == 0;
+        let Some((items, rank, previous)) = self
+            .with_session_mut(uuid, |session| {
+                if !session.gear_dirty && !periodic {
+                    return None;
+                }
+                session.gear_dirty = false;
+                Some((
+                    session.gear.clone(),
+                    session.stats.rank(),
+                    mem::take(&mut session.gear_applied),
+                ))
+            })
+            .flatten()
+        else {
+            return;
+        };
+        let bonuses = gear::modifiers(&items, rank);
+        let applied = bonuses
+            .iter()
+            .map(|(attribute, modifier)| (*attribute, modifier.id.clone()))
+            .collect::<Vec<_>>();
+        {
+            let mut attributes = player.attributes().lock();
+            for (attribute, id) in &previous {
+                if !applied
+                    .iter()
+                    .any(|(kept, kept_id)| kept.key == attribute.key && kept_id == id)
+                {
+                    attributes.remove_modifier(attribute, id);
+                }
+            }
+            for (attribute, modifier) in bonuses {
+                attributes.set_modifier(attribute, modifier, false);
+            }
+        }
+        // Lower maximum health must not leave health above it.
+        if player.get_health() > player.get_max_health() {
+            player.set_health(player.get_max_health());
+        }
+        self.with_session_mut(uuid, |session| session.gear_applied = applied);
+    }
+
     /// Adjusts damage before vanilla armor runs, for both sides of a hit.
     pub fn artifact_damage(
         &self,
@@ -129,14 +195,14 @@ impl SoloLevelingState {
             }
         }
         if let Some(player) = victim.as_player() {
-            let chest = self.slot_abilities(player, EquipmentSlot::Chest);
-            if !chest.is_empty() {
+            let gear = self.gear_abilities(player);
+            if !gear.is_empty() {
                 let fraction = victim.get_health() / victim.get_max_health().max(1.0);
                 let now = abilities::now_millis();
                 damage = self
                     .with_session_mut(player.gameprofile.id(), |session| {
                         abilities::incoming_damage(
-                            chest,
+                            &gear,
                             &mut session.cooldowns,
                             &mut session.abilities,
                             fraction,
@@ -151,15 +217,16 @@ impl SoloLevelingState {
     }
 
     /// Triggers on-hit abilities after a melee hit that took health.
-    pub fn artifact_hit(&self, victim: &dyn LivingEntity, source: &DamageSource) {
+    pub fn artifact_hit(&self, victim: &dyn LivingEntity, source: &DamageSource, amount: f32) {
         let Some(attacker) = melee_player(source) else {
             return;
         };
+        self.enchantment_hit(attacker, amount);
         let uuid = attacker.gameprofile.id();
         let mut held = self
             .slot_abilities(attacker, EquipmentSlot::MainHand)
             .to_vec();
-        held.extend_from_slice(self.slot_abilities(attacker, EquipmentSlot::Chest));
+        held.extend(self.gear_abilities(attacker));
         if held.is_empty() {
             return;
         }
@@ -178,6 +245,37 @@ impl SoloLevelingState {
         self.queue_ability_save(uuid);
     }
 
+    /// Applies the on-hit enchantments of the wielded weapon.
+    ///
+    /// Recoil is applied straight to health rather than as damage, so it can
+    /// never kill, never trigger another hook, and never count as a hit.
+    fn enchantment_hit(&self, attacker: &Player, amount: f32) {
+        let weapon = equipped(attacker, EquipmentSlot::MainHand);
+        if artifact::held(&weapon).is_none_or(|artifact| artifact.category != Category::Weapon)
+            || !self
+                .hunter_rank(attacker.gameprofile.id())
+                .is_some_and(|rank| artifact::usable_by(&weapon, rank))
+        {
+            return;
+        }
+        let mut health = attacker.get_health();
+        for enchantment in artifact::enchantments_of(&weapon) {
+            match enchantment.effect() {
+                Effect::Lifesteal => {
+                    health = (health + amount.max(0.0) * enchantment::LIFESTEAL_FRACTION)
+                        .min(attacker.get_max_health());
+                }
+                Effect::Recoil => {
+                    health = (health - enchantment::RECOIL_DAMAGE).max(1.0);
+                }
+                Effect::Attribute { .. } => {}
+            }
+        }
+        if (health - attacker.get_health()).abs() > f32::EPSILON {
+            attacker.set_health(health);
+        }
+    }
+
     /// Survives a lethal hit with the Red Knight's Helmet.
     pub fn artifact_prevent_death(&self, victim: &dyn LivingEntity, source: &DamageSource) -> bool {
         if source.bypasses_invulnerability() {
@@ -186,15 +284,15 @@ impl SoloLevelingState {
         let Some(player) = victim.as_player() else {
             return false;
         };
-        let head = self.slot_abilities(player, EquipmentSlot::Head);
-        if head.is_empty() {
+        let gear = self.gear_abilities(player);
+        if gear.is_empty() {
             return false;
         }
         let uuid = player.gameprofile.id();
         let now = abilities::now_millis();
         let Some((health, shield)) = self
             .with_session_mut(uuid, |session| {
-                abilities::on_lethal(head, &mut session.cooldowns, &mut session.abilities, now)
+                abilities::on_lethal(&gear, &mut session.cooldowns, &mut session.abilities, now)
             })
             .flatten()
         else {
@@ -258,9 +356,11 @@ impl SoloLevelingState {
         }
     }
 
-    /// Ends expired effects and unequips armor above the wearer's rank.
+    /// Ends expired effects, applies the System gear and unequips armor
+    /// above the wearer's rank.
     pub fn tick_artifacts(&self, player: &Player) {
         let uuid = player.gameprofile.id();
+        self.refresh_gear(player);
         let now = abilities::now_millis();
         if let Some((speed, shields)) =
             self.with_session_mut(uuid, |session| session.abilities.expire(now))
@@ -277,6 +377,23 @@ impl SoloLevelingState {
         let Some(rank) = self.hunter_rank(uuid) else {
             return;
         };
+        // A weapon or tool above the holder's rank does nothing at all, which
+        // looks like a bug unless the holder is told why.
+        if player.tick_count() % 20 == 0 {
+            let held = equipped(player, EquipmentSlot::MainHand);
+            if let Some(required) = artifact::required_rank(&held)
+                && rank < required
+            {
+                player.send_action_bar(
+                    TextComponent::plain(format!(
+                        "Артефакт не действует: нужен ранг {}, ваш ранг {}",
+                        required.name(),
+                        rank.name()
+                    ))
+                    .color(Color::Red),
+                );
+            }
+        }
         for slot in ARMOR_SLOTS {
             let mut removed = None;
             player.with_equipment_slot_mut(slot, &mut |stack| {
@@ -286,8 +403,12 @@ impl SoloLevelingState {
             });
             if let Some(stack) = removed {
                 player.send_message(
-                    &TextComponent::plain("Ваш ранг слишком низок для этого артефакта: он снят.")
-                        .color(Color::Red),
+                    &TextComponent::plain(format!(
+                        "Ваш ранг {} слишком низок для этого артефакта (нужен {}): он снят.",
+                        rank.name(),
+                        artifact::required_rank(&stack).map_or("?", |required| required.name())
+                    ))
+                    .color(Color::Red),
                 );
                 player.add_item_or_drop(stack, Prediction::ServerOnly);
             }

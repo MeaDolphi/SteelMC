@@ -4,6 +4,8 @@
 //! queued snapshot cannot undo a payment that completed in the meantime.
 
 mod account;
+mod enchant;
+mod gear;
 use account::load_account;
 pub(crate) use account::{AccountUpdate, CommitReport, PreparedCommit};
 
@@ -21,24 +23,33 @@ use steel_core::{
     player::player_data_storage::transaction::ExtensionStorageWrite, server::Server,
 };
 use steel_registry::item_stack::ItemStack;
-use steel_utils::types::InteractionHand;
+use steel_utils::{Identifier, types::InteractionHand};
 use text_components::TextComponent;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-use super::SoloLevelingState;
 use super::auction::AuctionRequest;
 use super::organization::GroupPayout;
+use super::{EnchantTarget, SoloLevelingState};
 use crate::{
     combat_reward::HunterReward,
     daily,
     economy::PaymentError,
+    gear::GearTransfer,
+    guild::{GuildError, GuildRegistry},
     item::crystal::{self, CrystalSale, CrystalSaleError},
+    item::enchantment::Enchantment,
     organization::{Contract, GroupContract, OrganizationError},
     player_data::SoloLevelingPlayerData,
     rank::HunterRank,
     shop::{Offer, ShopError},
+    shop_menu::ShopMenuKind,
+    sound::SystemSound,
 };
+
+const fn guild_document_key() -> Identifier {
+    Identifier::new_static("sololeveling", "guilds/registry")
+}
 
 #[derive(Debug)]
 enum Request {
@@ -66,6 +77,10 @@ enum Request {
         uuid: Uuid,
         slot: usize,
         offer: Offer,
+        from_menu: bool,
+    },
+    ShopRefresh {
+        uuid: Uuid,
     },
     TurnInPersonal {
         uuid: Uuid,
@@ -78,9 +93,33 @@ enum Request {
     CrystalSale {
         uuid: Uuid,
     },
+    Enchant {
+        uuid: Uuid,
+        enchantment: Enchantment,
+        target: EnchantTarget,
+    },
+    Gear {
+        uuid: Uuid,
+        transfer: GearTransfer,
+    },
     Auction(AuctionRequest),
     AuctionDeliver {
         hunter: Uuid,
+    },
+    GuildSnapshot {
+        bytes: Vec<u8>,
+        notify: Vec<Uuid>,
+    },
+    GuildTurnIn {
+        actor: Uuid,
+        index: usize,
+    },
+    GuildDeposit {
+        player: Uuid,
+        amount: u64,
+    },
+    GuildCollect {
+        player: Uuid,
     },
 }
 
@@ -91,6 +130,9 @@ pub(super) struct Persistence {
     expected: FxHashMap<Uuid, Option<Vec<u8>>>,
     prepared: FxHashMap<Uuid, SoloLevelingPlayerData>,
     failed: FxHashSet<Uuid>,
+    document_expected: FxHashMap<Identifier, Option<Vec<u8>>>,
+    guild_document_failed: bool,
+    guild_transaction_pending: bool,
     busy: bool,
     quiescing: bool,
 }
@@ -116,10 +158,197 @@ impl Persistence {
 }
 
 impl SoloLevelingState {
+    /// Refuses guild mutations while a multi-account guild transaction is active.
+    pub(super) fn ensure_guild_mutation_available(&self) -> Result<(), GuildError> {
+        let persistence = self.persistence.lock();
+        if persistence.guild_transaction_pending {
+            return Err(GuildError::TransactionPending);
+        }
+        if persistence.guild_document_failed || persistence.quiescing {
+            return Err(GuildError::Storage);
+        }
+        Ok(())
+    }
+
+    /// Loads the canonical guild registry from core gameplay-document storage.
+    pub async fn load_guilds(&self, server: &Server) -> Result<(), String> {
+        let key = guild_document_key();
+        let bytes = server
+            .player_data_storage
+            .load_extension(&key)
+            .await
+            .map_err(|error| format!("failed to load guild registry: {error}"))?;
+        let import_legacy = bytes.is_none()
+            && server
+                .player_data_storage
+                .allows_legacy_player_data_import();
+        let registry = bytes
+            .as_deref()
+            .map_or_else(
+                || {
+                    if import_legacy {
+                        GuildRegistry::load_legacy(self.storage.base_dir())
+                    } else {
+                        Ok(GuildRegistry::empty())
+                    }
+                },
+                GuildRegistry::from_document,
+            )
+            .map_err(|error| format!("failed to decode guild registry: {error}"))?;
+        *self.guilds.lock() = registry;
+        self.persistence.lock().document_expected.insert(key, bytes);
+        if import_legacy {
+            self.queue_guild_save(None)
+                .map_err(|error| format!("failed to queue guild import: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn restore_guild_registry(&self, bytes: Option<&[u8]>) {
+        let registry =
+            bytes.map_or_else(|| Ok(GuildRegistry::empty()), GuildRegistry::from_document);
+        match registry {
+            Ok(registry) => *self.guilds.lock() = registry,
+            Err(error) => {
+                log::error!(
+                    "sololeveling: failed to restore last committed guild registry: {error}"
+                );
+            }
+        }
+    }
+
+    /// Queues the current guild snapshot for durable publication.
+    pub(super) fn queue_guild_save(&self, notify: Option<Uuid>) -> io::Result<()> {
+        let bytes = self.guilds.lock().to_document()?;
+        let mut persistence = self.persistence.lock();
+        if persistence.guild_transaction_pending
+            || persistence.guild_document_failed
+            || persistence.quiescing
+        {
+            return Err(io::Error::other("guild document storage is unavailable"));
+        }
+        if let Some(Request::GuildSnapshot {
+            bytes: pending_bytes,
+            notify: pending_players,
+        }) = persistence
+            .requests
+            .iter_mut()
+            .find(|request| matches!(request, Request::GuildSnapshot { .. }))
+        {
+            *pending_bytes = bytes;
+            if let Some(player) = notify
+                && !pending_players.contains(&player)
+            {
+                pending_players.push(player);
+            }
+        } else {
+            persistence.requests.push_back(Request::GuildSnapshot {
+                bytes,
+                notify: notify.into_iter().collect(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Queues the durable settlement of a finished guild contract.
+    pub(super) fn queue_guild_turn_in(&self, actor: Uuid, index: usize) -> io::Result<()> {
+        if !self.active_guild_banks.lock().is_empty() {
+            return Err(io::Error::other("guild bank is open"));
+        }
+        let mut persistence = self.persistence.lock();
+        if persistence.guild_transaction_pending
+            || persistence.guild_document_failed
+            || persistence.quiescing
+        {
+            return Err(io::Error::other("guild storage is busy or unavailable"));
+        }
+        persistence.guild_transaction_pending = true;
+        persistence
+            .requests
+            .push_back(Request::GuildTurnIn { actor, index });
+        Ok(())
+    }
+
+    /// Queues a guild treasury deposit as a balance-and-document transaction.
+    pub(super) fn queue_guild_deposit(&self, player: Uuid, amount: u64) -> io::Result<()> {
+        if !self.active_guild_banks.lock().is_empty() {
+            return Err(io::Error::other("guild bank is open"));
+        }
+        let mut persistence = self.persistence.lock();
+        if persistence.guild_transaction_pending
+            || persistence.guild_document_failed
+            || persistence.quiescing
+        {
+            return Err(io::Error::other("guild storage is busy or unavailable"));
+        }
+        persistence.guild_transaction_pending = true;
+        persistence
+            .requests
+            .push_back(Request::GuildDeposit { player, amount });
+        Ok(())
+    }
+
+    /// Queues collection of offline guild earnings with their account credit.
+    pub(super) fn queue_guild_collection(&self, player: Uuid) -> io::Result<()> {
+        let mut persistence = self.persistence.lock();
+        if persistence.guild_transaction_pending
+            || persistence.guild_document_failed
+            || persistence.quiescing
+        {
+            return Err(io::Error::other("guild storage is busy or unavailable"));
+        }
+        persistence.guild_transaction_pending = true;
+        persistence
+            .requests
+            .push_back(Request::GuildCollect { player });
+        Ok(())
+    }
+
     fn release_shop_purchase(&self, uuid: Uuid) {
         self.persistence.lock().busy = false;
         self.sessions
             .with_mut(uuid, |session| session.economic_busy = false);
+    }
+
+    fn begin_shop_refresh(self: &Arc<Self>, server: &Arc<Server>, uuid: Uuid) {
+        let Some(mut snapshot) = self
+            .sessions
+            .with_mut(uuid, |session| session.saved_data(uuid))
+        else {
+            self.release_shop_purchase(uuid);
+            return;
+        };
+        snapshot.shop.refresh(daily::today());
+        let shop = snapshot.shop;
+        let prepared = PreparedCommit::prepare(
+            self,
+            vec![snapshot],
+            vec![AccountUpdate::Shop { uuid, shop }],
+        );
+        let server_task = Arc::clone(server);
+        self.submit_commit(server, prepared, move |state, report| {
+            state
+                .sessions
+                .with_mut(uuid, |session| session.economic_busy = false);
+            if report.committed {
+                state.queue_account_followup_save(uuid);
+            }
+            let Some(player) = server_task
+                .get_players()
+                .into_iter()
+                .find(|player| player.gameprofile.id() == uuid)
+            else {
+                return;
+            };
+            let message = if report.confirmed {
+                "Ассортимент Магазина Системы обновлён оператором."
+            } else if report.committed {
+                "Ассортимент обновлён, но подтверждение диска не получено."
+            } else {
+                "Не удалось сохранить новый ассортимент магазина."
+            };
+            player.send_message(&TextComponent::plain(message));
+        });
     }
 
     #[expect(
@@ -133,15 +362,21 @@ impl SoloLevelingState {
         uuid: Uuid,
         slot: usize,
         offer: Offer,
+        from_menu: bool,
     ) -> bool {
         if player.connection.closed() {
             self.release_shop_purchase(uuid);
             return false;
         }
-        let Ok(mut reservation) = player.reserve_stored_inventory() else {
+        let reservation = if from_menu {
+            player.reserve_stored_inventory_with_menu::<ShopMenuKind>()
+        } else {
+            player.reserve_stored_inventory()
+        };
+        let Ok(mut reservation) = reservation else {
             self.release_shop_purchase(uuid);
             player.send_message(&TextComponent::plain(
-                "Покупку не удалось начать: инвентарь сейчас занят.",
+                "Покупку не удалось начать: инвентарь занят или предмет находится на курсоре или в сетке крафта.",
             ));
             return false;
         };
@@ -222,6 +457,7 @@ impl SoloLevelingState {
                             "sololeveling: could not queue follow-up shop account save for {uuid}: {error}"
                         );
                     }
+                    SystemSound::Reward.play(&completion_player);
                     completion_player.send_message(&TextComponent::plain(format!(
                         "Куплено: {}.",
                         offer.display_name()
@@ -578,7 +814,12 @@ impl SoloLevelingState {
     ///
     /// Inventory reservation and disk work happen later, after the menu callback
     /// has released its locks.
-    pub fn request_shop_purchase(&self, player: &Player, slot: usize) -> Result<Offer, ShopError> {
+    pub fn request_shop_purchase(
+        &self,
+        player: &Player,
+        slot: usize,
+        from_menu: bool,
+    ) -> Result<Offer, ShopError> {
         let uuid = player.gameprofile.id();
         let today = daily::today();
         let offer = self
@@ -607,10 +848,43 @@ impl SoloLevelingState {
                 .with_mut(uuid, |session| session.economic_busy = false);
             return Err(ShopError::Storage);
         }
+        persistence.requests.push_back(Request::ShopPurchase {
+            uuid,
+            slot,
+            offer,
+            from_menu,
+        });
+        Ok(offer)
+    }
+
+    /// Queues an operator's per-hunter shop assortment refresh.
+    pub fn request_shop_refresh(&self, uuid: Uuid) -> Result<(), ShopError> {
+        if !self.persistence.lock().accepts_writes(uuid) {
+            return Err(ShopError::Storage);
+        }
+        let Some(accepted) = self.sessions.with_mut(uuid, |session| {
+            if session.economic_busy {
+                return false;
+            }
+            session.economic_busy = true;
+            true
+        }) else {
+            return Err(ShopError::NoSession);
+        };
+        if !accepted {
+            return Err(ShopError::Busy);
+        }
+        let mut persistence = self.persistence.lock();
+        if persistence.quiescing || persistence.failed.contains(&uuid) {
+            drop(persistence);
+            self.sessions
+                .with_mut(uuid, |session| session.economic_busy = false);
+            return Err(ShopError::Storage);
+        }
         persistence
             .requests
-            .push_back(Request::ShopPurchase { uuid, slot, offer });
-        Ok(offer)
+            .push_back(Request::ShopRefresh { uuid });
+        Ok(())
     }
 
     /// Queues a crystal sale as one inventory/account transaction.
@@ -1026,7 +1300,12 @@ impl SoloLevelingState {
             Request::Award { rewards } => {
                 self.submit_commit(server, PreparedCommit::rewards(self, rewards), |_, _| {});
             }
-            Request::ShopPurchase { uuid, slot, offer } => {
+            Request::ShopPurchase {
+                uuid,
+                slot,
+                offer,
+                from_menu,
+            } => {
                 let Some(player) = server
                     .get_players()
                     .into_iter()
@@ -1035,9 +1314,12 @@ impl SoloLevelingState {
                     self.release_shop_purchase(uuid);
                     return;
                 };
-                if !self.begin_shop_purchase(server, player, uuid, slot, offer) {
+                if !self.begin_shop_purchase(server, player, uuid, slot, offer, from_menu) {
                     self.persistence.lock().busy = false;
                 }
+            }
+            Request::ShopRefresh { uuid } => {
+                self.begin_shop_refresh(server, uuid);
             }
             Request::CrystalSale { uuid } => {
                 let Some(player) = server
@@ -1049,6 +1331,36 @@ impl SoloLevelingState {
                     return;
                 };
                 if !self.begin_crystal_sale(server, player, uuid) {
+                    self.persistence.lock().busy = false;
+                }
+            }
+            Request::Enchant {
+                uuid,
+                enchantment,
+                target,
+            } => {
+                let Some(player) = server
+                    .get_players()
+                    .into_iter()
+                    .find(|player| player.gameprofile.id() == uuid)
+                else {
+                    self.release_shop_purchase(uuid);
+                    return;
+                };
+                if !self.begin_enchantment(server, player, uuid, enchantment, target) {
+                    self.persistence.lock().busy = false;
+                }
+            }
+            Request::Gear { uuid, transfer } => {
+                let Some(player) = server
+                    .get_players()
+                    .into_iter()
+                    .find(|player| player.gameprofile.id() == uuid)
+                else {
+                    self.release_shop_purchase(uuid);
+                    return;
+                };
+                if !self.begin_gear_transfer(server, player, uuid, transfer) {
                     self.persistence.lock().busy = false;
                 }
             }
@@ -1070,6 +1382,447 @@ impl SoloLevelingState {
                     self.persistence.lock().busy = false;
                 }
             }
+            Request::GuildSnapshot { bytes, notify } => {
+                let key = guild_document_key();
+                let expected = self
+                    .persistence
+                    .lock()
+                    .document_expected
+                    .get(&key)
+                    .cloned()
+                    .flatten();
+                let prepared = PreparedCommit::document(key, expected, bytes.clone());
+                let server_task = Arc::clone(server);
+                self.submit_commit(server, Ok(prepared), move |state, report| {
+                    let mut persistence = state.persistence.lock();
+                    if report.committed {
+                        persistence
+                            .document_expected
+                            .insert(guild_document_key(), Some(bytes));
+                    } else {
+                        persistence.guild_document_failed = true;
+                        persistence
+                            .requests
+                            .retain(|request| !matches!(request, Request::GuildSnapshot { .. }));
+                        let previous = persistence
+                            .document_expected
+                            .get(&guild_document_key())
+                            .cloned()
+                            .flatten();
+                        drop(persistence);
+                        state.restore_guild_registry(previous.as_deref());
+                        log::error!(
+                            "sololeveling: guild registry write failed; further guild writes are disabled"
+                        );
+                    }
+                    for player in server_task.get_players() {
+                        if notify.contains(&player.gameprofile.id()) {
+                            let message = if report.confirmed {
+                                "Изменение гильдии сохранено."
+                            } else if report.committed {
+                                "Изменение гильдии записано, но подтверждение диска не получено."
+                            } else {
+                                "Не удалось сохранить изменение гильдии; восстановлены последние сохранённые данные."
+                            };
+                            player.send_message(&TextComponent::plain(message));
+                        }
+                    }
+                });
+            }
+            Request::GuildTurnIn { actor, index } => {
+                if self.persistence.lock().guild_document_failed {
+                    self.finish_guild_turn_in_failure(
+                        server,
+                        actor,
+                        index,
+                        "Хранилище гильдий недоступно; сдача отменена.",
+                    );
+                } else {
+                    self.begin_guild_contract_turn_in(server, actor, index);
+                }
+            }
+            Request::GuildDeposit { player, amount } => {
+                if self.persistence.lock().guild_document_failed {
+                    self.finish_guild_deposit_failure(
+                        server,
+                        player,
+                        "Хранилище гильдий недоступно; взнос не проведён.",
+                    );
+                } else {
+                    self.begin_guild_deposit(server, player, amount);
+                }
+            }
+            Request::GuildCollect { player } => {
+                if self.persistence.lock().guild_document_failed {
+                    self.finish_guild_deposit_failure(
+                        server,
+                        player,
+                        "Хранилище гильдий недоступно; выплата осталась в гильдии.",
+                    );
+                } else {
+                    self.begin_guild_collection(server, player);
+                }
+            }
+        }
+    }
+
+    fn begin_guild_deposit(self: &Arc<Self>, server: &Arc<Server>, player: Uuid, amount: u64) {
+        let mut candidate = self.guilds.lock().clone();
+        if let Err(error) = candidate.deposit_treasury(player, amount) {
+            self.finish_guild_deposit_failure(server, player, error.message());
+            return;
+        }
+        let Some(mut snapshot) = self
+            .sessions
+            .with_mut(player, |session| session.saved_data(player))
+        else {
+            self.finish_guild_deposit_failure(server, player, "Данные охотника не загружены.");
+            return;
+        };
+        if !snapshot.won.debit(amount) {
+            self.finish_guild_deposit_failure(server, player, "Недостаточно Won.");
+            return;
+        }
+        let balance = snapshot.won;
+        let replacement = match candidate.to_document() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.finish_guild_deposit_failure(server, player, "Не удалось подготовить данные.");
+                log::error!("sololeveling: could not encode guild deposit: {error}");
+                return;
+            }
+        };
+        let key = guild_document_key();
+        let expected = self
+            .persistence
+            .lock()
+            .document_expected
+            .get(&key)
+            .cloned()
+            .flatten();
+        let prepared = PreparedCommit::prepare(
+            self,
+            vec![snapshot],
+            vec![AccountUpdate::Won {
+                uuid: player,
+                balance,
+            }],
+        )
+        .map(|prepared| {
+            prepared
+                .with_document(key, expected, replacement)
+                .with_guild_registry(candidate)
+        });
+        let state_server = Arc::clone(server);
+        self.submit_commit(server, prepared, move |state, report| {
+            let mut persistence = state.persistence.lock();
+            persistence.guild_transaction_pending = false;
+            if !report.committed {
+                persistence.guild_document_failed = true;
+            }
+            drop(persistence);
+            state
+                .sessions
+                .with_mut(player, |session| session.economic_busy = false);
+            if report.committed {
+                state.queue_account_followup_save(player);
+            }
+            if let Some(player) = state_server
+                .get_players()
+                .into_iter()
+                .find(|online| online.gameprofile.id() == player)
+            {
+                let message = if report.confirmed {
+                    format!("В казну гильдии внесено {amount} Won.")
+                } else if report.committed {
+                    "Взнос записан, но подтверждение диска не получено; повторять операцию не нужно."
+                        .to_owned()
+                } else {
+                    "Взнос не сохранён; баланс не списан.".to_owned()
+                };
+                player.send_message(&TextComponent::plain(message));
+            }
+        });
+    }
+
+    fn finish_guild_deposit_failure(&self, server: &Server, player_uuid: Uuid, reason: &str) {
+        self.sessions
+            .with_mut(player_uuid, |session| session.economic_busy = false);
+        let mut persistence = self.persistence.lock();
+        persistence.guild_transaction_pending = false;
+        persistence.busy = false;
+        drop(persistence);
+        if let Some(player) = server
+            .get_players()
+            .into_iter()
+            .find(|player| player.gameprofile.id() == player_uuid)
+        {
+            player.send_message(&TextComponent::plain(reason.to_owned()));
+        }
+    }
+
+    fn queue_account_followup_save(&self, player: Uuid) {
+        if let Err(error) = self.save_session(player) {
+            log::error!(
+                "sololeveling: could not queue post-transaction account save for {player}: {error}"
+            );
+        }
+    }
+
+    fn begin_guild_collection(self: &Arc<Self>, server: &Arc<Server>, player_uuid: Uuid) {
+        let mut candidate = self.guilds.lock().clone();
+        let amount = candidate
+            .guild_of_mut(player_uuid)
+            .map_or(0, |guild| guild.organization.take_owed(player_uuid));
+        if amount == 0 {
+            self.finish_guild_deposit_failure(server, player_uuid, "Невостребованных выплат нет.");
+            return;
+        }
+        let Some(mut snapshot) = self
+            .sessions
+            .with_mut(player_uuid, |session| session.saved_data(player_uuid))
+        else {
+            self.finish_guild_deposit_failure(server, player_uuid, "Данные охотника не загружены.");
+            return;
+        };
+        if !snapshot.won.try_credit(amount) {
+            self.finish_guild_deposit_failure(
+                server,
+                player_uuid,
+                "Баланс Won переполнен; выплата оставлена в гильдии.",
+            );
+            return;
+        }
+        let balance = snapshot.won;
+        let replacement = match candidate.to_document() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.finish_guild_deposit_failure(
+                    server,
+                    player_uuid,
+                    "Не удалось подготовить данные выплаты.",
+                );
+                log::error!("sololeveling: could not encode guild collection: {error}");
+                return;
+            }
+        };
+        let key = guild_document_key();
+        let expected = self
+            .persistence
+            .lock()
+            .document_expected
+            .get(&key)
+            .cloned()
+            .flatten();
+        let prepared = PreparedCommit::prepare(
+            self,
+            vec![snapshot],
+            vec![AccountUpdate::Won {
+                uuid: player_uuid,
+                balance,
+            }],
+        )
+        .map(|prepared| {
+            prepared
+                .with_document(key, expected, replacement)
+                .with_guild_registry(candidate)
+        });
+        let server_task = Arc::clone(server);
+        self.submit_commit(server, prepared, move |state, report| {
+            let mut persistence = state.persistence.lock();
+            persistence.guild_transaction_pending = false;
+            if !report.committed {
+                persistence.guild_document_failed = true;
+            }
+            drop(persistence);
+            state
+                .sessions
+                .with_mut(player_uuid, |session| session.economic_busy = false);
+            if report.committed {
+                state.queue_account_followup_save(player_uuid);
+            }
+            if let Some(player) = server_task
+                .get_players()
+                .into_iter()
+                .find(|player| player.gameprofile.id() == player_uuid)
+            {
+                let message = if report.confirmed {
+                    format!("Гильдия выплатила вам {amount} Won.")
+                } else if report.committed {
+                    "Выплата записана, но подтверждение диска не получено; не повторяйте операцию."
+                        .to_owned()
+                } else {
+                    "Не удалось сохранить выплату; она остаётся в гильдии.".to_owned()
+                };
+                player.send_message(&TextComponent::plain(message));
+            }
+        });
+    }
+
+    fn begin_guild_contract_turn_in(
+        self: &Arc<Self>,
+        server: &Arc<Server>,
+        actor: Uuid,
+        index: usize,
+    ) {
+        let (prepared, contract, payment, credited) =
+            match self.prepare_guild_contract_turn_in(actor, index) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.finish_guild_turn_in_failure(
+                        server,
+                        actor,
+                        index,
+                        "Не удалось подготовить выплату гильдии.",
+                    );
+                    log::error!("sololeveling: could not prepare guild settlement: {error}");
+                    return;
+                }
+            };
+        let state_server = Arc::clone(server);
+        self.submit_commit(server, Ok(prepared), move |state, report| {
+            let mut persistence = state.persistence.lock();
+            persistence.guild_transaction_pending = false;
+            if !report.committed {
+                persistence.guild_document_failed = true;
+            }
+            drop(persistence);
+            if !report.committed {
+                state.clear_guild_turn_in_pending(actor, index);
+                let message =
+                    "Не удалось сохранить сдачу задания. Выплаты не произведены.".to_owned();
+                if let Some(player) = state_server
+                    .get_players()
+                    .into_iter()
+                    .find(|player| player.gameprofile.id() == actor)
+                {
+                    player.send_message(&TextComponent::plain(message));
+                }
+                return;
+            }
+            for hunter in &credited {
+                state.queue_account_followup_save(*hunter);
+            }
+            for player in state_server.get_players() {
+                let uuid = player.gameprofile.id();
+                if uuid == actor && report.confirmed {
+                    player.send_message(&TextComponent::plain(format!(
+                        "Задание гильдии «{}» сдано; участникам начислено по {payment} Won.",
+                        contract.template.title()
+                    )));
+                } else if uuid == actor {
+                    player.send_message(&TextComponent::plain(
+                        "Сдача зафиксирована, но подтверждение диска не получено; не повторяйте её.",
+                    ));
+                } else if credited.contains(&uuid) {
+                    let message = if report.confirmed {
+                        format!("Гильдия выплатила вам {payment} Won.")
+                    } else {
+                        "Выплата зафиксирована, но подтверждение диска не получено; не повторяйте операцию."
+                            .to_owned()
+                    };
+                    player.send_message(&TextComponent::plain(message));
+                }
+            }
+        });
+    }
+
+    fn prepare_guild_contract_turn_in(
+        &self,
+        actor: Uuid,
+        index: usize,
+    ) -> io::Result<(PreparedCommit, Contract, u64, Vec<Uuid>)> {
+        let mut candidate = self.guilds.lock().clone();
+        let (contract, paid) = candidate
+            .settle_contract(actor, index)
+            .map_err(|error| io::Error::other(error.message()))?;
+        let payment = contract.payment();
+        let mut snapshots = Vec::new();
+        let mut updates = Vec::new();
+        let mut credited = Vec::new();
+        for hunter in paid {
+            let Some(guild) = candidate.guild_of_mut(hunter) else {
+                continue;
+            };
+            let amount = guild.organization.take_owed(hunter);
+            if amount == 0 {
+                continue;
+            }
+            let snapshot = self.sessions.with_mut(hunter, |session| {
+                if session.economic_busy {
+                    return None;
+                }
+                let mut snapshot = session.saved_data(hunter);
+                snapshot.won.try_credit(amount).then_some(snapshot)
+            });
+            match snapshot.flatten() {
+                Some(snapshot) => {
+                    credited.push(hunter);
+                    updates.push(AccountUpdate::Won {
+                        uuid: hunter,
+                        balance: snapshot.won,
+                    });
+                    snapshots.push(snapshot);
+                }
+                None => {
+                    if let Some(guild) = candidate.guild_of_mut(hunter) {
+                        guild.organization.owed.insert(hunter, amount);
+                    }
+                }
+            }
+        }
+        let replacement = candidate.to_document()?;
+        let key = guild_document_key();
+        let expected = self
+            .persistence
+            .lock()
+            .document_expected
+            .get(&key)
+            .cloned()
+            .flatten();
+        let prepared = if snapshots.is_empty() {
+            PreparedCommit::document(key, expected, replacement)
+        } else {
+            PreparedCommit::prepare(self, snapshots, updates)?.with_document(
+                key,
+                expected,
+                replacement,
+            )
+        }
+        .with_guild_registry(candidate);
+        Ok((prepared, contract, payment, credited))
+    }
+
+    fn finish_guild_turn_in_failure(
+        &self,
+        server: &Server,
+        actor: Uuid,
+        index: usize,
+        reason: &str,
+    ) {
+        self.clear_guild_turn_in_pending(actor, index);
+        let mut persistence = self.persistence.lock();
+        persistence.guild_transaction_pending = false;
+        persistence.busy = false;
+        log::warn!("sololeveling: guild contract settlement refused: {reason}");
+        drop(persistence);
+        if let Some(player) = server
+            .get_players()
+            .into_iter()
+            .find(|player| player.gameprofile.id() == actor)
+        {
+            player.send_message(&TextComponent::plain(reason.to_owned()));
+        }
+    }
+
+    pub(super) fn clear_guild_turn_in_pending(&self, actor: Uuid, index: usize) {
+        if let Some(group) = self
+            .guilds
+            .lock()
+            .guild_of_mut(actor)
+            .and_then(|guild| guild.organization.contracts.get_mut(index))
+        {
+            group.pending_turn_in = false;
         }
     }
 
@@ -1131,6 +1884,9 @@ impl SoloLevelingState {
                         "Gameplay accounts with failed writes: {:?}",
                         persistence.failed
                     ));
+                }
+                if persistence.guild_document_failed {
+                    return Err("Guild registry storage failed".to_owned());
                 }
                 persistence.requests.is_empty() && !persistence.busy
             };

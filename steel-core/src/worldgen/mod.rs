@@ -15,13 +15,17 @@ pub(crate) mod structure;
 pub mod surface;
 pub(crate) mod template;
 
-pub use generator::context::{
-    ChunkGeneratorType, EndGenerator, NetherGenerator, OverworldGenerator, WorldGenContext,
+pub use generator::context::{EndGenerator, NetherGenerator, OverworldGenerator, WorldGenContext};
+pub use generator::registry::{
+    CustomWorldGeneratorConfig, GeneratorOutput, WorldGeneratorRegistry,
 };
-pub use generator::registry::{GeneratorOutput, WorldGeneratorRegistry};
-pub use generator::{ChunkGenerator, EmptyChunkGenerator, FlatChunkGenerator, VanillaGenerator};
+pub use generator::{
+    ChunkGenerator, ChunkGeneratorType, DynamicChunkGenerator, EmptyChunkGenerator,
+    FlatChunkGenerator, VanillaGenerator,
+};
 pub use region::WorldGenRegion;
 pub use steel_worldgen::density_functions::overworld::OverworldColumnCache;
+pub use steel_worldgen::noise::Beardifier;
 pub use steel_worldgen::noise::EndIslands;
 
 /// Compatibility path for the per-chunk carving bitset.

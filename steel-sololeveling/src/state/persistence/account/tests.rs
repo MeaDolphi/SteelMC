@@ -5,13 +5,20 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use steel_core::player::player_data_storage::transaction::TransactionCommit;
+use steel_core::{
+    config::StorageSelection,
+    player::player_data_storage::{
+        PlayerDataStorage as CoreStorage, transaction::TransactionCommit,
+    },
+};
+use steel_utils::Identifier;
 use uuid::Uuid;
 
-use super::{AccountUpdate, PreparedCommit};
+use super::{AccountUpdate, PreparedCommit, load_account};
 use crate::combat_reward::HunterReward;
-use crate::economy::SystemPoints;
-use crate::player_data::SoloLevelingPlayerData;
+use crate::economy::{SystemPoints, Won};
+use crate::guild::GuildRegistry;
+use crate::player_data::{PlayerDataStorage, SoloLevelingPlayerData};
 use crate::state::SoloLevelingState;
 
 fn state(name: &str) -> (SoloLevelingState, PathBuf) {
@@ -32,6 +39,74 @@ fn begin(state: &SoloLevelingState, uuid: Uuid, points: u64) {
         .lock()
         .expected
         .insert(uuid, Some(b"{}".to_vec()));
+}
+
+#[tokio::test]
+async fn sqlite_starts_fresh_without_importing_legacy_account_json() {
+    let directory = env::temp_dir().join(format!("sololeveling-sqlite-fresh-{}", Uuid::new_v4()));
+    let legacy = PlayerDataStorage::new(directory.join("legacy"));
+    legacy.init().expect("initialize legacy storage");
+    let uuid = Uuid::new_v4();
+    let mut old_account = SoloLevelingPlayerData::new(uuid);
+    old_account.won = Won::zero();
+    old_account.won.credit(900);
+    legacy.save(&old_account).expect("save legacy account");
+
+    let selection = StorageSelection {
+        kind: Identifier::from_steel("sqlite"),
+        config: None,
+    };
+    let sqlite = CoreStorage::from_selection(directory.join("database"), &selection)
+        .await
+        .expect("open fresh SQLite storage");
+    let loaded = load_account(&sqlite, legacy.clone(), uuid)
+        .await
+        .expect("load account");
+
+    assert_eq!(loaded.data.won.amount(), Won::starting_balance().amount());
+    assert!(loaded.bytes.is_none());
+    assert!(
+        legacy.path_for(uuid).exists(),
+        "legacy data remains untouched"
+    );
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn a_guild_registry_candidate_is_installed_only_after_its_document_commits() {
+    let (state, directory) = state("guild-document-commit");
+    let guildmaster = Uuid::new_v4();
+    let key = Identifier::new_static("sololeveling", "guilds/registry");
+    let mut candidate = GuildRegistry::empty();
+    candidate
+        .create("Hunters".to_owned(), guildmaster)
+        .expect("create candidate guild");
+    let bytes = candidate.to_document().expect("encode candidate");
+
+    let failed = PreparedCommit::document(key.clone(), None, bytes.clone())
+        .with_guild_registry(candidate.clone());
+    assert!(
+        !failed
+            .complete(&state, &Err(io::Error::other("injected storage failure")))
+            .committed
+    );
+    assert!(state.guilds.lock().guild_of(guildmaster).is_none());
+
+    let committed = PreparedCommit::document(key, None, bytes).with_guild_registry(candidate);
+    assert!(
+        committed
+            .complete(&state, &Ok(TransactionCommit::Committed))
+            .confirmed
+    );
+    assert_eq!(
+        state
+            .guilds
+            .lock()
+            .guild_of(guildmaster)
+            .map(|guild| guild.name.as_str()),
+        Some("Hunters")
+    );
+    fs::remove_dir_all(directory).expect("cleanup");
 }
 
 #[test]

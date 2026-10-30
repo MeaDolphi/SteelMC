@@ -17,7 +17,10 @@ pub mod chest;
 pub mod choice_menu;
 pub mod consume;
 pub mod crystal;
+pub mod enchantment;
+pub mod loot;
 pub mod menu_book;
+pub mod model;
 pub mod nbt;
 pub mod potion;
 pub mod shadow;
@@ -73,6 +76,18 @@ pub(crate) fn record(kind: &str) -> NbtCompound {
 pub(crate) fn named(mut stack: ItemStack, name: TextComponent) -> ItemStack {
     stack.set(CUSTOM_NAME, name);
     stack
+}
+
+/// Appends `lines` after the existing lore of `stack`.
+///
+/// Menus that price an item use this so the item keeps describing itself:
+/// replacing the lore would hide an artifact's stats and abilities.
+pub(crate) fn append_lore(stack: ItemStack, lines: Vec<TextComponent>) -> ItemStack {
+    let mut all = stack
+        .get(LORE)
+        .map_or_else(Vec::new, |lore| lore.lines().to_vec());
+    all.extend(lines);
+    with_lore(stack, all)
 }
 
 /// Replaces the lore of `stack`, ignoring an empty list.

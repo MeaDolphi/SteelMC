@@ -16,6 +16,8 @@ use super::{named, read_kind, record, with_lore, write_tag};
 
 /// Themed kind of the System book.
 const KIND: &str = "menu_book";
+/// Pack model of the book.
+const MODEL: &str = "system_book";
 /// Inventory slot the book lives in: the ninth hotbar slot.
 pub const SLOT: usize = 8;
 
@@ -30,6 +32,7 @@ pub fn stack() -> ItemStack {
         vec![TextComponent::plain("Правый клик — главное меню.").color(Color::Gray)],
     );
     write_tag(&mut stack, record(KIND));
+    super::model::apply(&mut stack, MODEL);
     stack
 }
 
@@ -56,7 +59,11 @@ pub fn keep_in_place(player: &Player) {
             }
         }
         let held = inventory.get_item(SLOT).clone();
-        if !is_menu_book(&held) {
+        // A book handed out before the resource pack existed is swapped for
+        // one that carries its model.
+        if is_menu_book(&held) && !super::model::has(&held, MODEL) {
+            inventory.set_item(SLOT, stack());
+        } else if !is_menu_book(&held) {
             if !held.is_empty() {
                 displaced = Some(held);
             }

@@ -1,0 +1,27 @@
+{
+  "system.open": {
+    "sounds": [
+      "sololeveling:system/open"
+    ]
+  },
+  "system.level_up": {
+    "sounds": [
+      "sololeveling:system/level_up"
+    ]
+  },
+  "system.quest": {
+    "sounds": [
+      "sololeveling:system/quest"
+    ]
+  },
+  "system.arise": {
+    "sounds": [
+      "sololeveling:system/arise"
+    ]
+  },
+  "system.reward": {
+    "sounds": [
+      "sololeveling:system/reward"
+    ]
+  }
+}

@@ -6,7 +6,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::daily;
+use crate::rank::HunterRank;
 
+/// Lowest hunter rank a failed daily quest sends to the penalty zone; weaker
+/// hunters are only told they failed.
+pub const PENALTY_MIN_RANK: HunterRank = HunterRank::C;
 /// Delay before a penalty owed from an earlier day starts after login.
 pub const PENALTY_DELAY_SECONDS: u64 = 10 * 60;
 /// Required jump count.
@@ -17,8 +21,8 @@ pub const REQUIRED_SNEAKS: u16 = 100;
 pub const REQUIRED_DISTANCE_BLOCKS: f64 = 3_000.0;
 /// Length of the future penalty-zone survival challenge.
 pub const PENALTY_ZONE_DURATION_SECONDS: u64 = 10 * 60;
-/// Number of zombies the future penalty-zone instance spawns every wave.
-pub const PENALTY_ZONE_ZOMBIES_PER_WAVE: u8 = 20;
+/// Number of mobs the penalty tower spawns ahead of the hunter every wave.
+pub const PENALTY_ZONE_ZOMBIES_PER_WAVE: u8 = 5;
 /// Interval between future penalty-zone zombie waves.
 pub const PENALTY_ZONE_WAVE_INTERVAL_SECONDS: u64 = 10;
 

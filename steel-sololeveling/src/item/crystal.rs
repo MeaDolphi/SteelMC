@@ -38,6 +38,10 @@ pub fn stack(rank: HunterRank) -> ItemStack {
     let mut fields = record(KIND);
     fields.insert(RANK, rank.name().to_owned());
     write_tag(&mut stack, fields);
+    super::model::apply(
+        &mut stack,
+        &format!("crystal/{}", rank.name().to_lowercase()),
+    );
     stack
 }
 

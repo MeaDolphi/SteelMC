@@ -82,8 +82,9 @@ impl ZombieEntity {
 
             let mut target_selector = mob_base.target_selector().lock();
             target_selector.add_goal(1, HurtByTargetGoal::new().set_alert_others(empty()));
+            target_selector.add_goal(2, NearestAttackableTargetGoal::new_for_tank_taunt());
             target_selector.add_goal(
-                2,
+                3,
                 NearestAttackableTargetGoal::new_for_players(true, |_, _| true),
             );
         }

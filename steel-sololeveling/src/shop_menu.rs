@@ -14,7 +14,7 @@ use text_components::format::Color;
 use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
-use crate::item::{named, with_lore};
+use crate::item::{append_lore, named, with_lore};
 use crate::shop::ShopDay;
 use crate::state::SoloLevelingState;
 
@@ -34,7 +34,9 @@ pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
 }
 
 fn build(container_id: u8, player: &Player, state: Arc<SoloLevelingState>) -> Menu {
-    let items = menu_items(&state, player.gameprofile.id());
+    let uuid = player.gameprofile.id();
+    let view = shop_view(&state, uuid);
+    let items = menu_items(view, uuid);
     let container = SimpleContainer::from_items(items).into_shared();
     let mut builder = MenuBuilder::new(&vanilla_menu_types::GENERIC_9X3, container_id);
     let buttons = builder.section_all(Arc::clone(&container));
@@ -43,6 +45,7 @@ fn build(container_id: u8, player: &Player, state: Arc<SoloLevelingState>) -> Me
         state,
         buttons,
         container,
+        view,
     })
 }
 
@@ -56,14 +59,17 @@ fn offer_at(slot: usize) -> Option<usize> {
     row(FIRST_ROW_START).or_else(|| row(SECOND_ROW_START).map(|index| index + PER_ROW))
 }
 
-fn menu_items(state: &SoloLevelingState, uuid: Uuid) -> Vec<ItemStack> {
+fn shop_view(state: &SoloLevelingState, uuid: Uuid) -> Option<(ShopDay, u64)> {
+    let day = state.shop_day(uuid)?;
+    let points = state.with_session_mut(uuid, |session| session.system_points.amount())?;
+    Some((day, points))
+}
+
+fn menu_items(view: Option<(ShopDay, u64)>, uuid: Uuid) -> Vec<ItemStack> {
     let mut items = vec![ItemStack::empty(); MENU_SLOTS];
-    let Some(day) = state.shop_day(uuid) else {
+    let Some((day, points)) = view else {
         return items;
     };
-    let points = state
-        .with_session_mut(uuid, |session| session.system_points.amount())
-        .unwrap_or(0);
     items[BALANCE_SLOT] = with_lore(
         named(
             ItemStack::new(&vanilla_items::AMETHYST_SHARD),
@@ -105,7 +111,7 @@ fn offer_item(day: &ShopDay, index: usize, points: u64, uuid: Uuid) -> ItemStack
             Color::Red
         }),
     );
-    with_lore(
+    append_lore(
         stack,
         vec![
             TextComponent::plain(format!("Цена: {} очков Системы", offer.price)).color(Color::Gold),
@@ -123,10 +129,11 @@ fn offer_item(day: &ShopDay, index: usize, points: u64, uuid: Uuid) -> ItemStack
     )
 }
 
-struct ShopMenuKind {
+pub(crate) struct ShopMenuKind {
     state: Arc<SoloLevelingState>,
     buttons: Section,
     container: Shared<SimpleContainer>,
+    view: Option<(ShopDay, u64)>,
 }
 
 // SAFETY: This Solo Leveling-owned key uniquely identifies the concrete menu kind.
@@ -135,10 +142,30 @@ unsafe impl DowncastType for ShopMenuKind {
 }
 
 impl MenuKind for ShopMenuKind {
-    fn on_slot_clicked(
+    fn on_tick(
         &mut self,
         _behavior: &mut MenuBehavior,
         guard: &mut ContainerLockGuard,
+        player: &Player,
+    ) {
+        let uuid = player.gameprofile.id();
+        let view = shop_view(&self.state, uuid);
+        if self.view == view {
+            return;
+        }
+        let container_id = ContainerId::from_arc(&self.container);
+        if let Some(container) = guard.get_typed_mut::<SimpleContainer>(container_id) {
+            for (index, item) in menu_items(view, uuid).into_iter().enumerate() {
+                container.set_item(index, item);
+            }
+            self.view = view;
+        }
+    }
+
+    fn on_slot_clicked(
+        &mut self,
+        _behavior: &mut MenuBehavior,
+        _guard: &mut ContainerLockGuard,
         click: Click,
         player: &Player,
     ) -> ClickOutcome {
@@ -155,8 +182,7 @@ impl MenuKind for ShopMenuKind {
         let Some(index) = offer_at(slot - self.buttons.start()) else {
             return ClickOutcome::Consume;
         };
-        let uuid = player.gameprofile.id();
-        match self.state.request_shop_purchase(player, index) {
+        match self.state.request_shop_purchase(player, index, true) {
             Ok(offer) => {
                 player.send_message(
                     &TextComponent::plain(format!(
@@ -170,20 +196,16 @@ impl MenuKind for ShopMenuKind {
                 player.send_message(&TextComponent::plain(error.message()).color(Color::Red));
             }
         }
-        let container_id = ContainerId::from_arc(&self.container);
-        if let Some(container) = guard.get_typed_mut::<SimpleContainer>(container_id) {
-            for (index, item) in menu_items(&self.state, uuid).into_iter().enumerate() {
-                container.set_item(index, item);
-            }
-        }
         ClickOutcome::Consume
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::offer_at;
-    use crate::shop::SLOTS;
+    use super::{FIRST_ROW_START, menu_items, offer_at};
+    use crate::shop::{SLOTS, ShopDay};
+    use steel_registry::{init_vanilla_registry, vanilla_items};
+    use uuid::Uuid;
 
     #[test]
     fn every_shop_slot_has_one_menu_slot() {
@@ -196,5 +218,21 @@ mod tests {
         }
         assert!(seen.iter().all(|shown| *shown));
         assert_eq!(offer_at(4), None);
+    }
+
+    #[test]
+    fn committed_purchase_updates_only_its_offer_in_the_menu() {
+        init_vanilla_registry();
+        let mut day = ShopDay::unset();
+        day.roll_over(1);
+        let owner = Uuid::new_v4();
+        let before = menu_items(Some((day, 1000)), owner);
+        assert!(day.mark(0));
+        let after = menu_items(Some((day, 1000)), owner);
+        assert!(
+            after[FIRST_ROW_START].is(&vanilla_items::GRAY_STAINED_GLASS_PANE),
+            "the committed offer is shown as purchased"
+        );
+        assert_eq!(before[FIRST_ROW_START + 1], after[FIRST_ROW_START + 1]);
     }
 }

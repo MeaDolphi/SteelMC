@@ -39,11 +39,21 @@ unsafe impl DowncastType for PlayerInventory {
 }
 
 impl PlayerInventory {
+    #[cfg(test)]
     pub(crate) fn take_death_drops(&mut self) -> Vec<ItemStack> {
+        self.take_death_drops_keeping(|_| false)
+    }
+
+    /// Empties the inventory for a death and returns what drops, leaving
+    /// every stack `keep` accepts in its slot.
+    pub(crate) fn take_death_drops_keeping(
+        &mut self,
+        keep: impl Fn(&ItemStack) -> bool,
+    ) -> Vec<ItemStack> {
         (0..self.get_container_size())
             .filter_map(|slot| {
                 let item = self.get_item(slot).clone();
-                if item.is_empty() {
+                if item.is_empty() || keep(&item) {
                     return None;
                 }
                 self.set_item(slot, ItemStack::empty());

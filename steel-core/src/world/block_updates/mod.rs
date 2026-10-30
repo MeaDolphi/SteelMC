@@ -163,7 +163,21 @@ impl World {
         block_state: BlockStateId,
         flags: UpdateFlags,
     ) -> bool {
-        self.set_block_with_limit(pos, block_state, flags, Self::UPDATE_LIMIT)
+        self.set_block_with_cause(pos, block_state, flags, BlockMutationCause::Gameplay)
+    }
+
+    /// Sets a block with an explicit mutation origin.
+    ///
+    /// `System` is reserved for server-owned setup and cleanup; ordinary gameplay
+    /// callers should use [`Self::set_block`].
+    pub fn set_block_with_cause(
+        self: &Arc<Self>,
+        pos: BlockPos,
+        block_state: BlockStateId,
+        flags: UpdateFlags,
+        cause: BlockMutationCause,
+    ) -> bool {
+        self.set_block_with_limit_and_cause(pos, block_state, flags, Self::UPDATE_LIMIT, cause)
     }
 
     /// Sets a block at the given position with a custom update limit.
@@ -180,7 +194,33 @@ impl World {
         flags: UpdateFlags,
         update_limit: i32,
     ) -> bool {
+        self.set_block_with_limit_and_cause(
+            pos,
+            block_state,
+            flags,
+            update_limit,
+            BlockMutationCause::Gameplay,
+        )
+    }
+
+    /// Sets a block with a custom update limit and explicit mutation origin.
+    pub fn set_block_with_limit_and_cause(
+        self: &Arc<Self>,
+        pos: BlockPos,
+        block_state: BlockStateId,
+        flags: UpdateFlags,
+        update_limit: i32,
+        cause: BlockMutationCause,
+    ) -> bool {
         if !self.is_in_valid_bounds(pos) {
+            return false;
+        }
+
+        let old_state = self.get_block_state(pos);
+        if !self
+            .gameplay_hooks
+            .allow_block_mutation(self, pos, old_state, block_state, cause)
+        {
             return false;
         }
 
@@ -212,12 +252,31 @@ impl World {
         new_state: BlockStateId,
         flags: UpdateFlags,
     ) -> ConditionalBlockSetResult {
-        self.set_block_if_unchanged_with_limit(
+        self.set_block_if_unchanged_with_cause(
+            pos,
+            expected_state,
+            new_state,
+            flags,
+            BlockMutationCause::Gameplay,
+        )
+    }
+
+    /// Conditional variant with an explicit mutation origin.
+    pub fn set_block_if_unchanged_with_cause(
+        self: &Arc<Self>,
+        pos: BlockPos,
+        expected_state: BlockStateId,
+        new_state: BlockStateId,
+        flags: UpdateFlags,
+        cause: BlockMutationCause,
+    ) -> ConditionalBlockSetResult {
+        self.set_block_if_unchanged_with_limit_and_cause(
             pos,
             expected_state,
             new_state,
             flags,
             Self::UPDATE_LIMIT,
+            cause,
         )
     }
 
@@ -230,8 +289,40 @@ impl World {
         flags: UpdateFlags,
         update_limit: i32,
     ) -> ConditionalBlockSetResult {
+        self.set_block_if_unchanged_with_limit_and_cause(
+            pos,
+            expected_state,
+            new_state,
+            flags,
+            update_limit,
+            BlockMutationCause::Gameplay,
+        )
+    }
+
+    /// Conditional variant of [`Self::set_block_with_limit_and_cause`].
+    pub fn set_block_if_unchanged_with_limit_and_cause(
+        self: &Arc<Self>,
+        pos: BlockPos,
+        expected_state: BlockStateId,
+        new_state: BlockStateId,
+        flags: UpdateFlags,
+        update_limit: i32,
+        cause: BlockMutationCause,
+    ) -> ConditionalBlockSetResult {
         if !self.is_in_valid_bounds(pos) {
             return ConditionalBlockSetResult::Unavailable;
+        }
+
+        if self.get_block_state(pos) == expected_state
+            && !self.gameplay_hooks.allow_block_mutation(
+                self,
+                pos,
+                expected_state,
+                new_state,
+                cause,
+            )
+        {
+            return ConditionalBlockSetResult::Rejected;
         }
 
         let chunk_pos = Self::chunk_pos_for_block(pos);

@@ -18,7 +18,7 @@ use crate::chunk::light::{
 };
 use crate::chunk::status::ChunkStatus;
 use crate::entity::damage::DamageHistory;
-use crate::gameplay_hooks::GameplayHooks;
+use crate::gameplay_hooks::{BlockMutationCause, GameplayHooks};
 use crate::poi::OccupationStatus;
 use crate::portal::WorldChangeRequest;
 use crate::world::game_event::{
@@ -204,6 +204,8 @@ pub enum ConditionalBlockSetResult {
     Stale(BlockStateId),
     /// The position is invalid, the chunk is unavailable, or the update limit was exhausted.
     Unavailable,
+    /// The gameplay hooks refused the mutation.
+    Rejected,
 }
 
 /// Configuration for creating a new world.

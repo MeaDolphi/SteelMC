@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::economy::Won;
 use crate::item::nbt;
-use crate::organization::GuildBoard;
+use crate::organization::{Contract, GuildBoard, OrganizationError};
 
 /// Maximum online and offline membership of one guild.
 pub const GUILD_MAX_MEMBERS: usize = 50;
@@ -144,6 +144,7 @@ impl GuildError {
             Self::BankInUse => "Банк гильдии уже открыт другим участником.",
             Self::InsufficientFunds => "Недостаточно Won.",
             Self::TransactionPending => "Дождитесь завершения текущей транзакции.",
+            Self::TreasuryOverflow => "В казне недостаточно места для этой суммы.",
         }
     }
 }
@@ -177,10 +178,12 @@ pub enum GuildError {
     InsufficientFunds,
     /// A pending financial transaction owns the hunter's balance.
     TransactionPending,
+    /// The requested deposit would overflow the guild treasury.
+    TreasuryOverflow,
 }
 
-/// JSON-backed persistent guild collection, separate from player data.
-#[derive(Debug, Clone)]
+/// Legacy JSON source used only when importing into a non-SQLite storage backend.
+#[derive(Debug)]
 pub struct GuildStorage {
     path: PathBuf,
 }
@@ -203,39 +206,63 @@ impl GuildStorage {
         serde_json::from_str(&contents)
             .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))
     }
-
-    /// Writes every guild after a successful mutation.
-    pub fn save(&self, guilds: &FxHashMap<String, Guild>) -> io::Result<()> {
-        let contents = serde_json::to_string_pretty(guilds)
-            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
-        fs::write(&self.path, contents)
-    }
 }
 
 /// Owns all loaded guild data and enforces cross-guild exclusive membership.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GuildRegistry {
-    storage: GuildStorage,
     guilds: FxHashMap<String, Guild>,
     membership: FxHashMap<Uuid, String>,
 }
 
 impl GuildRegistry {
-    /// Loads guild state and reconstructs the membership index.
-    pub fn load(base_dir: impl AsRef<Path>) -> io::Result<Self> {
-        let storage = GuildStorage::new(base_dir);
-        let guilds = storage.load()?;
+    /// Creates an empty registry.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            guilds: FxHashMap::default(),
+            membership: FxHashMap::default(),
+        }
+    }
+
+    /// Imports old `guilds.json` data; canonical storage is the core document.
+    pub fn load_legacy(base_dir: impl AsRef<Path>) -> io::Result<Self> {
+        let guilds = GuildStorage::new(base_dir).load()?;
+        Self::from_guilds(guilds)
+    }
+
+    /// Decodes the canonical transactionally stored guild document.
+    pub fn from_document(bytes: &[u8]) -> io::Result<Self> {
+        let guilds = serde_json::from_slice(bytes)
+            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+        Self::from_guilds(guilds)
+    }
+
+    /// Encodes the guild collection as one opaque gameplay document.
+    pub fn to_document(&self) -> io::Result<Vec<u8>> {
+        serde_json::to_vec(&self.guilds)
+            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))
+    }
+
+    fn from_guilds(guilds: FxHashMap<String, Guild>) -> io::Result<Self> {
         let mut membership = FxHashMap::default();
         for (key, guild) in &guilds {
             for member in guild.members.keys() {
-                membership.insert(*member, key.clone());
+                if membership.insert(*member, key.clone()).is_some() {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("player {member} belongs to multiple guilds"),
+                    ));
+                }
             }
         }
-        Ok(Self {
-            storage,
-            guilds,
-            membership,
-        })
+        Ok(Self { guilds, membership })
+    }
+
+    /// Replaces the registry with a freshly loaded document.
+    pub fn replace_from_document(&mut self, bytes: &[u8]) -> io::Result<()> {
+        *self = Self::from_document(bytes)?;
+        Ok(())
     }
 
     #[must_use]
@@ -399,8 +426,31 @@ impl GuildRegistry {
         {
             return Err(GuildError::PermissionDenied);
         }
-        guild.treasury.credit(amount);
+        if !guild.treasury.try_credit(amount) {
+            return Err(GuildError::TreasuryOverflow);
+        }
         Ok(())
+    }
+
+    /// Stages one completed guild contract settlement in this registry copy.
+    pub fn settle_contract(
+        &mut self,
+        actor: Uuid,
+        index: usize,
+    ) -> Result<(Contract, Vec<Uuid>), OrganizationError> {
+        let guild = self
+            .guild_of_mut(actor)
+            .ok_or(OrganizationError::NotInGuild)?;
+        let members: Vec<_> = guild.members.keys().copied().collect();
+        let group = guild
+            .organization
+            .contracts
+            .get_mut(index)
+            .ok_or(OrganizationError::Missing)?;
+        group.pending_turn_in = false;
+        guild
+            .organization
+            .turn_in(index, |hunter| members.contains(&hunter))
     }
 
     /// Returns the normalized guild key and its bank contents for an authorized member.
@@ -426,11 +476,6 @@ impl GuildRegistry {
             .map_err(|_| GuildError::Storage)?;
         Ok((key, items))
     }
-
-    /// Persists the registry after a successful mutation.
-    pub fn save(&self) -> io::Result<()> {
-        self.storage.save(&self.guilds)
-    }
 }
 
 fn normalize_name(name: &str) -> String {
@@ -447,30 +492,24 @@ fn valid_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::env;
-
     use super::*;
 
     #[test]
-    fn guild_membership_is_exclusive_and_persistent() {
-        let dir = env::temp_dir().join(format!("sololeveling-guild-test-{}", Uuid::new_v4()));
-        fs::create_dir_all(&dir).expect("test directory");
+    fn guild_membership_is_exclusive_and_round_trips_through_the_gameplay_document() {
         let guildmaster = Uuid::new_v4();
         let recruit = Uuid::new_v4();
-        let mut guilds = GuildRegistry::load(&dir).expect("load empty registry");
+        let mut guilds = GuildRegistry::empty();
         guilds
             .create("Hunters".to_owned(), guildmaster)
             .expect("create guild");
         guilds
             .add_recruit(guildmaster, recruit)
             .expect("add recruit");
-        guilds.save().expect("save guilds");
-
-        let loaded = GuildRegistry::load(&dir).expect("load saved registry");
+        let loaded = GuildRegistry::from_document(&guilds.to_document().expect("serialize guilds"))
+            .expect("load committed registry");
         assert_eq!(
             loaded.guild_of(recruit).map(|guild| guild.name.as_str()),
             Some("Hunters")
         );
-        fs::remove_dir_all(dir).expect("cleanup");
     }
 }

@@ -668,7 +668,7 @@ impl Player {
     }
 
     /// Handles a client request to interact with an entity.
-    pub fn handle_interact(&self, packet: SInteract) {
+    pub fn handle_interact(self: &Arc<Self>, packet: SInteract) {
         if !self.has_client_loaded() {
             return;
         }
@@ -698,7 +698,12 @@ impl Player {
         }
 
         let animation = self.interact_animation(packet.hand);
-        let result = self.interact_on(target.as_ref(), packet.hand, packet.location);
+        let hooked =
+            world
+                .gameplay_hooks
+                .on_player_interact_entity(self, &world, &target, packet.hand);
+        let result = hooked
+            .unwrap_or_else(|| self.interact_on(target.as_ref(), packet.hand, packet.location));
         self.swing_after_interaction(packet.hand, animation, result);
         self.broadcast_inventory_changes();
     }

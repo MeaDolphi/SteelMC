@@ -14,6 +14,7 @@ use text_components::format::Color;
 use text_components::translation::TranslatedMessage;
 use text_components::{Modifier as _, TextComponent};
 
+use crate::sound::SystemSound;
 use crate::stats::STAT_POINTS_PER_LEVEL;
 
 /// Rewards collected for one hunter since they were last shown.
@@ -87,6 +88,7 @@ impl Notice {
             player.send_action_bar(TextComponent::plain(line).color(Color::Gold));
         }
         if self.levels > 0 {
+            SystemSound::LevelUp.play(player);
             player.send_message(
                 &TextComponent::plain(format!(
                     "Уровень повышен до {}! Получено очков характеристик: {}.",
@@ -97,6 +99,9 @@ impl Notice {
             );
         }
         if let Some(line) = self.loot_line() {
+            if self.levels == 0 {
+                SystemSound::Reward.play(player);
+            }
             player.send_message(&line);
         }
     }

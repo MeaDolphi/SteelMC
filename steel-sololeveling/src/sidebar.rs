@@ -16,6 +16,7 @@ use text_components::format::Color;
 use crate::economy::{SystemPoints, Won};
 use crate::organization::Contract;
 use crate::quest::{REQUIRED_DISTANCE_BLOCKS, REQUIRED_JUMPS, REQUIRED_SNEAKS, SystemQuest};
+use crate::rank_icon;
 use crate::stats::HunterStats;
 
 /// The sidebar's server-internal objective name.
@@ -75,11 +76,13 @@ fn lines(view: &SidebarView) -> Vec<Line> {
     let stats = &view.stats;
     let quest = &view.quest;
     let mut lines = vec![
-        line(
-            "level",
-            format!("Уровень {} · ранг {}", stats.level, stats.rank().name()),
-            Color::Aqua,
-        ),
+        Line {
+            owner: "level".to_owned(),
+            text: TextComponent::plain(format!("Уровень {} · ранг ", stats.level))
+                .color(Color::Aqua)
+                .add_child(rank_icon::badge(stats.rank()))
+                .add_child(TextComponent::plain(format!(" {}", stats.rank().name()))),
+        },
         line("won", format!("Won: ₩{}", view.won.amount()), Color::Yellow),
         line(
             "system_points",

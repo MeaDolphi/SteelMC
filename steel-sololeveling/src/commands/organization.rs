@@ -6,6 +6,7 @@ use steel_core::command::{
     CommandError, CommandRegistration, CommandRegistrationError, CommandRegistry, literal,
 };
 use steel_core::entity::Entity as _;
+use steel_core::gameplay_hooks::BlockMutationCause;
 use steel_registry::blocks::block_state_ext::BlockStateExt as _;
 use steel_registry::vanilla_blocks;
 use steel_utils::types::UpdateFlags;
@@ -40,10 +41,11 @@ pub fn register(
                             "Встаньте на свободное место: доска ставится у ваших ног.",
                         ));
                     }
-                    if !world.set_block(
+                    if !world.set_block_with_cause(
                         pos,
                         vanilla_blocks::LECTERN.default_state(),
                         UpdateFlags::UPDATE_ALL,
+                        BlockMutationCause::System,
                     ) {
                         return Err(CommandError::from("Не удалось поставить кафедру."));
                     }
@@ -79,10 +81,11 @@ pub fn register(
                         return Err(CommandError::from("Рядом нет досок Организации."));
                     }
                     for pos in &removed {
-                        world.set_block(
+                        world.set_block_with_cause(
                             *pos,
                             vanilla_blocks::AIR.default_state(),
                             UpdateFlags::UPDATE_ALL,
+                            BlockMutationCause::System,
                         );
                     }
                     player.send_message(

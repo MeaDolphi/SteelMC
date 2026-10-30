@@ -5,9 +5,12 @@
 //! on changes and disconnect) plus the bookkeeping needed to throttle
 //! client-facing UI updates such as the sidebar.
 
+use crate::class::ClassChoice;
+use crate::gear::{AppliedGear, SavedGear};
 use glam::{DVec3, Vec3Swizzles};
 use rustc_hash::FxHashMap;
 use steel_core::player::PlayerInput;
+use steel_registry::item_stack::ItemStack;
 use steel_utils::locks::SyncRwLock;
 use uuid::Uuid;
 
@@ -15,7 +18,7 @@ use crate::abilities::{AbilityCooldowns, ActiveAbilities};
 use crate::economy::{PaymentError, SystemPoints, Won};
 use crate::organization::OrganizationBook;
 use crate::player_data::{PaymentDurability, PlayerDataStorage, SoloLevelingPlayerData};
-use crate::quest::{PENALTY_DELAY_SECONDS, SystemQuest};
+use crate::quest::{PENALTY_DELAY_SECONDS, PENALTY_MIN_RANK, SystemQuest};
 use crate::shadow::ShadowRoster;
 use crate::shop::ShopDay;
 use crate::sidebar::SidebarView;
@@ -52,6 +55,18 @@ pub struct HunterSession {
     pub cooldowns: AbilityCooldowns,
     /// Running effects of triggered artifact abilities.
     pub abilities: ActiveAbilities,
+    /// Chosen hunter class.
+    pub class: ClassChoice,
+    /// Artifacts equipped through the System, one stack per gear slot.
+    pub gear: Vec<ItemStack>,
+    /// Last persisted gear data, including slots that could not be decoded.
+    pub(crate) saved_gear: SavedGear,
+    /// Set when the gear changed and its bonuses must be re-applied.
+    pub(crate) gear_dirty: bool,
+    /// Attribute bonuses the gear currently applies.
+    pub(crate) gear_applied: AppliedGear,
+    /// Millisecond of the next Healer pulse.
+    pub(crate) class_pulse_at: u64,
     /// Unix second from which an owed penalty zone may start; `None` while
     /// nothing is owed.
     penalty_ready_at: Option<u64>,
@@ -87,6 +102,15 @@ impl HunterSession {
             organization: OrganizationBook::new(),
             cooldowns: AbilityCooldowns::new(),
             abilities: ActiveAbilities::new(),
+            class: ClassChoice {
+                class: None,
+                changed_at: 0,
+            },
+            gear: Vec::new(),
+            saved_gear: SavedGear { slots: Vec::new() },
+            gear_dirty: true,
+            gear_applied: Vec::new(),
+            class_pulse_at: 0,
             penalty_ready_at: None,
             ticks_since_sidebar_update: 0,
             last_sidebar: None,
@@ -109,6 +133,8 @@ impl HunterSession {
             shop: self.shop,
             organization: self.organization.clone(),
             cooldowns: self.cooldowns.clone(),
+            class: self.class,
+            gear: SavedGear::from_items_preserving(&self.gear, &self.saved_gear),
         }
     }
 
@@ -141,13 +167,36 @@ impl HunterSession {
     ///
     /// A penalty owed from an earlier day waits [`PENALTY_DELAY_SECONDS`] after
     /// every login, so reconnecting restarts the countdown.
-    pub const fn start_day(&mut self, day: u64, now_seconds: u64) {
+    pub fn start_day(&mut self, day: u64, now_seconds: u64) {
         self.quest.advance_window(day);
+        self.waive_penalty_below_rank();
         self.penalty_ready_at = if self.quest.penalty_pending {
             Some(now_seconds.saturating_add(PENALTY_DELAY_SECONDS))
         } else {
             None
         };
+    }
+
+    /// Drops an owed penalty while the hunter is below [`PENALTY_MIN_RANK`];
+    /// returns whether the hunter is exempt.
+    fn waive_penalty_below_rank(&mut self) -> bool {
+        let exempt = self.stats.rank() < PENALTY_MIN_RANK;
+        if exempt {
+            self.quest.penalty_pending = false;
+            self.penalty_ready_at = None;
+        }
+        exempt
+    }
+
+    /// Returns when an owed penalty zone starts, or `None` when it is due now
+    /// or nothing is owed.
+    #[must_use]
+    pub const fn penalty_ready_at(&self) -> Option<u64> {
+        if self.quest.penalty_pending {
+            self.penalty_ready_at
+        } else {
+            None
+        }
     }
 
     /// Returns whether an owed penalty zone should start at `now_seconds`.
@@ -183,7 +232,9 @@ impl HunterSession {
         if self.quest.window == u64::MAX {
             self.quest = SystemQuest::new(window);
         }
-        let penalty_pending = self.quest.advance_window(window);
+        let missed = self.quest.advance_window(window);
+        let waived = self.waive_penalty_below_rank();
+        let penalty_pending = missed && !waived;
         if penalty_pending {
             // The day ended while the hunter was online: the penalty is immediate.
             self.penalty_ready_at = Some(0);
@@ -193,6 +244,7 @@ impl HunterSession {
             self.last_sneak_pressed = input.shift();
             return QuestUpdate {
                 penalty_pending,
+                missed_without_penalty: missed && waived,
                 ..QuestUpdate::default()
             };
         };
@@ -212,6 +264,7 @@ impl HunterSession {
                 return QuestUpdate {
                     completed: true,
                     penalty_pending,
+                    missed_without_penalty: missed && waived,
                 };
             }
         }
@@ -220,6 +273,7 @@ impl HunterSession {
         self.last_sneak_pressed = input.shift();
         QuestUpdate {
             penalty_pending,
+            missed_without_penalty: missed && waived,
             ..QuestUpdate::default()
         }
     }
@@ -244,6 +298,9 @@ pub struct QuestUpdate {
     pub completed: bool,
     /// An expired unfinished quest created a pending penalty-zone challenge.
     pub penalty_pending: bool,
+    /// An expired unfinished quest went unpunished because the hunter is
+    /// below [`PENALTY_MIN_RANK`].
+    pub missed_without_penalty: bool,
 }
 
 /// Registry of live [`HunterSession`]s for all online players, keyed by
@@ -541,10 +598,40 @@ mod tests {
         assert!(session.quest.completed);
     }
 
+    fn c_rank_stats() -> HunterStats {
+        HunterStats {
+            level: 25,
+            ..HunterStats::new()
+        }
+    }
+
+    #[test]
+    fn hunters_below_rank_c_fail_the_quest_without_a_penalty() {
+        let mut session = HunterSession::new(
+            HunterStats::new(),
+            Won::default(),
+            SystemQuest::new(1),
+            ShadowRoster::default(),
+        );
+        session.start_day(1, 0);
+        let update = session.observe_quest(2, DVec3::ZERO, PlayerInput::EMPTY);
+        assert!(!update.penalty_pending);
+        assert!(update.missed_without_penalty);
+        assert!(!session.quest.penalty_pending);
+        assert!(!session.penalty_due(10_000));
+
+        session.quest.penalty_pending = true;
+        session.start_day(3, 1_000);
+        assert!(
+            !session.quest.penalty_pending,
+            "an older debt is waived too"
+        );
+    }
+
     #[test]
     fn a_penalty_from_an_earlier_day_waits_after_each_login() {
         let mut session = HunterSession::new(
-            HunterStats::new(),
+            c_rank_stats(),
             Won::default(),
             SystemQuest::new(1),
             ShadowRoster::default(),
@@ -563,7 +650,7 @@ mod tests {
     #[test]
     fn a_day_ending_online_owes_the_penalty_at_once() {
         let mut session = HunterSession::new(
-            HunterStats::new(),
+            c_rank_stats(),
             Won::default(),
             SystemQuest::new(1),
             ShadowRoster::default(),

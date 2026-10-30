@@ -17,13 +17,14 @@ use std::{
 
 use std::path::Path;
 
-use steel_core::config::{StorageSelection, WorldEntryConfig};
+use steel_core::config::{StorageSelection, WorldEntryConfig, WorldsConfig};
 use steel_core::gameplay_hooks::GameplayHooks;
 use steel_core::{
     GIT_HASH_SHORT, command::CommandRegistry, permission::PermissionGroupManager, server::Server,
+    worldgen::WorldGeneratorRegistry,
 };
 use steel_login::{JavaTcpClient, ServerConnectionSession};
-use steel_sololeveling::{commands, hooks::SoloLevelingHooks, state::SoloLevelingState};
+use steel_sololeveling::{city, commands, hooks::SoloLevelingHooks, state::SoloLevelingState};
 use tokio::{net::TcpListener, runtime::Runtime, select};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use toml::{Value, map::Map};
@@ -86,9 +87,8 @@ impl SteelServer {
     pub async fn new(
         chunk_runtime: Arc<Runtime>,
         cancel_token: CancellationToken,
-        mut steel_config: config::SteelConfig,
+        steel_config: config::SteelConfig,
     ) -> Result<Self, SteelServerError> {
-        ensure_sololeveling_instance_world(&mut steel_config)?;
         let sololeveling_dir = Path::new(&steel_config.worlds.save_path)
             .parent()
             .unwrap_or_else(|| Path::new("."))
@@ -122,10 +122,12 @@ impl SteelServer {
     pub async fn new_with_commands(
         chunk_runtime: Arc<Runtime>,
         cancel_token: CancellationToken,
-        steel_config: config::SteelConfig,
+        mut steel_config: config::SteelConfig,
         command_registry: CommandRegistry,
         gameplay_hooks: Arc<dyn GameplayHooks>,
     ) -> Result<Self, SteelServerError> {
+        ensure_sololeveling_city_world(&mut steel_config.worlds)?;
+        ensure_sololeveling_instance_world(&mut steel_config)?;
         log::info!("Starting Steel Server ({GIT_HASH_SHORT})");
 
         let permission_group_store = steel_config.permission_group_store();
@@ -140,7 +142,10 @@ impl SteelServer {
         let player_idle_timeout = steel_config.server.player_idle_timeout;
         let runtime_config = steel_config.server.into_runtime_config();
 
-        let server = Server::new_with_commands(
+        let mut generator_registry = WorldGeneratorRegistry::new_with_builtins()
+            .map_err(|error| SteelServerError::Core(error))?;
+        city::register_world_generator(&mut generator_registry).map_err(SteelServerError::Core)?;
+        let server = Server::new_with_commands_and_world_generators(
             chunk_runtime,
             cancel_token.clone(),
             runtime_config,
@@ -148,6 +153,7 @@ impl SteelServer {
             permission_groups,
             command_registry,
             gameplay_hooks,
+            generator_registry,
         )
         .await
         .map_err(SteelServerError::Core)?;
@@ -227,6 +233,69 @@ impl SteelServer {
     }
 }
 
+fn ensure_sololeveling_city_world(
+    worlds_config: &mut WorldsConfig,
+) -> Result<(), SteelServerError> {
+    let Some(domain) = worlds_config
+        .domains
+        .values_mut()
+        .find(|domain| domain.default)
+    else {
+        return Err(SteelServerError::Core(
+            "worlds.toml must declare a default domain before Solo Leveling can add its city world"
+                .to_owned(),
+        ));
+    };
+
+    let city_generator = steel_utils::Identifier::new("sololeveling", "city");
+    if let Some(city) = domain
+        .worlds
+        .iter_mut()
+        .find(|world| world.name == city::WORLD_NAME)
+    {
+        if city.generator != city_generator {
+            return Err(SteelServerError::Core(format!(
+                "world {} is reserved for generator {city_generator}, found {}",
+                city::WORLD_NAME,
+                city.generator
+            )));
+        }
+        city.default = true;
+        city.config = Some(Value::Table(Map::new()));
+    } else {
+        domain.worlds.push(WorldEntryConfig {
+            name: city::WORLD_NAME.to_owned(),
+            generator: city_generator,
+            default: true,
+            seed: None,
+            default_gamemode: None,
+            difficulty: None,
+            storage: None,
+            nether_portal_target: None,
+            end_portal_target: None,
+            config: Some(Value::Table(Map::new())),
+        });
+    }
+
+    let has_nether = domain.worlds.iter().any(|world| world.name == "the_nether");
+    let has_end = domain.worlds.iter().any(|world| world.name == "the_end");
+    for world in &mut domain.worlds {
+        world.default = world.name == city::WORLD_NAME;
+        if world.name == city::WORLD_NAME {
+            if has_nether {
+                world.nether_portal_target = Some("the_nether".to_owned());
+            }
+            if has_end {
+                world.end_portal_target = Some("the_end".to_owned());
+            }
+        } else if world.name == "the_nether" {
+            world.nether_portal_target = Some(city::WORLD_NAME.to_owned());
+        }
+    }
+
+    Ok(())
+}
+
 fn ensure_sololeveling_instance_world(
     steel_config: &mut config::SteelConfig,
 ) -> Result<(), SteelServerError> {
@@ -274,4 +343,82 @@ fn empty_world_generator_config(dimension_type: &str) -> Value {
         "dimension_type".to_owned(),
         Value::String(format!("minecraft:{dimension_type}")),
     )]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{city, ensure_sololeveling_city_world};
+    use steel_core::bootstrap::init_globals;
+    use steel_core::chunk_saver::registry::WorldStorageRegistry;
+    use steel_core::config::WorldsConfig;
+    use steel_core::worldgen::WorldGeneratorRegistry;
+    use steel_utils::Identifier;
+
+    #[test]
+    fn city_becomes_default_without_removing_the_existing_overworld() {
+        let mut worlds: WorldsConfig = toml::from_str(
+            r#"
+save_path = "saves"
+
+[domains.minecraft]
+default = true
+
+[[domains.minecraft.worlds]]
+name = "overworld"
+generator = "minecraft:overworld"
+default = true
+
+[[domains.minecraft.worlds]]
+name = "the_nether"
+generator = "minecraft:the_nether"
+
+[[domains.minecraft.worlds]]
+name = "the_end"
+generator = "minecraft:the_end"
+"#,
+        )
+        .expect("world config should parse");
+
+        ensure_sololeveling_city_world(&mut worlds).expect("city world should be configured");
+
+        let domain = worlds.domains.get("minecraft").expect("minecraft domain");
+        let city = domain
+            .worlds
+            .iter()
+            .find(|world| world.name == city::WORLD_NAME)
+            .expect("city world entry");
+        assert!(city.default);
+        assert_eq!(city.generator, Identifier::new("sololeveling", "city"));
+        assert_eq!(city.nether_portal_target.as_deref(), Some("the_nether"));
+        assert_eq!(city.end_portal_target.as_deref(), Some("the_end"));
+
+        let overworld = domain
+            .worlds
+            .iter()
+            .find(|world| world.name == "overworld")
+            .expect("the original world is retained");
+        assert!(!overworld.default);
+        assert_eq!(overworld.generator, Identifier::vanilla_static("overworld"));
+        assert_eq!(
+            domain
+                .worlds
+                .iter()
+                .find(|world| world.name == "the_nether")
+                .and_then(|world| world.nether_portal_target.as_deref()),
+            Some(city::WORLD_NAME)
+        );
+
+        init_globals();
+        let mut generators =
+            WorldGeneratorRegistry::new_with_builtins().expect("built-in generators");
+        city::register_world_generator(&mut generators).expect("city generator");
+        let storage = WorldStorageRegistry::new_with_builtins().expect("storage registry");
+        let resolved = worlds
+            .validate_and_resolve(&generators, &storage)
+            .expect("city world configuration");
+        assert_eq!(
+            resolved.domains[0].default_world,
+            Identifier::new("minecraft", city::WORLD_NAME)
+        );
+    }
 }

@@ -280,21 +280,22 @@ impl OrganizationMenuKind {
         Ok(match (button, action) {
             (Button::Offer(template), Action::Guild) => {
                 state.accept_guild_contract(uuid, template)?;
-                format!("Гильдийное задание взято: {}.", template.title())
+                format!(
+                    "Принятие гильдийного задания «{}» поставлено в очередь сохранения.",
+                    template.title()
+                )
             }
             (Button::Guild(index), Action::Primary) => {
                 let payout = state.turn_in_guild_contract(uuid, index)?;
                 format!(
-                    "Гильдийное задание сдано: {}. По {} Won начислено {} вкладчик(ам).",
+                    "Сдача гильдийного задания «{}» поставлена в очередь сохранения.",
                     payout.contract.template.title(),
-                    payout.contract.payment(),
-                    payout.paid.len()
                 )
             }
             (Button::Guild(index), _) => {
                 let contract = state.cancel_guild_contract(uuid, index)?;
                 format!(
-                    "Гильдийное задание отменено: {}.",
+                    "Отмена гильдийного задания «{}» поставлена в очередь сохранения.",
                     contract.template.title()
                 )
             }

@@ -14,8 +14,10 @@ use uuid::Uuid;
 use crate::{
     combat_reward::HunterReward,
     economy::{SystemPoints, Won},
+    guild::GuildRegistry,
     organization::OrganizationBook,
     player_data::{PlayerDataStorage, SoloLevelingPlayerData},
+    shop::ShopDay,
     state::SoloLevelingState,
 };
 
@@ -45,6 +47,7 @@ pub(crate) struct PreparedCommit {
     owners: Vec<Uuid>,
     pub transaction: PlayerStorageTransaction,
     updates: Vec<AccountUpdate>,
+    guild_registry: Option<GuildRegistry>,
 }
 
 pub(crate) enum AccountUpdate {
@@ -61,6 +64,10 @@ pub(crate) enum AccountUpdate {
         uuid: Uuid,
         book: OrganizationBook,
     },
+    Shop {
+        uuid: Uuid,
+        shop: ShopDay,
+    },
 }
 
 impl AccountUpdate {
@@ -68,7 +75,8 @@ impl AccountUpdate {
         match self {
             Self::Won { uuid, .. }
             | Self::Progress { uuid, .. }
-            | Self::Organization { uuid, .. } => *uuid,
+            | Self::Organization { uuid, .. }
+            | Self::Shop { uuid, .. } => *uuid,
         }
     }
 
@@ -91,6 +99,10 @@ impl AccountUpdate {
                 }
                 Self::Organization { book, .. } => {
                     session.organization = book;
+                    None
+                }
+                Self::Shop { shop, .. } => {
+                    session.shop = shop;
                     None
                 }
             }
@@ -176,6 +188,7 @@ impl PreparedCommit {
                 extensions,
             },
             updates,
+            guild_registry: None,
         })
     }
 
@@ -195,6 +208,7 @@ impl PreparedCommit {
                 }],
             },
             updates: Vec::new(),
+            guild_registry: None,
         }
     }
 
@@ -216,6 +230,12 @@ impl PreparedCommit {
         self
     }
 
+    /// Installs the candidate guild registry after the combined commit succeeds.
+    pub fn with_guild_registry(mut self, guild_registry: GuildRegistry) -> Self {
+        self.guild_registry = Some(guild_registry);
+        self
+    }
+
     /// Installs the after-images and reports what the storage achieved.
     pub fn complete(
         self,
@@ -230,12 +250,17 @@ impl PreparedCommit {
             if committed {
                 // Gameplay documents carry their own concurrency token, so only
                 // the account writes that precede them are recorded here.
-                for (uuid, extension) in
-                    self.owners.iter().copied().zip(self.transaction.extensions)
-                {
+                let mut extensions = self.transaction.extensions;
+                let documents = extensions.split_off(self.owners.len());
+                for (uuid, extension) in self.owners.iter().copied().zip(extensions) {
                     persistence
                         .expected
                         .insert(uuid, Some(extension.replacement));
+                }
+                for document in documents {
+                    persistence
+                        .document_expected
+                        .insert(document.key, Some(document.replacement));
                 }
             } else {
                 persistence.failed.extend(self.owners);
@@ -243,6 +268,9 @@ impl PreparedCommit {
         }
         for update in self.updates {
             update.apply(state, committed);
+        }
+        if committed && let Some(guild_registry) = self.guild_registry {
+            *state.guilds.lock() = guild_registry;
         }
         if !confirmed {
             log::error!("sololeveling: gameplay persistence not confirmed: {result:?}");
@@ -273,10 +301,15 @@ pub(super) async fn load_account(
             bytes: Some(bytes),
         });
     }
-    // Legacy JSON is a one-time import source, not a second live store.
-    let data = task::spawn_blocking(move || legacy.load_or_create(uuid))
-        .await
-        .map_err(io::Error::other)??;
+    // File-backed storage imports old account JSON once; SQLite deliberately
+    // starts fresh instead of silently seeding the new database from legacy files.
+    let data = if storage.allows_legacy_player_data_import() {
+        task::spawn_blocking(move || legacy.load_or_create(uuid))
+            .await
+            .map_err(io::Error::other)??
+    } else {
+        SoloLevelingPlayerData::new(uuid)
+    };
     if data.uuid != uuid {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

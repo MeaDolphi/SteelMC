@@ -105,6 +105,7 @@ impl ChestKind {
         let mut fields = record(KIND);
         fields.insert(CHEST, self.name().to_owned());
         write_tag(&mut stack, fields);
+        super::model::apply(&mut stack, &format!("chest/{}", self.name()));
         stack
     }
 }

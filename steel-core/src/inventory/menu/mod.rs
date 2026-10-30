@@ -118,6 +118,9 @@ impl Menu {
             Click::Swap { slot, with } if self.slot_is_external_storage(slot, player) => {
                 let guard = self.behavior.lock_all_containers();
                 let external_item_denied = external_stack_is_forbidden(slot, &guard);
+                // The guard also holds the player inventory, which is locked
+                // again below; parking_lot mutexes are not reentrant.
+                drop(guard);
                 let inventory_slot = match with {
                     SwapTarget::Hotbar(slot) => usize::from(slot),
                     SwapTarget::Offhand => 40,
@@ -212,6 +215,19 @@ impl Menu {
     #[must_use]
     pub const fn overrides_player_slots(&self) -> bool {
         self.overrides_player_slots
+    }
+
+    pub(crate) fn has_pending_returned_items(&self) -> bool {
+        if !self.behavior.carried().is_empty() {
+            return true;
+        }
+        let guard = self.behavior.lock_all_containers();
+        self.layout.drain_sections.iter().any(|range| {
+            range
+                .clone()
+                .into_iter()
+                .any(|index| !self.behavior.slots()[index].get_item(&guard).is_empty())
+        })
     }
 
     /// Returns true if this menu is still valid for the player.

@@ -43,6 +43,58 @@ pub struct ShadowRecovery {
     pub maximum_health: u16,
 }
 
+/// Fixed-point scale of the attribute values a shadow inherits.
+const ATTRIBUTE_SCALE: f64 = 1000.0;
+
+/// One piece of equipment a shadow inherited from its body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowGear {
+    /// Vanilla equipment slot index (`EquipmentSlot::index`).
+    pub slot: u8,
+    /// The stack in Solo Leveling's stored NBT form.
+    pub item: Vec<u8>,
+}
+
+/// What a shadow inherited from the mob it arose from.
+///
+/// Attribute values are the dead mob's *base* values, so dungeon scaling and
+/// class proportions carry over, while equipment modifiers come back through
+/// the equipment itself and are never counted twice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowOrigin {
+    /// What the mob was, as its nameplate showed it.
+    pub title: String,
+    /// Base maximum health, in thousandths.
+    pub max_health: u32,
+    /// Base attack damage, in thousandths.
+    pub attack_damage: u32,
+    /// Base movement speed, in thousandths.
+    pub movement_speed: u32,
+    /// Base armor, in thousandths.
+    pub armor: u32,
+    /// Equipment worn at death.
+    pub equipment: Vec<ShadowGear>,
+    /// Whether the source mob's role draws hostile aggro when summoned.
+    #[serde(default)]
+    pub is_tank: bool,
+}
+
+impl ShadowOrigin {
+    /// Converts an attribute value into the stored fixed-point form.
+    #[must_use]
+    pub fn scale(value: f64) -> u32 {
+        (value.max(0.0) * ATTRIBUTE_SCALE)
+            .round()
+            .min(f64::from(u32::MAX)) as u32
+    }
+
+    /// Converts a stored fixed-point value back into an attribute value.
+    #[must_use]
+    pub fn unscale(value: u32) -> f64 {
+        f64::from(value) / ATTRIBUTE_SCALE
+    }
+}
+
 /// A shadow retained by one hunter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Shadow {
@@ -67,15 +119,22 @@ pub struct Shadow {
     /// Present only while this shadow is rebuilding after its summoned body died.
     #[serde(default)]
     pub recovery: Option<ShadowRecovery>,
+    /// Stats, name and equipment inherited from the mob; absent on old saves.
+    #[serde(default)]
+    pub origin: Option<ShadowOrigin>,
 }
 
 impl Shadow {
     /// Creates a newly arisen shadow from a vanilla hostile mob type.
     #[must_use]
-    pub fn new(entity_type: Identifier, ordinal: usize) -> Self {
+    pub fn new(entity_type: Identifier, ordinal: usize, origin: Option<ShadowOrigin>) -> Self {
+        let name = origin.as_ref().map_or_else(
+            || format!("Shadow {ordinal}"),
+            |origin| format!("{} {ordinal}", origin.title),
+        );
         Self {
             id: Uuid::new_v4(),
-            name: format!("Shadow {ordinal}"),
+            name,
             entity_type,
             level: 1,
             experience: 0,
@@ -84,6 +143,7 @@ impl Shadow {
             attack: 0,
             speed: 0,
             recovery: None,
+            origin,
         }
     }
 
@@ -160,9 +220,20 @@ pub struct ShadowRoster {
 impl ShadowRoster {
     /// Adds a shadow with a name that is unique within this roster.
     pub fn arise(&mut self, entity_type: Identifier) -> &mut Shadow {
+        self.arise_from(entity_type, None)
+    }
+
+    /// Adds a shadow that keeps what it inherited from its mob.
+    ///
+    /// The ordinal in the name keeps two shadows of the same mob apart.
+    pub fn arise_from(
+        &mut self,
+        entity_type: Identifier,
+        origin: Option<ShadowOrigin>,
+    ) -> &mut Shadow {
         let index = self.shadows.len();
         let ordinal = index + 1;
-        self.shadows.push(Shadow::new(entity_type, ordinal));
+        self.shadows.push(Shadow::new(entity_type, ordinal, origin));
         &mut self.shadows[index]
     }
 
@@ -171,14 +242,14 @@ impl ShadowRoster {
     pub fn named(&self, name: &str) -> Option<&Shadow> {
         self.shadows
             .iter()
-            .find(|shadow| shadow.name.eq_ignore_ascii_case(name))
+            .find(|shadow| same_name(&shadow.name, name))
     }
 
     /// Returns a mutable shadow selected by its player-visible name.
     pub fn named_mut(&mut self, name: &str) -> Option<&mut Shadow> {
         self.shadows
             .iter_mut()
-            .find(|shadow| shadow.name.eq_ignore_ascii_case(name))
+            .find(|shadow| same_name(&shadow.name, name))
     }
 
     /// Restores every destroyed shadow by `health`, returning whether anything changed.
@@ -191,11 +262,16 @@ impl ShadowRoster {
     }
 }
 
+/// Compares shadow names case-insensitively, Cyrillic included.
+fn same_name(stored: &str, typed: &str) -> bool {
+    stored.trim().to_lowercase() == typed.trim().to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use steel_utils::Identifier;
 
-    use super::{Shadow, ShadowRoster};
+    use super::{Shadow, ShadowOrigin, ShadowRoster};
 
     #[test]
     fn arisen_shadows_have_stable_unique_ids_and_case_insensitive_names() {
@@ -251,5 +327,39 @@ mod tests {
         assert!(roster.shadows.iter().all(Shadow::is_recovering));
         assert!(roster.recover(10));
         assert!(roster.shadows.iter().all(|shadow| !shadow.is_recovering()));
+    }
+
+    #[test]
+    fn an_inherited_shadow_keeps_its_mob_name_and_stays_unique() {
+        let origin = ShadowOrigin {
+            title: "Упырь Страж".to_owned(),
+            max_health: ShadowOrigin::scale(28.0),
+            attack_damage: ShadowOrigin::scale(2.4),
+            movement_speed: ShadowOrigin::scale(0.195_5),
+            armor: 0,
+            equipment: Vec::new(),
+            is_tank: true,
+        };
+        let mut roster = ShadowRoster::default();
+        let first = roster
+            .arise_from(Identifier::vanilla_static("zombie"), Some(origin.clone()))
+            .name
+            .clone();
+        let second = roster
+            .arise_from(Identifier::vanilla_static("zombie"), Some(origin))
+            .name
+            .clone();
+        assert_eq!(first, "Упырь Страж 1");
+        assert_ne!(first, second);
+        assert!(roster.named("упырь страж 2").is_some());
+        assert!((ShadowOrigin::unscale(ShadowOrigin::scale(0.195_5)) - 0.195_5).abs() < 1e-3);
+        let encoded = serde_json::to_string(&roster).expect("serialize roster");
+        let restored: ShadowRoster = serde_json::from_str(&encoded).expect("restore roster");
+        assert!(
+            restored.shadows[0]
+                .origin
+                .as_ref()
+                .is_some_and(|origin| origin.is_tank)
+        );
     }
 }

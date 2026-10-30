@@ -16,6 +16,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use steel_registry::blocks::BlockRef;
 use steel_registry::vanilla_blocks;
 
+use crate::rank::HunterRank;
+
 /// Grid cells from the entrance cell to the grid edge.
 const GRID_RADIUS: i32 = 3;
 /// Blocks between the centres of two neighbouring grid cells.
@@ -26,10 +28,6 @@ const CORRIDOR_HEIGHT: u8 = 3;
 const CORRIDOR_LIGHT_SPACING: i32 = 5;
 /// Blocks between two room ceiling lights.
 const ROOM_LIGHT_SPACING: i32 = 4;
-/// Roughly one room wall block in this many is crystal ore.
-const ORE_CHANCE: u64 = 23;
-/// Side chambers are richer: one wall block in this many is ore.
-const CHAMBER_ORE_CHANCE: u64 = 7;
 /// Most spawn spots remembered per room.
 const SPAWN_SPOTS: usize = 24;
 
@@ -361,7 +359,7 @@ impl Blueprint {
             light_room(&air, &mut lights, room);
         }
 
-        let blocks = shell(seed, &air, &lights, &rooms);
+        let blocks = shell(seed, &air, &lights);
         let mut rooms = rooms;
         for (index, room) in rooms.iter_mut().enumerate() {
             room.spawns = spawn_spots(seed, &air, index, room);
@@ -374,6 +372,25 @@ impl Blueprint {
             blocks,
             bounds,
         }
+    }
+
+    /// Returns the dungeon's crystal-vein positions in a seed-stable order.
+    #[must_use]
+    pub fn crystal_ore_positions(&self, count: usize) -> Vec<(i32, i32, i32)> {
+        let mut positions = self
+            .blocks
+            .iter()
+            .filter(|placement| placement.part == Part::Ore)
+            .map(|placement| placement.offset)
+            .collect::<Vec<_>>();
+        positions.sort_by_key(|(x, y, z)| {
+            (
+                hash(self.seed ^ 0xC2B2_AE35_87B2_1F63, *x, *y, *z),
+                (*x, *y, *z),
+            )
+        });
+        positions.truncate(count.min(HunterRank::S.crystal_vein_count()));
+        positions
     }
 
     /// Returns the entrance room.
@@ -701,9 +718,9 @@ fn shell(
     seed: u64,
     air: &FxHashMap<(i32, i32), Column>,
     lights: &FxHashSet<(i32, i32)>,
-    rooms: &[Room],
 ) -> Vec<Placement> {
     let mut solid: FxHashMap<(i32, i32, i32), Part> = FxHashMap::default();
+    let mut ore_candidates = FxHashSet::default();
     let is_air = |x: i32, y: i32, z: i32| {
         air.get(&(x, z))
             .is_some_and(|column| y >= 0 && y < i32::from(column.height))
@@ -738,21 +755,13 @@ fn shell(
                     if y <= neighbour_top || is_air(nx, y, nz) {
                         continue;
                     }
-                    let ore_chance = match column.room.map(|room| rooms[room].role) {
-                        Some(RoomRole::Chamber) => Some(CHAMBER_ORE_CHANCE),
-                        Some(_) => Some(ORE_CHANCE),
-                        None => None,
-                    };
-                    let part = match ore_chance {
-                        Some(chance)
-                            if y >= 0
-                                && y < height
-                                && hash(seed, nx, y, nz).is_multiple_of(chance) =>
-                        {
-                            Part::Ore
-                        }
-                        _ if hash(seed ^ 0x5A5A, nx, y, nz).is_multiple_of(4) => Part::WallAlt,
-                        _ => Part::Wall,
+                    if column.room.is_some() && y >= 0 && y < height {
+                        ore_candidates.insert((nx, y, nz));
+                    }
+                    let part = if hash(seed ^ 0x5A5A, nx, y, nz).is_multiple_of(4) {
+                        Part::WallAlt
+                    } else {
+                        Part::Wall
                     };
                     solid.entry((nx, y, nz)).or_insert(part);
                 }
@@ -770,6 +779,22 @@ fn shell(
         {
             *part = Part::Pillar;
         }
+    }
+    let mut ore_candidates = ore_candidates
+        .into_iter()
+        .filter(|position| {
+            solid
+                .get(position)
+                .is_some_and(|part| matches!(part, Part::Wall | Part::WallAlt))
+        })
+        .collect::<Vec<_>>();
+    ore_candidates
+        .sort_by_key(|(x, y, z)| (hash(seed ^ 0xC2B2_AE35_87B2_1F63, *x, *y, *z), (*x, *y, *z)));
+    for position in ore_candidates
+        .into_iter()
+        .take(HunterRank::S.crystal_vein_count())
+    {
+        solid.insert(position, Part::Ore);
     }
     let mut blocks: Vec<Placement> = solid
         .into_iter()
@@ -829,6 +854,7 @@ mod tests {
     use rustc_hash::FxHashSet;
 
     use super::{Blueprint, CELL, GRID_RADIUS, Part, RoomRole, THEMES};
+    use crate::rank::HunterRank;
 
     fn air_columns(blueprint: &Blueprint) -> FxHashSet<(i32, i32)> {
         // The floor marks every walkable column.
@@ -849,6 +875,40 @@ mod tests {
             Blueprint::generate(42, 4).blocks,
             Blueprint::generate(43, 4).blocks
         );
+    }
+
+    #[test]
+    fn every_layout_has_nine_ranked_veins_and_rank_counts_select_a_stable_subset() {
+        for combat_rooms in 2..=5 {
+            for seed in 0..50 {
+                let blueprint = Blueprint::generate(seed, combat_rooms);
+                let all = blueprint.crystal_ore_positions(9);
+                let s_rank = blueprint.crystal_ore_positions(HunterRank::S.crystal_vein_count());
+                let d_rank = blueprint.crystal_ore_positions(HunterRank::D.crystal_vein_count());
+
+                assert_eq!(all.len(), 9, "seed {seed}, combat rooms {combat_rooms}");
+                assert_eq!(s_rank, all, "S rank must expose the whole vein set");
+                assert_eq!(d_rank.len(), 1, "seed {seed}, combat rooms {combat_rooms}");
+                assert_eq!(d_rank, all[..1], "lower ranks use a stable prefix");
+                for rank in [
+                    HunterRank::E,
+                    HunterRank::D,
+                    HunterRank::C,
+                    HunterRank::B,
+                    HunterRank::A,
+                    HunterRank::S,
+                ] {
+                    assert_eq!(
+                        blueprint
+                            .crystal_ore_positions(rank.crystal_vein_count())
+                            .len(),
+                        rank.crystal_vein_count(),
+                        "seed {seed}, combat rooms {combat_rooms}, rank {}",
+                        rank.name()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

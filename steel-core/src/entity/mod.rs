@@ -842,6 +842,10 @@ pub use manager::{
     AddEntityError, ChunkEntityLoadResult, EntityLifecycleChanges, EntityMoveError,
     EntityMoveUpdate, EntityOwnership, EntityVisibility, WorldEntityManager,
 };
+pub use mob::{
+    ALLIED_FOCUS_RANGE, ALLIED_FOLLOW_DISTANCE, ALLIED_GUARD_RADIUS, ALLIED_HOLD_RADIUS,
+    ALLIED_TELEPORT_DISTANCE, AlliedMode,
+};
 pub(crate) use mob::{Mob, MobBase, PathfinderMob};
 pub(crate) use monster::{Enemy, Monster};
 pub use movement_sync::{

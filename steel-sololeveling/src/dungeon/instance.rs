@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use glam::DVec3;
 use steel_core::entity::{SharedEntity, spawn_mob};
+use steel_core::gameplay_hooks::BlockMutationCause;
 use steel_core::world::World;
 use steel_registry::blocks::BlockRef;
 use steel_registry::blocks::block_state_ext::BlockStateExt;
@@ -16,8 +17,8 @@ use text_components::TextComponent;
 use text_components::format::Color;
 
 use super::boss::{BossKind, DungeonBoss};
-use super::generator::{Blueprint, Room};
-use super::mobs::{MobClass, MobLabel};
+use super::generator::{Blueprint, Part, Room, Theme};
+use super::mobs::{MobClass, MobLabel, MobRarity};
 use super::{
     DungeonLayout, DungeonWave, Footprint, Gate, INSTANCE_FLOOR_Y, InstanceRegion, boss_for_gate,
 };
@@ -31,10 +32,6 @@ const LEGACY_ROOM: (i32, i32, i32) = (13, 5, 7);
 const PENALTY_ARENA_SIZE: i32 = 31;
 /// Interior height of the penalty arena.
 const PENALTY_ARENA_HEIGHT: i32 = 7;
-/// Zombies per arena wave are laid out five across.
-const PENALTY_WAVE_COLUMNS: u8 = 5;
-/// Gap between zombies of the same arena wave.
-const PENALTY_WAVE_SPACING: i32 = 6;
 
 /// The block crystal ore is built from.
 ///
@@ -125,19 +122,6 @@ pub fn dungeon_chunks(
     chunks
 }
 
-/// Returns the chunk columns a penalty arena build writes, including the
-/// erasure of whatever `previous` left in the region.
-#[must_use]
-pub fn arena_chunks(region: InstanceRegion, previous: Option<Footprint>) -> Vec<ChunkPos> {
-    let mut chunks = penalty_arena_chunks(region);
-    for chunk in footprint_chunks(region, previous) {
-        if !chunks.contains(&chunk) {
-            chunks.push(chunk);
-        }
-    }
-    chunks
-}
-
 fn blueprint_chunks(region: InstanceRegion, blueprint: &Blueprint) -> Vec<ChunkPos> {
     let ((min_x, _, min_z), (max_x, _, max_z)) = blueprint.bounds;
     chunks_covering(
@@ -146,12 +130,16 @@ fn blueprint_chunks(region: InstanceRegion, blueprint: &Blueprint) -> Vec<ChunkP
     )
 }
 
-fn footprint_chunks(region: InstanceRegion, footprint: Option<Footprint>) -> Vec<ChunkPos> {
+pub(super) fn footprint_chunks(
+    region: InstanceRegion,
+    footprint: Option<Footprint>,
+) -> Vec<ChunkPos> {
     match footprint {
         Some(Footprint::Dungeon { seed }) => {
             blueprint_chunks(region, &DungeonLayout::from_seed(seed).blueprint)
         }
         Some(Footprint::Arena) => penalty_arena_chunks(region),
+        Some(Footprint::Tower) => super::tower::tower_chunks(region),
         None => {
             let (min, max) = legacy_box(region);
             let mut chunks = chunks_covering(min, max);
@@ -180,7 +168,7 @@ fn legacy_box(region: InstanceRegion) -> (BlockPos, BlockPos) {
 }
 
 /// Returns the world position of a blueprint offset inside `region`.
-fn at(region: InstanceRegion, (x, y, z): (i32, i32, i32)) -> BlockPos {
+pub(super) fn at(region: InstanceRegion, (x, y, z): (i32, i32, i32)) -> BlockPos {
     let origin = BlockPos::from(region.spawn);
     BlockPos::new(origin.x() + x, INSTANCE_FLOOR_Y + y, origin.z() + z)
 }
@@ -201,7 +189,7 @@ pub fn penalty_arena_chunks(region: InstanceRegion) -> Vec<ChunkPos> {
 }
 
 /// Returns every chunk column the block box `min`..=`max` touches.
-fn chunks_covering(min: BlockPos, max: BlockPos) -> Vec<ChunkPos> {
+pub(super) fn chunks_covering(min: BlockPos, max: BlockPos) -> Vec<ChunkPos> {
     let min = ChunkPos::from_block_pos(min);
     let max = ChunkPos::from_block_pos(max);
     let mut chunks = Vec::new();
@@ -278,22 +266,34 @@ pub fn place_gate_frame(world: &Arc<World>, entrance: BlockPos, red: bool) {
 pub fn remove_gate_frame(world: &Arc<World>, gate: &Gate) {
     let block = gate_frame_block(gate.red);
     for pos in gate_frame_positions(gate.entrance) {
-        let _ = world.set_block_if_unchanged(
+        let _ = world.set_block_if_unchanged_with_cause(
             pos,
             block,
             vanilla_blocks::AIR.default_state(),
             UpdateFlags::UPDATE_ALL,
+            BlockMutationCause::System,
         );
     }
 }
 
 /// Builds every room, corridor and light of one generated dungeon.
-pub fn build_dungeon(world: &Arc<World>, region: InstanceRegion, layout: &DungeonLayout) {
+pub fn build_dungeon(
+    world: &Arc<World>,
+    region: InstanceRegion,
+    layout: &DungeonLayout,
+    rank: HunterRank,
+) {
     let blueprint = &layout.blueprint;
     let palette = blueprint.theme.palette();
+    let crystal_ores = blueprint.crystal_ore_positions(rank.crystal_vein_count());
     let mut failed = 0;
     for placement in &blueprint.blocks {
-        let block = palette.block(placement.part, CRYSTAL_ORE);
+        let part = if placement.part == Part::Ore && !crystal_ores.contains(&placement.offset) {
+            Part::Wall
+        } else {
+            placement.part
+        };
+        let block = palette.block(part, CRYSTAL_ORE);
         set_fixture(
             world,
             at(region, placement.offset),
@@ -324,6 +324,7 @@ pub fn erase_footprint(world: &Arc<World>, region: InstanceRegion, footprint: Op
             }
         }
         Some(Footprint::Arena) => clear_box_of(world, arena_box(region), &mut failed),
+        Some(Footprint::Tower) => super::tower::erase_tower(world, region, &mut failed),
         None => {
             clear_box_of(world, legacy_box(region), &mut failed);
             clear_box_of(world, arena_box(region), &mut failed);
@@ -332,7 +333,7 @@ pub fn erase_footprint(world: &Arc<World>, region: InstanceRegion, footprint: Op
     warn_unwritten("previous instance", BlockPos::from(region.spawn), failed);
 }
 
-fn clear_box_of(world: &Arc<World>, (min, max): (BlockPos, BlockPos), failed: &mut u32) {
+pub(super) fn clear_box_of(world: &Arc<World>, (min, max): (BlockPos, BlockPos), failed: &mut u32) {
     let air = vanilla_blocks::AIR.default_state();
     for x in min.x()..=max.x() {
         for z in min.z()..=max.z() {
@@ -364,12 +365,6 @@ pub fn open_dungeon_exit(
     entrance
 }
 
-/// Builds the single sealed arena of one penalty-zone instance.
-pub fn build_penalty_arena(world: &Arc<World>, region: InstanceRegion) {
-    let corner = penalty_arena_corner(BlockPos::from(region.spawn));
-    build_room(world, corner, PENALTY_ARENA_SIZE, PENALTY_ARENA_HEIGHT);
-}
-
 /// Returns the box the penalty arena occupies, walls included.
 fn arena_box(region: InstanceRegion) -> (BlockPos, BlockPos) {
     let corner = penalty_arena_corner(BlockPos::from(region.spawn));
@@ -389,50 +384,22 @@ const fn penalty_arena_corner(origin: BlockPos) -> BlockPos {
     BlockPos::new(origin.x() - half, INSTANCE_FLOOR_Y - 1, origin.z() - half)
 }
 
-/// Builds one hollow quartz room with a solid floor, starting at the floor
-/// block of the room's north-west wall corner.
-///
-/// The interior is emptied as well, in case the region's record was lost.
-/// A penalty arena is not a place to mine, so it has no crystal ore.
-fn build_room(world: &Arc<World>, corner: BlockPos, size: i32, height: i32) {
-    let mut failed = 0;
-    for x in -1..=size {
-        for z in -1..=size {
-            for y in 0..=height {
-                let boundary = x == -1 || x == size || z == -1 || z == size || y == height;
-                if y != 0 && !boundary {
-                    continue;
-                }
-                let pos = BlockPos::new(corner.x() + x, corner.y() + y, corner.z() + z);
-                set_fixture(
-                    world,
-                    pos,
-                    vanilla_blocks::QUARTZ_BLOCK.default_state(),
-                    &mut failed,
-                );
-            }
-        }
-    }
-    for x in 0..size {
-        for z in 0..size {
-            for y in 1..height {
-                let pos = BlockPos::new(corner.x() + x, corner.y() + y, corner.z() + z);
-                if world.get_block_state(pos) != vanilla_blocks::AIR.default_state() {
-                    set_fixture(world, pos, vanilla_blocks::AIR.default_state(), &mut failed);
-                }
-            }
-        }
-    }
-    warn_unwritten("room", corner, failed);
+/// One mob a wave or guard group spawned.
+#[derive(Debug, Clone)]
+pub struct SpawnedMob {
+    /// Entity id of the mob.
+    pub id: i32,
+    /// Its class, which decides whether it has an ability.
+    pub class: MobClass,
+    /// Its nameplate.
+    pub label: MobLabel,
 }
 
-/// Spawns the fixed wave of `room` and returns the spawned entity ids.
+/// Spawns the fixed wave of combat room `room`.
 ///
-/// The wave is all zombies: Steel has no arrow projectile or ranged-attack goal
-/// yet, so a skeleton could only be a melee mob, which is not what vanilla does.
-///
-/// Each mob rolls a class from the dungeon seed, the room and its place in
-/// the wave, and carries a nameplate with its name, class and health.
+/// The wave is all zombie bodies: Steel has no arrow projectile or
+/// ranged-attack goal yet, so a skeleton could only be a melee mob, which is
+/// not what vanilla does. Variety comes from the classes instead.
 pub fn spawn_dungeon_wave(
     world: &Arc<World>,
     region: InstanceRegion,
@@ -440,44 +407,90 @@ pub fn spawn_dungeon_wave(
     wave: DungeonWave,
     rank: HunterRank,
     room: u8,
-) -> Vec<(i32, MobLabel)> {
+) -> Vec<SpawnedMob> {
     let Some(plan) = layout.blueprint.combat_room(room) else {
         return Vec::new();
     };
+    let salt = layout.seed.rotate_left(u32::from(room) * 7);
+    spawn_room_mobs(
+        world,
+        region,
+        layout.blueprint.theme,
+        plan,
+        wave.mob_count,
+        wave,
+        rank,
+        salt,
+    )
+}
+
+/// Spawns `count` mobs across the spawn spots of `plan`.
+///
+/// Each mob rolls a class from `salt` and its place in the group, and carries
+/// a nameplate with its name, class and health.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a spawn is fully described by where, how many, how strong and which roll"
+)]
+pub fn spawn_room_mobs(
+    world: &Arc<World>,
+    region: InstanceRegion,
+    theme: Theme,
+    plan: &Room,
+    count: u8,
+    wave: DungeonWave,
+    rank: HunterRank,
+    salt: u64,
+) -> Vec<SpawnedMob> {
     let mut spawned = Vec::new();
-    for index in 0..wave.mob_count {
+    for index in 0..count {
         let position = spawn_position(region, plan, usize::from(index));
-        let roll = layout
-            .seed
-            .rotate_left(u32::from(room) * 7)
-            .wrapping_add(u64::from(index).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let roll = salt.wrapping_add(u64::from(index).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let class = MobClass::from_roll(roll ^ (roll >> 29));
-        let (health, damage, _) = class.proportions();
-        let Some(entity) = spawn_scaled_mob(
-            world,
-            &vanilla_entities::ZOMBIE,
-            position,
-            wave.health_multiplier * health,
-            wave.damage_multiplier * damage,
-        ) else {
-            continue;
-        };
-        let Some(living) = entity.as_living_entity() else {
-            continue;
-        };
-        class.equip(living, rank);
-        let label = MobLabel::mob(layout.blueprint.theme, class);
-        label.show(living);
-        spawned.push((entity.id(), label));
+        if let Some(mob) = spawn_class_mob(world, theme, position, class, wave, rank) {
+            spawned.push(mob);
+        }
     }
-    let missing = u32::from(wave.mob_count) - u32::try_from(spawned.len()).unwrap_or(u32::MAX);
+    let missing = u32::from(count) - u32::try_from(spawned.len()).unwrap_or(u32::MAX);
     if missing > 0 {
         log::warn!(
-            "sololeveling: {missing} mob(s) of the wave in room {room} at {:?} could not be spawned",
+            "sololeveling: {missing} mob(s) of a group at {:?} could not be spawned",
             at(region, (plan.center.0, 0, plan.center.1))
         );
     }
     spawned
+}
+
+/// Spawns one zombie-bodied mob of `class`, scaled by `wave` and geared for
+/// `rank`, with its nameplate.
+pub(super) fn spawn_class_mob(
+    world: &Arc<World>,
+    theme: Theme,
+    position: BlockPos,
+    class: MobClass,
+    wave: DungeonWave,
+    rank: HunterRank,
+) -> Option<SpawnedMob> {
+    let (health, damage, _) = class.proportions();
+    let entity = spawn_scaled_mob(
+        world,
+        &vanilla_entities::ZOMBIE,
+        position,
+        wave.health_multiplier * health,
+        wave.damage_multiplier * damage,
+    )?;
+    let living = entity.as_living_entity()?;
+    class.equip(living, rank);
+    let label = MobLabel::mob(theme, class);
+    if let Some(mob) = entity.as_mob() {
+        mob.set_allied_tank(label.is_tank);
+    }
+    label.show(world, living);
+    Some(SpawnedMob {
+        id: entity.id(),
+        class,
+        label,
+    })
 }
 
 /// Returns the `index`-th spawn spot of a room, cycling through its spots.
@@ -523,7 +536,7 @@ pub fn spawn_dungeon_boss(
     let living = entity.as_living_entity()?;
     boss.apply_to(living);
     let label = boss_label(kind, rank, red);
-    label.show(living);
+    label.show(world, living);
     // The boss was spawned at scale 1.0, so its hitbox has to follow the new
     // scale before the fight starts.
     entity.refresh_dimensions();
@@ -546,35 +559,9 @@ fn boss_label(kind: BossKind, rank: HunterRank, red: bool) -> MobLabel {
         name,
         title: format!("Босс, ранг {}", rank.name()),
         color: Color::Red,
+        is_tank: false,
+        rarity: MobRarity::Boss,
     }
-}
-
-/// Spawns `count` vanilla zombies spread around the penalty arena and returns
-/// the spawned entity ids.
-pub fn spawn_penalty_wave(world: &Arc<World>, region: InstanceRegion, count: u8) -> Vec<i32> {
-    let origin = BlockPos::from(region.spawn);
-    let half = PENALTY_ARENA_SIZE / 2;
-    let mut spawned = Vec::new();
-    for index in 0..count {
-        let column = i32::from(index % PENALTY_WAVE_COLUMNS);
-        let row = i32::from(index / PENALTY_WAVE_COLUMNS);
-        let position = BlockPos::new(
-            origin.x() - half + 3 + column * PENALTY_WAVE_SPACING,
-            INSTANCE_FLOOR_Y,
-            origin.z() - half + 3 + row * PENALTY_WAVE_SPACING,
-        );
-        if let Some(entity) = spawn_scaled_mob(world, &vanilla_entities::ZOMBIE, position, 1.0, 1.0)
-        {
-            spawned.push(entity.id());
-        }
-    }
-    let missing = u32::from(count) - u32::try_from(spawned.len()).unwrap_or(u32::MAX);
-    if missing > 0 {
-        log::warn!(
-            "sololeveling: {missing} zombie(s) of the penalty wave at {origin:?} could not be spawned"
-        );
-    }
-    spawned
 }
 
 /// Spawns one mob and applies the rank multipliers to its vanilla attributes.
@@ -622,19 +609,29 @@ fn spawn_scaled_mob(
 ///
 /// [`World::set_block`] reports an out-of-bounds position or an unloaded chunk
 /// as a plain `false`; ignoring that would leave an invisible dungeon behind.
-fn set_fixture(world: &Arc<World>, pos: BlockPos, state: BlockStateId, failed: &mut u32) {
+pub(super) fn set_fixture(
+    world: &Arc<World>,
+    pos: BlockPos,
+    state: BlockStateId,
+    failed: &mut u32,
+) {
     if world.get_block_state(pos) == state {
         return;
     }
     // `set_block` only reports a chunk it could not write to; an unchanged
     // write never reaches it, so a `false` here means the chunk was missing.
-    if !world.set_block(pos, state, UpdateFlags::UPDATE_ALL) {
+    if !world.set_block_with_cause(
+        pos,
+        state,
+        UpdateFlags::UPDATE_ALL,
+        BlockMutationCause::System,
+    ) {
         *failed += 1;
     }
 }
 
 /// Reports fixture blocks that silently failed to write.
-fn warn_unwritten(what: &str, anchor: BlockPos, failed: u32) {
+pub(super) fn warn_unwritten(what: &str, anchor: BlockPos, failed: u32) {
     if failed > 0 {
         log::warn!(
             "sololeveling: {failed} block(s) of the {what} at {anchor:?} could not be written"

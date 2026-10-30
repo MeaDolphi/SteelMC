@@ -17,11 +17,22 @@ use steel_utils::types::{BlockStateId, InteractionHand};
 use uuid::Uuid;
 
 use crate::behavior::InteractionResult;
-use crate::entity::LivingEntity;
 use crate::entity::damage::DamageSource;
+use crate::entity::{LivingEntity, SharedEntity};
 use crate::player::Player;
 use crate::server::Server;
 use crate::world::World;
+
+/// Origin of a block-state mutation submitted through [`World`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockMutationCause {
+    /// Ordinary block behavior, such as fluid or neighbor updates.
+    Gameplay,
+    /// A player completing a permitted block break.
+    PlayerBreak,
+    /// Server-owned setup or cleanup, such as dungeon generation.
+    System,
+}
 
 /// Observes core server lifecycle events on behalf of an attached gameplay layer.
 ///
@@ -85,6 +96,26 @@ pub trait GameplayHooks: Send + Sync {
         _source: &DamageSource,
         _amount: f32,
     ) {
+    }
+
+    /// Called before the living-entity damage pipeline; `false` rejects the hit.
+    fn allow_living_entity_damage(
+        &self,
+        _world: &World,
+        _victim: &dyn LivingEntity,
+        _source: &DamageSource,
+    ) -> bool {
+        true
+    }
+
+    /// Returns whether a living entity should be selected before ordinary targets.
+    fn is_tank_taunt_target(&self, _world: &World, _candidate: &dyn LivingEntity) -> bool {
+        false
+    }
+
+    /// Returns whether two mobs should be treated as allies for target selection.
+    fn are_mobs_allied(&self, _world: &World, _attacker_id: i32, _candidate_id: i32) -> bool {
+        false
     }
 
     /// Called after vanilla rolls a living entity's loot but before it spawns.
@@ -167,6 +198,18 @@ pub trait GameplayHooks: Send + Sync {
         true
     }
 
+    /// Called before a block state changes through the world mutation APIs.
+    fn allow_block_mutation(
+        &self,
+        _world: &World,
+        _pos: BlockPos,
+        _old_state: BlockStateId,
+        _new_state: BlockStateId,
+        _cause: BlockMutationCause,
+    ) -> bool {
+        true
+    }
+
     /// Called when a player uses an item, before the item's vanilla behavior.
     ///
     /// Returning `Some` replaces the vanilla result, which is how a gameplay
@@ -194,6 +237,24 @@ pub trait GameplayHooks: Send + Sync {
         _hand: InteractionHand,
     ) -> Option<InteractionResult> {
         None
+    }
+
+    /// Called when a player right-clicks an entity, before vanilla handles it;
+    /// `Some` consumes the interaction with that result.
+    fn on_player_interact_entity(
+        &self,
+        _player: &Arc<Player>,
+        _world: &Arc<World>,
+        _target: &SharedEntity,
+        _hand: InteractionHand,
+    ) -> Option<InteractionResult> {
+        None
+    }
+
+    /// Called for every stack a dying player would drop; `true` keeps the
+    /// stack in its slot, so it survives the respawn.
+    fn keep_item_on_death(&self, _player: &Player, _stack: &ItemStack) -> bool {
+        false
     }
 
     /// Called before a player throws or drops an item, including death drops;

@@ -117,7 +117,30 @@ pub enum PartyError {
     NoInvitation,
 }
 
+impl PartyError {
+    /// Returns the Russian message shown to the hunter.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::NotInParty => "Игрок не состоит в этой группе.",
+            Self::NotLeader => "Это может только лидер группы.",
+            Self::Full => "В группе уже четыре участника.",
+            Self::AlreadyMember => "Игрок уже состоит в этой группе.",
+            Self::NoInvitation => "Активного приглашения в группу нет.",
+        }
+    }
+}
+
 impl PartyRuntime {
+    /// Returns the leader whose party invited `target`, while it is valid.
+    #[must_use]
+    pub fn invitation_for(&self, target: Uuid, tick: u64) -> Option<Uuid> {
+        self.invitations
+            .get(&target)
+            .filter(|invitation| invitation.expires_at >= tick)
+            .map(|invitation| invitation.party_leader)
+    }
+
     /// Returns a party snapshot for `player`.
     #[must_use]
     pub fn party_of(&self, player: Uuid) -> Option<&Party> {

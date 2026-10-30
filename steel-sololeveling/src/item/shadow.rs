@@ -44,6 +44,7 @@ pub fn stack(entity: &Identifier) -> ItemStack {
     let mut fields = record(KIND);
     fields.insert(ENTITY, entity.to_string());
     write_tag(&mut stack, fields);
+    super::model::apply(&mut stack, "shadow/soul");
     stack
 }
 
