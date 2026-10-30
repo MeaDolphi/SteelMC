@@ -3,7 +3,7 @@
 //! The rebuilt artifact and the Won debit commit together: a failed write
 //! leaves the old artifact and the old balance, never one without the other.
 
-use std::sync::Arc;
+use std::{cell::Cell, sync::Arc};
 
 use steel_core::player::Player;
 use steel_core::player::player_data_storage::transaction::ExtensionStorageWrite;
@@ -13,15 +13,18 @@ use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
 use super::{Request, account};
+use crate::enchant_menu::EnchantMenuKind;
 use crate::item::artifact;
 use crate::item::binding;
 use crate::item::enchantment::{self, EnchantError, Enchantment};
 use crate::item::nbt;
+use crate::quest_book::Goal;
 use crate::sound::SystemSound;
 use crate::state::auction::park_main_hand_stack;
 use crate::state::{EnchantTarget, SoloLevelingState};
 use steel_core::inventory::container::Container as _;
 use steel_registry::item_stack::ItemStack;
+use steel_utils::locks::SyncMutex;
 
 fn refuse(player: &Player, message: &str) {
     player.send_message(&TextComponent::plain(message.to_owned()).color(Color::Red));
@@ -37,6 +40,7 @@ impl SoloLevelingState {
         player: &Player,
         enchantment: Enchantment,
         target: EnchantTarget,
+        completion: Arc<SyncMutex<Option<EnchantTarget>>>,
     ) -> Result<(), EnchantError> {
         let uuid = player.gameprofile.id();
         let held = self
@@ -48,7 +52,7 @@ impl SoloLevelingState {
             .unwrap_or(0);
         enchantment::check(
             artifact.rarity,
-            artifact.category,
+            artifact.id.enchant_kind(),
             &artifact::enchantments_of(&held),
             enchantment,
             balance,
@@ -77,6 +81,7 @@ impl SoloLevelingState {
             uuid,
             enchantment,
             target,
+            completion,
         });
         Ok(())
     }
@@ -108,10 +113,13 @@ impl SoloLevelingState {
         uuid: Uuid,
         enchantment: Enchantment,
         target: EnchantTarget,
+        completion: Arc<SyncMutex<Option<EnchantTarget>>>,
     ) -> bool {
+        let current_target = Cell::new(target);
         let fail = |message: &str| {
             self.release_shop_purchase(uuid);
             refuse(&player, message);
+            *completion.lock() = Some(current_target.get());
             false
         };
         let Some(held) = self.enchant_target_stack(&player, target) else {
@@ -130,7 +138,7 @@ impl SoloLevelingState {
         };
         if let Err(error) = enchantment::check(
             catalog.rarity,
-            catalog.category,
+            id.enchant_kind(),
             &applied,
             enchantment,
             snapshot.won.amount(),
@@ -171,6 +179,7 @@ impl SoloLevelingState {
                 let Some(slot) = park_main_hand_stack(&player) else {
                     return fail("Освободите слот в инвентаре для зачарования.");
                 };
+                current_target.set(EnchantTarget::Inventory(slot));
                 Some(slot)
             }
             EnchantTarget::Inventory(slot) => Some(slot),
@@ -178,7 +187,8 @@ impl SoloLevelingState {
         };
         // Gear changes no inventory slot, but the transaction still owns the
         // inventory for the length of the account write.
-        let Ok(mut reservation) = player.reserve_stored_inventory() else {
+        let Ok(mut reservation) = player.reserve_stored_inventory_with_menu::<EnchantMenuKind>()
+        else {
             return fail("Инвентарь занят: повторите через мгновение.");
         };
         if let Some(slot) = inventory_slot
@@ -189,6 +199,8 @@ impl SoloLevelingState {
         let committed_bytes = replacement.clone();
         let state = Arc::clone(self);
         let completion_player = Arc::clone(&player);
+        let finished = Arc::clone(&completion);
+        let finished_target = current_target.get();
         let transaction = server.submit_stored_inventory_transaction(
             vec![reservation],
             vec![ExtensionStorageWrite {
@@ -198,6 +210,7 @@ impl SoloLevelingState {
             }],
             move |result| {
                 if result.is_ok() {
+                    state.record_goal(uuid, Goal::Enchant, 1);
                     state
                         .persistence
                         .lock()
@@ -236,6 +249,7 @@ impl SoloLevelingState {
                     );
                 }
                 state.persistence.lock().busy = false;
+                *finished.lock() = Some(finished_target);
             },
         );
         if let Err(error) = transaction {

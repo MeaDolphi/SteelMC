@@ -2,14 +2,16 @@
 
 use std::f64::consts::TAU;
 use std::fmt::{self, Debug, Formatter};
-use std::io;
+use std::fs;
+use std::io::{self, ErrorKind};
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use glam::DVec3;
 use rand::RngExt as _;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use steel_core::chunk::chunk_request::{
     ChunkRequest, ChunkRequestHandle, ChunkRequestState, ChunkTicketKind,
 };
@@ -32,34 +34,43 @@ use super::boss::{BossAbilityAction, BossFight};
 use super::generator::{Room, RoomRole};
 use super::instance::{
     SpawnedMob, build_dungeon, dungeon_chunks, erase_footprint, footprint_chunks,
-    gate_frame_chunks, gate_ground_is_dry, gate_space_is_clear, open_dungeon_exit,
-    opening_contains, place_gate_frame, remove_gate_frame, spawn_dungeon_boss, spawn_dungeon_wave,
-    spawn_room_mobs,
+    gate_frame_chunks, gate_frame_is_clear, gate_frame_matches, gate_ground_is_dry,
+    gate_space_is_clear, open_dungeon_exit, opening_contains, place_gate_frame, remove_gate_frame,
+    spawn_dungeon_boss, spawn_dungeon_wave, spawn_room_mobs,
 };
-use super::mobs::MobLabel;
+use super::mobs::{MobClass, MobLabel};
 use super::skills::{MobSkills, SkillAction, refresh_plates};
 use super::tower;
 use super::{
     DUNGEON_TIME_LIMIT_TICKS, DungeonLayout, DungeonWave, Footprint, GATE_SPAWN_INTERVAL_TICKS,
-    GATES_PER_SPAWN_CYCLE, Gate, GateRegistry, INSTANCE_WORLD_PATH, InstanceRegion,
-    InstanceRegionAllocator, PENALTY_ZONE_DURATION_TICKS, PENALTY_ZONE_WAVE_INTERVAL_TICKS,
-    penalty_wave_size, wave_for_gate, wave_for_rank,
+    GATES_PER_SPAWN_CYCLE, Gate, GateRegistry, GateRegistryChanges, GateRegistrySnapshot,
+    GateRegistryWrite, GateRetirementReason, INSTANCE_WORLD_PATH, InstanceRegion,
+    InstanceRegionAllocator, LegacyGateCleanup, PENALTY_ZONE_DURATION_TICKS,
+    PENALTY_ZONE_WAVE_INTERVAL_TICKS, TICKS_PER_SECOND, penalty_wave_size, wave_for_gate,
+    wave_for_rank,
 };
+use crate::castle;
 use crate::city;
 use crate::item::chest::{self, ChestKind};
-use crate::item::loot;
+use crate::item::{key, material, pouch};
 use crate::organization::Event;
 use crate::party::RaidContribution;
 use crate::rank::HunterRank;
-use crate::state::SoloLevelingState;
+use crate::state::{GateClear, SoloLevelingState};
 
-const GATE_MIN_DISTANCE: f64 = 128.0;
+/// Horizontal distance kept between two gates. The four gate plazas are
+/// small, so the gap only has to keep two frames from touching; a wider gap
+/// once left room for a single gate per plaza and starved the rank demand.
+const GATE_MIN_DISTANCE: f64 = 10.0;
+/// Horizontal distance an automatic gate keeps from every hunter, so it does
+/// not appear on top of someone.
+const GATE_PLAYER_DISTANCE: f64 = 16.0;
 
 /// Prototype switch: place one gate next to a hunter who joins the overworld,
 /// so a dungeon can be reached without waiting for the automatic cycle.
 ///
 /// Set to `false` to restore vanilla gate scheduling only.
-pub const TEST_GATE_ON_JOIN: bool = true;
+pub const TEST_GATE_ON_JOIN: bool = false;
 /// Rank of the prototype gate placed next to a joining hunter.
 const TEST_GATE_RANK: HunterRank = HunterRank::D;
 /// Whether the prototype gate is a red gate.
@@ -74,6 +85,14 @@ const TEST_GATE_MIN_DISTANCE: f64 = 4.0;
 const TEST_GATE_REUSE_RADIUS: f64 = 64.0;
 /// Sites the prototype gate placement tries before giving up.
 const TEST_GATE_MAX_ATTEMPTS: u8 = 8;
+/// Unentered gates kept open for every rank a hunter online holds.
+const DEMAND_GATES_PER_RANK: usize = 2;
+/// How long a rank may run short of gates before one is added.
+const DEMAND_DELAY_TICKS: u64 = TICKS_PER_SECOND * 120;
+/// How often the open gates are counted against the online ranks.
+const DEMAND_CHECK_TICKS: u64 = TICKS_PER_SECOND * 10;
+/// Gates the demand check never adds beyond, in the main world.
+const MAX_LIVE_GATES: usize = 18;
 /// Sites one spawn cycle may test before settling for fewer gates, so a crowded
 /// world cannot keep the scheduler busy forever.
 const GATE_MAX_SITE_ATTEMPTS: u8 = 12;
@@ -138,14 +157,30 @@ pub struct DungeonRuntime {
     spent_gates: Vec<u64>,
     /// Gate frames waiting for their chunks to load before removal.
     pending_gate_cleanup: Vec<PendingGateCleanup>,
+    /// Committed gates waiting for their frame chunks before placement/repair.
+    pending_gate_placement: Vec<PendingGatePlacement>,
+    /// Gates whose frame has been verified in the current process.
+    verified_gate_frames: FxHashSet<u64>,
+    /// Gates whose frame site was occupied and must not be overwritten.
+    blocked_gate_frames: FxHashSet<u64>,
+    /// One-time cleanup records for gate frames orphaned by older releases.
+    legacy_gate_cleanups: Vec<LegacyGateCleanup>,
+    pending_legacy_gate_cleanups: Vec<PendingLegacyGateCleanup>,
+    completed_legacy_gate_cleanups: FxHashSet<usize>,
+    blocked_legacy_gate_cleanups: FxHashSet<usize>,
     /// Instance mobs to discard once a [`Server`] handle is available again.
     spent_mobs: Vec<(Identifier, i32)>,
     /// Loot removed from instance entities and delivered after the runtime lock.
     pending_loot: Vec<(Uuid, ItemStack)>,
-    /// Hunters waiting for a prototype gate, with the attempts they spent.
-    test_gates: FxHashMap<Uuid, u8>,
+    /// Hunters waiting for a gate placed next to them: prototype gates and
+    /// gates opened with a dungeon key.
+    test_gates: FxHashMap<Uuid, NearbyGate>,
+    /// When each rank held by an online hunter first ran short of open gates.
+    demand_since: FxHashMap<HunterRank, u64>,
     /// Tick each hunter was last told why a gate refused them.
     gate_refusals: FxHashMap<Uuid, u64>,
+    /// Test-gate ids and the hunter who requested them.
+    pending_test_gate_players: FxHashMap<u64, Uuid>,
 }
 
 impl Debug for DungeonRuntime {
@@ -160,9 +195,30 @@ impl Debug for DungeonRuntime {
             .field("runs", &self.runs.len())
             .field("spent_gates", &self.spent_gates.len())
             .field("pending_gate_cleanup", &self.pending_gate_cleanup.len())
+            .field("pending_gate_placement", &self.pending_gate_placement.len())
+            .field("verified_gate_frames", &self.verified_gate_frames.len())
+            .field("blocked_gate_frames", &self.blocked_gate_frames.len())
+            .field("legacy_gate_cleanups", &self.legacy_gate_cleanups.len())
+            .field(
+                "pending_legacy_gate_cleanups",
+                &self.pending_legacy_gate_cleanups.len(),
+            )
+            .field(
+                "completed_legacy_gate_cleanups",
+                &self.completed_legacy_gate_cleanups.len(),
+            )
+            .field(
+                "blocked_legacy_gate_cleanups",
+                &self.blocked_legacy_gate_cleanups.len(),
+            )
             .field("spent_mobs", &self.spent_mobs.len())
             .field("pending_loot", &self.pending_loot.len())
             .field("test_gates", &self.test_gates.len())
+            .field("demand_since", &self.demand_since.len())
+            .field(
+                "pending_test_gate_players",
+                &self.pending_test_gate_players.len(),
+            )
             .field("gate_refusals", &self.gate_refusals.len())
             .finish()
     }
@@ -176,6 +232,8 @@ struct PendingGate {
     tick: u64,
     /// Set for a prototype gate placed next to a hunter instead of rolled.
     test: Option<PendingTestGate>,
+    /// Set for a gate the demand check asks for, in the rank that ran short.
+    rank: Option<HunterRank>,
 }
 
 struct PendingGateCleanup {
@@ -184,12 +242,44 @@ struct PendingGateCleanup {
     request: ChunkRequestHandle,
 }
 
-/// State of one prototype gate placement.
+struct PendingGatePlacement {
+    world: Arc<World>,
+    gate: Gate,
+    request: ChunkRequestHandle,
+}
+
+struct PendingLegacyGateCleanup {
+    index: usize,
+    world: Arc<World>,
+    gate: Gate,
+    request: ChunkRequestHandle,
+}
+
+/// A gate requested next to one hunter.
+#[derive(Debug, Clone, Copy)]
+struct NearbyGate {
+    /// Placement attempts already spent.
+    attempts: u8,
+    /// Rank of the gate.
+    rank: HunterRank,
+    /// Whether a dungeon key paid for it; a failed placement returns the key.
+    key: bool,
+    /// Demon Castle floor the gate opens, if it is a castle floor.
+    floor: Option<u32>,
+}
+
+/// State of one gate placement next to a hunter.
 struct PendingTestGate {
     /// Hunter the gate is placed next to.
     player: Uuid,
     /// Placement attempts already spent, including this one.
     attempts: u8,
+    /// Rank of the gate.
+    rank: HunterRank,
+    /// Whether a dungeon key paid for it.
+    key: bool,
+    /// Demon Castle floor the gate opens, if it is a castle floor.
+    floor: Option<u32>,
 }
 
 /// Progress of the ten-minute gate-spawn cycle of the main world.
@@ -252,6 +342,10 @@ enum RunProgress {
 
 struct DungeonProgress {
     rank: HunterRank,
+    /// Hunters of the run who died inside it.
+    deaths: u32,
+    /// Demon Castle floor of the run, if it climbs the castle.
+    floor: Option<u32>,
     /// Whether the gate was a red gate; scales waves, boss, and reward.
     red: bool,
     /// Wave parameters derived from `rank` and `red` once, at entry.
@@ -287,6 +381,11 @@ struct DungeonProgress {
     skills: MobSkills,
     /// Abilities to apply once the runtime lock is released.
     pending_skills: Vec<SkillAction>,
+    /// Classes of the wave mobs and chamber guards; hatched larvae have none
+    /// and so drop no materials.
+    classes: FxHashMap<i32, MobClass>,
+    /// Boss materials owed to survivors, delivered with the boss chest.
+    boss_materials: Vec<(Uuid, ItemStack)>,
 }
 
 impl DungeonProgress {
@@ -336,6 +435,7 @@ impl DungeonProgress {
     fn adopt(&mut self, spawned: Vec<SpawnedMob>, tick: u64) {
         for mob in spawned {
             self.skills.track(mob.id, mob.class, tick);
+            self.classes.insert(mob.id, mob.class);
             self.labels.insert(mob.id, mob.label);
         }
     }
@@ -437,6 +537,8 @@ impl InstanceRun {
 /// parameters.
 struct RunContext<'a> {
     state: &'a SoloLevelingState,
+    /// Tick the run started, for the clear time.
+    started_tick: u64,
     world: &'a Arc<World>,
     player: &'a Player,
     uuid: Uuid,
@@ -446,9 +548,126 @@ struct RunContext<'a> {
 }
 
 impl DungeonRuntime {
+    /// Loads one-time cleanup records for legacy orphan gate frames.
+    pub fn load_legacy_gate_cleanups(&mut self, path: PathBuf) -> io::Result<()> {
+        self.legacy_gate_cleanups = match fs::read_to_string(path) {
+            Ok(contents) => serde_json::from_str(&contents)
+                .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?,
+            Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        Ok(())
+    }
+
     /// Loads what each instance region holds, saving later builds to `path`.
     pub fn load_region_records(&mut self, path: PathBuf) -> io::Result<()> {
         self.regions.load_footprints(path)
+    }
+
+    /// Restores the durable gate registry after the main world has been loaded.
+    pub fn restore_gate_registry(&mut self, snapshot: GateRegistrySnapshot) -> Result<(), String> {
+        self.gates.restore(snapshot)
+    }
+
+    /// Starts an asynchronous write for changed gate metadata.
+    pub fn begin_gate_persistence(&mut self) -> Option<GateRegistryWrite> {
+        self.gates.begin_persistence()
+    }
+
+    /// Returns the last committed gates for a discovery menu.
+    #[must_use]
+    pub fn committed_gates(&self) -> Vec<Gate> {
+        self.gates.committed_gates()
+    }
+
+    /// Returns one committed gate by id.
+    #[must_use]
+    pub fn committed_gate(&self, id: u64) -> Option<&Gate> {
+        self.gates.committed_gate(id)
+    }
+
+    /// Returns whether the current gate registry cannot safely serve mutations.
+    #[must_use]
+    pub const fn gate_persistence_blocks_actions(&self) -> bool {
+        self.gates.persistence_blocks_gate_actions()
+    }
+
+    /// Publishes gate effects only after their metadata transaction commits.
+    pub fn commit_gate_persistence(&mut self, server: &Server, revision: u64) {
+        let changes = self.gates.commit_persistence(revision);
+        self.apply_gate_registry_changes(server, changes);
+    }
+
+    /// Restores the prior gate registry if a persistence write fails.
+    pub fn fail_gate_persistence(&mut self, revision: u64) {
+        let created = self.gates.fail_persistence(revision);
+        for gate in created {
+            self.pending_test_gate_players.remove(&gate.id);
+        }
+        let pending_gate_entries = self
+            .pending_entries
+            .iter()
+            .filter_map(|(uuid, entry)| {
+                matches!(entry.start, RunStart::Gate { .. }).then_some(*uuid)
+            })
+            .collect::<Vec<_>>();
+        for uuid in pending_gate_entries {
+            if let Some(entry) = self.pending_entries.remove(&uuid) {
+                self.regions.release(entry.region);
+            }
+        }
+        self.gate_cycle = None;
+        log::error!("sololeveling: gate registry persistence failed; gate entry is disabled");
+    }
+
+    fn apply_gate_registry_changes(&mut self, server: &Server, changes: GateRegistryChanges) {
+        for gate in changes.created {
+            let Some(world) = server.worlds.get(&gate.world) else {
+                log::error!(
+                    "sololeveling: committed gate {} has no loaded world {}",
+                    gate.id,
+                    gate.world
+                );
+                continue;
+            };
+            self.queue_gate_placement(Arc::clone(world), gate.clone());
+            announce_gate(server, &gate);
+            if let Some(test_player) = self.pending_test_gate_players.remove(&gate.id) {
+                if let Some(player) = find_player(server, test_player) {
+                    player.send_message(
+                        &TextComponent::plain(format!(
+                            "Test gate: {}-rank at {}, {}, {}",
+                            gate.rank.name(),
+                            gate.entrance.x(),
+                            gate.entrance.y(),
+                            gate.entrance.z()
+                        ))
+                        .color(Color::Aqua),
+                    );
+                }
+            } else if let Some(cycle) = &mut self.gate_cycle
+                && cycle.world == gate.world
+            {
+                cycle.gates_created += 1;
+            }
+            log::info!(
+                "sololeveling: created {}-rank{} gate {} in {} at {:?}",
+                gate.rank.name(),
+                if gate.red { " red" } else { "" },
+                gate.id,
+                gate.world,
+                gate.entrance
+            );
+        }
+        for (gate, reason) in changes.removed {
+            match reason {
+                GateRetirementReason::Expired => announce_gate_expired(server, &gate),
+                GateRetirementReason::Consumed => announce_gate_consumed(server, &gate),
+            }
+            if let Some(world) = server.worlds.get(&gate.world) {
+                self.queue_gate_cleanup(Arc::clone(world), gate);
+            }
+        }
     }
 
     /// Advances gate scheduling, chunk preparation, entry, and active runs.
@@ -461,13 +680,25 @@ impl DungeonRuntime {
         server: &Arc<Server>,
         tick: u64,
     ) -> Vec<RunAction> {
-        self.flush_spent(server);
+        self.schedule_legacy_gate_cleanups(server);
+        self.finish_legacy_gate_cleanups();
         self.finish_gate_cleanup();
-        self.expire_gates(server, tick);
-        self.schedule_gates(server, tick);
-        self.schedule_test_gates(server, tick);
-        self.finish_gate_requests(server);
-        self.find_gate_entries(state, server, tick);
+        self.schedule_retired_gate_cleanups(server);
+        self.finish_gate_placement();
+        self.schedule_committed_gate_placements(server);
+        if !self.gates.persistence_blocks_gate_actions() {
+            self.flush_spent(server);
+        }
+        if !self.gates.persistence_blocks_gate_actions() {
+            self.expire_gates();
+            self.schedule_gates(server, tick);
+            self.schedule_demand_gates(state, server, tick);
+            self.schedule_test_gates(server, tick);
+            self.finish_gate_requests(server);
+        }
+        if !self.gates.persistence_blocks_gate_actions() {
+            self.find_gate_entries(state, server, tick);
+        }
         self.find_penalty_entries(state, server);
         self.finish_entries(state, server, tick);
 
@@ -569,6 +800,29 @@ impl DungeonRuntime {
         })
     }
 
+    /// Returns the class and gate rank of a wave mob or chamber guard that
+    /// `hunter`'s run is fighting, for its material drop.
+    #[must_use]
+    pub fn material_source(
+        &self,
+        world: &World,
+        entity_id: i32,
+        hunter: Uuid,
+    ) -> Option<(MobClass, HunterRank)> {
+        self.runs.values().find_map(|run| {
+            if run.instance_world != world.key || !run.members.contains(&hunter) {
+                return None;
+            }
+            let RunProgress::Dungeon(progress) = &run.progress else {
+                return None;
+            };
+            if !progress.tracks(entity_id) {
+                return None;
+            }
+            Some((*progress.classes.get(&entity_id)?, progress.rank))
+        })
+    }
+
     /// Resolves an ordinary kill's effective rank only for a participant of that run.
     /// Boss kills are settled separately when the surviving party clears the gate.
     #[must_use]
@@ -626,77 +880,20 @@ impl DungeonRuntime {
         }
     }
 
-    /// Removes tracked dungeon drops and queues their contribution-based delivery.
-    pub fn capture_raid_loot(&mut self, world: &World, entity_id: i32, drops: &mut Vec<ItemStack>) {
-        for run in self.runs.values_mut() {
+    /// Returns the entity id of the living boss of a run in `world`.
+    pub fn boss_entity(&self, world: &World) -> Option<i32> {
+        self.runs.values().find_map(|run| {
             if run.instance_world != world.key {
-                continue;
+                return None;
             }
-            let RunProgress::Dungeon(progress) = &run.progress else {
-                continue;
-            };
-            if progress.boss != BossState::Alive(entity_id) && !progress.tracks(entity_id) {
-                continue;
+            match &run.progress {
+                RunProgress::Dungeon(progress) => match progress.boss {
+                    BossState::Alive(id) => Some(id),
+                    _ => None,
+                },
+                RunProgress::Penalty(_) => None,
             }
-            let total = run
-                .members
-                .iter()
-                .map(|member| {
-                    progress
-                        .contributions
-                        .get(member)
-                        .copied()
-                        .unwrap_or_default()
-                        .score()
-                })
-                .sum::<u64>();
-            for mut stack in mem::take(drops) {
-                // Delivered straight into inventories, so it is marked here as
-                // what a hunter loses on dying inside the run.
-                loot::mark(&mut stack);
-                let count = stack.count().max(0) as u64;
-                let mut allocated = 0_u64;
-                for (index, member) in run.members.iter().enumerate() {
-                    let score = progress
-                        .contributions
-                        .get(member)
-                        .copied()
-                        .unwrap_or_default()
-                        .score();
-                    let share = count
-                        .saturating_mul(score)
-                        .checked_div(total)
-                        .unwrap_or_else(|| even_share(count, run.members.len(), index));
-                    allocated = allocated.saturating_add(share);
-                    let Ok(share) = i32::try_from(share) else {
-                        continue;
-                    };
-                    if share == 0 {
-                        continue;
-                    }
-                    let mut stack = stack.clone();
-                    stack.set_count(share);
-                    self.pending_loot.push((*member, stack));
-                }
-                if total > 0
-                    && let Some(member) = run.members.iter().max_by_key(|member| {
-                        progress
-                            .contributions
-                            .get(member)
-                            .copied()
-                            .unwrap_or_default()
-                            .score()
-                    })
-                    && let Ok(remainder) = i32::try_from(count.saturating_sub(allocated))
-                    && remainder > 0
-                {
-                    let mut remainder_stack = stack;
-                    remainder_stack.set_count(remainder);
-                    self.pending_loot.push((*member, remainder_stack));
-                }
-            }
-            return;
-        }
+        })
     }
 
     /// Drains loot that must be delivered outside the runtime lock.
@@ -721,8 +918,11 @@ impl DungeonRuntime {
         };
         run.hide_boss_bar(player);
         run.members.retain(|member| *member != uuid);
-        let death = match &run.progress {
-            RunProgress::Dungeon(_) => RunDeath::DungeonFailed,
+        let death = match &mut run.progress {
+            RunProgress::Dungeon(progress) => {
+                progress.deaths += 1;
+                RunDeath::DungeonFailed
+            }
             RunProgress::Penalty(_) => RunDeath::PenaltyFailed {
                 roll: rand::rng().random_range(0..5),
             },
@@ -819,12 +1019,7 @@ impl DungeonRuntime {
     /// cleanup is queued and drained here.
     fn flush_spent(&mut self, server: &Server) {
         for id in mem::take(&mut self.spent_gates) {
-            let Some(gate) = self.gates.remove(id) else {
-                continue;
-            };
-            if let Some(world) = server.worlds.get(&gate.world) {
-                self.queue_gate_cleanup(Arc::clone(world), gate);
-            }
+            self.gates.remove(id);
         }
         for (world_key, entity_id) in mem::take(&mut self.spent_mobs) {
             let Some(world) = server.worlds.get(&world_key) else {
@@ -837,13 +1032,11 @@ impl DungeonRuntime {
         }
     }
 
-    fn expire_gates(&mut self, server: &Server, tick: u64) {
-        for gate in self.gates.expire_unused(tick) {
-            announce_gate_expired(server, &gate);
-            if let Some(world) = server.worlds.get(&gate.world) {
-                self.queue_gate_cleanup(Arc::clone(world), gate);
-            }
-        }
+    fn expire_gates(&mut self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let _ = self.gates.expire_unused_at(now);
     }
 
     fn queue_gate_cleanup(&mut self, world: Arc<World>, gate: Gate) {
@@ -859,6 +1052,164 @@ impl DungeonRuntime {
         });
     }
 
+    fn queue_gate_placement(&mut self, world: Arc<World>, gate: Gate) {
+        let request = world.chunk_map.request_chunks(ChunkRequest {
+            status: ChunkStatus::Full,
+            positions: gate_frame_chunks(gate.entrance),
+            ticket_kind: ChunkTicketKind::Command,
+        });
+        self.pending_gate_placement.push(PendingGatePlacement {
+            world,
+            gate,
+            request,
+        });
+    }
+
+    fn schedule_committed_gate_placements(&mut self, server: &Server) {
+        for gate in self.gates.committed_gates() {
+            if self.verified_gate_frames.contains(&gate.id)
+                || self.blocked_gate_frames.contains(&gate.id)
+                || self
+                    .pending_gate_placement
+                    .iter()
+                    .any(|pending| pending.gate.id == gate.id)
+            {
+                continue;
+            }
+            let Some(world) = server.worlds.get(&gate.world) else {
+                continue;
+            };
+            self.queue_gate_placement(Arc::clone(world), gate);
+        }
+    }
+
+    fn finish_gate_placement(&mut self) {
+        let mut index = 0;
+        while index < self.pending_gate_placement.len() {
+            match self.pending_gate_placement[index].request.poll() {
+                ChunkRequestState::Ready => {
+                    let placement = self.pending_gate_placement.swap_remove(index);
+                    if place_gate_frame(
+                        &placement.world,
+                        placement.gate.entrance,
+                        placement.gate.red,
+                    ) {
+                        self.verified_gate_frames.insert(placement.gate.id);
+                    } else {
+                        self.blocked_gate_frames.insert(placement.gate.id);
+                        log::warn!(
+                            "sololeveling: gate frame placement refused or incomplete in {} at {:?}; keeping the registry entry",
+                            placement.gate.world,
+                            placement.gate.entrance
+                        );
+                    }
+                }
+                ChunkRequestState::Cancelled => {
+                    let placement = self.pending_gate_placement.swap_remove(index);
+                    self.queue_gate_placement(Arc::clone(&placement.world), placement.gate);
+                }
+                ChunkRequestState::Pending { .. } => index += 1,
+            }
+        }
+    }
+
+    fn schedule_retired_gate_cleanups(&mut self, server: &Server) {
+        for (gate, _) in self.gates.retired_gates() {
+            if self
+                .pending_gate_cleanup
+                .iter()
+                .any(|pending| pending.gate.id == gate.id)
+            {
+                continue;
+            }
+            let Some(world) = server.worlds.get(&gate.world) else {
+                continue;
+            };
+            self.queue_gate_cleanup(Arc::clone(world), gate);
+        }
+    }
+
+    fn schedule_legacy_gate_cleanups(&mut self, server: &Server) {
+        for index in 0..self.legacy_gate_cleanups.len() {
+            if self.completed_legacy_gate_cleanups.contains(&index)
+                || self.blocked_legacy_gate_cleanups.contains(&index)
+                || self
+                    .pending_legacy_gate_cleanups
+                    .iter()
+                    .any(|pending| pending.index == index)
+            {
+                continue;
+            }
+            let record = &self.legacy_gate_cleanups[index];
+            let gate = record.gate();
+            if self.gates.has_gate_at(&record.world, gate.entrance) {
+                self.completed_legacy_gate_cleanups.insert(index);
+                continue;
+            }
+            let Some(world) = server.worlds.get(&record.world) else {
+                continue;
+            };
+            let request = world.chunk_map.request_chunks(ChunkRequest {
+                status: ChunkStatus::Full,
+                positions: gate_frame_chunks(gate.entrance),
+                ticket_kind: ChunkTicketKind::Command,
+            });
+            self.pending_legacy_gate_cleanups
+                .push(PendingLegacyGateCleanup {
+                    index,
+                    world: Arc::clone(world),
+                    gate,
+                    request,
+                });
+        }
+    }
+
+    fn finish_legacy_gate_cleanups(&mut self) {
+        let mut index = 0;
+        while index < self.pending_legacy_gate_cleanups.len() {
+            match self.pending_legacy_gate_cleanups[index].request.poll() {
+                ChunkRequestState::Ready => {
+                    let cleanup = self.pending_legacy_gate_cleanups.swap_remove(index);
+                    let record_index = cleanup.index;
+                    let gate = cleanup.gate;
+                    if self.gates.has_gate_at(&gate.world, gate.entrance) {
+                        self.completed_legacy_gate_cleanups.insert(record_index);
+                        continue;
+                    }
+                    if gate_frame_is_clear(&cleanup.world, &gate) {
+                        self.completed_legacy_gate_cleanups.insert(record_index);
+                    } else if gate_frame_matches(&cleanup.world, &gate) {
+                        remove_gate_frame(&cleanup.world, &gate);
+                        self.completed_legacy_gate_cleanups.insert(record_index);
+                        log::info!(
+                            "sololeveling: removed verified legacy orphan gate frame in {} at {:?}",
+                            gate.world,
+                            gate.entrance
+                        );
+                    } else {
+                        self.blocked_legacy_gate_cleanups.insert(record_index);
+                        log::warn!(
+                            "sololeveling: legacy gate cleanup refused for mismatched frame in {} at {:?}",
+                            gate.world,
+                            gate.entrance
+                        );
+                    }
+                }
+                ChunkRequestState::Cancelled => {
+                    let cleanup = self.pending_legacy_gate_cleanups.swap_remove(index);
+                    let request = cleanup.world.chunk_map.request_chunks(ChunkRequest {
+                        status: ChunkStatus::Full,
+                        positions: gate_frame_chunks(cleanup.gate.entrance),
+                        ticket_kind: ChunkTicketKind::Command,
+                    });
+                    self.pending_legacy_gate_cleanups
+                        .push(PendingLegacyGateCleanup { request, ..cleanup });
+                }
+                ChunkRequestState::Pending { .. } => index += 1,
+            }
+        }
+    }
+
     fn finish_gate_cleanup(&mut self) {
         let mut index = 0;
         while index < self.pending_gate_cleanup.len() {
@@ -866,9 +1217,21 @@ impl DungeonRuntime {
                 ChunkRequestState::Ready => {
                     let cleanup = self.pending_gate_cleanup.swap_remove(index);
                     remove_gate_frame(&cleanup.world, &cleanup.gate);
+                    if gate_frame_is_clear(&cleanup.world, &cleanup.gate) {
+                        self.gates.acknowledge_gate_cleanup(cleanup.gate.id);
+                    } else {
+                        log::warn!(
+                            "sololeveling: gate frame cleanup is incomplete in {} at {:?}; retaining durable retirement",
+                            cleanup.gate.world,
+                            cleanup.gate.entrance
+                        );
+                        self.queue_gate_cleanup(Arc::clone(&cleanup.world), cleanup.gate);
+                    }
                 }
                 ChunkRequestState::Cancelled => {
-                    self.pending_gate_cleanup.swap_remove(index);
+                    let cleanup = self.pending_gate_cleanup.swap_remove(index);
+                    let world = Arc::clone(&cleanup.world);
+                    self.queue_gate_cleanup(world, cleanup.gate);
                 }
                 ChunkRequestState::Pending { .. } => index += 1,
             }
@@ -900,6 +1263,88 @@ impl DungeonRuntime {
             });
         }
         self.request_gate_site(server);
+    }
+
+    /// Keeps open gates available for every rank a hunter online in the main
+    /// world holds.
+    ///
+    /// The ten-minute cycle seeds the world, but a fast hunter clears its few
+    /// gates long before the next one. When a rank has fewer than
+    /// [`DEMAND_GATES_PER_RANK`] unentered gates for [`DEMAND_DELAY_TICKS`],
+    /// one gate of exactly that rank is added, up to [`MAX_LIVE_GATES`].
+    fn schedule_demand_gates(
+        &mut self,
+        state: &SoloLevelingState,
+        server: &Arc<Server>,
+        tick: u64,
+    ) {
+        if !tick.is_multiple_of(DEMAND_CHECK_TICKS) {
+            return;
+        }
+        let Some(world) = main_world(server) else {
+            return;
+        };
+        let mut ranks: Vec<HunterRank> = Vec::new();
+        world.players.iter_players(|_, player| {
+            if let Some(rank) = state.hunter_rank(player.gameprofile.id())
+                && !ranks.contains(&rank)
+            {
+                ranks.push(rank);
+            }
+            true
+        });
+        let gates = self.gates.committed_gates();
+        let live = gates.iter().filter(|gate| gate.world == world.key).count();
+        self.demand_since.retain(|rank, _| ranks.contains(rank));
+        if live >= MAX_LIVE_GATES
+            || self
+                .pending_gates
+                .iter()
+                .any(|pending| pending.rank.is_some())
+        {
+            return;
+        }
+        for rank in ranks {
+            let open = gates
+                .iter()
+                .filter(|gate| gate.world == world.key && gate.rank == rank && !gate.entered)
+                .count();
+            if open >= DEMAND_GATES_PER_RANK {
+                self.demand_since.remove(&rank);
+                continue;
+            }
+            let since = *self.demand_since.entry(rank).or_insert(tick);
+            if tick.saturating_sub(since) < DEMAND_DELAY_TICKS {
+                continue;
+            }
+            self.demand_since.insert(rank, tick);
+            let spawn = world.level_data.read().data().spawn_pos();
+            let candidate = random_gate_candidate(spawn);
+            let requests = gate_frame_chunks(candidate)
+                .into_iter()
+                .map(|chunk| {
+                    world.chunk_map.request_chunk(
+                        chunk,
+                        ChunkStatus::Full,
+                        ChunkTicketKind::Command,
+                    )
+                })
+                .collect();
+            self.pending_gates.push(PendingGate {
+                world: Arc::clone(world),
+                candidate,
+                requests,
+                tick,
+                test: None,
+                rank: Some(rank),
+            });
+            log::debug!(
+                "sololeveling: hunters of rank {} wait for a gate",
+                rank.name()
+            );
+            // One demand gate in flight at a time keeps sites from colliding.
+            return;
+        }
     }
 
     /// Keeps one candidate site in flight until the cycle places all of its
@@ -948,6 +1393,7 @@ impl DungeonRuntime {
             requests,
             tick: cycle_tick,
             test: None,
+            rank: None,
         });
     }
 
@@ -957,7 +1403,53 @@ impl DungeonRuntime {
     /// hunter's position are loaded, so it works from the join hook where no
     /// [`Server`] tick is available yet.
     pub fn request_test_gate(&mut self, player: Uuid) {
-        self.test_gates.insert(player, 0);
+        self.test_gates.insert(
+            player,
+            NearbyGate {
+                attempts: 0,
+                rank: TEST_GATE_RANK,
+                key: false,
+                floor: None,
+            },
+        );
+    }
+
+    /// Asks for a gate of `rank` next to a hunter who used a dungeon key.
+    ///
+    /// Returns `false` while an earlier request of the hunter is still being
+    /// placed, so the caller keeps the key.
+    pub fn request_key_gate(&mut self, player: Uuid, rank: HunterRank, floor: Option<u32>) -> bool {
+        let busy = self.test_gates.contains_key(&player)
+            || self.pending_gates.iter().any(|pending| {
+                pending
+                    .test
+                    .as_ref()
+                    .is_some_and(|test| test.player == player)
+            });
+        if busy {
+            return false;
+        }
+        self.test_gates.insert(
+            player,
+            NearbyGate {
+                attempts: 0,
+                rank,
+                key: true,
+                floor,
+            },
+        );
+        true
+    }
+
+    /// Gives a key back when its gate could not be placed: a castle key for
+    /// a castle floor, so even a free entry is not lost.
+    fn refund_key(&mut self, player: Uuid, rank: HunterRank, floor: Option<u32>) {
+        let stack = if floor.is_some() {
+            key::castle_stack()
+        } else {
+            key::stack(rank)
+        };
+        self.pending_loot.push((player, stack));
     }
 
     /// Starts the prototype gate placements the join hook asked for.
@@ -966,16 +1458,33 @@ impl DungeonRuntime {
             return;
         }
         let requests = mem::take(&mut self.test_gates);
-        for (uuid, attempts) in requests {
+        for (uuid, request) in requests {
+            let refund = |runtime: &mut Self| {
+                if request.key {
+                    runtime.refund_key(uuid, request.rank, request.floor);
+                }
+            };
             let Some(player) = find_player(server, uuid) else {
+                refund(self);
                 continue;
             };
             let world = player.get_world();
             if main_world(server).is_none_or(|main| main.key != world.key) {
                 log::debug!("sololeveling: hunter {uuid} is not in the main world; no test gate");
+                if request.key {
+                    player.send_message(
+                        &TextComponent::plain("Ключ открывает врата только в главном мире.")
+                            .color(Color::Red),
+                    );
+                }
+                refund(self);
                 continue;
             }
-            if self.gates_near(&world.key, player.position(), TEST_GATE_REUSE_RADIUS) {
+            // A key opens its gate even beside another one; only the
+            // prototype gate avoids stacking on top of a nearby gate.
+            if !request.key
+                && self.gates_near(&world.key, player.position(), TEST_GATE_REUSE_RADIUS)
+            {
                 log::debug!("sololeveling: hunter {uuid} already stands next to a gate");
                 continue;
             }
@@ -997,8 +1506,12 @@ impl DungeonRuntime {
                 tick,
                 test: Some(PendingTestGate {
                     player: uuid,
-                    attempts: attempts.saturating_add(1),
+                    attempts: request.attempts.saturating_add(1),
+                    rank: request.rank,
+                    key: request.key,
+                    floor: request.floor,
                 }),
+                rank: None,
             });
         }
     }
@@ -1027,6 +1540,7 @@ impl DungeonRuntime {
                 .safe_surface_position(pending.candidate.x(), pending.candidate.z())
             else {
                 self.retry_test_gate(&pending);
+                self.retry_demand_gate(&pending);
                 log::debug!(
                     "sololeveling: gate candidate {:?} in {} has no dry surface",
                     pending.candidate,
@@ -1049,6 +1563,7 @@ impl DungeonRuntime {
                 || !gate_ground_is_dry(&pending.world, surface)
             {
                 self.retry_test_gate(&pending);
+                self.retry_demand_gate(&pending);
                 log::debug!(
                     "sololeveling: rejected gate site {surface:?} in {} (occupied, crowded, or too wet)",
                     pending.world.key
@@ -1056,13 +1571,24 @@ impl DungeonRuntime {
                 continue;
             }
             let test_gate = pending.test.is_some();
-            let gate = if test_gate {
+            let gate = if let Some(floor) = pending.test.as_ref().and_then(|test| test.floor) {
+                self.gates
+                    .create_castle(pending.world.key.clone(), surface, pending.tick, floor)
+            } else if let Some(test) = &pending.test {
                 self.gates.create_ranked(
                     pending.world.key.clone(),
                     surface,
                     pending.tick,
-                    TEST_GATE_RANK,
+                    test.rank,
                     TEST_GATE_RED,
+                )
+            } else if let Some(rank) = pending.rank {
+                self.gates.create_ranked(
+                    pending.world.key.clone(),
+                    surface,
+                    pending.tick,
+                    rank,
+                    false,
                 )
             } else {
                 let mut rng = rand::rng();
@@ -1074,16 +1600,11 @@ impl DungeonRuntime {
                     rng.random_range(0..100),
                 )
             };
-            place_gate_frame(&pending.world, surface, gate.red);
-            announce_gate(server, &gate);
-            if !test_gate
-                && let Some(cycle) = &mut self.gate_cycle
-                && cycle.world == pending.world.key
-            {
-                cycle.gates_created += 1;
+            if let Some(test) = &pending.test {
+                self.pending_test_gate_players.insert(gate.id, test.player);
             }
-            log::info!(
-                "sololeveling: created {}-rank{} gate {} in {} at {:?}{}",
+            log::debug!(
+                "sololeveling: staged {}-rank{} gate {} in {} at {:?}{}",
                 gate.rank.name(),
                 if gate.red { " red" } else { "" },
                 gate.id,
@@ -1091,21 +1612,16 @@ impl DungeonRuntime {
                 surface,
                 if test_gate { " (test gate)" } else { "" }
             );
-            if test_gate
-                && let Some(test) = &pending.test
-                && let Some(player) = find_player(server, test.player)
-            {
-                player.send_message(
-                    &TextComponent::plain(format!(
-                        "Test gate: {}-rank at {}, {}, {}",
-                        gate.rank.name(),
-                        surface.x(),
-                        surface.y(),
-                        surface.z()
-                    ))
-                    .color(Color::Aqua),
-                );
-            }
+        }
+    }
+
+    /// Lets a rank whose demand gate found no site try again on the next
+    /// demand check instead of waiting out the whole delay.
+    fn retry_demand_gate(&mut self, pending: &PendingGate) {
+        if pending.test.is_none()
+            && let Some(rank) = pending.rank
+        {
+            self.demand_since.insert(rank, 0);
         }
     }
 
@@ -1121,9 +1637,20 @@ impl DungeonRuntime {
                 test.player,
                 test.attempts
             );
+            if test.key {
+                self.refund_key(test.player, test.rank, test.floor);
+            }
             return;
         }
-        self.test_gates.insert(test.player, test.attempts);
+        self.test_gates.insert(
+            test.player,
+            NearbyGate {
+                attempts: test.attempts,
+                rank: test.rank,
+                key: test.key,
+                floor: test.floor,
+            },
+        );
     }
 
     fn gates_too_close_within(&self, world: &Identifier, position: BlockPos, radius: f64) -> bool {
@@ -1313,12 +1840,17 @@ impl DungeonRuntime {
             .pending_entries
             .iter()
             .filter_map(|(uuid, entry)| match entry.request.poll() {
-                ChunkRequestState::Ready => Some(*uuid),
+                ChunkRequestState::Ready
+                    if !self.gates.persistence_blocks_gate_actions()
+                        || matches!(entry.start, RunStart::Penalty) =>
+                {
+                    Some(*uuid)
+                }
+                ChunkRequestState::Ready | ChunkRequestState::Pending { .. } => None,
                 ChunkRequestState::Cancelled => {
                     cancelled.push(*uuid);
                     None
                 }
-                ChunkRequestState::Pending { .. } => None,
             })
             .collect::<Vec<_>>();
         for uuid in cancelled {
@@ -1326,6 +1858,23 @@ impl DungeonRuntime {
         }
 
         for uuid in ready {
+            if self.gates.persistence_blocks_gate_actions()
+                && self
+                    .pending_entries
+                    .get(&uuid)
+                    .is_some_and(|entry| matches!(entry.start, RunStart::Gate { .. }))
+            {
+                continue;
+            }
+            if let Some(PendingEntry {
+                start: RunStart::Gate { gate, .. },
+                ..
+            }) = self.pending_entries.get(&uuid)
+                && self.gates.remove(gate.id).is_some()
+            {
+                // The entrance is consumed only after its removal commits.
+                continue;
+            }
             let Some(entry) = self.pending_entries.remove(&uuid) else {
                 continue;
             };
@@ -1383,24 +1932,19 @@ impl DungeonRuntime {
             if members.is_empty() {
                 self.regions.release(region);
                 if let RunStart::Gate { gate, .. } = &start {
-                    self.gates.reopen(gate.id);
+                    self.gates.restore_gate(gate.clone());
                 }
                 continue;
-            }
-            if let RunStart::Gate { gate, .. } = &start
-                && let Some(consumed) = self.gates.remove(gate.id)
-            {
-                announce_gate_consumed(server, &consumed);
-                if let Some(world) = server.worlds.get(&consumed.world) {
-                    self.queue_gate_cleanup(Arc::clone(world), consumed);
-                }
             }
             let (progress, gate) = match start {
                 RunStart::Gate { gate, layout } => (
                     RunProgress::Dungeon(Box::new(DungeonProgress {
                         rank: gate.rank,
+                        floor: gate.floor,
                         red: gate.red,
-                        wave: wave_for_gate(gate.rank, gate.red),
+                        wave: gate
+                            .floor
+                            .map_or_else(|| wave_for_gate(gate.rank, gate.red), castle::wave),
                         layout,
                         combat_room: 0,
                         remaining_mobs: Vec::new(),
@@ -1420,6 +1964,9 @@ impl DungeonRuntime {
                         extra_mobs: Vec::new(),
                         skills: MobSkills::default(),
                         pending_skills: Vec::new(),
+                        classes: FxHashMap::default(),
+                        boss_materials: Vec::new(),
+                        deaths: 0,
                     })),
                     Some(gate.id),
                 ),
@@ -1533,6 +2080,7 @@ impl DungeonRuntime {
     ) -> Option<RunAction> {
         let RunContext {
             state,
+            started_tick,
             world,
             player,
             uuid,
@@ -1677,11 +2225,66 @@ impl DungeonRuntime {
             })
             .collect();
         state.credit_dungeon_boss(survivors.clone(), progress.rank);
-        state.record_organization_event(survivors.clone(), Event::Boss);
+        state.on_gate_cleared(&GateClear {
+            scores: survivors
+                .iter()
+                .map(|survivor| {
+                    progress
+                        .contributions
+                        .get(survivor)
+                        .copied()
+                        .unwrap_or_default()
+                        .score()
+                })
+                .collect(),
+            survivors: survivors.clone(),
+            rank: progress.rank,
+            red: progress.red,
+            floor: progress.floor,
+            seconds: tick.saturating_sub(started_tick) / TICKS_PER_SECOND,
+            deaths: progress.deaths,
+            party: progress.contributions.len(),
+        });
+        state.record_organization_event(survivors.clone(), Event::Boss(progress.rank));
         state.record_organization_event(survivors.clone(), Event::Dungeon(progress.rank));
         // One roll decides whether the squad gets a chest at all; every survivor
         // then receives the same kind, as the boss reward table specifies.
         progress.boss_chest = chest::boss_chest_for(progress.rank, rand::random_range(0..100));
+        for survivor in &survivors {
+            for stack in material::roll_boss(progress.rank, || rand::random_range(0..100)) {
+                progress.boss_materials.push((*survivor, stack));
+            }
+            progress
+                .boss_materials
+                .push((*survivor, pouch::stack(pouch::boss_amount(progress.rank))));
+            if rand::random_range(0..100) < key::BOSS_KEY_PERCENT {
+                progress
+                    .boss_materials
+                    .push((*survivor, key::stack(progress.rank)));
+            }
+            if progress.rank >= HunterRank::B
+                && rand::random_range(0..100) < castle::CASTLE_KEY_PERCENT
+            {
+                progress
+                    .boss_materials
+                    .push((*survivor, key::castle_stack()));
+            }
+            if let Some(floor) = progress.floor {
+                for stack in castle::floor_loot(floor, || rand::random_range(0..100)) {
+                    progress.boss_materials.push((*survivor, stack));
+                }
+            }
+        }
+        if let Some(floor) = progress.floor {
+            let climbers: Vec<(Uuid, String)> = survivors
+                .iter()
+                .filter_map(|uuid| {
+                    let player = world.players.get_by_uuid(uuid)?;
+                    Some((*uuid, player.gameprofile.name().to_owned()))
+                })
+                .collect();
+            state.record_castle_clear(&climbers, floor);
+        }
         progress.survivors = survivors;
         Some(RunAction::ReturnPlayer {
             uuid,
@@ -1769,6 +2372,7 @@ impl DungeonRuntime {
                 RunProgress::Dungeon(progress) => {
                     let context = RunContext {
                         state,
+                        started_tick: run.started_tick,
                         world: &world,
                         player,
                         uuid,
@@ -1778,6 +2382,7 @@ impl DungeonRuntime {
                     };
                     let action = Self::tick_dungeon_run(progress, &context, tick);
                     actions.extend(progress.pending_skills.drain(..).map(RunAction::MobSkill));
+                    self.pending_loot.append(&mut progress.boss_materials);
                     if let Some(kind) = progress.boss_chest.take() {
                         for survivor in progress.survivors.drain(..) {
                             self.pending_loot.push((survivor, kind.stack()));
@@ -1910,13 +2515,6 @@ pub fn apply_action(state: &SoloLevelingState, server: &Arc<Server>, action: &Ru
     }
 }
 
-/// Splits `count` items as evenly as possible across `members`, giving the
-/// first `count % members` of them one extra item.
-fn even_share(count: u64, members: usize, index: usize) -> u64 {
-    let members = members as u64;
-    count / members + u64::from((index as u64) < count % members)
-}
-
 pub(crate) fn find_player(server: &Server, uuid: Uuid) -> Option<Arc<Player>> {
     server
         .get_players()
@@ -1973,7 +2571,7 @@ fn players_too_close(world: &World, position: BlockPos, server: &Server) -> bool
         let player_position = player.position();
         let dx = player_position.x - f64::from(position.x());
         let dz = player_position.z - f64::from(position.z());
-        dx * dx + dz * dz < GATE_MIN_DISTANCE.powi(2)
+        dx * dx + dz * dz < GATE_PLAYER_DISTANCE.powi(2)
     })
 }
 

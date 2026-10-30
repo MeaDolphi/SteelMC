@@ -115,6 +115,9 @@ impl SoloLevelingState {
                 if gear::kind_of(&item).is_none() {
                     return fail("Этот предмет нельзя экипировать.");
                 }
+                if !gear::wearable(&item, self.class_of(uuid)) {
+                    return fail("Эту броню может носить только указанный в описании класс.");
+                }
                 let Some(index) = gear::free_slot(&items, &item) else {
                     return fail("Нет свободного подходящего слота снаряжения.");
                 };

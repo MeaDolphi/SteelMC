@@ -3711,6 +3711,9 @@ pub trait Entity: EntityEventSource + ErasedType + Send + Sync + 'static {
         y_offset: f64,
     ) -> Option<Arc<entities::ItemEntity>> {
         let world = self.level()?;
+        if self.as_mob().is_some() && world.gameplay_hooks.suppress_mob_drops(&world, self.id()) {
+            return None;
+        }
         let pos = self.position();
         let entity = world.spawn_item(DVec3::new(pos.x, pos.y + y_offset, pos.z), item)?;
         entity.set_default_pickup_delay();
@@ -3724,6 +3727,9 @@ pub trait Entity: EntityEventSource + ErasedType + Send + Sync + 'static {
         offset: DVec3,
     ) -> Option<Arc<entities::ItemEntity>> {
         let world = self.level()?;
+        if self.as_mob().is_some() && world.gameplay_hooks.suppress_mob_drops(&world, self.id()) {
+            return None;
+        }
         let entity = world.spawn_item(self.position() + offset, item)?;
         entity.set_default_pickup_delay();
         Some(entity)

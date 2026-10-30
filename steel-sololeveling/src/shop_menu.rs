@@ -1,7 +1,7 @@
 //! The personal System shop as a chest menu.
 //!
 //! The top row shows the hunter's system points; the two rows below hold the
-//! day's ten slots. Clicking an offer buys it, and a bought slot turns grey.
+//! current ten slots. Clicking an offer buys it, and a bought slot turns grey.
 
 use std::sync::Arc;
 
@@ -76,8 +76,8 @@ fn menu_items(view: Option<(ShopDay, u64)>, uuid: Uuid) -> Vec<ItemStack> {
             TextComponent::plain(format!("Очки Системы: {points}")).color(Color::LightPurple),
         ),
         vec![
-            TextComponent::plain("Набор товаров меняется в 00:00 по Москве.").color(Color::Gray),
-            TextComponent::plain("Каждый слот покупается раз в день.").color(Color::Gray),
+            TextComponent::plain("Набор товаров меняется каждые 20 минут.").color(Color::Gray),
+            TextComponent::plain("Каждый слот покупается раз за обновление.").color(Color::Gray),
             TextComponent::plain("Покупки привязаны к вам.").color(Color::Gray),
         ],
     );
@@ -182,7 +182,13 @@ impl MenuKind for ShopMenuKind {
         let Some(index) = offer_at(slot - self.buttons.start()) else {
             return ClickOutcome::Consume;
         };
-        match self.state.request_shop_purchase(player, index, true) {
+        let Some((displayed, _)) = self.view else {
+            return ClickOutcome::Consume;
+        };
+        match self
+            .state
+            .request_shop_purchase(player, index, true, Some(displayed))
+        {
             Ok(offer) => {
                 player.send_message(
                     &TextComponent::plain(format!(

@@ -1,0 +1,14 @@
+{
+  "layers": {
+    "humanoid": [
+      {
+        "texture": "sololeveling:mob_jungle"
+      }
+    ],
+    "humanoid_leggings": [
+      {
+        "texture": "sololeveling:mob_jungle"
+      }
+    ]
+  }
+}

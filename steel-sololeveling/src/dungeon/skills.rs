@@ -12,6 +12,7 @@ use glam::DVec3;
 use rustc_hash::FxHashMap;
 use steel_core::entity::damage::DamageSource;
 use steel_core::entity::{Entity as _, LivingEntity, MobEffectInstance, SharedEntity, spawn_mob};
+use steel_core::physics::{CollisionWorld, WorldCollisionProvider};
 use steel_core::server::Server;
 use steel_core::world::World;
 use steel_registry::particle_type::{ParticleData, ParticleType};
@@ -20,7 +21,7 @@ use steel_registry::{
     sound_events, vanilla_damage_types, vanilla_entities, vanilla_mob_effects,
     vanilla_particle_types,
 };
-use steel_utils::{BlockPos, Identifier};
+use steel_utils::{BlockPos, Identifier, WorldAabb};
 use text_components::format::Color;
 
 use super::boss::line_of_sight;
@@ -39,11 +40,24 @@ const BOMBER_FUSE_TICKS: u64 = 30;
 /// Reach of the blast.
 const BOMBER_BLAST_RADIUS: f64 = 4.5;
 /// Ticks between two broods of a broodmother.
-const BROOD_COOLDOWN_TICKS: u64 = 160;
+pub(crate) const BROOD_COOLDOWN_TICKS: u64 = 160;
 /// Larvae one brood hatches.
 const BROOD_SIZE: usize = 2;
 /// Live larvae one broodmother keeps at most.
 const BROOD_LIMIT: usize = 4;
+/// Candidate blocks one block around a broodmother, keeping hatchlings apart.
+const LARVA_SPAWN_OFFSETS: [(i32, i32); 8] = [
+    (1, 0),
+    (-1, 0),
+    (0, 1),
+    (0, -1),
+    (1, 1),
+    (1, -1),
+    (-1, 1),
+    (-1, -1),
+];
+/// Minimum horizontal distance between a hatchling's spawn point and an occupant.
+const LARVA_MIN_SEPARATION_SQUARED: f64 = 0.64;
 /// How close a hunter has to come before a shaman or broodmother acts.
 const AWARE_RANGE: f64 = 14.0;
 /// Height of a mob's eyes above its feet, for sight lines.
@@ -59,6 +73,7 @@ pub fn larva_label() -> MobLabel {
         title: "Рой".to_owned(),
         color: Color::DarkPurple,
         is_tank: false,
+        is_broodmother: false,
         rarity: MobRarity::Common,
     }
 }
@@ -189,8 +204,16 @@ impl MobSkills {
                         caster.play_sound(&sound_events::ENTITY_TURTLE_EGG_HATCH, 1.0, 0.6);
                         particles(world, &vanilla_particle_types::PORTAL, position, 30, 0.6);
                         let wanted = BROOD_SIZE.min(BROOD_LIMIT - state.larvae.len());
+                        let mut occupied = state
+                            .larvae
+                            .iter()
+                            .filter_map(|id| world.get_entity_by_id(*id))
+                            .map(|entity| entity.position())
+                            .collect::<Vec<_>>();
+                        occupied.push(position);
                         for _ in 0..wanted {
-                            if let Some(larva) = hatch(world, position) {
+                            if let Some(larva) = hatch(world, position, &occupied) {
+                                occupied.push(larva.position());
                                 state.larvae.push(larva.id());
                                 out.hatched.push((larva.id(), larva_label()));
                             }
@@ -205,11 +228,87 @@ impl MobSkills {
     }
 }
 
-fn hatch(world: &Arc<World>, around: DVec3) -> Option<SharedEntity> {
-    let entity = spawn_mob(world, &vanilla_entities::ENDERMITE, BlockPos::from(around)).ok()?;
+fn hatch(world: &Arc<World>, around: DVec3, occupied: &[DVec3]) -> Option<SharedEntity> {
+    let position = larva_spawn_position(around, occupied)?;
+    let entity = spawn_mob(world, &vanilla_entities::ENDERMITE, position).ok()?;
     let living = entity.as_living_entity()?;
     larva_label().show(world, living);
     Some(entity)
+}
+
+/// Hatches an allied larva only where it has space and solid support.
+pub(crate) fn hatch_shadow(
+    world: &Arc<World>,
+    around: DVec3,
+    occupied: &[DVec3],
+) -> Option<SharedEntity> {
+    let collision = WorldCollisionProvider::new(world);
+    let dimensions = &vanilla_entities::ENDERMITE.dimensions;
+    let radius = f64::from(dimensions.width) / 2.0;
+    let height = f64::from(dimensions.height);
+    for position in larva_spawn_candidates(around, occupied) {
+        let x = f64::from(position.x()) + 0.5;
+        let y = f64::from(position.y());
+        let z = f64::from(position.z()) + 0.5;
+        let body = WorldAabb::new(
+            x - radius,
+            y,
+            z - radius,
+            x + radius,
+            y + height,
+            z + radius,
+        );
+        let support = WorldAabb::new(x - radius, y - 0.1, z - radius, x + radius, y, z + radius);
+        if collision.has_block_collision(&body)
+            || world.has_entity_in_aabb_matching(&body, |entity| {
+                !entity.is_removed() && !entity.is_spectator()
+            })
+            || collision.has_world_border_collision(&body)
+            || !collision.has_block_collision(&support)
+        {
+            continue;
+        }
+        match spawn_mob(world, &vanilla_entities::ENDERMITE, position) {
+            Ok(entity) => {
+                if let Some(living) = entity.as_living_entity() {
+                    larva_label().show(world, living);
+                }
+                return Some(entity);
+            }
+            Err(error) => {
+                log::debug!(
+                    "sololeveling: shadow larva could not spawn at {position:?}: {error:?}"
+                );
+            }
+        }
+    }
+    None
+}
+
+fn larva_spawn_position(around: DVec3, occupied: &[DVec3]) -> Option<BlockPos> {
+    larva_spawn_candidates(around, occupied).next()
+}
+
+fn larva_spawn_candidates(
+    around: DVec3,
+    occupied: &[DVec3],
+) -> impl Iterator<Item = BlockPos> + '_ {
+    let base = BlockPos::from(around);
+    LARVA_SPAWN_OFFSETS
+        .iter()
+        .filter_map(move |(offset_x, offset_z)| {
+            let candidate = base.offset(*offset_x, 0, *offset_z);
+            let center_x = f64::from(candidate.x()) + 0.5;
+            let center_z = f64::from(candidate.z()) + 0.5;
+            occupied
+                .iter()
+                .all(|point| {
+                    let dx = center_x - point.x;
+                    let dz = center_z - point.z;
+                    dx * dx + dz * dz >= LARVA_MIN_SEPARATION_SQUARED
+                })
+                .then_some(candidate)
+        })
 }
 
 fn particles(world: &World, particle: &'static ParticleType, at: DVec3, count: i32, spread: f64) {
@@ -347,4 +446,34 @@ fn blast(world: &World, caster: &SharedEntity, power: f32) {
 
 fn play(caster: &SharedEntity, sound: SoundEventRef, pitch: f32) {
     caster.play_sound(sound, 1.2, pitch);
+}
+
+#[cfg(test)]
+mod tests {
+    use glam::DVec3;
+
+    use super::larva_spawn_position;
+
+    #[test]
+    fn brood_hatchlings_get_distinct_positions_outside_the_mother() {
+        let mother = DVec3::new(10.5, 64.0, 10.5);
+        let first = larva_spawn_position(mother, &[mother]).expect("first spawn position");
+        let first_center = center(first);
+        let second =
+            larva_spawn_position(mother, &[mother, first_center]).expect("second spawn position");
+        let second_center = center(second);
+
+        assert_ne!(first, second);
+        assert!(first_center.distance(mother) > 0.8);
+        assert!(second_center.distance(mother) > 0.8);
+        assert!(first_center.distance(second_center) > 0.8);
+    }
+
+    fn center(pos: steel_utils::BlockPos) -> DVec3 {
+        DVec3::new(
+            f64::from(pos.x()) + 0.5,
+            f64::from(pos.y()),
+            f64::from(pos.z()) + 0.5,
+        )
+    }
 }

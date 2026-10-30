@@ -252,14 +252,32 @@ fn gate_frame_block(red: bool) -> BlockStateId {
     }
 }
 
-/// Places the frame of a new gate.
-pub fn place_gate_frame(world: &Arc<World>, entrance: BlockPos, red: bool) {
+/// Places a gate frame without replacing blocks built after its site was chosen.
+pub fn place_gate_frame(world: &Arc<World>, entrance: BlockPos, red: bool) -> bool {
     let block = gate_frame_block(red);
+    let positions = gate_frame_positions(entrance);
+    if positions.iter().any(|pos| {
+        let state = world.get_block_state(*pos);
+        !state.is_air() && state != block
+    }) || !(1..4).all(|height| {
+        (0..2).all(|offset| {
+            world
+                .get_block_state(BlockPos::new(
+                    entrance.x() + offset,
+                    entrance.y() + height,
+                    entrance.z(),
+                ))
+                .is_air()
+        })
+    }) {
+        return false;
+    }
     let mut failed = 0;
-    for pos in gate_frame_positions(entrance) {
+    for pos in positions {
         set_fixture(world, pos, block, &mut failed);
     }
     warn_unwritten("gate frame", entrance, failed);
+    failed == 0
 }
 
 /// Restores a gate entrance to air, leaving any other block untouched.
@@ -274,6 +292,34 @@ pub fn remove_gate_frame(world: &Arc<World>, gate: &Gate) {
             BlockMutationCause::System,
         );
     }
+}
+
+/// Returns whether a legacy gate frame exactly matches its expected pattern.
+#[must_use]
+pub fn gate_frame_matches(world: &Arc<World>, gate: &Gate) -> bool {
+    let block = gate_frame_block(gate.red);
+    gate_frame_positions(gate.entrance)
+        .into_iter()
+        .all(|pos| world.get_block_state(pos) == block)
+        && (1..4).all(|height| {
+            (0..2).all(|offset| {
+                world
+                    .get_block_state(BlockPos::new(
+                        gate.entrance.x() + offset,
+                        gate.entrance.y() + height,
+                        gate.entrance.z(),
+                    ))
+                    .is_air()
+            })
+        })
+}
+
+/// Returns whether every expected frame location is already clear.
+#[must_use]
+pub fn gate_frame_is_clear(world: &Arc<World>, gate: &Gate) -> bool {
+    gate_frame_positions(gate.entrance)
+        .into_iter()
+        .all(|pos| world.get_block_state(pos).is_air())
 }
 
 /// Builds every room, corridor and light of one generated dungeon.
@@ -480,7 +526,7 @@ pub(super) fn spawn_class_mob(
         wave.damage_multiplier * damage,
     )?;
     let living = entity.as_living_entity()?;
-    class.equip(living, rank);
+    class.equip(living, rank, theme);
     let label = MobLabel::mob(theme, class);
     if let Some(mob) = entity.as_mob() {
         mob.set_allied_tank(label.is_tank);
@@ -560,6 +606,7 @@ fn boss_label(kind: BossKind, rank: HunterRank, red: bool) -> MobLabel {
         title: format!("Босс, ранг {}", rank.name()),
         color: Color::Red,
         is_tank: false,
+        is_broodmother: false,
         rarity: MobRarity::Boss,
     }
 }

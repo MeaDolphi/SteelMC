@@ -1,11 +1,17 @@
 //! Hunter classes.
 //!
-//! The six roles are the canonical hunter classes of Solo Leveling: Fighter,
-//! Tanker, Assassin, Ranger, Mage and Healer. The source describes roles, not
+//! The five roles are canonical hunter classes of Solo Leveling: Fighter,
+//! Tanker, Assassin, Ranger and Mage. The Healer of the source is folded into
+//! the Mage, whose grimoire carries a school of healing; saves that still name
+//! the Healer read as no class with one free change. The source describes roles, not
 //! numbers, so every bonus below is a server adaptation for Minecraft balance.
 //!
 //! A hunter picks a class from rank D. The first pick is free; afterwards the
 //! class may change once per seven days for [`CHANGE_PRICE`] Won.
+//!
+//! The constants below are the rank-D values; [`rank_scale`] grows them with
+//! the hunter's rank up to twice as much at S, so a class keeps pace with the
+//! gates it is fighting.
 
 use serde::{Deserialize, Serialize};
 use steel_core::entity::attribute::{AttributeMap, AttributeModifier, AttributeModifierOperation};
@@ -24,25 +30,54 @@ pub const CHANGE_COOLDOWN_SECONDS: u64 = 7 * 24 * 60 * 60;
 pub const CHANGE_PRICE: u64 = 1_000;
 
 /// Fighter bonus to melee damage, as a fraction.
-pub const FIGHTER_MELEE_BONUS: f32 = 0.10;
+pub const FIGHTER_MELEE_BONUS: f32 = 0.25;
+/// Fighter bonus to attack speed, as a fraction of the base.
+pub const FIGHTER_ATTACK_SPEED: f64 = 0.15;
+/// Share of the Fighter's melee damage returned as health.
+pub const FIGHTER_LIFESTEAL: f32 = 0.05;
 /// Tanker bonus to maximum health, in half-hearts.
-pub const TANKER_MAX_HEALTH: f64 = 4.0;
+pub const TANKER_MAX_HEALTH: f64 = 8.0;
 /// Tanker reduction of incoming damage, as a fraction.
-pub const TANKER_DAMAGE_REDUCTION: f32 = 0.10;
+pub const TANKER_DAMAGE_REDUCTION: f32 = 0.20;
+/// Highest Tanker damage reduction at any rank.
+pub const TANKER_MAX_REDUCTION: f32 = 0.35;
+/// Tanker knockback resistance; it does not scale with rank.
+pub const TANKER_KNOCKBACK_RESISTANCE: f64 = 0.5;
 /// Assassin bonus to movement speed, as a fraction.
-pub const ASSASSIN_SPEED: f64 = 0.10;
+pub const ASSASSIN_SPEED: f64 = 0.15;
+/// Assassin bonus to every melee hit, as a fraction.
+pub const ASSASSIN_MELEE_BONUS: f32 = 0.10;
 /// Assassin bonus to melee damage from behind the target, as a fraction.
-pub const ASSASSIN_BACKSTAB_BONUS: f32 = 0.30;
+pub const ASSASSIN_BACKSTAB_BONUS: f32 = 0.60;
 /// Ranger bonus to projectile damage, as a fraction.
-pub const RANGER_PROJECTILE_BONUS: f32 = 0.20;
+pub const RANGER_PROJECTILE_BONUS: f32 = 0.40;
+/// Ranger bonus to movement speed, as a fraction.
+pub const RANGER_SPEED: f64 = 0.10;
 /// Mage bonus to magic damage the hunter causes, as a fraction.
-pub const MAGE_MAGIC_BONUS: f32 = 0.25;
-/// Health a Healer restores to each nearby party member per pulse.
-pub const HEALER_PULSE_HEALTH: f32 = 1.0;
-/// Milliseconds between two Healer pulses.
-pub const HEALER_PULSE_MILLIS: u64 = 5_000;
-/// Radius of a Healer pulse in blocks.
-pub const HEALER_RADIUS: f64 = 8.0;
+pub const MAGE_MAGIC_BONUS: f32 = 0.50;
+
+/// Returns how much of the rank-D bonuses a hunter of `rank` gets.
+#[must_use]
+pub const fn rank_scale(rank: HunterRank) -> f32 {
+    match rank {
+        HunterRank::E | HunterRank::D => 1.0,
+        HunterRank::C => 1.25,
+        HunterRank::B => 1.5,
+        HunterRank::A => 1.75,
+        HunterRank::S => 2.0,
+    }
+}
+
+/// Returns the Tanker's reduction of incoming damage at `rank`.
+#[must_use]
+pub fn tanker_reduction(rank: HunterRank) -> f32 {
+    (TANKER_DAMAGE_REDUCTION * rank_scale(rank)).min(TANKER_MAX_REDUCTION)
+}
+
+/// Formats a fraction as whole percent.
+fn percent(fraction: f32) -> u32 {
+    (fraction * 100.0).round() as u32
+}
 
 /// One hunter class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -56,20 +91,17 @@ pub enum HunterClass {
     Assassin,
     /// Archer.
     Ranger,
-    /// Magic damage dealer.
+    /// Spellcaster: destruction, healing, control and utility magic.
     Mage,
-    /// Keeps the party alive.
-    Healer,
 }
 
 /// Every class, in menu order.
-pub const ALL: [HunterClass; 6] = [
+pub const ALL: [HunterClass; 5] = [
     HunterClass::Fighter,
     HunterClass::Tanker,
     HunterClass::Assassin,
     HunterClass::Ranger,
     HunterClass::Mage,
-    HunterClass::Healer,
 ];
 
 impl HunterClass {
@@ -82,7 +114,6 @@ impl HunterClass {
             Self::Assassin => "Убийца",
             Self::Ranger => "Стрелок",
             Self::Mage => "Маг",
-            Self::Healer => "Целитель",
         }
     }
 
@@ -95,7 +126,6 @@ impl HunterClass {
             Self::Assassin => "assassin",
             Self::Ranger => "ranger",
             Self::Mage => "mage",
-            Self::Healer => "healer",
         }
     }
 
@@ -107,42 +137,100 @@ impl HunterClass {
             .find(|class| class.name() == input || class.display_name().to_lowercase() == input)
     }
 
-    /// Returns a one-line Russian summary of the class bonus.
+    /// Returns the Russian summary of the class bonuses at `rank`.
     #[must_use]
-    pub const fn describe(self) -> &'static str {
+    pub fn describe(self, rank: HunterRank) -> Vec<String> {
+        let scale = rank_scale(rank);
+        let wide = f64::from(scale);
         match self {
-            Self::Fighter => "+10% урона в ближнем бою",
-            Self::Tanker => "+4 максимального здоровья, -10% входящего урона",
-            Self::Assassin => "+10% скорости, +30% урона в спину",
-            Self::Ranger => "+20% урона снарядами",
-            Self::Mage => "+25% магического урона (буря и способности)",
-            Self::Healer => "Каждые 5 с лечит группу в радиусе 8 блоков на 1 HP",
+            Self::Fighter => vec![
+                format!(
+                    "+{}% урона в ближнем бою",
+                    percent(FIGHTER_MELEE_BONUS * scale)
+                ),
+                format!(
+                    "+{}% скорости атаки",
+                    percent((FIGHTER_ATTACK_SPEED * wide) as f32)
+                ),
+                format!(
+                    "Лечение на {}% нанесённого урона",
+                    percent(FIGHTER_LIFESTEAL * scale)
+                ),
+            ],
+            Self::Tanker => vec![
+                format!("+{} максимального здоровья", TANKER_MAX_HEALTH * wide),
+                format!("-{}% входящего урона", percent(tanker_reduction(rank))),
+                format!(
+                    "+{}% устойчивости к отбрасыванию",
+                    percent(TANKER_KNOCKBACK_RESISTANCE as f32)
+                ),
+            ],
+            Self::Assassin => vec![
+                format!("+{}% скорости", percent((ASSASSIN_SPEED * wide) as f32)),
+                format!(
+                    "+{}% урона в ближнем бою",
+                    percent(ASSASSIN_MELEE_BONUS * scale)
+                ),
+                format!(
+                    "+{}% урона в спину",
+                    percent(ASSASSIN_BACKSTAB_BONUS * scale)
+                ),
+            ],
+            Self::Ranger => vec![
+                format!(
+                    "+{}% урона снарядами",
+                    percent(RANGER_PROJECTILE_BONUS * scale)
+                ),
+                format!("+{}% скорости", percent((RANGER_SPEED * wide) as f32)),
+            ],
+            Self::Mage => vec![
+                format!("+{}% магического урона", percent(MAGE_MAGIC_BONUS * scale)),
+                "Мана и гримуар заклинаний; мана растёт от Интеллекта".to_owned(),
+            ],
         }
     }
 
-    /// Attribute bonuses of the class, applied while it is chosen.
-    fn attributes(self) -> &'static [ClassModifier] {
+    /// Attribute bonuses of the class at `rank`, applied while it is chosen.
+    ///
+    /// Every class touches the same attributes at every rank, so removing a
+    /// class needs no rank.
+    fn attributes(self, rank: HunterRank) -> Vec<ClassModifier> {
+        let scale = f64::from(rank_scale(rank));
         match self {
-            Self::Tanker => &TANKER_MODIFIERS,
-            Self::Assassin => &ASSASSIN_MODIFIERS,
-            Self::Fighter | Self::Ranger | Self::Mage | Self::Healer => &[],
+            Self::Fighter => vec![(
+                vanilla_attributes::ATTACK_SPEED,
+                FIGHTER_ATTACK_SPEED * scale,
+                AttributeModifierOperation::AddMultipliedBase,
+            )],
+            Self::Tanker => vec![
+                (
+                    vanilla_attributes::MAX_HEALTH,
+                    TANKER_MAX_HEALTH * scale,
+                    AttributeModifierOperation::AddValue,
+                ),
+                (
+                    vanilla_attributes::KNOCKBACK_RESISTANCE,
+                    TANKER_KNOCKBACK_RESISTANCE,
+                    AttributeModifierOperation::AddValue,
+                ),
+            ],
+            Self::Assassin => vec![(
+                vanilla_attributes::MOVEMENT_SPEED,
+                ASSASSIN_SPEED * scale,
+                AttributeModifierOperation::AddMultipliedBase,
+            )],
+            Self::Ranger => vec![(
+                vanilla_attributes::MOVEMENT_SPEED,
+                RANGER_SPEED * scale,
+                AttributeModifierOperation::AddMultipliedBase,
+            )],
+            Self::Mage => Vec::new(),
         }
     }
 }
 
 /// One attribute bonus of a class: attribute, amount and operation.
 type ClassModifier = (AttributeRef, f64, AttributeModifierOperation);
-
-static TANKER_MODIFIERS: [ClassModifier; 1] = [(
-    vanilla_attributes::MAX_HEALTH,
-    TANKER_MAX_HEALTH,
-    AttributeModifierOperation::AddValue,
-)];
-static ASSASSIN_MODIFIERS: [ClassModifier; 1] = [(
-    vanilla_attributes::MOVEMENT_SPEED,
-    ASSASSIN_SPEED,
-    AttributeModifierOperation::AddMultipliedBase,
-)];
 
 /// Why a class cannot be chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,12 +269,40 @@ impl ClassError {
 
 /// A hunter's chosen class and when it last changed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "SavedClassChoice")]
 pub struct ClassChoice {
     /// The chosen class, `None` before the first pick.
     pub class: Option<HunterClass>,
     /// Unix second of the last change.
     #[serde(default)]
     pub changed_at: u64,
+    /// The next change skips the wait and the price; granted to hunters
+    /// whose removed class was dropped.
+    #[serde(default)]
+    pub free_change: bool,
+}
+
+/// [`ClassChoice`] as saved, where the class may name a removed class.
+#[derive(Deserialize)]
+struct SavedClassChoice {
+    #[serde(default)]
+    class: Option<String>,
+    #[serde(default)]
+    changed_at: u64,
+    #[serde(default)]
+    free_change: bool,
+}
+
+impl From<SavedClassChoice> for ClassChoice {
+    fn from(saved: SavedClassChoice) -> Self {
+        let class = saved.class.as_deref().and_then(HunterClass::parse);
+        Self {
+            class,
+            changed_at: saved.changed_at,
+            // A class that no longer exists, the Healer, frees the next pick.
+            free_change: saved.free_change || (saved.class.is_some() && class.is_none()),
+        }
+    }
 }
 
 impl ClassChoice {
@@ -206,7 +322,7 @@ impl ClassChoice {
         if self.class == Some(class) {
             return Err(ClassError::AlreadyChosen);
         }
-        let price = if self.class.is_some() {
+        let price = if self.class.is_some() && !self.free_change {
             let ready = self.changed_at.saturating_add(CHANGE_COOLDOWN_SECONDS);
             if now < ready {
                 return Err(ClassError::TooSoon {
@@ -222,21 +338,23 @@ impl ClassChoice {
         };
         self.class = Some(class);
         self.changed_at = now;
+        self.free_change = false;
         Ok(price)
     }
 
-    /// Writes the class attribute modifiers, removing those of other classes.
-    pub fn apply_to(&self, attributes: &mut AttributeMap) {
+    /// Writes the class attribute modifiers for `rank`, removing those of
+    /// other classes.
+    pub fn apply_to(&self, attributes: &mut AttributeMap, rank: HunterRank) {
         for class in ALL {
-            for (attribute, amount, operation) in class.attributes() {
+            for (attribute, amount, operation) in class.attributes(rank) {
                 let id = from_sololeveling(format!("class/{}", class.name()));
                 if self.class == Some(class) {
                     attributes.set_modifier(
                         attribute,
                         AttributeModifier {
                             id,
-                            amount: *amount,
-                            operation: *operation,
+                            amount,
+                            operation,
                         },
                         false,
                     );
@@ -295,6 +413,61 @@ mod tests {
         );
         assert_eq!(won.amount(), 0);
         assert_eq!(choice.class, Some(HunterClass::Tanker));
+    }
+
+    #[test]
+    fn bonuses_double_from_rank_d_to_s_and_the_tank_is_capped() {
+        assert!((rank_scale(HunterRank::D) - 1.0).abs() < f32::EPSILON);
+        assert!((rank_scale(HunterRank::S) - 2.0).abs() < f32::EPSILON);
+        assert!((tanker_reduction(HunterRank::D) - 0.20).abs() < 1e-6);
+        assert!((tanker_reduction(HunterRank::S) - TANKER_MAX_REDUCTION).abs() < 1e-6);
+        assert_eq!(
+            HunterClass::Fighter.describe(HunterRank::S)[0],
+            "+50% урона в ближнем бою"
+        );
+        for class in ALL {
+            let at_d: Vec<_> = class
+                .attributes(HunterRank::D)
+                .iter()
+                .map(|(attribute, ..)| attribute.key.clone())
+                .collect();
+            let at_s: Vec<_> = class
+                .attributes(HunterRank::S)
+                .iter()
+                .map(|(attribute, ..)| attribute.key.clone())
+                .collect();
+            assert_eq!(at_d, at_s, "{class:?} must touch the same attributes");
+        }
+    }
+
+    #[test]
+    fn a_saved_healer_becomes_no_class_with_a_free_change() {
+        let choice: ClassChoice =
+            serde_json::from_str(r#"{"class":"healer","changed_at":500}"#).expect("old save");
+        assert_eq!(choice.class, None);
+        assert!(choice.free_change);
+        let mage: ClassChoice =
+            serde_json::from_str(r#"{"class":"mage","changed_at":500}"#).expect("save");
+        assert_eq!(mage.class, Some(HunterClass::Mage));
+        assert!(!mage.free_change);
+        let round: ClassChoice =
+            serde_json::from_str(&serde_json::to_string(&mage).expect("encode")).expect("decode");
+        assert_eq!(round, mage);
+    }
+
+    #[test]
+    fn a_free_change_skips_the_wait_and_the_price_once() {
+        let mut choice = ClassChoice {
+            class: Some(HunterClass::Mage),
+            changed_at: 100,
+            free_change: true,
+        };
+        let mut won = Won::zero();
+        assert_eq!(
+            choice.choose(HunterClass::Tanker, HunterRank::D, 101, &mut won),
+            Ok(0)
+        );
+        assert!(!choice.free_change);
     }
 
     #[test]

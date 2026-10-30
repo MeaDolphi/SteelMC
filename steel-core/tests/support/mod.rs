@@ -1,6 +1,6 @@
 use crate::config::ResolvedDomainConfig;
 use crate::entity::damage::DamageHistory;
-use crate::gameplay_hooks::NoopGameplayHooks;
+use crate::gameplay_hooks::{GameplayHooks, NoopGameplayHooks};
 use crate::server::worlds::WorldMap;
 use std::cell::{Cell, RefCell};
 use std::ops::Deref;
@@ -127,6 +127,19 @@ pub(crate) fn dropped_items(world: &World, center: DVec3) -> Vec<SharedEntity> {
 
 pub(crate) fn fresh_test_world(key: &'static str) -> TestWorld {
     create_test_world(key)
+}
+
+pub(crate) fn fresh_test_world_with_gameplay_hooks(
+    key: &'static str,
+    gameplay_hooks: Arc<dyn GameplayHooks>,
+) -> TestWorld {
+    create_test_world_with_time_source_and_hooks(
+        Identifier::vanilla_static(key),
+        Difficulty::Normal,
+        &vanilla_dimension_types::OVERWORLD,
+        GameTimeSource::Primary,
+        gameplay_hooks,
+    )
 }
 
 pub(crate) fn fresh_test_world_in_domain(domain: &'static str, key: &'static str) -> TestWorld {
@@ -303,6 +316,22 @@ pub(crate) fn create_test_world_with_time_source(
     dimension_type: DimensionTypeRef,
     game_time_source: GameTimeSource,
 ) -> TestWorld {
+    create_test_world_with_time_source_and_hooks(
+        key,
+        difficulty,
+        dimension_type,
+        game_time_source,
+        Arc::new(NoopGameplayHooks),
+    )
+}
+
+fn create_test_world_with_time_source_and_hooks(
+    key: Identifier,
+    difficulty: Difficulty,
+    dimension_type: DimensionTypeRef,
+    game_time_source: GameTimeSource,
+    gameplay_hooks: Arc<dyn GameplayHooks>,
+) -> TestWorld {
     let history = DAMAGE_HISTORY.with(|slot| {
         let mut weak = slot.borrow_mut();
         if let Some(history) = weak.upgrade() {
@@ -312,12 +341,13 @@ pub(crate) fn create_test_world_with_time_source(
         *weak = Arc::downgrade(&history);
         history
     });
-    let world = create_test_world_with_damage_history(
+    let world = create_test_world_with_damage_history_and_hooks(
         key,
         difficulty,
         dimension_type,
         game_time_source,
         &history,
+        gameplay_hooks,
     );
     TestWorld { world, history }
 }
@@ -328,6 +358,24 @@ pub(crate) fn create_test_world_with_damage_history(
     dimension_type: DimensionTypeRef,
     game_time_source: GameTimeSource,
     history: &Arc<DamageHistory>,
+) -> Arc<World> {
+    create_test_world_with_damage_history_and_hooks(
+        key,
+        difficulty,
+        dimension_type,
+        game_time_source,
+        history,
+        Arc::new(NoopGameplayHooks),
+    )
+}
+
+fn create_test_world_with_damage_history_and_hooks(
+    key: Identifier,
+    difficulty: Difficulty,
+    dimension_type: DimensionTypeRef,
+    game_time_source: GameTimeSource,
+    history: &Arc<DamageHistory>,
+    gameplay_hooks: Arc<dyn GameplayHooks>,
 ) -> Arc<World> {
     init_vanilla_registry();
     let resources = test_world_resources();
@@ -357,7 +405,7 @@ pub(crate) fn create_test_world_with_damage_history(
             0,
             WorldConfig {
                 damage_history: Arc::clone(history),
-                gameplay_hooks: Arc::new(NoopGameplayHooks),
+                gameplay_hooks,
                 game_time_source,
                 storage: WorldStorageConfig::RamOnly,
                 level_data_path: None,

@@ -1,5 +1,7 @@
 //! Hunter classes applied to live players.
 
+use std::mem;
+
 use steel_core::entity::damage::DamageSource;
 use steel_core::entity::{Entity as _, LivingEntity};
 use steel_core::player::Player;
@@ -9,6 +11,9 @@ use uuid::Uuid;
 use super::SoloLevelingState;
 use crate::abilities;
 use crate::class::{self, ClassError, HunterClass};
+use crate::gear;
+use crate::quest_book::Goal;
+use crate::rank::HunterRank;
 
 /// Returns whether `source` is magic: artifact storms and potion-style damage.
 fn is_magic(source: &DamageSource) -> bool {
@@ -35,17 +40,23 @@ impl SoloLevelingState {
             return Err(ClassError::Storage);
         }
         let now = abilities::now_millis() / 1_000;
-        let (price, choice) = self
+        let (price, choice, rank) = self
             .with_session_mut(uuid, |session| {
                 if session.economic_busy {
                     return Err(ClassError::Storage);
                 }
                 let rank = session.stats.rank();
                 let price = session.class.choose(class, rank, now, &mut session.won)?;
-                Ok((price, session.class))
+                session.class_rank = Some(rank);
+                if class == HunterClass::Mage {
+                    session.spells.learn_starting();
+                    session.magic.grimoire_due = true;
+                }
+                Ok((price, session.class, rank))
             })
             .ok_or(ClassError::Storage)??;
-        choice.apply_to(&mut player.attributes().lock());
+        choice.apply_to(&mut player.attributes().lock(), rank);
+        self.record_goal(uuid, Goal::ClassChosen, 1);
         if let Err(error) = self.save_session(uuid) {
             log::warn!("sololeveling: failed to persist class of {uuid}: {error}");
         }
@@ -54,13 +65,21 @@ impl SoloLevelingState {
 
     /// Re-applies class attribute modifiers after join or respawn.
     pub fn apply_class(&self, player: &Player) {
-        let choice = self
-            .with_session_mut(player.gameprofile.id(), |session| session.class)
-            .unwrap_or_default();
-        choice.apply_to(&mut player.attributes().lock());
+        let Some((choice, rank)) = self.with_session_mut(player.gameprofile.id(), |session| {
+            let rank = session.stats.rank();
+            session.class_rank = Some(rank);
+            (session.class, rank)
+        }) else {
+            return;
+        };
+        choice.apply_to(&mut player.attributes().lock(), rank);
     }
 
     /// Adjusts damage for the classes of the attacker and the victim.
+    ///
+    /// Bonuses add up before they multiply the hit. The Fighter's lifesteal
+    /// is owed here and paid on the next player tick, outside the damage
+    /// callback.
     pub fn class_damage(
         &self,
         victim: &dyn LivingEntity,
@@ -72,69 +91,97 @@ impl SoloLevelingState {
             .causing_entity()
             .and_then(|entity| entity.as_player())
         {
-            let bonus = match self.class_of(attacker.gameprofile.id()) {
-                Some(HunterClass::Fighter) if source.is_direct() => class::FIGHTER_MELEE_BONUS,
-                Some(HunterClass::Assassin)
-                    if source.is_direct()
-                        && class::is_behind(
-                            victim.position(),
-                            victim.look_angle(),
-                            attacker.position(),
-                        ) =>
-                {
-                    class::ASSASSIN_BACKSTAB_BONUS
+            let uuid = attacker.gameprofile.id();
+            let (class, rank, gear_magic) = self
+                .with_session_mut(uuid, |session| {
+                    (
+                        session.class.class,
+                        session.stats.rank(),
+                        gear::magic_bonus(
+                            &session.gear,
+                            session.class.class,
+                            session.stats.strength,
+                        ),
+                    )
+                })
+                .unwrap_or((None, HunterRank::E, 0.0));
+            let scale = class::rank_scale(rank);
+            let melee = source.is_direct();
+            let magic = is_magic(source);
+            // Only magic hits read the held items for magic bonuses.
+            let magic_bonus = if magic {
+                gear_magic
+                    + self.magic_focus(attacker)
+                    + self.spell_gear(attacker).magic
+                    + if class == Some(HunterClass::Mage) {
+                        class::MAGE_MAGIC_BONUS * scale
+                    } else {
+                        0.0
+                    }
+            } else {
+                0.0
+            };
+            let class_bonus = match class {
+                Some(HunterClass::Fighter) if melee => class::FIGHTER_MELEE_BONUS * scale,
+                Some(HunterClass::Assassin) if melee => {
+                    let behind = class::is_behind(
+                        victim.position(),
+                        victim.look_angle(),
+                        attacker.position(),
+                    );
+                    class::ASSASSIN_MELEE_BONUS * scale
+                        + if behind {
+                            class::ASSASSIN_BACKSTAB_BONUS * scale
+                        } else {
+                            0.0
+                        }
                 }
                 Some(HunterClass::Ranger) if source.is(&DamageTypeTag::IS_PROJECTILE) => {
-                    class::RANGER_PROJECTILE_BONUS
+                    class::RANGER_PROJECTILE_BONUS * scale
                 }
-                Some(HunterClass::Mage) if is_magic(source) => class::MAGE_MAGIC_BONUS,
                 _ => 0.0,
             };
-            damage *= 1.0 + bonus;
+            damage *= 1.0 + class_bonus + magic_bonus;
+            if class == Some(HunterClass::Fighter) && melee {
+                let heal = damage * class::FIGHTER_LIFESTEAL * scale;
+                self.with_session_mut(uuid, |session| session.class_heal += heal);
+            }
         }
-        if let Some(player) = victim.as_player()
-            && self.class_of(player.gameprofile.id()) == Some(HunterClass::Tanker)
-        {
-            damage *= 1.0 - class::TANKER_DAMAGE_REDUCTION;
+        damage = self.spell_damage(victim, source, damage);
+        damage = self.enchant_damage(victim, source, damage);
+        if let Some(player) = victim.as_player() {
+            let tank_rank = self
+                .with_session_mut(player.gameprofile.id(), |session| {
+                    (session.class.class == Some(HunterClass::Tanker)).then(|| session.stats.rank())
+                })
+                .flatten();
+            if let Some(rank) = tank_rank {
+                damage *= 1.0 - class::tanker_reduction(rank);
+            }
         }
         damage
     }
 
-    /// Runs the Healer pulse for one hunter.
+    /// Pays owed lifesteal and keeps the class bonuses in step with the rank.
     pub fn tick_class(&self, player: &Player) {
         let uuid = player.gameprofile.id();
-        let now = abilities::now_millis();
-        let due = self
-            .with_session_mut(uuid, |session| {
-                if session.class.class != Some(HunterClass::Healer) || now < session.class_pulse_at
-                {
-                    return false;
-                }
-                session.class_pulse_at = now + class::HEALER_PULSE_MILLIS;
-                true
-            })
-            .unwrap_or(false);
-        if !due || player.is_dead_or_dying() {
+        let Some((choice, rank, rank_changed, heal)) = self.with_session_mut(uuid, |session| {
+            let rank = session.stats.rank();
+            let rank_changed = session.class_rank != Some(rank);
+            session.class_rank = Some(rank);
+            let heal = mem::take(&mut session.class_heal);
+            (session.class, rank, rank_changed, heal)
+        }) else {
             return;
+        };
+        if rank_changed {
+            choice.apply_to(&mut player.attributes().lock(), rank);
         }
-        let members = self
-            .party_of(uuid)
-            .map_or_else(|| vec![uuid], |party| party.members().to_vec());
-        let world = player.get_world();
-        let center = player.position();
-        let radius = class::HEALER_RADIUS * class::HEALER_RADIUS;
-        for member in members {
-            let Some(target) = world.players.get_by_uuid(&member) else {
-                continue;
-            };
-            if target.is_dead_or_dying() || target.position().distance_squared(center) > radius {
-                continue;
-            }
-            let health =
-                (target.get_health() + class::HEALER_PULSE_HEALTH).min(target.get_max_health());
-            if health > target.get_health() {
-                target.set_health(health);
-            }
+        if heal > 0.0 {
+            let _ = self.heal_hunter(player, heal);
         }
+        self.tick_mana(player);
+        self.tick_enchantments(player);
+        self.tick_quests(player);
     }
 }

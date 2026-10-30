@@ -39,6 +39,8 @@ pub fn has(stack: &ItemStack, path: &str) -> bool {
 mod tests {
     use std::path::Path;
 
+    use crate::city;
+    use crate::gear::GearKind;
     use crate::item::{artifact, chest, potion};
     use crate::rank::HunterRank;
 
@@ -57,6 +59,7 @@ mod tests {
             HunterRank::S,
         ] {
             paths.push(format!("crystal/{}", rank.name().to_lowercase()));
+            paths.push(format!("key/{}", rank.name().to_lowercase()));
         }
         for chest in chest::ALL_KINDS {
             paths.push(format!("chest/{}", chest.name()));
@@ -69,6 +72,15 @@ mod tests {
             paths.push(format!("ui/{icon}"));
         }
         paths.push("system_book".to_owned());
+        paths.push("grimoire".to_owned());
+        paths.push("won_pouch".to_owned());
+        for id in artifact::MAGE_SHOP {
+            paths.push(format!("artifact/{}", id.name()));
+        }
+        paths.push("key/castle".to_owned());
+        for (kind, _) in city::SIGNS {
+            paths.push(kind.model().to_owned());
+        }
         paths
     }
 
@@ -78,7 +90,10 @@ mod tests {
         let equipment = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("resourcepack/pack/assets/sololeveling/equipment");
         for id in artifact::ALL {
-            if id.artifact().category != artifact::Category::Armor {
+            // Rings and amulets sit in System slots and are never drawn worn.
+            if id.artifact().category != artifact::Category::Armor
+                || matches!(id.gear_kind(), Some(GearKind::Ring | GearKind::Amulet))
+            {
                 continue;
             }
             let stack = artifact::stack(id, None);

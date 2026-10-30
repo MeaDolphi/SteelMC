@@ -16,12 +16,17 @@ use steel_utils::locks::SyncMutex;
 use uuid::Uuid;
 
 use crate::abilities::AbilityCooldowns;
+use crate::castle::CastleProgress;
 use crate::economy::{SystemPoints, Won};
 use crate::gear::SavedGear;
+use crate::merchant::MerchantRecord;
 use crate::organization::OrganizationBook;
 use crate::quest::SystemQuest;
+use crate::quest_book::QuestBook;
 use crate::shadow::ShadowRoster;
 use crate::shop::ShopDay;
+use crate::spell::SpellBook;
+use crate::starter::StarterKit;
 use crate::stats::HunterStats;
 
 /// Solo Leveling data tracked for a single player.
@@ -46,7 +51,7 @@ pub struct SoloLevelingPlayerData {
     /// from these records and are never saved as vanilla world entities.
     #[serde(default)]
     pub shadows: ShadowRoster,
-    /// Daily personal-shop purchases, reset by the Moscow day counter.
+    /// Personal-shop offers and purchases for the current 20-minute window.
     #[serde(default)]
     pub shop: ShopDay,
     /// Personal Adventurer Organization contracts and today's allowance.
@@ -61,6 +66,24 @@ pub struct SoloLevelingPlayerData {
     /// Artifacts equipped through the System rather than worn.
     #[serde(default)]
     pub gear: SavedGear,
+    /// Item NBT compounds held by the System when inventory delivery overflowed.
+    #[serde(default)]
+    pub deferred_inventory: Vec<Vec<u8>>,
+    /// The one-time Association starter kit.
+    #[serde(default)]
+    pub starter: StarterKit,
+    /// Personal city-merchant purchases of the current period.
+    #[serde(default)]
+    pub merchant: MerchantRecord,
+    /// Demon Castle climb.
+    #[serde(default)]
+    pub castle: CastleProgress,
+    /// Unlocked and prepared spells.
+    #[serde(default)]
+    pub spells: SpellBook,
+    /// Quests, errands, trials and achievements of the hunter.
+    #[serde(default)]
+    pub quests: QuestBook,
 }
 
 impl SoloLevelingPlayerData {
@@ -79,6 +102,12 @@ impl SoloLevelingPlayerData {
             cooldowns: AbilityCooldowns::default(),
             class: ClassChoice::default(),
             gear: SavedGear::default(),
+            deferred_inventory: Vec::new(),
+            starter: StarterKit::default(),
+            merchant: MerchantRecord::default(),
+            castle: CastleProgress::default(),
+            spells: SpellBook::default(),
+            quests: QuestBook::default(),
         }
     }
 }
@@ -325,5 +354,21 @@ mod tests {
         assert_eq!(loaded.won.amount(), 25);
         assert_eq!(loaded.system_points.amount(), 90);
         fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn deferred_inventory_defaults_for_old_saves_and_preserves_raw_entries() {
+        let uuid = Uuid::new_v4();
+        let legacy = serde_json::json!({ "uuid": uuid });
+        let mut data: SoloLevelingPlayerData =
+            serde_json::from_value(legacy).expect("legacy account should load");
+        assert_eq!(data.deferred_inventory, Vec::<Vec<u8>>::new());
+
+        let unsupported = vec![0xff, 0x00, 0x7f];
+        data.deferred_inventory.push(unsupported.clone());
+        let bytes = serde_json::to_vec(&data).expect("account should serialize");
+        let restored: SoloLevelingPlayerData =
+            serde_json::from_slice(&bytes).expect("account should deserialize");
+        assert_eq!(restored.deferred_inventory, [unsupported]);
     }
 }

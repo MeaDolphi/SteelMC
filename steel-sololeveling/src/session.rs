@@ -15,13 +15,20 @@ use steel_utils::locks::SyncRwLock;
 use uuid::Uuid;
 
 use crate::abilities::{AbilityCooldowns, ActiveAbilities};
+use crate::castle::CastleProgress;
 use crate::economy::{PaymentError, SystemPoints, Won};
+use crate::item::enchantment::EnchantState;
+use crate::merchant::{MerchantRecord, PERSONAL_OFFERS};
 use crate::organization::OrganizationBook;
 use crate::player_data::{PaymentDurability, PlayerDataStorage, SoloLevelingPlayerData};
 use crate::quest::{PENALTY_DELAY_SECONDS, PENALTY_MIN_RANK, SystemQuest};
+use crate::quest_book::QuestBook;
+use crate::rank::HunterRank;
 use crate::shadow::ShadowRoster;
 use crate::shop::ShopDay;
 use crate::sidebar::SidebarView;
+use crate::spell::{MagicState, SpellBook};
+use crate::starter::StarterKit;
 use crate::stats::HunterStats;
 
 /// How many ticks to wait between sidebar refreshes for a given player.
@@ -47,7 +54,7 @@ pub struct HunterSession {
     pub quest: SystemQuest,
     /// Persistent Shadow Monarch roster.
     pub shadows: ShadowRoster,
-    /// Daily personal-shop purchases.
+    /// Personal-shop offers and purchases for the current 20-minute window.
     pub shop: ShopDay,
     /// Personal Adventurer Organization contracts.
     pub organization: OrganizationBook,
@@ -61,12 +68,34 @@ pub struct HunterSession {
     pub gear: Vec<ItemStack>,
     /// Last persisted gear data, including slots that could not be decoded.
     pub(crate) saved_gear: SavedGear,
+    /// Raw NBT entries, including entries this version cannot decode.
+    pub(crate) deferred_inventory: Vec<Vec<u8>>,
+    /// The one-time Association starter kit.
+    pub starter: StarterKit,
+    /// Personal city-merchant purchases of the current period.
+    pub merchant: MerchantRecord,
+    /// Demon Castle climb.
+    pub castle: CastleProgress,
+    /// Unlocked and prepared spells.
+    pub spells: SpellBook,
+    /// Quests, errands, trials and achievements of the hunter.
+    pub quests: QuestBook,
+    /// Mana, cooldowns and running spell effects.
+    pub(crate) magic: MagicState,
+    /// Worn enchantment effects and their timers.
+    pub(crate) enchant: EnchantState,
+    /// Where the hunter stood at the last run count.
+    pub(crate) run_position: Option<DVec3>,
+    /// Blocks run but not yet counted.
+    pub(crate) run_carry: f64,
     /// Set when the gear changed and its bonuses must be re-applied.
     pub(crate) gear_dirty: bool,
     /// Attribute bonuses the gear currently applies.
     pub(crate) gear_applied: AppliedGear,
-    /// Millisecond of the next Healer pulse.
-    pub(crate) class_pulse_at: u64,
+    /// Health the Fighter's lifesteal owes, paid on the next player tick.
+    pub(crate) class_heal: f32,
+    /// Rank the class attributes were last written for.
+    pub(crate) class_rank: Option<HunterRank>,
     /// Unix second from which an owed penalty zone may start; `None` while
     /// nothing is owed.
     penalty_ready_at: Option<u64>,
@@ -105,12 +134,36 @@ impl HunterSession {
             class: ClassChoice {
                 class: None,
                 changed_at: 0,
+                free_change: false,
             },
             gear: Vec::new(),
             saved_gear: SavedGear { slots: Vec::new() },
+            deferred_inventory: Vec::new(),
+            starter: StarterKit {
+                weapon: None,
+                swap_closed: false,
+                pickaxe: false,
+            },
+            merchant: MerchantRecord {
+                period: 0,
+                bought: [false; PERSONAL_OFFERS],
+            },
+            castle: CastleProgress {
+                next_floor: 1,
+                checkpoint: 0,
+                best: 0,
+                free_at: 0,
+            },
+            spells: SpellBook::new(),
+            quests: QuestBook::new(),
+            magic: MagicState::new(),
+            enchant: EnchantState::new(),
+            run_position: None,
+            run_carry: 0.0,
             gear_dirty: true,
             gear_applied: Vec::new(),
-            class_pulse_at: 0,
+            class_heal: 0.0,
+            class_rank: None,
             penalty_ready_at: None,
             ticks_since_sidebar_update: 0,
             last_sidebar: None,
@@ -135,6 +188,12 @@ impl HunterSession {
             cooldowns: self.cooldowns.clone(),
             class: self.class,
             gear: SavedGear::from_items_preserving(&self.gear, &self.saved_gear),
+            deferred_inventory: self.deferred_inventory.clone(),
+            starter: self.starter,
+            merchant: self.merchant,
+            castle: self.castle,
+            spells: self.spells.clone(),
+            quests: self.quests.clone(),
         }
     }
 

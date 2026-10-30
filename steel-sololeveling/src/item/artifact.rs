@@ -16,10 +16,13 @@
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 use steel_registry::attribute::AttributeRef;
+use steel_registry::data_components::components::DyedItemColor;
 use steel_registry::data_components::components::{
     ItemAttributeModifierDisplay, ItemAttributeModifierEntry, ItemAttributeModifiers,
 };
-use steel_registry::data_components::vanilla_components::ATTRIBUTE_MODIFIERS;
+use steel_registry::data_components::vanilla_components::{
+    ATTRIBUTE_MODIFIERS, DYED_COLOR, UNBREAKABLE,
+};
 use steel_registry::equipment::EquipmentSlotGroup;
 use steel_registry::item_stack::ItemStack;
 
@@ -32,11 +35,13 @@ use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
 use super::binding;
-use super::enchantment::{self, Effect, Enchantment};
+use super::enchantment::{self, Effect, Enchantment, ItemKind};
 use super::{named, read_kind, record, tag_string, with_lore, write_tag};
+use crate::class::HunterClass;
 use crate::gear::GearKind;
 use crate::identifier::from_sololeveling;
 use crate::rank::HunterRank;
+use crate::spell::SpellGear;
 
 /// Kind stored in the record of an artifact item.
 const KIND: &str = "artifact";
@@ -138,6 +143,158 @@ pub enum ArtifactId {
     RedKnightsHelmet,
     /// Epic pickaxe: extra crystals from dungeon ore.
     CrystalPickaxe,
+    /// Rare dagger from the D-rank Steel-Fanged Raikan.
+    RaikansFang,
+    /// Rare ring: extra maximum health.
+    RingOfEndurance,
+    /// Rare amulet: movement speed.
+    WindAmulet,
+    /// Rare helmet: armor and toughness.
+    DungeonWardensHelmet,
+    /// Rare leggings: armor and speed.
+    TrackersLeggings,
+    /// Epic amulet: speed and a burst after a hit.
+    GatekeepersNecklace,
+    /// Epic ring: stronger magic.
+    HighMagiciansRing,
+    /// Epic staff of the high orc shaman: stronger magic.
+    KargalgansStaff,
+    /// Epic leggings: damage reduction at low health.
+    HighKnightsGreaves,
+    /// Legendary daggers from the dragon Kamish: strength-scaling damage.
+    KamishsWrath,
+    /// Legendary orb: much stronger magic.
+    OrbOfAvarice,
+    /// Legendary chestplate: health and damage reduction.
+    BlackHeart,
+    /// Legendary ring: health and strength-scaling damage.
+    DemonMonarchsRing,
+    /// Rare Mage staff: magic damage and cheaper destruction.
+    AshStaff,
+    /// Rare Mage ring: maximum mana.
+    ManaRing,
+    /// Rare Mage earrings: mana regeneration.
+    ClearMindEarrings,
+    /// Epic Mage robe: armor, mana and magic damage.
+    ArchmageMantle,
+    /// Epic Mage amulet: stronger healing and Barrier.
+    HighPriestsBreviary,
+    /// Epic Mage amulet: every fifth spell is free.
+    ElementalOrb,
+    /// Legendary Mage staff: destruction spells may strike twice.
+    DemonKingsStaff,
+    /// Legendary Mage crown: deep mana and free Meditation.
+    CrownOfBottomlessMana,
+    /// Common Mage staff sold by the city merchant.
+    ApprenticeStaff,
+    /// Rare ring: attack speed.
+    AgileRing,
+    /// Rare ring: attack damage.
+    StrengthRing,
+    /// Rare amulet: armor and knockback resistance.
+    WardenAmulet,
+    /// Rare amulet: health and speed.
+    HuntersAmulet,
+    /// Epic ring: power while badly hurt.
+    BerserkerRing,
+    /// Epic ring: damage against gate bosses.
+    BossHunterRing,
+    /// Epic amulet: melee lifesteal and health.
+    BloodAmulet,
+    /// Epic amulet: crystals and system points.
+    ProspectorsNecklace,
+    /// Legendary ring of the island's Ant King: double strikes.
+    AntKingRing,
+    /// Legendary amulet: cheats death with invulnerability.
+    ShadowGuardAmulet,
+    /// Common starter sword: steady all-round damage.
+    HunterSword,
+    /// Common starter dagger: fast, light hits.
+    HunterDagger,
+    /// Common starter axe: slow, heavy hits.
+    HunterAxe,
+    /// Common starter shield.
+    HunterShield,
+    /// Common starter helmet.
+    HunterHelmet,
+    /// Common starter chestplate.
+    HunterChestplate,
+    /// Common starter leggings.
+    HunterLeggings,
+    /// Common starter boots.
+    HunterBoots,
+    /// Common starter pickaxe for dungeon crystals.
+    HunterPickaxe,
+    /// Light specialization helmet.
+    LightHelmet,
+    /// Light specialization chestplate.
+    LightChestplate,
+    /// Light specialization leggings.
+    LightLeggings,
+    /// Light specialization boots.
+    LightBoots,
+    /// Reinforced specialization helmet.
+    ReinforcedHelmet,
+    /// Reinforced specialization chestplate.
+    ReinforcedChestplate,
+    /// Reinforced specialization leggings.
+    ReinforcedLeggings,
+    /// Reinforced specialization boots.
+    ReinforcedBoots,
+    /// Initial heavy specialization helmet.
+    HeavyHelmet,
+    /// Initial heavy specialization chestplate.
+    HeavyChestplate,
+    /// Initial heavy specialization leggings.
+    HeavyLeggings,
+    /// Initial heavy specialization boots.
+    HeavyBoots,
+    /// Mage clothing specialization helmet.
+    RobeHelmet,
+    /// Mage clothing specialization chestplate.
+    RobeChestplate,
+    /// Mage clothing specialization leggings.
+    RobeLeggings,
+    /// Mage clothing specialization boots.
+    RobeBoots,
+    /// Improved light specialization helmet.
+    ImprovedLightHelmet,
+    /// Improved light specialization chestplate.
+    ImprovedLightChestplate,
+    /// Improved light specialization leggings.
+    ImprovedLightLeggings,
+    /// Improved light specialization boots.
+    ImprovedLightBoots,
+    /// Improved reinforced specialization helmet.
+    ImprovedReinforcedHelmet,
+    /// Improved reinforced specialization chestplate.
+    ImprovedReinforcedChestplate,
+    /// Improved reinforced specialization leggings.
+    ImprovedReinforcedLeggings,
+    /// Improved reinforced specialization boots.
+    ImprovedReinforcedBoots,
+    /// Improved heavy specialization helmet.
+    ImprovedHeavyHelmet,
+    /// Improved heavy specialization chestplate.
+    ImprovedHeavyChestplate,
+    /// Improved heavy specialization leggings.
+    ImprovedHeavyLeggings,
+    /// Improved heavy specialization boots.
+    ImprovedHeavyBoots,
+    /// Improved robe specialization helmet.
+    ImprovedRobeHelmet,
+    /// Improved robe specialization chestplate.
+    ImprovedRobeChestplate,
+    /// Improved robe specialization leggings.
+    ImprovedRobeLeggings,
+    /// Improved robe specialization boots.
+    ImprovedRobeBoots,
+    /// Improved starter-line weapon.
+    ImprovedHunterSword,
+    /// Improved starter-line weapon.
+    ImprovedHunterDagger,
+    /// Improved starter-line weapon.
+    ImprovedHunterAxe,
 }
 
 impl ArtifactId {
@@ -156,13 +313,94 @@ impl ArtifactId {
             Self::HighKnightsGauntlet => "high_knights_gauntlet",
             Self::RedKnightsHelmet => "red_knights_helmet",
             Self::CrystalPickaxe => "crystal_pickaxe",
+            Self::RaikansFang => "raikans_fang",
+            Self::RingOfEndurance => "ring_of_endurance",
+            Self::WindAmulet => "wind_amulet",
+            Self::DungeonWardensHelmet => "dungeon_wardens_helmet",
+            Self::TrackersLeggings => "trackers_leggings",
+            Self::GatekeepersNecklace => "gatekeepers_necklace",
+            Self::HighMagiciansRing => "high_magicians_ring",
+            Self::KargalgansStaff => "kargalgans_staff",
+            Self::HighKnightsGreaves => "high_knights_greaves",
+            Self::KamishsWrath => "kamishs_wrath",
+            Self::OrbOfAvarice => "orb_of_avarice",
+            Self::BlackHeart => "black_heart",
+            Self::DemonMonarchsRing => "demon_monarchs_ring",
+            Self::AshStaff => "ash_staff",
+            Self::ManaRing => "mana_ring",
+            Self::ClearMindEarrings => "clear_mind_earrings",
+            Self::ArchmageMantle => "archmage_mantle",
+            Self::HighPriestsBreviary => "high_priests_breviary",
+            Self::ElementalOrb => "elemental_orb",
+            Self::DemonKingsStaff => "demon_kings_staff",
+            Self::CrownOfBottomlessMana => "crown_of_bottomless_mana",
+            Self::ApprenticeStaff => "apprentice_staff",
+            Self::AgileRing => "agile_ring",
+            Self::StrengthRing => "strength_ring",
+            Self::WardenAmulet => "warden_amulet",
+            Self::HuntersAmulet => "hunters_amulet",
+            Self::BerserkerRing => "berserker_ring",
+            Self::BossHunterRing => "boss_hunter_ring",
+            Self::BloodAmulet => "blood_amulet",
+            Self::ProspectorsNecklace => "prospectors_necklace",
+            Self::AntKingRing => "ant_king_ring",
+            Self::ShadowGuardAmulet => "shadow_guard_amulet",
+            Self::HunterSword => "hunter_sword",
+            Self::HunterDagger => "hunter_dagger",
+            Self::HunterAxe => "hunter_axe",
+            Self::HunterShield => "hunter_shield",
+            Self::HunterHelmet => "hunter_helmet",
+            Self::HunterChestplate => "hunter_chestplate",
+            Self::HunterLeggings => "hunter_leggings",
+            Self::HunterBoots => "hunter_boots",
+            Self::HunterPickaxe => "hunter_pickaxe",
+            Self::LightHelmet => "light_helmet",
+            Self::LightChestplate => "light_chestplate",
+            Self::LightLeggings => "light_leggings",
+            Self::LightBoots => "light_boots",
+            Self::ReinforcedHelmet => "reinforced_helmet",
+            Self::ReinforcedChestplate => "reinforced_chestplate",
+            Self::ReinforcedLeggings => "reinforced_leggings",
+            Self::ReinforcedBoots => "reinforced_boots",
+            Self::HeavyHelmet => "heavy_helmet",
+            Self::HeavyChestplate => "heavy_chestplate",
+            Self::HeavyLeggings => "heavy_leggings",
+            Self::HeavyBoots => "heavy_boots",
+            Self::RobeHelmet => "robe_helmet",
+            Self::RobeChestplate => "robe_chestplate",
+            Self::RobeLeggings => "robe_leggings",
+            Self::RobeBoots => "robe_boots",
+            Self::ImprovedLightHelmet => "improved_light_helmet",
+            Self::ImprovedLightChestplate => "improved_light_chestplate",
+            Self::ImprovedLightLeggings => "improved_light_leggings",
+            Self::ImprovedLightBoots => "improved_light_boots",
+            Self::ImprovedReinforcedHelmet => "improved_reinforced_helmet",
+            Self::ImprovedReinforcedChestplate => "improved_reinforced_chestplate",
+            Self::ImprovedReinforcedLeggings => "improved_reinforced_leggings",
+            Self::ImprovedReinforcedBoots => "improved_reinforced_boots",
+            Self::ImprovedHeavyHelmet => "improved_heavy_helmet",
+            Self::ImprovedHeavyChestplate => "improved_heavy_chestplate",
+            Self::ImprovedHeavyLeggings => "improved_heavy_leggings",
+            Self::ImprovedHeavyBoots => "improved_heavy_boots",
+            Self::ImprovedRobeHelmet => "improved_robe_helmet",
+            Self::ImprovedRobeChestplate => "improved_robe_chestplate",
+            Self::ImprovedRobeLeggings => "improved_robe_leggings",
+            Self::ImprovedRobeBoots => "improved_robe_boots",
+            Self::ImprovedHunterSword => "improved_hunter_sword",
+            Self::ImprovedHunterDagger => "improved_hunter_dagger",
+            Self::ImprovedHunterAxe => "improved_hunter_axe",
         }
     }
 
     /// Parses the stable tag value.
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
-        ALL.into_iter().find(|artifact| artifact.name() == name)
+        ALL.into_iter()
+            .chain(STARTER)
+            .chain(SPECIALIZATION)
+            .chain(IMPROVED)
+            .chain(MAGE_SHOP)
+            .find(|artifact| artifact.name() == name)
     }
 
     /// Returns the System equipment slot this artifact goes into, or `None`
@@ -170,16 +408,92 @@ impl ArtifactId {
     #[must_use]
     pub const fn gear_kind(self) -> Option<GearKind> {
         match self {
-            Self::RedKnightsHelmet => Some(GearKind::Head),
-            Self::HighKnightsChestplate => Some(GearKind::Chest),
-            Self::AssassinsShoes => Some(GearKind::Feet),
+            Self::RedKnightsHelmet
+            | Self::HunterHelmet
+            | Self::LightHelmet
+            | Self::ReinforcedHelmet
+            | Self::HeavyHelmet
+            | Self::RobeHelmet
+            | Self::ImprovedLightHelmet
+            | Self::ImprovedReinforcedHelmet
+            | Self::ImprovedHeavyHelmet
+            | Self::ImprovedRobeHelmet
+            | Self::DungeonWardensHelmet
+            | Self::CrownOfBottomlessMana => Some(GearKind::Head),
+            Self::HighKnightsChestplate
+            | Self::HunterChestplate
+            | Self::LightChestplate
+            | Self::ReinforcedChestplate
+            | Self::HeavyChestplate
+            | Self::RobeChestplate
+            | Self::ImprovedLightChestplate
+            | Self::ImprovedReinforcedChestplate
+            | Self::ImprovedHeavyChestplate
+            | Self::ImprovedRobeChestplate
+            | Self::BlackHeart
+            | Self::ArchmageMantle => Some(GearKind::Chest),
+            Self::HunterLeggings
+            | Self::LightLeggings
+            | Self::ReinforcedLeggings
+            | Self::HeavyLeggings
+            | Self::RobeLeggings
+            | Self::ImprovedLightLeggings
+            | Self::ImprovedReinforcedLeggings
+            | Self::ImprovedHeavyLeggings
+            | Self::ImprovedRobeLeggings
+            | Self::TrackersLeggings
+            | Self::HighKnightsGreaves => Some(GearKind::Legs),
+            Self::AssassinsShoes
+            | Self::HunterBoots
+            | Self::LightBoots
+            | Self::ReinforcedBoots
+            | Self::HeavyBoots
+            | Self::RobeBoots
+            | Self::ImprovedLightBoots
+            | Self::ImprovedReinforcedBoots
+            | Self::ImprovedHeavyBoots
+            | Self::ImprovedRobeBoots => Some(GearKind::Feet),
             Self::ArchersGloves | Self::HighKnightsGauntlet => Some(GearKind::Gloves),
+            Self::RingOfEndurance
+            | Self::HighMagiciansRing
+            | Self::DemonMonarchsRing
+            | Self::ManaRing
+            | Self::AgileRing
+            | Self::StrengthRing
+            | Self::BerserkerRing
+            | Self::BossHunterRing
+            | Self::AntKingRing => Some(GearKind::Ring),
+            Self::WindAmulet
+            | Self::GatekeepersNecklace
+            | Self::OrbOfAvarice
+            | Self::ClearMindEarrings
+            | Self::HighPriestsBreviary
+            | Self::ElementalOrb
+            | Self::WardenAmulet
+            | Self::HuntersAmulet
+            | Self::BloodAmulet
+            | Self::ProspectorsNecklace
+            | Self::ShadowGuardAmulet => Some(GearKind::Amulet),
             Self::KasakasVenomFang
+            | Self::RaikansFang
+            | Self::KargalgansStaff
+            | Self::AshStaff
+            | Self::DemonKingsStaff
+            | Self::ApprenticeStaff
+            | Self::KamishsWrath
             | Self::KnightsKiller
             | Self::BarukasDagger
             | Self::DemonKingsDaggers
             | Self::DemonKingsLongsword
-            | Self::CrystalPickaxe => None,
+            | Self::CrystalPickaxe
+            | Self::HunterSword
+            | Self::HunterDagger
+            | Self::HunterAxe
+            | Self::HunterShield
+            | Self::HunterPickaxe
+            | Self::ImprovedHunterSword
+            | Self::ImprovedHunterDagger
+            | Self::ImprovedHunterAxe => None,
         }
     }
 
@@ -198,12 +512,344 @@ impl ArtifactId {
             Self::HighKnightsGauntlet => &HIGH_KNIGHTS_GAUNTLET,
             Self::RedKnightsHelmet => &RED_KNIGHTS_HELMET,
             Self::CrystalPickaxe => &CRYSTAL_PICKAXE,
+            Self::RaikansFang => &RAIKANS_FANG,
+            Self::RingOfEndurance => &RING_OF_ENDURANCE,
+            Self::WindAmulet => &WIND_AMULET,
+            Self::DungeonWardensHelmet => &DUNGEON_WARDENS_HELMET,
+            Self::TrackersLeggings => &TRACKERS_LEGGINGS,
+            Self::GatekeepersNecklace => &GATEKEEPERS_NECKLACE,
+            Self::HighMagiciansRing => &HIGH_MAGICIANS_RING,
+            Self::KargalgansStaff => &KARGALGANS_STAFF,
+            Self::HighKnightsGreaves => &HIGH_KNIGHTS_GREAVES,
+            Self::KamishsWrath => &KAMISHS_WRATH,
+            Self::OrbOfAvarice => &ORB_OF_AVARICE,
+            Self::BlackHeart => &BLACK_HEART,
+            Self::DemonMonarchsRing => &DEMON_MONARCHS_RING,
+            Self::AshStaff => &ASH_STAFF,
+            Self::ManaRing => &MANA_RING,
+            Self::ClearMindEarrings => &CLEAR_MIND_EARRINGS,
+            Self::ArchmageMantle => &ARCHMAGE_MANTLE,
+            Self::HighPriestsBreviary => &HIGH_PRIESTS_BREVIARY,
+            Self::ElementalOrb => &ELEMENTAL_ORB,
+            Self::DemonKingsStaff => &DEMON_KINGS_STAFF,
+            Self::CrownOfBottomlessMana => &CROWN_OF_BOTTOMLESS_MANA,
+            Self::ApprenticeStaff => &APPRENTICE_STAFF,
+            Self::AgileRing => &AGILE_RING,
+            Self::StrengthRing => &STRENGTH_RING,
+            Self::WardenAmulet => &WARDEN_AMULET,
+            Self::HuntersAmulet => &HUNTERS_AMULET,
+            Self::BerserkerRing => &BERSERKER_RING,
+            Self::BossHunterRing => &BOSS_HUNTER_RING,
+            Self::BloodAmulet => &BLOOD_AMULET,
+            Self::ProspectorsNecklace => &PROSPECTORS_NECKLACE,
+            Self::AntKingRing => &ANT_KING_RING,
+            Self::ShadowGuardAmulet => &SHADOW_GUARD_AMULET,
+            Self::HunterSword => &HUNTER_SWORD,
+            Self::HunterDagger => &HUNTER_DAGGER,
+            Self::HunterAxe => &HUNTER_AXE,
+            Self::HunterShield => &HUNTER_SHIELD,
+            Self::HunterHelmet => &HUNTER_HELMET,
+            Self::HunterChestplate => &HUNTER_CHESTPLATE,
+            Self::HunterLeggings => &HUNTER_LEGGINGS,
+            Self::HunterBoots => &HUNTER_BOOTS,
+            Self::HunterPickaxe => &HUNTER_PICKAXE,
+            Self::LightHelmet => &LIGHTHELMET,
+            Self::LightChestplate => &LIGHTCHESTPLATE,
+            Self::LightLeggings => &LIGHTLEGGINGS,
+            Self::LightBoots => &LIGHTBOOTS,
+            Self::ReinforcedHelmet => &REINFORCEDHELMET,
+            Self::ReinforcedChestplate => &REINFORCEDCHESTPLATE,
+            Self::ReinforcedLeggings => &REINFORCEDLEGGINGS,
+            Self::ReinforcedBoots => &REINFORCEDBOOTS,
+            Self::HeavyHelmet => &HEAVYHELMET,
+            Self::HeavyChestplate => &HEAVYCHESTPLATE,
+            Self::HeavyLeggings => &HEAVYLEGGINGS,
+            Self::HeavyBoots => &HEAVYBOOTS,
+            Self::RobeHelmet => &ROBEHELMET,
+            Self::RobeChestplate => &ROBECHESTPLATE,
+            Self::RobeLeggings => &ROBELEGGINGS,
+            Self::RobeBoots => &ROBEBOOTS,
+            Self::ImprovedLightHelmet => &IMPROVED_LIGHT_HELMET,
+            Self::ImprovedLightChestplate => &IMPROVED_LIGHT_CHESTPLATE,
+            Self::ImprovedLightLeggings => &IMPROVED_LIGHT_LEGGINGS,
+            Self::ImprovedLightBoots => &IMPROVED_LIGHT_BOOTS,
+            Self::ImprovedReinforcedHelmet => &IMPROVED_REINFORCED_HELMET,
+            Self::ImprovedReinforcedChestplate => &IMPROVED_REINFORCED_CHESTPLATE,
+            Self::ImprovedReinforcedLeggings => &IMPROVED_REINFORCED_LEGGINGS,
+            Self::ImprovedReinforcedBoots => &IMPROVED_REINFORCED_BOOTS,
+            Self::ImprovedHeavyHelmet => &IMPROVED_HEAVY_HELMET,
+            Self::ImprovedHeavyChestplate => &IMPROVED_HEAVY_CHESTPLATE,
+            Self::ImprovedHeavyLeggings => &IMPROVED_HEAVY_LEGGINGS,
+            Self::ImprovedHeavyBoots => &IMPROVED_HEAVY_BOOTS,
+            Self::ImprovedRobeHelmet => &IMPROVED_ROBE_HELMET,
+            Self::ImprovedRobeChestplate => &IMPROVED_ROBE_CHESTPLATE,
+            Self::ImprovedRobeLeggings => &IMPROVED_ROBE_LEGGINGS,
+            Self::ImprovedRobeBoots => &IMPROVED_ROBE_BOOTS,
+            Self::ImprovedHunterSword => &IMPROVED_HUNTER_SWORD,
+            Self::ImprovedHunterDagger => &IMPROVED_HUNTER_DAGGER,
+            Self::ImprovedHunterAxe => &IMPROVED_HUNTER_AXE,
+        }
+    }
+
+    /// Returns whether this is a piece of the Association starter kit.
+    #[must_use]
+    pub fn is_starter(self) -> bool {
+        STARTER.contains(&self)
+    }
+
+    /// Returns the specialization armor line of this piece, if any.
+    ///
+    /// [`SPECIALIZATION`] and [`IMPROVED`] list each line's four pieces in
+    /// [`ArmorLine::ALL`] order, so the position decides the line.
+    #[must_use]
+    pub fn line(self) -> Option<ArmorLine> {
+        let index = SPECIALIZATION
+            .iter()
+            .position(|id| *id == self)
+            .or_else(|| IMPROVED.iter().position(|id| *id == self))?;
+        ArmorLine::ALL.get(index / 4).copied()
+    }
+
+    /// Returns the classes that may wear this piece; `None` means everyone.
+    #[must_use]
+    pub fn allowed_classes(self) -> Option<&'static [HunterClass]> {
+        if self.spell_gear().is_some() {
+            return Some(&[HunterClass::Mage]);
+        }
+        self.line().map(ArmorLine::classes)
+    }
+
+    /// Returns the type of item the item maker enchants this artifact as;
+    /// `None` for the shield, which takes no enchantments.
+    #[must_use]
+    pub fn enchant_kind(self) -> Option<ItemKind> {
+        let kind = match self.gear_kind() {
+            Some(GearKind::Head) => ItemKind::Helmet,
+            Some(GearKind::Chest) => ItemKind::Chest,
+            Some(GearKind::Legs) => ItemKind::Legs,
+            Some(GearKind::Feet) => ItemKind::Boots,
+            Some(GearKind::Gloves) => ItemKind::Gloves,
+            Some(GearKind::Ring | GearKind::Amulet) => ItemKind::Jewelry,
+            None => match self {
+                Self::HunterShield => return None,
+                Self::CrystalPickaxe | Self::HunterPickaxe => ItemKind::Pickaxe,
+                _ if self.spell_gear().is_some() => ItemKind::Staff,
+                _ => ItemKind::Melee,
+            },
+        };
+        Some(kind)
+    }
+
+    /// Returns the spellcasting bonuses of a Mage artifact; `None` for
+    /// everything a non-Mage may use.
+    #[must_use]
+    pub fn spell_gear(self) -> Option<SpellGear> {
+        let none = SpellGear::default();
+        let gear = match self {
+            Self::ApprenticeStaff => SpellGear {
+                magic: 0.10,
+                ..none
+            },
+            Self::AshStaff => SpellGear {
+                magic: 0.20,
+                destruction_cost: -0.10,
+                ..none
+            },
+            Self::ManaRing => SpellGear { mana: 40.0, ..none },
+            Self::ClearMindEarrings => SpellGear {
+                regen: 0.30,
+                ..none
+            },
+            // Its +30% magic damage is the Magic Focus ability.
+            Self::KargalgansStaff => SpellGear {
+                burning: true,
+                ..none
+            },
+            Self::HighMagiciansRing => SpellGear {
+                mana: 60.0,
+                cooldown: 0.10,
+                ..none
+            },
+            Self::ArchmageMantle => SpellGear {
+                magic: 0.10,
+                mana: 60.0,
+                ..none
+            },
+            Self::HighPriestsBreviary => SpellGear {
+                healing: 0.30,
+                barrier: 4.0,
+                ..none
+            },
+            Self::ElementalOrb => SpellGear {
+                free_every: 5,
+                ..none
+            },
+            Self::OrbOfAvarice => SpellGear { cost: 0.20, ..none },
+            Self::DemonKingsStaff => SpellGear {
+                magic: 0.25,
+                echo_percent: 20,
+                ..none
+            },
+            Self::CrownOfBottomlessMana => SpellGear {
+                mana: 100.0,
+                regen: 0.50,
+                free_meditation: true,
+                ..none
+            },
+            _ => return None,
+        };
+        Some(gear)
+    }
+
+    /// Returns the bonus to outgoing magic damage this piece grants, as a
+    /// fraction.
+    #[must_use]
+    pub fn magic_bonus(self) -> f32 {
+        match self.line() {
+            Some(ArmorLine::Robe) if self.is_improved() => IMPROVED_ROBE_MAGIC_BONUS_PER_PIECE,
+            Some(ArmorLine::Robe) => ROBE_MAGIC_BONUS_PER_PIECE,
+            _ => 0.0,
+        }
+    }
+
+    /// Returns whether this is an improved serial piece, made to order.
+    #[must_use]
+    pub fn is_improved(self) -> bool {
+        IMPROVED.contains(&self)
+    }
+
+    /// Returns the Strength this piece needs before its bonuses apply.
+    #[must_use]
+    pub fn required_strength(self) -> u32 {
+        if self.is_improved() && self.line() == Some(ArmorLine::Heavy) {
+            IMPROVED_HEAVY_STRENGTH
+        } else {
+            0
+        }
+    }
+
+    /// Returns the leather dye of this piece, if it is dyed.
+    fn dye(self) -> Option<i32> {
+        (self.line() == Some(ArmorLine::Robe)).then_some(0x5B_2C_8F)
+    }
+}
+
+/// Bonus to outgoing magic damage of one mage-clothing piece.
+pub const ROBE_MAGIC_BONUS_PER_PIECE: f32 = 0.03;
+/// Bonus to outgoing magic damage of one improved mage-clothing piece.
+pub const IMPROVED_ROBE_MAGIC_BONUS_PER_PIECE: f32 = 0.04;
+/// Strength improved heavy armor needs before its bonuses apply.
+pub const IMPROVED_HEAVY_STRENGTH: u32 = 20;
+
+/// A specialization armor line sold by the city merchant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArmorLine {
+    /// Light armor: little protection, extra speed.
+    Light,
+    /// Reinforced armor: starter-level protection plus toughness.
+    Reinforced,
+    /// Initial heavy armor: most protection, slower movement.
+    Heavy,
+    /// Mage clothing: weakest protection, stronger magic.
+    Robe,
+}
+
+impl ArmorLine {
+    /// Every line, in catalog order.
+    pub const ALL: [Self; 4] = [Self::Light, Self::Reinforced, Self::Heavy, Self::Robe];
+
+    /// Returns the classes that may wear the line.
+    #[must_use]
+    pub const fn classes(self) -> &'static [HunterClass] {
+        match self {
+            Self::Light => &[HunterClass::Assassin, HunterClass::Ranger],
+            Self::Reinforced => &[HunterClass::Fighter, HunterClass::Tanker],
+            Self::Heavy => &[HunterClass::Tanker],
+            Self::Robe => &[HunterClass::Mage],
         }
     }
 }
 
+/// Improved serial gear made to order from dungeon materials: four pieces
+/// per armor line in [`ArmorLine::ALL`] order, then the weapons.
+pub const IMPROVED: [ArtifactId; 19] = [
+    ArtifactId::ImprovedLightHelmet,
+    ArtifactId::ImprovedLightChestplate,
+    ArtifactId::ImprovedLightLeggings,
+    ArtifactId::ImprovedLightBoots,
+    ArtifactId::ImprovedReinforcedHelmet,
+    ArtifactId::ImprovedReinforcedChestplate,
+    ArtifactId::ImprovedReinforcedLeggings,
+    ArtifactId::ImprovedReinforcedBoots,
+    ArtifactId::ImprovedHeavyHelmet,
+    ArtifactId::ImprovedHeavyChestplate,
+    ArtifactId::ImprovedHeavyLeggings,
+    ArtifactId::ImprovedHeavyBoots,
+    ArtifactId::ImprovedRobeHelmet,
+    ArtifactId::ImprovedRobeChestplate,
+    ArtifactId::ImprovedRobeLeggings,
+    ArtifactId::ImprovedRobeBoots,
+    ArtifactId::ImprovedHunterSword,
+    ArtifactId::ImprovedHunterDagger,
+    ArtifactId::ImprovedHunterAxe,
+];
+
+/// Specialization armor sold by the city merchant, four pieces per line.
+pub const SPECIALIZATION: [ArtifactId; 16] = [
+    ArtifactId::LightHelmet,
+    ArtifactId::LightChestplate,
+    ArtifactId::LightLeggings,
+    ArtifactId::LightBoots,
+    ArtifactId::ReinforcedHelmet,
+    ArtifactId::ReinforcedChestplate,
+    ArtifactId::ReinforcedLeggings,
+    ArtifactId::ReinforcedBoots,
+    ArtifactId::HeavyHelmet,
+    ArtifactId::HeavyChestplate,
+    ArtifactId::HeavyLeggings,
+    ArtifactId::HeavyBoots,
+    ArtifactId::RobeHelmet,
+    ArtifactId::RobeChestplate,
+    ArtifactId::RobeLeggings,
+    ArtifactId::RobeBoots,
+];
+
+/// The Association's Common starter equipment.
+///
+/// Kept apart from [`ALL`]: those are the named rewards that chests and the
+/// System shop roll and that have resource-pack models, while starter pieces
+/// are serial hunter gear shown as their vanilla holder.
+pub const STARTER: [ArtifactId; 9] = [
+    ArtifactId::HunterSword,
+    ArtifactId::HunterDagger,
+    ArtifactId::HunterAxe,
+    ArtifactId::HunterShield,
+    ArtifactId::HunterHelmet,
+    ArtifactId::HunterChestplate,
+    ArtifactId::HunterLeggings,
+    ArtifactId::HunterBoots,
+    ArtifactId::HunterPickaxe,
+];
+
+/// Starter weapons a hunter picks one of.
+pub const STARTER_WEAPONS: [ArtifactId; 3] = [
+    ArtifactId::HunterSword,
+    ArtifactId::HunterDagger,
+    ArtifactId::HunterAxe,
+];
+
+/// Starter pieces every hunter receives besides the chosen weapon.
+pub const STARTER_OUTFIT: [ArtifactId; 6] = [
+    ArtifactId::HunterShield,
+    ArtifactId::HunterHelmet,
+    ArtifactId::HunterChestplate,
+    ArtifactId::HunterLeggings,
+    ArtifactId::HunterBoots,
+    ArtifactId::HunterPickaxe,
+];
+
 /// Every catalog artifact.
-pub const ALL: [ArtifactId; 11] = [
+pub const ALL: [ArtifactId; 42] = [
     ArtifactId::KasakasVenomFang,
     ArtifactId::KnightsKiller,
     ArtifactId::BarukasDagger,
@@ -215,7 +861,41 @@ pub const ALL: [ArtifactId; 11] = [
     ArtifactId::HighKnightsGauntlet,
     ArtifactId::RedKnightsHelmet,
     ArtifactId::CrystalPickaxe,
+    ArtifactId::RaikansFang,
+    ArtifactId::RingOfEndurance,
+    ArtifactId::WindAmulet,
+    ArtifactId::DungeonWardensHelmet,
+    ArtifactId::TrackersLeggings,
+    ArtifactId::GatekeepersNecklace,
+    ArtifactId::HighMagiciansRing,
+    ArtifactId::KargalgansStaff,
+    ArtifactId::HighKnightsGreaves,
+    ArtifactId::KamishsWrath,
+    ArtifactId::OrbOfAvarice,
+    ArtifactId::BlackHeart,
+    ArtifactId::DemonMonarchsRing,
+    ArtifactId::AshStaff,
+    ArtifactId::ManaRing,
+    ArtifactId::ClearMindEarrings,
+    ArtifactId::ArchmageMantle,
+    ArtifactId::HighPriestsBreviary,
+    ArtifactId::ElementalOrb,
+    ArtifactId::DemonKingsStaff,
+    ArtifactId::CrownOfBottomlessMana,
+    ArtifactId::AgileRing,
+    ArtifactId::StrengthRing,
+    ArtifactId::WardenAmulet,
+    ArtifactId::HuntersAmulet,
+    ArtifactId::BerserkerRing,
+    ArtifactId::BossHunterRing,
+    ArtifactId::BloodAmulet,
+    ArtifactId::ProspectorsNecklace,
+    ArtifactId::AntKingRing,
+    ArtifactId::ShadowGuardAmulet,
 ];
+
+/// Mage artifacts sold by the city merchant instead of rolled as rewards.
+pub const MAGE_SHOP: [ArtifactId; 1] = [ArtifactId::ApprenticeStaff];
 
 /// Which catalog list an artifact belongs to, for chest and shop rolls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,10 +987,51 @@ pub enum Ability {
         /// Cooldown in seconds.
         cooldown: u64,
     },
+    /// Stronger outgoing magic damage while worn or held.
+    MagicFocus {
+        /// Bonus as a fraction of the magic hit.
+        percent: f32,
+    },
     /// Extra magic crystals from dungeon ore.
     CrystalLuck {
         /// Percent chance of one additional crystal.
         percent: u32,
+    },
+    /// More damage and attack speed while badly hurt.
+    Berserk {
+        /// Health fraction below which the ability is active.
+        threshold: f32,
+        /// Damage bonus as a fraction of the hit.
+        percent: f32,
+    },
+    /// Extra damage against gate bosses.
+    BossSlayer {
+        /// Damage bonus as a fraction of the hit.
+        percent: f32,
+    },
+    /// Melee hits heal the holder.
+    Bloodthirst {
+        /// Healing as a fraction of the damage dealt.
+        percent: f32,
+    },
+    /// More system points from kills.
+    Greed {
+        /// Bonus as a fraction of the reward.
+        percent: f32,
+    },
+    /// Every Nth melee hit strikes the target again.
+    DoubleStrike {
+        /// Hits per extra strike.
+        every: u32,
+        /// Damage of the extra strike as a fraction of the hit.
+        percent: f32,
+    },
+    /// Survives a lethal hit and turns briefly invulnerable.
+    ShadowGuard {
+        /// Seconds of invulnerability.
+        seconds: u64,
+        /// Cooldown in seconds.
+        cooldown: u64,
     },
 }
 
@@ -327,6 +1048,13 @@ impl Ability {
             Self::Storm { .. } => "storm",
             Self::LethalSurvival { .. } => "lethal_survival",
             Self::CrystalLuck { .. } => "crystal_luck",
+            Self::MagicFocus { .. } => "magic_focus",
+            Self::Berserk { .. } => "berserk",
+            Self::BossSlayer { .. } => "boss_slayer",
+            Self::Bloodthirst { .. } => "bloodthirst",
+            Self::Greed { .. } => "greed",
+            Self::DoubleStrike { .. } => "double_strike",
+            Self::ShadowGuard { .. } => "shadow_guard",
         }
     }
 
@@ -338,10 +1066,17 @@ impl Ability {
             | Self::LowHealthReduction { cooldown, .. }
             | Self::HitCounterShield { cooldown, .. }
             | Self::Storm { cooldown, .. }
-            | Self::LethalSurvival { cooldown, .. } => cooldown,
+            | Self::LethalSurvival { cooldown, .. }
+            | Self::ShadowGuard { cooldown, .. } => cooldown,
             Self::ArmorPiercing { .. }
             | Self::StrengthScaling { .. }
-            | Self::CrystalLuck { .. } => 0,
+            | Self::CrystalLuck { .. }
+            | Self::MagicFocus { .. }
+            | Self::Berserk { .. }
+            | Self::BossSlayer { .. }
+            | Self::Bloodthirst { .. }
+            | Self::Greed { .. }
+            | Self::DoubleStrike { .. } => 0,
         }
     }
 }
@@ -588,6 +1323,1360 @@ static CRYSTAL_PICKAXE: Artifact = Artifact {
     abilities: &[Ability::CrystalLuck { percent: 50 }],
 };
 
+/// A held starter weapon: flat damage plus the vanilla attack-speed offset.
+///
+/// The item's own modifier component replaces the holder's vanilla one, so the
+/// speed offset has to be restated: base attack speed is 4 per second.
+const fn weapon_modifiers(damage: f64, speed: f64) -> [Modifier; 2] {
+    [
+        Modifier {
+            attribute: vanilla_attributes::ATTACK_DAMAGE,
+            amount: damage,
+            operation: AttributeModifierOperation::AddValue,
+            slot: ATTACK,
+        },
+        Modifier {
+            attribute: vanilla_attributes::ATTACK_SPEED,
+            amount: speed - 4.0,
+            operation: AttributeModifierOperation::AddValue,
+            slot: ATTACK,
+        },
+    ]
+}
+
+const fn armor_modifier(amount: f64, slot: EquipmentSlotGroup) -> [Modifier; 1] {
+    [Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount,
+        operation: AttributeModifierOperation::AddValue,
+        slot,
+    }]
+}
+
+// Starter numbers mirror an iron set and iron weapons: 15 armor in total, a
+// 6-damage sword at 1.6 attacks per second, a quicker and lighter dagger,
+// and a slow, heavy axe.
+static HUNTER_SWORD_MODIFIERS: [Modifier; 2] = weapon_modifiers(5.0, 1.6);
+static HUNTER_DAGGER_MODIFIERS: [Modifier; 2] = weapon_modifiers(3.0, 2.4);
+static HUNTER_AXE_MODIFIERS: [Modifier; 2] = weapon_modifiers(8.0, 0.9);
+static HUNTER_HELMET_MODIFIERS: [Modifier; 1] = armor_modifier(2.0, HELMET);
+static HUNTER_CHESTPLATE_MODIFIERS: [Modifier; 1] = armor_modifier(6.0, CHEST);
+static HUNTER_LEGGINGS_MODIFIERS: [Modifier; 1] = armor_modifier(5.0, EquipmentSlotGroup::Legs);
+static HUNTER_BOOTS_MODIFIERS: [Modifier; 1] = armor_modifier(2.0, FEET);
+
+static LIGHTHELMET_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 1.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: HELMET,
+    },
+    Modifier {
+        attribute: vanilla_attributes::MOVEMENT_SPEED,
+        amount: 0.02,
+        operation: AttributeModifierOperation::AddMultipliedBase,
+        slot: HELMET,
+    },
+];
+static LIGHTHELMET: Artifact = Artifact {
+    id: ArtifactId::LightHelmet,
+    name: "Лёгкий капюшон",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::LEATHER_HELMET,
+    modifiers: &LIGHTHELMET_MODIFIERS,
+    abilities: &[],
+};
+static LIGHTCHESTPLATE_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 4.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: CHEST,
+    },
+    Modifier {
+        attribute: vanilla_attributes::MOVEMENT_SPEED,
+        amount: 0.03,
+        operation: AttributeModifierOperation::AddMultipliedBase,
+        slot: CHEST,
+    },
+];
+static LIGHTCHESTPLATE: Artifact = Artifact {
+    id: ArtifactId::LightChestplate,
+    name: "Лёгкая куртка",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::LEATHER_CHESTPLATE,
+    modifiers: &LIGHTCHESTPLATE_MODIFIERS,
+    abilities: &[],
+};
+static LIGHTLEGGINGS_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 3.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: EquipmentSlotGroup::Legs,
+    },
+    Modifier {
+        attribute: vanilla_attributes::MOVEMENT_SPEED,
+        amount: 0.03,
+        operation: AttributeModifierOperation::AddMultipliedBase,
+        slot: EquipmentSlotGroup::Legs,
+    },
+];
+static LIGHTLEGGINGS: Artifact = Artifact {
+    id: ArtifactId::LightLeggings,
+    name: "Лёгкие штаны",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::LEATHER_LEGGINGS,
+    modifiers: &LIGHTLEGGINGS_MODIFIERS,
+    abilities: &[],
+};
+static LIGHTBOOTS_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 1.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: FEET,
+    },
+    Modifier {
+        attribute: vanilla_attributes::MOVEMENT_SPEED,
+        amount: 0.02,
+        operation: AttributeModifierOperation::AddMultipliedBase,
+        slot: FEET,
+    },
+];
+static LIGHTBOOTS: Artifact = Artifact {
+    id: ArtifactId::LightBoots,
+    name: "Лёгкие сапоги",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::LEATHER_BOOTS,
+    modifiers: &LIGHTBOOTS_MODIFIERS,
+    abilities: &[],
+};
+static REINFORCEDHELMET_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 2.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: HELMET,
+    },
+    Modifier {
+        attribute: vanilla_attributes::ARMOR_TOUGHNESS,
+        amount: 0.5,
+        operation: AttributeModifierOperation::AddValue,
+        slot: HELMET,
+    },
+];
+static REINFORCEDHELMET: Artifact = Artifact {
+    id: ArtifactId::ReinforcedHelmet,
+    name: "Усиленный шлем",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::IRON_HELMET,
+    modifiers: &REINFORCEDHELMET_MODIFIERS,
+    abilities: &[],
+};
+static REINFORCEDCHESTPLATE_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 6.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: CHEST,
+    },
+    Modifier {
+        attribute: vanilla_attributes::ARMOR_TOUGHNESS,
+        amount: 0.5,
+        operation: AttributeModifierOperation::AddValue,
+        slot: CHEST,
+    },
+];
+static REINFORCEDCHESTPLATE: Artifact = Artifact {
+    id: ArtifactId::ReinforcedChestplate,
+    name: "Усиленный нагрудник",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::IRON_CHESTPLATE,
+    modifiers: &REINFORCEDCHESTPLATE_MODIFIERS,
+    abilities: &[],
+};
+static REINFORCEDLEGGINGS_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 5.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: EquipmentSlotGroup::Legs,
+    },
+    Modifier {
+        attribute: vanilla_attributes::ARMOR_TOUGHNESS,
+        amount: 0.5,
+        operation: AttributeModifierOperation::AddValue,
+        slot: EquipmentSlotGroup::Legs,
+    },
+];
+static REINFORCEDLEGGINGS: Artifact = Artifact {
+    id: ArtifactId::ReinforcedLeggings,
+    name: "Усиленные поножи",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::IRON_LEGGINGS,
+    modifiers: &REINFORCEDLEGGINGS_MODIFIERS,
+    abilities: &[],
+};
+static REINFORCEDBOOTS_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 2.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: FEET,
+    },
+    Modifier {
+        attribute: vanilla_attributes::ARMOR_TOUGHNESS,
+        amount: 0.5,
+        operation: AttributeModifierOperation::AddValue,
+        slot: FEET,
+    },
+];
+static REINFORCEDBOOTS: Artifact = Artifact {
+    id: ArtifactId::ReinforcedBoots,
+    name: "Усиленные сапоги",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::IRON_BOOTS,
+    modifiers: &REINFORCEDBOOTS_MODIFIERS,
+    abilities: &[],
+};
+static HEAVYHELMET_MODIFIERS: [Modifier; 3] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 3.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: HELMET,
+    },
+    Modifier {
+        attribute: vanilla_attributes::ARMOR_TOUGHNESS,
+        amount: 1.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: HELMET,
+    },
+    Modifier {
+        attribute: vanilla_attributes::MOVEMENT_SPEED,
+        amount: -0.03,
+        operation: AttributeModifierOperation::AddMultipliedBase,
+        slot: HELMET,
+    },
+];
+static HEAVYHELMET: Artifact = Artifact {
+    id: ArtifactId::HeavyHelmet,
+    name: "Тяжёлый шлем",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::DIAMOND_HELMET,
+    modifiers: &HEAVYHELMET_MODIFIERS,
+    abilities: &[],
+};
+static HEAVYCHESTPLATE_MODIFIERS: [Modifier; 3] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 7.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: CHEST,
+    },
+    Modifier {
+        attribute: vanilla_attributes::ARMOR_TOUGHNESS,
+        amount: 1.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: CHEST,
+    },
+    Modifier {
+        attribute: vanilla_attributes::MOVEMENT_SPEED,
+        amount: -0.03,
+        operation: AttributeModifierOperation::AddMultipliedBase,
+        slot: CHEST,
+    },
+];
+static HEAVYCHESTPLATE: Artifact = Artifact {
+    id: ArtifactId::HeavyChestplate,
+    name: "Тяжёлый нагрудник",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::DIAMOND_CHESTPLATE,
+    modifiers: &HEAVYCHESTPLATE_MODIFIERS,
+    abilities: &[],
+};
+static HEAVYLEGGINGS_MODIFIERS: [Modifier; 3] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 6.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: EquipmentSlotGroup::Legs,
+    },
+    Modifier {
+        attribute: vanilla_attributes::ARMOR_TOUGHNESS,
+        amount: 1.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: EquipmentSlotGroup::Legs,
+    },
+    Modifier {
+        attribute: vanilla_attributes::MOVEMENT_SPEED,
+        amount: -0.03,
+        operation: AttributeModifierOperation::AddMultipliedBase,
+        slot: EquipmentSlotGroup::Legs,
+    },
+];
+static HEAVYLEGGINGS: Artifact = Artifact {
+    id: ArtifactId::HeavyLeggings,
+    name: "Тяжёлые поножи",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::DIAMOND_LEGGINGS,
+    modifiers: &HEAVYLEGGINGS_MODIFIERS,
+    abilities: &[],
+};
+static HEAVYBOOTS_MODIFIERS: [Modifier; 3] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 3.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: FEET,
+    },
+    Modifier {
+        attribute: vanilla_attributes::ARMOR_TOUGHNESS,
+        amount: 1.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: FEET,
+    },
+    Modifier {
+        attribute: vanilla_attributes::MOVEMENT_SPEED,
+        amount: -0.03,
+        operation: AttributeModifierOperation::AddMultipliedBase,
+        slot: FEET,
+    },
+];
+static HEAVYBOOTS: Artifact = Artifact {
+    id: ArtifactId::HeavyBoots,
+    name: "Тяжёлые сабатоны",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::DIAMOND_BOOTS,
+    modifiers: &HEAVYBOOTS_MODIFIERS,
+    abilities: &[],
+};
+static ROBEHELMET_MODIFIERS: [Modifier; 1] = [Modifier {
+    attribute: vanilla_attributes::ARMOR,
+    amount: 1.0,
+    operation: AttributeModifierOperation::AddValue,
+    slot: HELMET,
+}];
+static ROBEHELMET: Artifact = Artifact {
+    id: ArtifactId::RobeHelmet,
+    name: "Капюшон мага",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::LEATHER_HELMET,
+    modifiers: &ROBEHELMET_MODIFIERS,
+    abilities: &[],
+};
+static ROBECHESTPLATE_MODIFIERS: [Modifier; 1] = [Modifier {
+    attribute: vanilla_attributes::ARMOR,
+    amount: 3.0,
+    operation: AttributeModifierOperation::AddValue,
+    slot: CHEST,
+}];
+static ROBECHESTPLATE: Artifact = Artifact {
+    id: ArtifactId::RobeChestplate,
+    name: "Мантия мага",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::LEATHER_CHESTPLATE,
+    modifiers: &ROBECHESTPLATE_MODIFIERS,
+    abilities: &[],
+};
+static ROBELEGGINGS_MODIFIERS: [Modifier; 1] = [Modifier {
+    attribute: vanilla_attributes::ARMOR,
+    amount: 2.0,
+    operation: AttributeModifierOperation::AddValue,
+    slot: EquipmentSlotGroup::Legs,
+}];
+static ROBELEGGINGS: Artifact = Artifact {
+    id: ArtifactId::RobeLeggings,
+    name: "Брюки мага",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::LEATHER_LEGGINGS,
+    modifiers: &ROBELEGGINGS_MODIFIERS,
+    abilities: &[],
+};
+static ROBEBOOTS_MODIFIERS: [Modifier; 1] = [Modifier {
+    attribute: vanilla_attributes::ARMOR,
+    amount: 1.0,
+    operation: AttributeModifierOperation::AddValue,
+    slot: FEET,
+}];
+static ROBEBOOTS: Artifact = Artifact {
+    id: ArtifactId::RobeBoots,
+    name: "Туфли мага",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::LEATHER_BOOTS,
+    modifiers: &ROBEBOOTS_MODIFIERS,
+    abilities: &[],
+};
+
+static IMPROVED_LIGHT_HELMET_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 2.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: HELMET,
+    },
+    Modifier {
+        attribute: vanilla_attributes::MOVEMENT_SPEED,
+        amount: 0.03,
+        operation: AttributeModifierOperation::AddMultipliedBase,
+        slot: HELMET,
+    },
+];
+static IMPROVED_LIGHT_HELMET: Artifact = Artifact {
+    id: ArtifactId::ImprovedLightHelmet,
+    name: "Лёгкий капюшон II",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::LEATHER_HELMET,
+    modifiers: &IMPROVED_LIGHT_HELMET_MODIFIERS,
+    abilities: &[],
+};
+static IMPROVED_LIGHT_CHESTPLATE_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 5.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: CHEST,
+    },
+    Modifier {
+        attribute: vanilla_attributes::MOVEMENT_SPEED,
+        amount: 0.04,
+        operation: AttributeModifierOperation::AddMultipliedBase,
+        slot: CHEST,
+    },
+];
+static IMPROVED_LIGHT_CHESTPLATE: Artifact = Artifact {
+    id: ArtifactId::ImprovedLightChestplate,
+    name: "Лёгкая куртка II",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::LEATHER_CHESTPLATE,
+    modifiers: &IMPROVED_LIGHT_CHESTPLATE_MODIFIERS,
+    abilities: &[],
+};
+static IMPROVED_LIGHT_LEGGINGS_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 4.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: EquipmentSlotGroup::Legs,
+    },
+    Modifier {
+        attribute: vanilla_attributes::MOVEMENT_SPEED,
+        amount: 0.04,
+        operation: AttributeModifierOperation::AddMultipliedBase,
+        slot: EquipmentSlotGroup::Legs,
+    },
+];
+static IMPROVED_LIGHT_LEGGINGS: Artifact = Artifact {
+    id: ArtifactId::ImprovedLightLeggings,
+    name: "Лёгкие штаны II",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::LEATHER_LEGGINGS,
+    modifiers: &IMPROVED_LIGHT_LEGGINGS_MODIFIERS,
+    abilities: &[],
+};
+static IMPROVED_LIGHT_BOOTS_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 1.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: FEET,
+    },
+    Modifier {
+        attribute: vanilla_attributes::MOVEMENT_SPEED,
+        amount: 0.03,
+        operation: AttributeModifierOperation::AddMultipliedBase,
+        slot: FEET,
+    },
+];
+static IMPROVED_LIGHT_BOOTS: Artifact = Artifact {
+    id: ArtifactId::ImprovedLightBoots,
+    name: "Лёгкие сапоги II",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::LEATHER_BOOTS,
+    modifiers: &IMPROVED_LIGHT_BOOTS_MODIFIERS,
+    abilities: &[],
+};
+static IMPROVED_REINFORCED_HELMET_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 3.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: HELMET,
+    },
+    Modifier {
+        attribute: vanilla_attributes::ARMOR_TOUGHNESS,
+        amount: 1.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: HELMET,
+    },
+];
+static IMPROVED_REINFORCED_HELMET: Artifact = Artifact {
+    id: ArtifactId::ImprovedReinforcedHelmet,
+    name: "Усиленный шлем II",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::IRON_HELMET,
+    modifiers: &IMPROVED_REINFORCED_HELMET_MODIFIERS,
+    abilities: &[],
+};
+static IMPROVED_REINFORCED_CHESTPLATE_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 7.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: CHEST,
+    },
+    Modifier {
+        attribute: vanilla_attributes::ARMOR_TOUGHNESS,
+        amount: 1.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: CHEST,
+    },
+];
+static IMPROVED_REINFORCED_CHESTPLATE: Artifact = Artifact {
+    id: ArtifactId::ImprovedReinforcedChestplate,
+    name: "Усиленный нагрудник II",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::IRON_CHESTPLATE,
+    modifiers: &IMPROVED_REINFORCED_CHESTPLATE_MODIFIERS,
+    abilities: &[],
+};
+static IMPROVED_REINFORCED_LEGGINGS_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 6.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: EquipmentSlotGroup::Legs,
+    },
+    Modifier {
+        attribute: vanilla_attributes::ARMOR_TOUGHNESS,
+        amount: 1.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: EquipmentSlotGroup::Legs,
+    },
+];
+static IMPROVED_REINFORCED_LEGGINGS: Artifact = Artifact {
+    id: ArtifactId::ImprovedReinforcedLeggings,
+    name: "Усиленные поножи II",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::IRON_LEGGINGS,
+    modifiers: &IMPROVED_REINFORCED_LEGGINGS_MODIFIERS,
+    abilities: &[],
+};
+static IMPROVED_REINFORCED_BOOTS_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 2.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: FEET,
+    },
+    Modifier {
+        attribute: vanilla_attributes::ARMOR_TOUGHNESS,
+        amount: 1.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: FEET,
+    },
+];
+static IMPROVED_REINFORCED_BOOTS: Artifact = Artifact {
+    id: ArtifactId::ImprovedReinforcedBoots,
+    name: "Усиленные сапоги II",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::IRON_BOOTS,
+    modifiers: &IMPROVED_REINFORCED_BOOTS_MODIFIERS,
+    abilities: &[],
+};
+static IMPROVED_HEAVY_HELMET_MODIFIERS: [Modifier; 3] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 3.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: HELMET,
+    },
+    Modifier {
+        attribute: vanilla_attributes::ARMOR_TOUGHNESS,
+        amount: 1.5,
+        operation: AttributeModifierOperation::AddValue,
+        slot: HELMET,
+    },
+    Modifier {
+        attribute: vanilla_attributes::MOVEMENT_SPEED,
+        amount: -0.03,
+        operation: AttributeModifierOperation::AddMultipliedBase,
+        slot: HELMET,
+    },
+];
+static IMPROVED_HEAVY_HELMET: Artifact = Artifact {
+    id: ArtifactId::ImprovedHeavyHelmet,
+    name: "Тяжёлый шлем II",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::DIAMOND_HELMET,
+    modifiers: &IMPROVED_HEAVY_HELMET_MODIFIERS,
+    abilities: &[],
+};
+static IMPROVED_HEAVY_CHESTPLATE_MODIFIERS: [Modifier; 3] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 8.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: CHEST,
+    },
+    Modifier {
+        attribute: vanilla_attributes::ARMOR_TOUGHNESS,
+        amount: 1.5,
+        operation: AttributeModifierOperation::AddValue,
+        slot: CHEST,
+    },
+    Modifier {
+        attribute: vanilla_attributes::MOVEMENT_SPEED,
+        amount: -0.03,
+        operation: AttributeModifierOperation::AddMultipliedBase,
+        slot: CHEST,
+    },
+];
+static IMPROVED_HEAVY_CHESTPLATE: Artifact = Artifact {
+    id: ArtifactId::ImprovedHeavyChestplate,
+    name: "Тяжёлый нагрудник II",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::DIAMOND_CHESTPLATE,
+    modifiers: &IMPROVED_HEAVY_CHESTPLATE_MODIFIERS,
+    abilities: &[],
+};
+static IMPROVED_HEAVY_LEGGINGS_MODIFIERS: [Modifier; 3] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 6.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: EquipmentSlotGroup::Legs,
+    },
+    Modifier {
+        attribute: vanilla_attributes::ARMOR_TOUGHNESS,
+        amount: 1.5,
+        operation: AttributeModifierOperation::AddValue,
+        slot: EquipmentSlotGroup::Legs,
+    },
+    Modifier {
+        attribute: vanilla_attributes::MOVEMENT_SPEED,
+        amount: -0.03,
+        operation: AttributeModifierOperation::AddMultipliedBase,
+        slot: EquipmentSlotGroup::Legs,
+    },
+];
+static IMPROVED_HEAVY_LEGGINGS: Artifact = Artifact {
+    id: ArtifactId::ImprovedHeavyLeggings,
+    name: "Тяжёлые поножи II",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::DIAMOND_LEGGINGS,
+    modifiers: &IMPROVED_HEAVY_LEGGINGS_MODIFIERS,
+    abilities: &[],
+};
+static IMPROVED_HEAVY_BOOTS_MODIFIERS: [Modifier; 3] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 3.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: FEET,
+    },
+    Modifier {
+        attribute: vanilla_attributes::ARMOR_TOUGHNESS,
+        amount: 1.5,
+        operation: AttributeModifierOperation::AddValue,
+        slot: FEET,
+    },
+    Modifier {
+        attribute: vanilla_attributes::MOVEMENT_SPEED,
+        amount: -0.03,
+        operation: AttributeModifierOperation::AddMultipliedBase,
+        slot: FEET,
+    },
+];
+static IMPROVED_HEAVY_BOOTS: Artifact = Artifact {
+    id: ArtifactId::ImprovedHeavyBoots,
+    name: "Тяжёлые сабатоны II",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::DIAMOND_BOOTS,
+    modifiers: &IMPROVED_HEAVY_BOOTS_MODIFIERS,
+    abilities: &[],
+};
+static IMPROVED_ROBE_HELMET_MODIFIERS: [Modifier; 1] = [Modifier {
+    attribute: vanilla_attributes::ARMOR,
+    amount: 1.0,
+    operation: AttributeModifierOperation::AddValue,
+    slot: HELMET,
+}];
+static IMPROVED_ROBE_HELMET: Artifact = Artifact {
+    id: ArtifactId::ImprovedRobeHelmet,
+    name: "Капюшон мага II",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::LEATHER_HELMET,
+    modifiers: &IMPROVED_ROBE_HELMET_MODIFIERS,
+    abilities: &[],
+};
+static IMPROVED_ROBE_CHESTPLATE_MODIFIERS: [Modifier; 1] = [Modifier {
+    attribute: vanilla_attributes::ARMOR,
+    amount: 4.0,
+    operation: AttributeModifierOperation::AddValue,
+    slot: CHEST,
+}];
+static IMPROVED_ROBE_CHESTPLATE: Artifact = Artifact {
+    id: ArtifactId::ImprovedRobeChestplate,
+    name: "Мантия мага II",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::LEATHER_CHESTPLATE,
+    modifiers: &IMPROVED_ROBE_CHESTPLATE_MODIFIERS,
+    abilities: &[],
+};
+static IMPROVED_ROBE_LEGGINGS_MODIFIERS: [Modifier; 1] = [Modifier {
+    attribute: vanilla_attributes::ARMOR,
+    amount: 3.0,
+    operation: AttributeModifierOperation::AddValue,
+    slot: EquipmentSlotGroup::Legs,
+}];
+static IMPROVED_ROBE_LEGGINGS: Artifact = Artifact {
+    id: ArtifactId::ImprovedRobeLeggings,
+    name: "Брюки мага II",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::LEATHER_LEGGINGS,
+    modifiers: &IMPROVED_ROBE_LEGGINGS_MODIFIERS,
+    abilities: &[],
+};
+static IMPROVED_ROBE_BOOTS_MODIFIERS: [Modifier; 1] = [Modifier {
+    attribute: vanilla_attributes::ARMOR,
+    amount: 1.0,
+    operation: AttributeModifierOperation::AddValue,
+    slot: FEET,
+}];
+static IMPROVED_ROBE_BOOTS: Artifact = Artifact {
+    id: ArtifactId::ImprovedRobeBoots,
+    name: "Туфли мага II",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::LEATHER_BOOTS,
+    modifiers: &IMPROVED_ROBE_BOOTS_MODIFIERS,
+    abilities: &[],
+};
+static IMPROVED_HUNTER_SWORD_MODIFIERS: [Modifier; 2] = weapon_modifiers(6.0, 1.6);
+static IMPROVED_HUNTER_SWORD: Artifact = Artifact {
+    id: ArtifactId::ImprovedHunterSword,
+    name: "Стальной меч охотника II",
+    rarity: Rarity::Common,
+    category: Category::Weapon,
+    holder: &vanilla_items::IRON_SWORD,
+    modifiers: &IMPROVED_HUNTER_SWORD_MODIFIERS,
+    abilities: &[],
+};
+static IMPROVED_HUNTER_DAGGER_MODIFIERS: [Modifier; 2] = weapon_modifiers(4.0, 2.4);
+static IMPROVED_HUNTER_DAGGER: Artifact = Artifact {
+    id: ArtifactId::ImprovedHunterDagger,
+    name: "Охотничий кинжал II",
+    rarity: Rarity::Common,
+    category: Category::Weapon,
+    holder: &vanilla_items::STONE_SWORD,
+    modifiers: &IMPROVED_HUNTER_DAGGER_MODIFIERS,
+    abilities: &[],
+};
+static IMPROVED_HUNTER_AXE_MODIFIERS: [Modifier; 2] = weapon_modifiers(9.0, 0.9);
+static IMPROVED_HUNTER_AXE: Artifact = Artifact {
+    id: ArtifactId::ImprovedHunterAxe,
+    name: "Тяжёлый топор охотника II",
+    rarity: Rarity::Common,
+    category: Category::Weapon,
+    holder: &vanilla_items::IRON_AXE,
+    modifiers: &IMPROVED_HUNTER_AXE_MODIFIERS,
+    abilities: &[],
+};
+
+static HUNTER_SWORD: Artifact = Artifact {
+    id: ArtifactId::HunterSword,
+    name: "Стальной меч охотника",
+    rarity: Rarity::Common,
+    category: Category::Weapon,
+    holder: &vanilla_items::IRON_SWORD,
+    modifiers: &HUNTER_SWORD_MODIFIERS,
+    abilities: &[],
+};
+static HUNTER_DAGGER: Artifact = Artifact {
+    id: ArtifactId::HunterDagger,
+    name: "Охотничий кинжал",
+    rarity: Rarity::Common,
+    category: Category::Weapon,
+    holder: &vanilla_items::STONE_SWORD,
+    modifiers: &HUNTER_DAGGER_MODIFIERS,
+    abilities: &[],
+};
+static HUNTER_AXE: Artifact = Artifact {
+    id: ArtifactId::HunterAxe,
+    name: "Тяжёлый топор охотника",
+    rarity: Rarity::Common,
+    category: Category::Weapon,
+    holder: &vanilla_items::IRON_AXE,
+    modifiers: &HUNTER_AXE_MODIFIERS,
+    abilities: &[],
+};
+static HUNTER_SHIELD: Artifact = Artifact {
+    id: ArtifactId::HunterShield,
+    name: "Щит охотника",
+    rarity: Rarity::Common,
+    category: Category::Weapon,
+    holder: &vanilla_items::SHIELD,
+    modifiers: &[],
+    abilities: &[],
+};
+static HUNTER_HELMET: Artifact = Artifact {
+    id: ArtifactId::HunterHelmet,
+    name: "Шлем охотника",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::CHAINMAIL_HELMET,
+    modifiers: &HUNTER_HELMET_MODIFIERS,
+    abilities: &[],
+};
+static HUNTER_CHESTPLATE: Artifact = Artifact {
+    id: ArtifactId::HunterChestplate,
+    name: "Нагрудник охотника",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::CHAINMAIL_CHESTPLATE,
+    modifiers: &HUNTER_CHESTPLATE_MODIFIERS,
+    abilities: &[],
+};
+static HUNTER_LEGGINGS: Artifact = Artifact {
+    id: ArtifactId::HunterLeggings,
+    name: "Поножи охотника",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::CHAINMAIL_LEGGINGS,
+    modifiers: &HUNTER_LEGGINGS_MODIFIERS,
+    abilities: &[],
+};
+static HUNTER_BOOTS: Artifact = Artifact {
+    id: ArtifactId::HunterBoots,
+    name: "Ботинки охотника",
+    rarity: Rarity::Common,
+    category: Category::Armor,
+    holder: &vanilla_items::CHAINMAIL_BOOTS,
+    modifiers: &HUNTER_BOOTS_MODIFIERS,
+    abilities: &[],
+};
+/// Keeps the holder's vanilla attack and mining stats.
+static HUNTER_PICKAXE: Artifact = Artifact {
+    id: ArtifactId::HunterPickaxe,
+    name: "Кирка охотника",
+    rarity: Rarity::Common,
+    category: Category::Weapon,
+    holder: &vanilla_items::IRON_PICKAXE,
+    modifiers: &[],
+    abilities: &[],
+};
+
+static RAIKANS_FANG_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ATTACK_DAMAGE,
+        amount: 3.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: ATTACK,
+    },
+    Modifier {
+        attribute: vanilla_attributes::ATTACK_SPEED,
+        amount: -2.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: ATTACK,
+    },
+];
+static RAIKANS_FANG: Artifact = Artifact {
+    id: ArtifactId::RaikansFang,
+    name: "Клык стального райкана",
+    rarity: Rarity::Rare,
+    category: Category::Weapon,
+    holder: &vanilla_items::IRON_SWORD,
+    modifiers: &RAIKANS_FANG_MODIFIERS,
+    abilities: &[],
+};
+static RING_OF_ENDURANCE_MODIFIERS: [Modifier; 1] = [Modifier {
+    attribute: vanilla_attributes::MAX_HEALTH,
+    amount: 2.0,
+    operation: AttributeModifierOperation::AddValue,
+    slot: EquipmentSlotGroup::Body,
+}];
+static RING_OF_ENDURANCE: Artifact = Artifact {
+    id: ArtifactId::RingOfEndurance,
+    name: "Кольцо стойкости",
+    rarity: Rarity::Rare,
+    category: Category::Armor,
+    holder: &vanilla_items::GOLD_NUGGET,
+    modifiers: &RING_OF_ENDURANCE_MODIFIERS,
+    abilities: &[],
+};
+static WIND_AMULET_MODIFIERS: [Modifier; 1] = [Modifier {
+    attribute: vanilla_attributes::MOVEMENT_SPEED,
+    amount: 0.05,
+    operation: AttributeModifierOperation::AddMultipliedBase,
+    slot: EquipmentSlotGroup::Body,
+}];
+static WIND_AMULET: Artifact = Artifact {
+    id: ArtifactId::WindAmulet,
+    name: "Амулет ветра",
+    rarity: Rarity::Rare,
+    category: Category::Armor,
+    holder: &vanilla_items::HEART_OF_THE_SEA,
+    modifiers: &WIND_AMULET_MODIFIERS,
+    abilities: &[],
+};
+static DUNGEON_WARDENS_HELMET_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 2.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: HELMET,
+    },
+    Modifier {
+        attribute: vanilla_attributes::ARMOR_TOUGHNESS,
+        amount: 1.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: HELMET,
+    },
+];
+static DUNGEON_WARDENS_HELMET: Artifact = Artifact {
+    id: ArtifactId::DungeonWardensHelmet,
+    name: "Шлем стража подземелья",
+    rarity: Rarity::Rare,
+    category: Category::Armor,
+    holder: &vanilla_items::IRON_HELMET,
+    modifiers: &DUNGEON_WARDENS_HELMET_MODIFIERS,
+    abilities: &[],
+};
+static TRACKERS_LEGGINGS_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 3.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: EquipmentSlotGroup::Legs,
+    },
+    Modifier {
+        attribute: vanilla_attributes::MOVEMENT_SPEED,
+        amount: 0.03,
+        operation: AttributeModifierOperation::AddMultipliedBase,
+        slot: EquipmentSlotGroup::Legs,
+    },
+];
+static TRACKERS_LEGGINGS: Artifact = Artifact {
+    id: ArtifactId::TrackersLeggings,
+    name: "Поножи следопыта",
+    rarity: Rarity::Rare,
+    category: Category::Armor,
+    holder: &vanilla_items::LEATHER_LEGGINGS,
+    modifiers: &TRACKERS_LEGGINGS_MODIFIERS,
+    abilities: &[],
+};
+static GATEKEEPERS_NECKLACE_MODIFIERS: [Modifier; 1] = [Modifier {
+    attribute: vanilla_attributes::MOVEMENT_SPEED,
+    amount: 0.06,
+    operation: AttributeModifierOperation::AddMultipliedBase,
+    slot: EquipmentSlotGroup::Body,
+}];
+static GATEKEEPERS_NECKLACE: Artifact = Artifact {
+    id: ArtifactId::GatekeepersNecklace,
+    name: "Ожерелье привратника",
+    rarity: Rarity::Epic,
+    category: Category::Armor,
+    holder: &vanilla_items::HEART_OF_THE_SEA,
+    modifiers: &GATEKEEPERS_NECKLACE_MODIFIERS,
+    abilities: &[Ability::SpeedOnHit {
+        percent: 0.2,
+        seconds: 3,
+        cooldown: 12,
+    }],
+};
+static HIGH_MAGICIANS_RING: Artifact = Artifact {
+    id: ArtifactId::HighMagiciansRing,
+    name: "Кольцо высшего мага",
+    rarity: Rarity::Epic,
+    category: Category::Armor,
+    holder: &vanilla_items::GOLD_NUGGET,
+    modifiers: &[],
+    abilities: &[Ability::MagicFocus { percent: 0.15 }],
+};
+static KARGALGANS_STAFF_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ATTACK_DAMAGE,
+        amount: 2.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: ATTACK,
+    },
+    Modifier {
+        attribute: vanilla_attributes::ATTACK_SPEED,
+        amount: -2.4,
+        operation: AttributeModifierOperation::AddValue,
+        slot: ATTACK,
+    },
+];
+static KARGALGANS_STAFF: Artifact = Artifact {
+    id: ArtifactId::KargalgansStaff,
+    name: "Посох Каргалгана",
+    rarity: Rarity::Epic,
+    category: Category::Weapon,
+    holder: &vanilla_items::BLAZE_ROD,
+    modifiers: &KARGALGANS_STAFF_MODIFIERS,
+    abilities: &[Ability::MagicFocus { percent: 0.3 }],
+};
+static HIGH_KNIGHTS_GREAVES_MODIFIERS: [Modifier; 1] = [Modifier {
+    attribute: vanilla_attributes::ARMOR,
+    amount: 4.0,
+    operation: AttributeModifierOperation::AddValue,
+    slot: EquipmentSlotGroup::Legs,
+}];
+static HIGH_KNIGHTS_GREAVES: Artifact = Artifact {
+    id: ArtifactId::HighKnightsGreaves,
+    name: "Поножи высшего рыцаря",
+    rarity: Rarity::Epic,
+    category: Category::Armor,
+    holder: &vanilla_items::IRON_LEGGINGS,
+    modifiers: &HIGH_KNIGHTS_GREAVES_MODIFIERS,
+    abilities: &[Ability::LowHealthReduction {
+        threshold: 0.35,
+        reduction: 0.1,
+        seconds: 4,
+        cooldown: 30,
+    }],
+};
+static KAMISHS_WRATH_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ATTACK_DAMAGE,
+        amount: 8.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: ATTACK,
+    },
+    Modifier {
+        attribute: vanilla_attributes::ATTACK_SPEED,
+        amount: -2.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: ATTACK,
+    },
+];
+static KAMISHS_WRATH: Artifact = Artifact {
+    id: ArtifactId::KamishsWrath,
+    name: "Гнев Камиша",
+    rarity: Rarity::Legendary,
+    category: Category::Weapon,
+    holder: &vanilla_items::NETHERITE_SWORD,
+    modifiers: &KAMISHS_WRATH_MODIFIERS,
+    abilities: &[Ability::StrengthScaling {
+        per_point: 0.08,
+        maximum: 8.0,
+    }],
+};
+static ORB_OF_AVARICE: Artifact = Artifact {
+    id: ArtifactId::OrbOfAvarice,
+    name: "Сфера алчности",
+    rarity: Rarity::Legendary,
+    category: Category::Armor,
+    holder: &vanilla_items::ENDER_EYE,
+    modifiers: &[],
+    abilities: &[Ability::MagicFocus { percent: 0.4 }],
+};
+static BLACK_HEART_MODIFIERS: [Modifier; 2] = [
+    Modifier {
+        attribute: vanilla_attributes::ARMOR,
+        amount: 4.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: CHEST,
+    },
+    Modifier {
+        attribute: vanilla_attributes::MAX_HEALTH,
+        amount: 6.0,
+        operation: AttributeModifierOperation::AddValue,
+        slot: CHEST,
+    },
+];
+static BLACK_HEART: Artifact = Artifact {
+    id: ArtifactId::BlackHeart,
+    name: "Чёрное сердце",
+    rarity: Rarity::Legendary,
+    category: Category::Armor,
+    holder: &vanilla_items::NETHERITE_CHESTPLATE,
+    modifiers: &BLACK_HEART_MODIFIERS,
+    abilities: &[Ability::LowHealthReduction {
+        threshold: 0.3,
+        reduction: 0.25,
+        seconds: 5,
+        cooldown: 45,
+    }],
+};
+static DEMON_MONARCHS_RING_MODIFIERS: [Modifier; 1] = [Modifier {
+    attribute: vanilla_attributes::MAX_HEALTH,
+    amount: 4.0,
+    operation: AttributeModifierOperation::AddValue,
+    slot: EquipmentSlotGroup::Body,
+}];
+static DEMON_MONARCHS_RING: Artifact = Artifact {
+    id: ArtifactId::DemonMonarchsRing,
+    name: "Кольцо Монарха демонов",
+    rarity: Rarity::Legendary,
+    category: Category::Armor,
+    holder: &vanilla_items::GOLD_NUGGET,
+    modifiers: &DEMON_MONARCHS_RING_MODIFIERS,
+    abilities: &[Ability::StrengthScaling {
+        per_point: 0.03,
+        maximum: 3.0,
+    }],
+};
+
+static ASH_STAFF_MODIFIERS: [Modifier; 2] = weapon_modifiers(2.0, 1.2);
+static ASH_STAFF: Artifact = Artifact {
+    id: ArtifactId::AshStaff,
+    name: "Ясеневый посох",
+    rarity: Rarity::Rare,
+    category: Category::Weapon,
+    holder: &vanilla_items::STICK,
+    modifiers: &ASH_STAFF_MODIFIERS,
+    abilities: &[],
+};
+static APPRENTICE_STAFF_MODIFIERS: [Modifier; 2] = weapon_modifiers(1.0, 1.2);
+static APPRENTICE_STAFF: Artifact = Artifact {
+    id: ArtifactId::ApprenticeStaff,
+    name: "Посох ученика",
+    rarity: Rarity::Common,
+    category: Category::Weapon,
+    holder: &vanilla_items::STICK,
+    modifiers: &APPRENTICE_STAFF_MODIFIERS,
+    abilities: &[],
+};
+static MANA_RING: Artifact = Artifact {
+    id: ArtifactId::ManaRing,
+    name: "Кольцо маны",
+    rarity: Rarity::Rare,
+    category: Category::Armor,
+    holder: &vanilla_items::GOLD_NUGGET,
+    modifiers: &[],
+    abilities: &[],
+};
+static CLEAR_MIND_EARRINGS: Artifact = Artifact {
+    id: ArtifactId::ClearMindEarrings,
+    name: "Серьги ясного разума",
+    rarity: Rarity::Rare,
+    category: Category::Armor,
+    holder: &vanilla_items::HEART_OF_THE_SEA,
+    modifiers: &[],
+    abilities: &[],
+};
+static ARCHMAGE_MANTLE_MODIFIERS: [Modifier; 1] = [Modifier {
+    attribute: vanilla_attributes::ARMOR,
+    amount: 4.0,
+    operation: AttributeModifierOperation::AddValue,
+    slot: EquipmentSlotGroup::Chest,
+}];
+static ARCHMAGE_MANTLE: Artifact = Artifact {
+    id: ArtifactId::ArchmageMantle,
+    name: "Мантия архимага",
+    rarity: Rarity::Epic,
+    category: Category::Armor,
+    holder: &vanilla_items::LEATHER_CHESTPLATE,
+    modifiers: &ARCHMAGE_MANTLE_MODIFIERS,
+    abilities: &[],
+};
+static HIGH_PRIESTS_BREVIARY: Artifact = Artifact {
+    id: ArtifactId::HighPriestsBreviary,
+    name: "Требник верховного жреца",
+    rarity: Rarity::Epic,
+    category: Category::Armor,
+    holder: &vanilla_items::HEART_OF_THE_SEA,
+    modifiers: &[],
+    abilities: &[],
+};
+static ELEMENTAL_ORB: Artifact = Artifact {
+    id: ArtifactId::ElementalOrb,
+    name: "Сфера стихий",
+    rarity: Rarity::Epic,
+    category: Category::Armor,
+    holder: &vanilla_items::ENDER_EYE,
+    modifiers: &[],
+    abilities: &[],
+};
+static DEMON_KINGS_STAFF_MODIFIERS: [Modifier; 2] = weapon_modifiers(4.0, 1.2);
+static DEMON_KINGS_STAFF: Artifact = Artifact {
+    id: ArtifactId::DemonKingsStaff,
+    name: "Посох короля демонов",
+    rarity: Rarity::Legendary,
+    category: Category::Weapon,
+    holder: &vanilla_items::BLAZE_ROD,
+    modifiers: &DEMON_KINGS_STAFF_MODIFIERS,
+    abilities: &[],
+};
+static CROWN_OF_BOTTOMLESS_MANA_MODIFIERS: [Modifier; 1] = [Modifier {
+    attribute: vanilla_attributes::ARMOR,
+    amount: 2.0,
+    operation: AttributeModifierOperation::AddValue,
+    slot: EquipmentSlotGroup::Head,
+}];
+static CROWN_OF_BOTTOMLESS_MANA: Artifact = Artifact {
+    id: ArtifactId::CrownOfBottomlessMana,
+    name: "Венец бездонной маны",
+    rarity: Rarity::Legendary,
+    category: Category::Armor,
+    holder: &vanilla_items::GOLDEN_HELMET,
+    modifiers: &CROWN_OF_BOTTOMLESS_MANA_MODIFIERS,
+    abilities: &[],
+};
+
+const fn body(attribute: AttributeRef, amount: f64, multiplied: bool) -> Modifier {
+    Modifier {
+        attribute,
+        amount,
+        operation: if multiplied {
+            AttributeModifierOperation::AddMultipliedBase
+        } else {
+            AttributeModifierOperation::AddValue
+        },
+        slot: EquipmentSlotGroup::Body,
+    }
+}
+
+static AGILE_RING_MODIFIERS: [Modifier; 1] = [body(vanilla_attributes::ATTACK_SPEED, 0.08, true)];
+static AGILE_RING: Artifact = Artifact {
+    id: ArtifactId::AgileRing,
+    name: "Кольцо ловкача",
+    rarity: Rarity::Rare,
+    category: Category::Armor,
+    holder: &vanilla_items::GOLD_NUGGET,
+    modifiers: &AGILE_RING_MODIFIERS,
+    abilities: &[],
+};
+static STRENGTH_RING_MODIFIERS: [Modifier; 1] =
+    [body(vanilla_attributes::ATTACK_DAMAGE, 1.0, false)];
+static STRENGTH_RING: Artifact = Artifact {
+    id: ArtifactId::StrengthRing,
+    name: "Кольцо силы",
+    rarity: Rarity::Rare,
+    category: Category::Armor,
+    holder: &vanilla_items::GOLD_NUGGET,
+    modifiers: &STRENGTH_RING_MODIFIERS,
+    abilities: &[],
+};
+static WARDEN_AMULET_MODIFIERS: [Modifier; 2] = [
+    body(vanilla_attributes::ARMOR, 2.0, false),
+    body(vanilla_attributes::KNOCKBACK_RESISTANCE, 0.1, false),
+];
+static WARDEN_AMULET: Artifact = Artifact {
+    id: ArtifactId::WardenAmulet,
+    name: "Амулет стража",
+    rarity: Rarity::Rare,
+    category: Category::Armor,
+    holder: &vanilla_items::HEART_OF_THE_SEA,
+    modifiers: &WARDEN_AMULET_MODIFIERS,
+    abilities: &[],
+};
+static HUNTERS_AMULET_MODIFIERS: [Modifier; 2] = [
+    body(vanilla_attributes::MAX_HEALTH, 2.0, false),
+    body(vanilla_attributes::MOVEMENT_SPEED, 0.05, true),
+];
+static HUNTERS_AMULET: Artifact = Artifact {
+    id: ArtifactId::HuntersAmulet,
+    name: "Амулет охотника",
+    rarity: Rarity::Rare,
+    category: Category::Armor,
+    holder: &vanilla_items::HEART_OF_THE_SEA,
+    modifiers: &HUNTERS_AMULET_MODIFIERS,
+    abilities: &[],
+};
+static BERSERKER_RING: Artifact = Artifact {
+    id: ArtifactId::BerserkerRing,
+    name: "Кольцо берсерка",
+    rarity: Rarity::Epic,
+    category: Category::Armor,
+    holder: &vanilla_items::GOLD_NUGGET,
+    modifiers: &[],
+    abilities: &[Ability::Berserk {
+        threshold: 0.4,
+        percent: 0.25,
+    }],
+};
+static BOSS_HUNTER_RING: Artifact = Artifact {
+    id: ArtifactId::BossHunterRing,
+    name: "Кольцо охотника на боссов",
+    rarity: Rarity::Epic,
+    category: Category::Armor,
+    holder: &vanilla_items::GOLD_NUGGET,
+    modifiers: &[],
+    abilities: &[Ability::BossSlayer { percent: 0.2 }],
+};
+static BLOOD_AMULET_MODIFIERS: [Modifier; 1] = [body(vanilla_attributes::MAX_HEALTH, 2.0, false)];
+static BLOOD_AMULET: Artifact = Artifact {
+    id: ArtifactId::BloodAmulet,
+    name: "Амулет крови",
+    rarity: Rarity::Epic,
+    category: Category::Armor,
+    holder: &vanilla_items::HEART_OF_THE_SEA,
+    modifiers: &BLOOD_AMULET_MODIFIERS,
+    abilities: &[Ability::Bloodthirst { percent: 0.06 }],
+};
+static PROSPECTORS_NECKLACE: Artifact = Artifact {
+    id: ArtifactId::ProspectorsNecklace,
+    name: "Ожерелье старателя",
+    rarity: Rarity::Epic,
+    category: Category::Armor,
+    holder: &vanilla_items::HEART_OF_THE_SEA,
+    modifiers: &[],
+    abilities: &[
+        Ability::CrystalLuck { percent: 20 },
+        Ability::Greed { percent: 0.1 },
+    ],
+};
+static ANT_KING_RING_MODIFIERS: [Modifier; 1] = [body(vanilla_attributes::MAX_HEALTH, 4.0, false)];
+static ANT_KING_RING: Artifact = Artifact {
+    id: ArtifactId::AntKingRing,
+    name: "Кольцо Короля муравьёв",
+    rarity: Rarity::Legendary,
+    category: Category::Armor,
+    holder: &vanilla_items::GOLD_NUGGET,
+    modifiers: &ANT_KING_RING_MODIFIERS,
+    abilities: &[Ability::DoubleStrike {
+        every: 4,
+        percent: 0.5,
+    }],
+};
+static SHADOW_GUARD_AMULET: Artifact = Artifact {
+    id: ArtifactId::ShadowGuardAmulet,
+    name: "Амулет теневого стража",
+    rarity: Rarity::Legendary,
+    category: Category::Armor,
+    holder: &vanilla_items::HEART_OF_THE_SEA,
+    modifiers: &[],
+    abilities: &[Ability::ShadowGuard {
+        seconds: 3,
+        cooldown: 90,
+    }],
+};
+
 /// Returns every weapon artifact of `rarity`.
 #[must_use]
 pub fn weapons_of(rarity: Rarity) -> Vec<ArtifactId> {
@@ -624,6 +2713,10 @@ pub fn stack(id: ArtifactId, owner: Option<Uuid>) -> ItemStack {
 /// Enchanting rebuilds the stack from the catalog, so the binding is passed
 /// back in and survives.
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the lore is one chain of every kind of line an artifact can show"
+)]
 pub fn enchanted_stack(
     id: ArtifactId,
     owner: Option<Uuid>,
@@ -655,6 +2748,28 @@ pub fn enchanted_stack(
             } else {
                 Color::Blue
             })
+        }))
+        .chain(
+            id.spell_gear()
+                .into_iter()
+                .flat_map(SpellGear::describe)
+                .map(|line| TextComponent::plain(line).color(Color::LightPurple)),
+        )
+        .chain((id.magic_bonus() > 0.0).then(|| {
+            TextComponent::plain(format!("Магический урон {:+.0}%", id.magic_bonus() * 100.0))
+                .color(Color::Gray)
+        }))
+        .chain(id.allowed_classes().map(|classes| {
+            let names = classes
+                .iter()
+                .map(|class| class.display_name())
+                .collect::<Vec<_>>()
+                .join(", ");
+            TextComponent::plain(format!("Только для класса: {names}")).color(Color::Yellow)
+        }))
+        .chain((id.required_strength() > 0).then(|| {
+            TextComponent::plain(format!("Требуется сила: {}", id.required_strength()))
+                .color(Color::Yellow)
         }))
         .chain([
             TextComponent::plain(format!("Редкость: {}", artifact.rarity.display_name()))
@@ -689,9 +2804,20 @@ pub fn enchanted_stack(
     if !modifiers.modifiers.is_empty() {
         stack.set(ATTRIBUTE_MODIFIERS, modifiers);
     }
-    super::model::apply(&mut stack, &format!("artifact/{}", id.name()));
-    if artifact.category == Category::Armor {
-        super::model::apply_equipment(&mut stack, id.name());
+    if id.is_starter() || id.line().is_some() || id.is_improved() {
+        // Serial gear keeps its vanilla look; only the free, bound starter
+        // kit never breaks, merchant copies wear like any tool.
+        if id.is_starter() && owner.is_some() {
+            stack.set(UNBREAKABLE, ());
+        }
+        if let Some(color) = id.dye() {
+            stack.set(DYED_COLOR, DyedItemColor::new(color));
+        }
+    } else {
+        super::model::apply(&mut stack, &format!("artifact/{}", id.name()));
+        if artifact.category == Category::Armor {
+            super::model::apply_equipment(&mut stack, id.name());
+        }
     }
     let mut fields = record(KIND);
     fields.insert(ID, id.name().to_owned());
@@ -856,6 +2982,8 @@ fn attribute_modifier_id(artifact: ArtifactId, attribute: AttributeRef) -> Ident
 fn describe_attribute(attribute: AttributeRef) -> &'static str {
     match attribute.key.path.as_ref() {
         "attack_damage" => "Урон атаки",
+        "attack_speed" => "Скорость атаки",
+        "armor_toughness" => "Прочность брони",
         "armor" => "Броня",
         "movement_speed" => "Скорость",
         "max_health" => "Максимальное здоровье",
@@ -865,6 +2993,15 @@ fn describe_attribute(attribute: AttributeRef) -> &'static str {
 }
 
 fn describe_amount(modifier: &Modifier) -> String {
+    if modifier.attribute.key == vanilla_attributes::ATTACK_SPEED.key
+        && modifier.operation == AttributeModifierOperation::AddValue
+    {
+        // The offset is relative to the base of 4; hunters read the result.
+        return format!(
+            "{:.1} в секунду",
+            vanilla_attributes::ATTACK_SPEED.default_value + modifier.amount
+        );
+    }
     match modifier.operation {
         AttributeModifierOperation::AddMultipliedBase
         | AttributeModifierOperation::AddMultipliedTotal => {
@@ -929,6 +3066,30 @@ pub fn describe_ability(ability: Ability) -> String {
         Ability::CrystalLuck { percent } => {
             format!("+{percent}% шанс дополнительного кристалла")
         }
+        Ability::MagicFocus { percent } => {
+            format!("+{:.0}% магического урона", percent * 100.0)
+        }
+        Ability::Berserk { threshold, percent } => format!(
+            "Ниже {:.0}% здоровья: +{:.0}% урона и +10% скорости атаки",
+            threshold * 100.0,
+            percent * 100.0
+        ),
+        Ability::BossSlayer { percent } => {
+            format!("+{:.0}% урона по боссам врат", percent * 100.0)
+        }
+        Ability::Bloodthirst { percent } => {
+            format!("Удар лечит на {:.0}% урона", percent * 100.0)
+        }
+        Ability::Greed { percent } => {
+            format!("+{:.0}% очков Системы за убийства", percent * 100.0)
+        }
+        Ability::DoubleStrike { every, percent } => format!(
+            "Каждое {every}-е попадание бьёт ещё раз на {:.0}% урона",
+            percent * 100.0
+        ),
+        Ability::ShadowGuard { seconds, cooldown } => format!(
+            "Смертельный удар оставляет 1 HP и даёт {seconds} с неуязвимости (перезарядка {cooldown} с)"
+        ),
     }
 }
 
@@ -941,10 +3102,15 @@ mod tests {
     fn only_epic_and_above_artifacts_have_abilities() {
         for id in ALL {
             let artifact = id.artifact();
+            // Mage artifacts carry their power as spellcasting bonuses.
             if artifact.rarity == Rarity::Rare {
                 assert!(artifact.abilities.is_empty(), "{:?}", artifact.id);
             } else {
-                assert!(!artifact.abilities.is_empty(), "{:?}", artifact.id);
+                assert!(
+                    !artifact.abilities.is_empty() || id.spell_gear().is_some(),
+                    "{:?}",
+                    artifact.id
+                );
             }
         }
     }

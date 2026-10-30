@@ -4,6 +4,7 @@
 //! and its health, so a hunter can read a room at a glance. The plate is
 //! rewritten whenever the mob loses health.
 
+use std::sync::LazyLock;
 use steel_core::entity::LivingEntity;
 use steel_core::inventory::equipment::EquipmentSlot;
 use steel_core::player::Player;
@@ -12,7 +13,11 @@ use steel_protocol::packets::game::{
     CResetScore, CSetDisplayObjective, CSetObjective, CSetScore, DisplaySlot, NumberFormat,
     ObjectiveRenderType,
 };
+use steel_registry::data_components::components::ItemAttributeModifiers;
+use steel_registry::data_components::vanilla_components::ATTRIBUTE_MODIFIERS;
+
 use steel_registry::item_stack::ItemStack;
+use steel_registry::items::Item;
 use steel_registry::items::ItemRef;
 use steel_registry::{vanilla_attributes, vanilla_items};
 use text_components::format::Color;
@@ -20,6 +25,7 @@ use text_components::{Modifier as _, TextComponent};
 
 use super::boss::BossGear;
 use super::generator::Theme;
+use crate::item::model;
 use crate::rank::HunterRank;
 
 const HEALTH_OBJECTIVE: &str = "sl_mob_health";
@@ -148,16 +154,10 @@ impl MobClass {
     }
 
     /// Equips the class's weapon and armor and adjusts its speed and armor.
-    pub fn equip(self, living: &dyn LivingEntity, rank: HunterRank) {
-        let gear = BossGear::for_rank(rank);
+    pub fn equip(self, living: &dyn LivingEntity, rank: HunterRank, theme: Theme) {
         let weapon: ItemRef = match self {
-            Self::Warrior => gear.sword(),
+            Self::Warrior | Self::Berserker => weapon_for(self, rank),
             Self::Guard => &vanilla_items::SHIELD,
-            Self::Berserker => match gear {
-                BossGear::Iron => &vanilla_items::IRON_AXE,
-                BossGear::Diamond => &vanilla_items::DIAMOND_AXE,
-                BossGear::Netherite => &vanilla_items::NETHERITE_AXE,
-            },
             Self::Shaman => &vanilla_items::BLAZE_ROD,
             Self::Bomber | Self::Broodmother => &vanilla_items::AIR,
         };
@@ -185,6 +185,16 @@ impl MobClass {
                 ItemStack::new(&vanilla_items::IRON_CHESTPLATE),
             ));
         }
+        // Every armor slot not taken by a class marker wears the theme skin.
+        for (slot, plain) in SKIN_SLOTS {
+            if let Some((_, item)) = items.iter_mut().find(|(taken, _)| *taken == slot) {
+                if !item.is(&vanilla_items::TNT) {
+                    model::apply_equipment(item, theme_skin(theme));
+                }
+            } else {
+                items.push((slot, skin_piece(plain, theme)));
+            }
+        }
         for (slot, item) in items {
             living.with_equipment_slot_mut(slot, &mut |stack| *stack = item.clone());
         }
@@ -194,6 +204,62 @@ impl MobClass {
             .lock()
             .required_value(vanilla_attributes::MOVEMENT_SPEED);
         living.set_base_attribute_value(vanilla_attributes::MOVEMENT_SPEED, base * speed);
+    }
+}
+
+/// Armor slots a theme skin covers, with the leather piece worn when the
+/// class has nothing there.
+const SKIN_SLOTS: [(EquipmentSlot, &LazyLock<Item>); 4] = [
+    (EquipmentSlot::Head, &vanilla_items::LEATHER_HELMET),
+    (EquipmentSlot::Chest, &vanilla_items::LEATHER_CHESTPLATE),
+    (EquipmentSlot::Legs, &vanilla_items::LEATHER_LEGGINGS),
+    (EquipmentSlot::Feet, &vanilla_items::LEATHER_BOOTS),
+];
+
+/// Returns the pack equipment asset that dresses mobs of `theme`.
+#[must_use]
+pub const fn theme_skin(theme: Theme) -> &'static str {
+    match theme {
+        Theme::Crypt => "mob_crypt",
+        Theme::Ice => "mob_ice",
+        Theme::Nether => "mob_nether",
+        Theme::Desert => "mob_desert",
+        Theme::Jungle => "mob_jungle",
+        Theme::DeepDark => "mob_deep_dark",
+        Theme::End => "mob_end",
+    }
+}
+
+/// Builds one skin piece: it only changes the look, so it grants no armor.
+fn skin_piece(holder: &'static LazyLock<Item>, theme: Theme) -> ItemStack {
+    let mut stack = ItemStack::new(holder);
+    stack.set(
+        ATTRIBUTE_MODIFIERS,
+        ItemAttributeModifiers {
+            modifiers: Vec::new(),
+        },
+    );
+    model::apply_equipment(&mut stack, theme_skin(theme));
+    stack
+}
+
+/// Returns the weapon a sword- or axe-wielding mob of `class` carries at `rank`.
+///
+/// A held weapon adds its full vanilla attack bonus on top of the rank-scaled
+/// base damage, so an iron axe alone more than tripled an E-rank berserker's
+/// hit. The two lowest ranks therefore carry wooden and stone tools; the
+/// higher ranks keep the boss gear tier.
+fn weapon_for(class: MobClass, rank: HunterRank) -> ItemRef {
+    let axe = class == MobClass::Berserker;
+    match (rank, BossGear::for_rank(rank)) {
+        (HunterRank::E, _) if axe => &vanilla_items::WOODEN_AXE,
+        (HunterRank::E, _) => &vanilla_items::WOODEN_SWORD,
+        (HunterRank::D, _) if axe => &vanilla_items::STONE_AXE,
+        (HunterRank::D, _) => &vanilla_items::STONE_SWORD,
+        (_, BossGear::Iron) if axe => &vanilla_items::IRON_AXE,
+        (_, BossGear::Diamond) if axe => &vanilla_items::DIAMOND_AXE,
+        (_, BossGear::Netherite) if axe => &vanilla_items::NETHERITE_AXE,
+        (_, gear) => gear.sword(),
     }
 }
 
@@ -222,6 +288,8 @@ pub struct MobLabel {
     pub color: Color,
     /// Whether a shadow raised from this mob should draw hostile aggro.
     pub is_tank: bool,
+    /// Whether a shadow raised from this mob can hatch larvae.
+    pub is_broodmother: bool,
     /// How rare the mob is, which decides how hard it is to raise.
     pub rarity: MobRarity,
 }
@@ -258,6 +326,7 @@ impl MobLabel {
             title: class.display_name().to_owned(),
             color: class.color(),
             is_tank: class == MobClass::Guard,
+            is_broodmother: class == MobClass::Broodmother,
             rarity: if matches!(
                 class,
                 MobClass::Shaman | MobClass::Bomber | MobClass::Broodmother

@@ -12,8 +12,10 @@ pub use boss::{BossKind, boss_for_gate};
 
 use std::fs;
 use std::io::{self, ErrorKind};
+use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use glam::DVec3;
 use rustc_hash::FxHashMap;
@@ -23,6 +25,7 @@ use steel_utils::{BlockPos, Identifier};
 
 use self::generator::Blueprint;
 
+use crate::castle;
 use crate::quest::{
     PENALTY_ZONE_DURATION_SECONDS, PENALTY_ZONE_WAVE_INTERVAL_SECONDS,
     PENALTY_ZONE_ZOMBIES_PER_WAVE,
@@ -77,8 +80,41 @@ pub struct Gate {
     pub red: bool,
     /// Server tick when this gate appeared.
     pub created_tick: u64,
+    /// Unix timestamp used to expire gates across server restarts.
+    pub created_at_unix_seconds: u64,
     /// Whether a hunter has already entered this gate.
     pub entered: bool,
+    /// Demon Castle floor this gate opens; `None` for an ordinary gate.
+    pub floor: Option<u32>,
+}
+
+/// One-time cleanup request for a legacy gate frame left without a registry record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyGateCleanup {
+    /// World containing the old frame.
+    pub world: Identifier,
+    /// Bottom-left block of the old frame.
+    pub entrance: [i32; 3],
+    /// Whether the old frame used red stained glass.
+    pub red: bool,
+}
+
+impl LegacyGateCleanup {
+    /// Builds the expected frame metadata used by the guarded cleanup.
+    #[must_use]
+    pub fn gate(&self) -> Gate {
+        Gate {
+            id: u64::MAX,
+            world: self.world.clone(),
+            entrance: BlockPos::new(self.entrance[0], self.entrance[1], self.entrance[2]),
+            rank: HunterRank::D,
+            red: self.red,
+            created_tick: 0,
+            created_at_unix_seconds: 0,
+            entered: false,
+            floor: None,
+        }
+    }
 }
 
 impl Gate {
@@ -88,6 +124,10 @@ impl Gate {
     /// remain available to E-rank hunters.
     #[must_use]
     pub const fn minimum_hunter_rank(&self) -> HunterRank {
+        // A castle floor is opened for its climber, whatever its rank.
+        if self.floor.is_some() {
+            return HunterRank::E;
+        }
         match self.rank {
             HunterRank::E | HunterRank::D => HunterRank::E,
             HunterRank::C => HunterRank::D,
@@ -118,9 +158,289 @@ pub fn is_instance_world(world: &World) -> bool {
 pub struct GateRegistry {
     next_id: u64,
     gates: FxHashMap<u64, Gate>,
+    revision: u64,
+    persisted_revision: u64,
+    pending_revision: Option<u64>,
+    persisted: GateRegistrySnapshot,
+    committed_gates: FxHashMap<u64, Gate>,
+    retired_gates: FxHashMap<u64, (Gate, GateRetirementReason)>,
+    pending_created: Vec<Gate>,
+    pending_removed: Vec<(Gate, GateRetirementReason)>,
+    persistence_failed: bool,
+}
+
+/// The durable gate metadata, independent of runtime-only enter locks.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateRegistrySnapshot {
+    next_id: u64,
+    gates: Vec<PersistedGate>,
+    #[serde(default)]
+    retired_gates: Vec<PersistedGateRetirement>,
+}
+
+/// Stable serialized form that avoids requiring `BlockPos` or `HunterRank` serde support.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedGate {
+    id: u64,
+    world: Identifier,
+    entrance: [i32; 3],
+    rank: String,
+    red: bool,
+    created_tick: u64,
+    #[serde(default)]
+    created_at_unix_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    floor: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedGateRetirement {
+    gate: PersistedGate,
+    reason: GateRetirementReason,
+}
+
+impl PersistedGate {
+    fn from_gate(gate: &Gate) -> Self {
+        Self {
+            id: gate.id,
+            world: gate.world.clone(),
+            entrance: [gate.entrance.x(), gate.entrance.y(), gate.entrance.z()],
+            rank: gate.rank.name().to_owned(),
+            red: gate.red,
+            created_tick: gate.created_tick,
+            created_at_unix_seconds: gate.created_at_unix_seconds,
+            floor: gate.floor,
+        }
+    }
+
+    fn into_gate(self) -> Result<Gate, String> {
+        let rank = HunterRank::from_name(&self.rank)
+            .ok_or_else(|| format!("unknown gate rank {:?}", self.rank))?;
+        Ok(Gate {
+            id: self.id,
+            world: self.world,
+            entrance: BlockPos::new(self.entrance[0], self.entrance[1], self.entrance[2]),
+            rank,
+            red: self.red,
+            created_tick: self.created_tick,
+            created_at_unix_seconds: self.created_at_unix_seconds,
+            entered: false,
+            floor: self.floor,
+        })
+    }
+}
+
+/// A gate snapshot staged for one persistence transaction.
+#[derive(Debug, Clone)]
+pub struct GateRegistryWrite {
+    /// Revision expected to become durable.
+    pub revision: u64,
+    /// Gate state to publish.
+    pub snapshot: GateRegistrySnapshot,
+}
+
+/// Physical side effects to run only after a gate snapshot commits.
+#[derive(Debug, Default)]
+pub struct GateRegistryChanges {
+    /// Newly committed gate frames.
+    pub created: Vec<Gate>,
+    /// Gate frames whose removal is now durable.
+    pub removed: Vec<(Gate, GateRetirementReason)>,
+}
+
+/// Why a committed gate was retired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateRetirementReason {
+    /// The unused lifetime expired.
+    Expired,
+    /// A hunter entered the gate.
+    Consumed,
 }
 
 impl GateRegistry {
+    /// Replaces the live registry with the last committed snapshot.
+    pub fn restore(&mut self, snapshot: GateRegistrySnapshot) -> Result<(), String> {
+        let gates = snapshot
+            .gates
+            .iter()
+            .cloned()
+            .map(PersistedGate::into_gate)
+            .collect::<Result<Vec<_>, _>>()?;
+        let retired_gates = snapshot
+            .retired_gates
+            .iter()
+            .cloned()
+            .map(|retirement| {
+                retirement
+                    .gate
+                    .into_gate()
+                    .map(|gate| (gate, retirement.reason))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.next_id = snapshot.next_id;
+        self.gates = gates.iter().cloned().map(|gate| (gate.id, gate)).collect();
+        self.committed_gates = self.gates.clone();
+        self.retired_gates = retired_gates
+            .into_iter()
+            .map(|(gate, reason)| (gate.id, (gate, reason)))
+            .collect();
+        self.persisted = snapshot;
+        self.revision = 0;
+        self.persisted_revision = 0;
+        self.pending_revision = None;
+        self.pending_created.clear();
+        self.pending_removed.clear();
+        self.persistence_failed = false;
+        Ok(())
+    }
+
+    /// Returns the currently committed gates, for menus and navigation.
+    #[must_use]
+    pub fn committed_gates(&self) -> Vec<Gate> {
+        self.committed_gates.values().cloned().collect()
+    }
+
+    /// Returns whether a write is pending or the gate document has failed.
+    #[must_use]
+    pub const fn persistence_blocks_gate_actions(&self) -> bool {
+        self.persistence_failed
+            || self.pending_revision.is_some()
+            || self.revision != self.persisted_revision
+    }
+
+    /// Returns the next changed gate snapshot, marking its revision pending.
+    pub fn begin_persistence(&mut self) -> Option<GateRegistryWrite> {
+        if self.persistence_failed
+            || self.pending_revision.is_some()
+            || self.revision == self.persisted_revision
+        {
+            return None;
+        }
+        self.pending_revision = Some(self.revision);
+        Some(GateRegistryWrite {
+            revision: self.revision,
+            snapshot: self.snapshot(),
+        })
+    }
+
+    /// Accepts a committed snapshot and exposes its physical changes.
+    pub fn commit_persistence(&mut self, revision: u64) -> GateRegistryChanges {
+        if self.pending_revision != Some(revision) {
+            return GateRegistryChanges::default();
+        }
+        self.persisted = self.snapshot();
+        self.committed_gates = self
+            .gates
+            .iter()
+            .map(|(id, gate)| {
+                let mut gate = gate.clone();
+                gate.entered = false;
+                (*id, gate)
+            })
+            .collect();
+        self.persisted_revision = revision;
+        self.pending_revision = None;
+        GateRegistryChanges {
+            created: mem::take(&mut self.pending_created),
+            removed: mem::take(&mut self.pending_removed),
+        }
+    }
+
+    /// Restores the last committed registry after a failed write and fences future writes.
+    pub fn fail_persistence(&mut self, revision: u64) -> Vec<Gate> {
+        if self.pending_revision != Some(revision) {
+            return Vec::new();
+        }
+        let created = mem::take(&mut self.pending_created);
+        self.next_id = self.persisted.next_id;
+        self.gates = self.committed_gates.clone();
+        self.revision = self.persisted_revision;
+        self.pending_revision = None;
+        self.pending_removed.clear();
+        self.retired_gates = self
+            .persisted
+            .retired_gates
+            .iter()
+            .filter_map(|retirement| {
+                retirement
+                    .gate
+                    .clone()
+                    .into_gate()
+                    .ok()
+                    .map(|gate| (gate.id, (gate, retirement.reason)))
+            })
+            .collect();
+        self.persistence_failed = true;
+        created
+    }
+
+    /// Returns the last committed gate id lookup, if present.
+    #[must_use]
+    pub fn committed_gate(&self, id: u64) -> Option<&Gate> {
+        self.committed_gates.get(&id)
+    }
+
+    /// Returns whether a committed registry entry already owns this frame.
+    #[must_use]
+    pub fn has_committed_gate_at(&self, world: &Identifier, entrance: BlockPos) -> bool {
+        self.committed_gates
+            .values()
+            .any(|gate| gate.world == *world && gate.entrance == entrance)
+    }
+
+    /// Returns whether either the pending or committed registry owns this frame.
+    #[must_use]
+    pub fn has_gate_at(&self, world: &Identifier, entrance: BlockPos) -> bool {
+        self.gates
+            .values()
+            .any(|gate| gate.world == *world && gate.entrance == entrance)
+            || self.has_committed_gate_at(world, entrance)
+    }
+
+    /// Returns durable removals whose physical frames still need cleanup.
+    #[must_use]
+    pub fn retired_gates(&self) -> Vec<(Gate, GateRetirementReason)> {
+        self.retired_gates.values().cloned().collect()
+    }
+
+    /// Removes a retirement tombstone after its frame has been verified clear.
+    pub fn acknowledge_gate_cleanup(&mut self, id: u64) -> bool {
+        if self.retired_gates.remove(&id).is_some() {
+            self.changed();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn snapshot(&self) -> GateRegistrySnapshot {
+        let mut gates = self
+            .gates
+            .values()
+            .map(PersistedGate::from_gate)
+            .collect::<Vec<_>>();
+        gates.sort_unstable_by_key(|gate| gate.id);
+        let mut retired_gates = self
+            .retired_gates
+            .values()
+            .map(|(gate, reason)| PersistedGateRetirement {
+                gate: PersistedGate::from_gate(gate),
+                reason: *reason,
+            })
+            .collect::<Vec<_>>();
+        retired_gates.sort_unstable_by_key(|retirement| retirement.gate.id);
+        GateRegistrySnapshot {
+            next_id: self.next_id,
+            gates,
+            retired_gates,
+        }
+    }
+
+    const fn changed(&mut self) {
+        self.revision = self.revision.saturating_add(1);
+    }
+
     /// Creates a gate from a deterministic rank roll and red-gate roll.
     ///
     /// A red gate is rolled first, then promoted one rank, so the roll
@@ -165,9 +485,39 @@ impl GateRegistry {
             rank,
             red,
             created_tick: tick,
+            created_at_unix_seconds: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs()),
             entered: false,
+            floor: None,
         };
         self.gates.insert(id, gate.clone());
+        self.pending_created.push(gate.clone());
+        self.changed();
+        gate
+    }
+
+    /// Creates the gate of Demon Castle `floor`, ranked by the floor.
+    pub fn create_castle(
+        &mut self,
+        world: Identifier,
+        entrance: BlockPos,
+        tick: u64,
+        floor: u32,
+    ) -> Gate {
+        let mut gate =
+            self.create_ranked(world, entrance, tick, castle::rank_for_floor(floor), false);
+        gate.floor = Some(floor);
+        if let Some(stored) = self.gates.get_mut(&gate.id) {
+            stored.floor = Some(floor);
+        }
+        if let Some(staged) = self
+            .pending_created
+            .iter_mut()
+            .find(|staged| staged.id == gate.id)
+        {
+            staged.floor = Some(floor);
+        }
         gate
     }
 
@@ -184,7 +534,25 @@ impl GateRegistry {
             .collect::<Vec<_>>();
         expired
             .into_iter()
-            .filter_map(|id| self.gates.remove(&id))
+            .filter_map(|id| self.remove_with_reason(id, GateRetirementReason::Expired))
+            .collect()
+    }
+
+    /// Removes gates whose wall-clock lifetime elapsed, including while the server was offline.
+    pub fn expire_unused_at(&mut self, now_unix_seconds: u64) -> Vec<Gate> {
+        let expired = self
+            .gates
+            .values()
+            .filter(|gate| {
+                !gate.entered
+                    && now_unix_seconds.saturating_sub(gate.created_at_unix_seconds)
+                        >= UNUSED_GATE_LIFETIME_TICKS / TICKS_PER_SECOND
+            })
+            .map(|gate| gate.id)
+            .collect::<Vec<_>>();
+        expired
+            .into_iter()
+            .filter_map(|id| self.remove_with_reason(id, GateRetirementReason::Expired))
             .collect()
     }
 
@@ -209,6 +577,15 @@ impl GateRegistry {
         }
     }
 
+    /// Restores a consumed gate when no hunter could be moved into its instance.
+    pub fn restore_gate(&mut self, mut gate: Gate) {
+        gate.entered = false;
+        self.next_id = self.next_id.max(gate.id.saturating_add(1));
+        self.gates.insert(gate.id, gate.clone());
+        self.pending_created.push(gate);
+        self.changed();
+    }
+
     /// Returns the unentered gate whose opening contains `position`, whatever
     /// the hunter's rank.
     #[must_use]
@@ -227,7 +604,15 @@ impl GateRegistry {
 
     /// Removes one gate that was consumed by a hunter.
     pub fn remove(&mut self, id: u64) -> Option<Gate> {
-        self.gates.remove(&id)
+        self.remove_with_reason(id, GateRetirementReason::Consumed)
+    }
+
+    fn remove_with_reason(&mut self, id: u64, reason: GateRetirementReason) -> Option<Gate> {
+        let gate = self.gates.remove(&id)?;
+        self.retired_gates.insert(id, (gate.clone(), reason));
+        self.pending_removed.push((gate.clone(), reason));
+        self.changed();
+        Some(gate)
     }
 }
 
@@ -541,6 +926,107 @@ mod tests {
                 .is_some()
         );
         assert_eq!(gates.expire_unused(UNUSED_GATE_LIFETIME_TICKS).len(), 0);
+    }
+
+    #[test]
+    fn gate_snapshots_round_trip_and_expire_using_wall_time() {
+        let mut gates = GateRegistry::default();
+        let created = gates.create_ranked(
+            Identifier::from_steel("city"),
+            BlockPos::new(22, 4, 2),
+            5,
+            HunterRank::D,
+            false,
+        );
+        let write = gates.begin_persistence().expect("new gate is dirty");
+        let bytes = serde_json::to_vec(&write.snapshot).expect("snapshot should serialize");
+        let snapshot: GateRegistrySnapshot =
+            serde_json::from_slice(&bytes).expect("snapshot should deserialize");
+        assert_eq!(gates.commit_persistence(write.revision).created[0], created);
+
+        let mut restored = GateRegistry::default();
+        restored.restore(snapshot).expect("snapshot should restore");
+        let saved = restored.committed_gates();
+        assert_eq!(saved.len(), 1);
+        assert!(
+            !saved[0].entered,
+            "a pending entry is reopened after restart"
+        );
+        assert!(
+            restored
+                .expire_unused_at(created.created_at_unix_seconds + 3_599)
+                .is_empty(),
+            "the saved gate remains active for its whole lifetime"
+        );
+        assert_eq!(
+            restored
+                .expire_unused_at(created.created_at_unix_seconds + 3_600)
+                .len(),
+            1,
+            "offline time counts toward unused-gate expiration"
+        );
+    }
+
+    #[test]
+    fn retired_gate_tombstone_survives_restart_until_cleanup_is_acknowledged() {
+        let mut gates = GateRegistry::default();
+        let gate = gates.create_ranked(
+            Identifier::from_steel("city"),
+            BlockPos::new(22, 4, 2),
+            5,
+            HunterRank::D,
+            false,
+        );
+        let created = gates.begin_persistence().expect("new gate is dirty");
+        gates.commit_persistence(created.revision);
+        assert!(gates.remove(gate.id).is_some());
+
+        let retirement = gates
+            .begin_persistence()
+            .expect("retirement is a durable change");
+        let encoded =
+            serde_json::to_vec(&retirement.snapshot).expect("retirement snapshot should serialize");
+        let snapshot: GateRegistrySnapshot =
+            serde_json::from_slice(&encoded).expect("retirement snapshot should deserialize");
+        gates.commit_persistence(retirement.revision);
+
+        let mut restored = GateRegistry::default();
+        restored
+            .restore(snapshot)
+            .expect("retirement should restore");
+        assert_eq!(restored.committed_gates(), Vec::<Gate>::new());
+        assert_eq!(
+            restored.retired_gates(),
+            vec![(gate.clone(), GateRetirementReason::Consumed)]
+        );
+
+        assert!(restored.acknowledge_gate_cleanup(gate.id));
+        assert!(
+            restored
+                .begin_persistence()
+                .is_some_and(|write| write.snapshot.retired_gates.is_empty()),
+            "the tombstone is removed only in a later durable write"
+        );
+    }
+
+    #[test]
+    fn failed_gate_snapshot_keeps_the_committed_registry_and_fences_changes() {
+        let mut gates = GateRegistry::default();
+        let gate = gates.create_ranked(
+            Identifier::from_steel("city"),
+            BlockPos::new(22, 4, 2),
+            5,
+            HunterRank::D,
+            false,
+        );
+        let write = gates.begin_persistence().expect("new gate is dirty");
+
+        assert_eq!(gates.committed_gates(), Vec::<Gate>::new());
+        gates.fail_persistence(write.revision);
+
+        assert_eq!(gates.committed_gates(), Vec::<Gate>::new());
+        assert!(gates.persistence_blocks_gate_actions());
+        assert!(!gates.values().any(|candidate| candidate.id == gate.id));
     }
 
     #[test]

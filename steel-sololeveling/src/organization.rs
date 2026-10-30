@@ -24,25 +24,46 @@ pub const GUILD_SCALE: u32 = 5;
 /// What a contract asks the hunter to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Objective {
-    /// Kill any mobs.
+    /// Kill mobs in a dungeon of the contract rank.
     Mobs,
-    /// Kill zombies, the class the Organization tracks.
+    /// Kill zombies in a dungeon of the contract rank.
     Zombies,
     /// Defeat a dungeon boss.
     Boss,
     /// Clear one dungeon of exactly the contract rank.
     RankedDungeon,
-    /// Clear dungeons of any rank.
+    /// Clear dungeons of the contract rank.
     Dungeons,
+    /// Clear a red gate.
+    RedGate,
+    /// Clear a gate with nobody of the squad dying.
+    CleanGate,
+    /// Clear a gate faster than eight minutes.
+    FastGate,
+    /// Mine crystals of exactly the contract rank.
+    CrystalHaul,
+    /// Gather mob materials of exactly the contract rank's quality.
+    TrophyHaul,
+    /// Destroy island nests.
+    Nests,
+    /// Clear Demon Castle floors.
+    Castle,
 }
 
 /// Every objective, in board order.
-pub const OBJECTIVES: [Objective; 5] = [
+pub const OBJECTIVES: [Objective; 12] = [
     Objective::Mobs,
     Objective::Zombies,
     Objective::Boss,
     Objective::RankedDungeon,
     Objective::Dungeons,
+    Objective::RedGate,
+    Objective::CleanGate,
+    Objective::FastGate,
+    Objective::CrystalHaul,
+    Objective::TrophyHaul,
+    Objective::Nests,
+    Objective::Castle,
 ];
 
 /// Every rank, in board order.
@@ -60,10 +81,13 @@ impl Objective {
     #[must_use]
     pub const fn target(self) -> u32 {
         match self {
-            Self::Mobs => 20,
+            Self::Mobs | Self::CrystalHaul => 20,
             Self::Zombies => 10,
-            Self::Boss | Self::RankedDungeon => 1,
-            Self::Dungeons => 3,
+            Self::Boss | Self::RankedDungeon | Self::RedGate | Self::CleanGate | Self::FastGate => {
+                1
+            }
+            Self::Dungeons | Self::Nests | Self::Castle => 3,
+            Self::TrophyHaul => 8,
         }
     }
 
@@ -74,7 +98,11 @@ impl Objective {
             Self::Mobs | Self::Zombies => 100,
             Self::Boss => 150,
             Self::RankedDungeon => 200,
+            Self::CrystalHaul | Self::TrophyHaul => 250,
+            Self::CleanGate | Self::FastGate => 300,
+            Self::Nests | Self::Castle => 400,
             Self::Dungeons => 500,
+            Self::RedGate => 600,
         }
     }
 }
@@ -106,6 +134,13 @@ impl Template {
             Objective::Boss => format!("[{rank}] Босс"),
             Objective::RankedDungeon => format!("[{rank}] Данж {rank}"),
             Objective::Dungeons => format!("[{rank}] Данжи"),
+            Objective::RedGate => format!("[{rank}] Красные"),
+            Objective::CleanGate => format!("[{rank}] Без смертей"),
+            Objective::FastGate => format!("[{rank}] Срочно"),
+            Objective::CrystalHaul => format!("[{rank}] Кристаллы"),
+            Objective::TrophyHaul => format!("[{rank}] Трофеи"),
+            Objective::Nests => format!("[{rank}] Гнёзда"),
+            Objective::Castle => format!("[{rank}] Замок"),
         }
     }
 
@@ -115,11 +150,20 @@ impl Template {
         let rank = self.rank.name();
         let target = self.objective.target();
         match self.objective {
-            Objective::Mobs => format!("[{rank}] Убить {target} любых мобов"),
-            Objective::Zombies => format!("[{rank}] Убить {target} зомби"),
-            Objective::Boss => format!("[{rank}] Победить босса данжа"),
+            Objective::Mobs => format!("[{rank}] Убить {target} мобов в данже ранга {rank}"),
+            Objective::Zombies => format!("[{rank}] Убить {target} зомби в данже ранга {rank}"),
+            Objective::Boss => format!("[{rank}] Победить босса данжа ранга {rank}"),
             Objective::RankedDungeon => format!("[{rank}] Закрыть данж ранга {rank}"),
-            Objective::Dungeons => format!("[{rank}] Закрыть {target} данжа"),
+            Objective::Dungeons => format!("[{rank}] Закрыть {target} данжа ранга {rank}"),
+            Objective::RedGate => format!("[{rank}] Закрыть красные врата ранга {rank}"),
+            Objective::CleanGate => format!("[{rank}] Закрыть врата ранга {rank} без смертей"),
+            Objective::FastGate => format!("[{rank}] Закрыть врата ранга {rank} быстрее 8 минут"),
+            Objective::CrystalHaul => format!("[{rank}] Добыть {target} кристаллов ранга {rank}"),
+            Objective::TrophyHaul => {
+                format!("[{rank}] Получить {target} материалов врат ранга {rank}")
+            }
+            Objective::Nests => format!("[{rank}] Уничтожить {target} гнезда на острове"),
+            Objective::Castle => format!("[{rank}] Пройти {target} этажа Замка демонов"),
         }
     }
 }
@@ -144,11 +188,32 @@ pub enum Event {
     Kill {
         /// Whether the mob was a zombie.
         zombie: bool,
+        /// Effective rank of the dungeon, if the kill happened inside one.
+        rank: Option<HunterRank>,
     },
     /// The hunter's squad defeated a dungeon boss and left alive.
-    Boss,
+    Boss(HunterRank),
     /// The hunter cleared a dungeon of the given final rank.
     Dungeon(HunterRank),
+    /// The hunter's squad cleared a gate.
+    Gate {
+        /// Effective rank of the gate.
+        rank: HunterRank,
+        /// Whether it was a red gate.
+        red: bool,
+        /// Whether nobody of the squad died.
+        clean: bool,
+        /// Whether it took less than eight minutes.
+        fast: bool,
+    },
+    /// The hunter mined one crystal of a gate of this rank.
+    Crystal(HunterRank),
+    /// The hunter received one mob material from a gate of this rank.
+    Material(HunterRank),
+    /// The hunter destroyed an island nest.
+    Nest,
+    /// The hunter cleared a Demon Castle floor.
+    CastleFloor,
 }
 
 /// An accepted contract and its progress.
@@ -161,6 +226,9 @@ pub struct Contract {
     /// Multiplier of the template's target and payment.
     #[serde(default = "single")]
     pub scale: u32,
+    /// Day the allowance was spent, if known.
+    #[serde(default)]
+    pub accepted_day: Option<u64>,
 }
 
 const fn single() -> u32 {
@@ -181,7 +249,16 @@ impl Contract {
             template,
             progress: 0,
             scale,
+            accepted_day: None,
         }
+    }
+
+    /// Starts a contract that spends the allowance for `day`.
+    #[must_use]
+    pub const fn accepted(template: Template, scale: u32, day: u64) -> Self {
+        let mut contract = Self::scaled(template, scale);
+        contract.accepted_day = Some(day);
+        contract
     }
 
     /// Returns how many events finish the contract.
@@ -214,11 +291,27 @@ impl Contract {
 
 fn counts(template: Template, event: Event) -> bool {
     match (template.objective, event) {
-        (Objective::Mobs, Event::Kill { .. })
-        | (Objective::Zombies, Event::Kill { zombie: true })
-        | (Objective::Boss, Event::Boss)
-        | (Objective::Dungeons, Event::Dungeon(_)) => true,
-        (Objective::RankedDungeon, Event::Dungeon(rank)) => rank == template.rank,
+        (Objective::Nests, Event::Nest) | (Objective::Castle, Event::CastleFloor) => true,
+        (
+            Objective::Mobs,
+            Event::Kill {
+                rank: Some(rank), ..
+            },
+        )
+        | (
+            Objective::Zombies,
+            Event::Kill {
+                zombie: true,
+                rank: Some(rank),
+            },
+        )
+        | (Objective::Boss, Event::Boss(rank))
+        | (Objective::RankedDungeon | Objective::Dungeons, Event::Dungeon(rank))
+        | (Objective::CrystalHaul, Event::Crystal(rank))
+        | (Objective::TrophyHaul, Event::Material(rank)) => rank == template.rank,
+        (Objective::RedGate, Event::Gate { rank, red, .. }) => rank == template.rank && red,
+        (Objective::CleanGate, Event::Gate { rank, clean, .. }) => rank == template.rank && clean,
+        (Objective::FastGate, Event::Gate { rank, fast, .. }) => rank == template.rank && fast,
         _ => false,
     }
 }
@@ -323,6 +416,13 @@ impl OrganizationBook {
         }
     }
 
+    /// Restores an allowance spent by a contract accepted today.
+    pub fn release_cancelled(&mut self, contract: Contract, today: u64) {
+        if self.day == today && contract.accepted_day == Some(today) {
+            self.used.retain(|template| *template != contract.template);
+        }
+    }
+
     /// Accepts a personal contract for a hunter of `rank`.
     pub fn accept(
         &mut self,
@@ -340,16 +440,18 @@ impl OrganizationBook {
             return Err(OrganizationError::UsedToday);
         }
         self.mark_used(template, today);
-        self.contracts.push(Contract::new(template));
+        self.contracts.push(Contract::accepted(template, 1, today));
         Ok(())
     }
 
-    /// Cancels a contract; the day's allowance stays spent.
-    pub fn cancel(&mut self, index: usize) -> Result<Contract, OrganizationError> {
+    /// Cancels a contract and restores its allowance if accepted today.
+    pub fn cancel(&mut self, index: usize, today: u64) -> Result<Contract, OrganizationError> {
         if index >= self.contracts.len() {
             return Err(OrganizationError::Missing);
         }
-        Ok(self.contracts.remove(index))
+        let contract = self.contracts.remove(index);
+        self.release_cancelled(contract, today);
+        Ok(contract)
     }
 
     /// Removes a finished contract so it can be paid exactly once.
@@ -456,19 +558,26 @@ impl GuildBoard {
         }
         self.used.push(template);
         self.contracts.push(GuildContract {
-            contract: Contract::scaled(template, GUILD_SCALE),
+            contract: Contract::accepted(template, GUILD_SCALE, today),
             contributors: Vec::new(),
             pending_turn_in: false,
         });
         Ok(())
     }
 
-    /// Cancels a contract; the day's allowance stays spent.
-    pub fn cancel(&mut self, index: usize) -> Result<Contract, OrganizationError> {
+    /// Cancels a contract and restores its allowance if accepted today.
+    pub fn cancel(&mut self, index: usize, today: u64) -> Result<Contract, OrganizationError> {
         if index >= self.contracts.len() {
             return Err(OrganizationError::Missing);
         }
-        Ok(self.contracts.remove(index).contract)
+        if self.contracts[index].pending_turn_in {
+            return Err(OrganizationError::Storage);
+        }
+        let contract = self.contracts.remove(index).contract;
+        if self.day == today && contract.accepted_day == Some(today) {
+            self.used.retain(|template| *template != contract.template);
+        }
+        Ok(contract)
     }
 
     /// Settles a finished contract, owing its payment to every contributor
@@ -585,12 +694,24 @@ mod tests {
     #[test]
     fn contracts_count_only_matching_events_and_finish_once() {
         let mut zombies = Contract::new(template(Objective::Zombies, HunterRank::E));
-        assert!(!zombies.observe(Event::Kill { zombie: false }));
+        assert!(!zombies.observe(Event::Kill {
+            zombie: false,
+            rank: Some(HunterRank::E)
+        }));
         for _ in 0..9 {
-            assert!(!zombies.observe(Event::Kill { zombie: true }));
+            assert!(!zombies.observe(Event::Kill {
+                zombie: true,
+                rank: Some(HunterRank::E)
+            }));
         }
-        assert!(zombies.observe(Event::Kill { zombie: true }));
-        assert!(!zombies.observe(Event::Kill { zombie: true }));
+        assert!(zombies.observe(Event::Kill {
+            zombie: true,
+            rank: Some(HunterRank::E)
+        }));
+        assert!(!zombies.observe(Event::Kill {
+            zombie: true,
+            rank: Some(HunterRank::E)
+        }));
         assert_eq!(zombies.progress, 10);
 
         let mut ranked = Contract::new(template(Objective::RankedDungeon, HunterRank::C));
@@ -599,7 +720,88 @@ mod tests {
 
         let mut any = Contract::new(template(Objective::Dungeons, HunterRank::C));
         assert!(!any.observe(Event::Dungeon(HunterRank::E)));
+        assert_eq!(any.progress, 0);
+        assert!(!any.observe(Event::Dungeon(HunterRank::C)));
         assert_eq!(any.progress, 1);
+    }
+
+    #[test]
+    fn dungeon_contracts_require_exact_effective_rank() {
+        for (objective, matching) in [
+            (
+                Objective::Mobs,
+                Event::Kill {
+                    zombie: true,
+                    rank: Some(HunterRank::C),
+                },
+            ),
+            (
+                Objective::Zombies,
+                Event::Kill {
+                    zombie: true,
+                    rank: Some(HunterRank::C),
+                },
+            ),
+            (Objective::Boss, Event::Boss(HunterRank::C)),
+            (Objective::RankedDungeon, Event::Dungeon(HunterRank::C)),
+            (Objective::Dungeons, Event::Dungeon(HunterRank::C)),
+            (
+                Objective::RedGate,
+                Event::Gate {
+                    rank: HunterRank::C,
+                    red: true,
+                    clean: true,
+                    fast: true,
+                },
+            ),
+            (
+                Objective::CleanGate,
+                Event::Gate {
+                    rank: HunterRank::C,
+                    red: true,
+                    clean: true,
+                    fast: true,
+                },
+            ),
+            (
+                Objective::FastGate,
+                Event::Gate {
+                    rank: HunterRank::C,
+                    red: true,
+                    clean: true,
+                    fast: true,
+                },
+            ),
+        ] {
+            let mut contract = Contract::new(template(objective, HunterRank::C));
+            let wrong = match matching {
+                Event::Kill { zombie, .. } => Event::Kill {
+                    zombie,
+                    rank: Some(HunterRank::D),
+                },
+                Event::Boss(_) => Event::Boss(HunterRank::D),
+                Event::Dungeon(_) => Event::Dungeon(HunterRank::D),
+                Event::Gate {
+                    red, clean, fast, ..
+                } => Event::Gate {
+                    rank: HunterRank::D,
+                    red,
+                    clean,
+                    fast,
+                },
+                _ => unreachable!(),
+            };
+            contract.observe(wrong);
+            assert_eq!(contract.progress, 0, "{objective:?}");
+            contract.observe(matching);
+            assert_eq!(contract.progress, 1, "{objective:?}");
+        }
+        let mut mobs = Contract::new(template(Objective::Mobs, HunterRank::C));
+        mobs.observe(Event::Kill {
+            zombie: true,
+            rank: None,
+        });
+        assert_eq!(mobs.progress, 0);
     }
 
     #[test]
@@ -611,11 +813,14 @@ mod tests {
             Err(OrganizationError::RankTooHigh)
         );
         book.accept(mobs, HunterRank::E, 1).expect("first take");
-        book.cancel(0).expect("cancel");
+        book.cancel(0, 1).expect("cancel");
+        book.accept(mobs, HunterRank::E, 1)
+            .expect("retake after cancellation");
         assert_eq!(
             book.accept(mobs, HunterRank::E, 1),
             Err(OrganizationError::UsedToday)
         );
+        book.cancel(0, 1).expect("cancel retake");
         book.accept(mobs, HunterRank::E, 2).expect("next day");
 
         for objective in [Objective::Zombies, Objective::Boss] {
@@ -634,12 +839,43 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_an_old_contract_does_not_restore_a_newer_allowance() {
+        let boss = template(Objective::Boss, HunterRank::E);
+        let mut book = OrganizationBook::default();
+        book.accept(boss, HunterRank::E, 1).expect("old");
+        book.accept(boss, HunterRank::E, 2).expect("new");
+        book.observe(Event::Boss(HunterRank::E));
+        book.turn_in(1).expect("reward");
+        book.cancel(0, 2).expect("old cancellation");
+        assert_eq!(
+            book.accept(boss, HunterRank::E, 2),
+            Err(OrganizationError::UsedToday)
+        );
+        book.accept(boss, HunterRank::E, 3).expect("next day");
+    }
+
+    #[test]
+    fn guild_cancellation_restores_only_the_current_day_allowance() {
+        let boss = template(Objective::Boss, HunterRank::E);
+        let mut board = GuildBoard::default();
+        board.accept(boss, HunterRank::E, 1).expect("accept");
+        board.cancel(0, 1).expect("cancel");
+        board.accept(boss, HunterRank::E, 1).expect("retake");
+        board.accept(boss, HunterRank::E, 2).expect("next day");
+        board.cancel(0, 2).expect("old cancellation");
+        assert_eq!(
+            board.accept(boss, HunterRank::E, 2),
+            Err(OrganizationError::UsedToday)
+        );
+    }
+
+    #[test]
     fn only_finished_contracts_are_turned_in() {
         let mut book = OrganizationBook::default();
         book.accept(template(Objective::Boss, HunterRank::E), HunterRank::E, 1)
             .expect("accept");
         assert_eq!(book.turn_in(0), Err(OrganizationError::NotComplete));
-        assert_eq!(book.observe(Event::Boss).len(), 1);
+        assert_eq!(book.observe(Event::Boss(HunterRank::E)).len(), 1);
         let paid = book.turn_in(0).expect("turn in");
         assert_eq!(paid.template.payment(), 150);
         assert_eq!(book.contracts, Vec::<Contract>::new());
@@ -681,11 +917,11 @@ mod tests {
 
         let (first, second, leaver) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         assert_eq!(board.contracts[0].contract.target(), 5);
-        board.observe(&[first, second], Event::Boss);
+        board.observe(&[first, second], Event::Boss(HunterRank::E));
         for _ in 0..3 {
-            board.observe(&[leaver], Event::Boss);
+            board.observe(&[leaver], Event::Boss(HunterRank::E));
         }
-        let (changed, finished) = board.observe(&[first], Event::Boss);
+        let (changed, finished) = board.observe(&[first], Event::Boss(HunterRank::E));
         assert!(changed);
         assert_eq!(finished.len(), 1);
         assert_eq!(board.contracts[0].contract.progress, 5);

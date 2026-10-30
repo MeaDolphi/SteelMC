@@ -1,7 +1,7 @@
 //! Daily system quest progress and penalty-zone eligibility.
 //!
 //! The quest day is the Moscow day of [`crate::daily`], so the quest resets
-//! together with the personal shop at 00:00 Moscow time.
+//! at 00:00 Moscow time.
 
 use serde::{Deserialize, Serialize};
 

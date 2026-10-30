@@ -15,7 +15,7 @@ use crate::{
     combat_reward::HunterReward,
     economy::{SystemPoints, Won},
     guild::GuildRegistry,
-    organization::OrganizationBook,
+    organization::Contract,
     player_data::{PlayerDataStorage, SoloLevelingPlayerData},
     shop::ShopDay,
     state::SoloLevelingState,
@@ -62,7 +62,8 @@ pub(crate) enum AccountUpdate {
     },
     Organization {
         uuid: Uuid,
-        book: OrganizationBook,
+        index: usize,
+        contract: Contract,
     },
     Shop {
         uuid: Uuid,
@@ -97,8 +98,12 @@ impl AccountUpdate {
                     session.system_points = points;
                     Some((reward, level_up, session.stats.level))
                 }
-                Self::Organization { book, .. } => {
-                    session.organization = book;
+                Self::Organization { index, contract, .. } => {
+                    if session.organization.contracts.get(index) == Some(&contract) {
+                        session.organization.contracts.remove(index);
+                    } else {
+                        log::error!("sololeveling: committed contract no longer matches its live slot for {uuid}");
+                    }
                     None
                 }
                 Self::Shop { shop, .. } => {

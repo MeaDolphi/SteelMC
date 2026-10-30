@@ -18,11 +18,15 @@ pub mod choice_menu;
 pub mod consume;
 pub mod crystal;
 pub mod enchantment;
+pub mod grimoire;
+pub mod key;
 pub mod loot;
+pub mod material;
 pub mod menu_book;
 pub mod model;
 pub mod nbt;
 pub mod potion;
+pub mod pouch;
 pub mod shadow;
 
 use simdnbt::owned::{NbtCompound, NbtTag};

@@ -260,6 +260,120 @@ SOUL = """
 ................
 """
 
+RING = """
+................
+................
+................
+......ooo.......
+.....o3g3o......
+......o3o.......
+....oo222oo.....
+...o21ooo12o....
+..o21o...o12o...
+..o1o.....o1o...
+..o1o.....o1o...
+..o11o...o11o...
+...o11ooo11o....
+....oo111oo.....
+......ooo.......
+................
+"""
+
+AMULET = """
+....oo....oo....
+...o4o....o4o...
+...o4o....o4o...
+....o4o..o4o....
+.....o4oo4o.....
+......o44o......
+.....ooooo......
+....o22221o.....
+...o2gg2111o....
+...o2g21111o....
+...o1111113o....
+...o1111133o....
+....o11133o.....
+.....o133o......
+......ooo.......
+................
+"""
+
+STAFF = """
+...........ooo..
+..........o2ggo.
+.........o2gg3o.
+.........og33o..
+........o4ooo...
+.......o45o.....
+......o45o......
+.....o45o.......
+....o45o........
+...o45o.........
+..o45o..........
+.o45o...........
+.o5o............
+..o.............
+................
+................
+"""
+
+ORB = """
+................
+.....oooooo.....
+....o222111o....
+...o22gg1113o...
+..o22gg111133o..
+..o2gg1111133o..
+..o2g11111133o..
+..o11111113333o.
+..o11111113333o.
+..o1111113333o..
+...o11113333o...
+....o133333o....
+.....oooooo.....
+....o44444o.....
+...o4555554o....
+...oooooooooo...
+"""
+
+LEGGINGS = """
+................
+...oooooooooo...
+...o22222222o...
+...o13333331o...
+...o11111111o...
+...o111oo111o...
+...o111oo111o...
+...o11o..o11o...
+...o11o..o11o...
+...o11o..o11o...
+...o11o..o11o...
+...o11o..o11o...
+...o22o..o22o...
+...o11o..o11o...
+...oooo..oooo...
+................
+"""
+
+KEY = """
+................
+.........oooo...
+........o2gg1o..
+.......o2g11g1o.
+.......og1oo1go.
+.......o11oo11o.
+.......o1g11g1o.
+......o2o1gg1o..
+.....o21ooooo...
+....o21o........
+...o21o.........
+..o21o.o........
+.o21o.o3o.......
+.o1o.o33o.......
+..o.o3o.........
+.....o..........
+"""
+
 
 def palette(main, highlight, accent, handle="#3a2a1c", handle_hi="#6b4f33", glow="#7cf3ff"):
     return {
@@ -305,7 +419,48 @@ ITEMS = {
     "artifact/high_knights_gauntlet": (GLOVE, STEEL),
     "artifact/red_knights_helmet": (HELMET, palette("#9e1c2c", "#ff6b78", "#3a0a12", glow="#ffb3b9")),
     "artifact/crystal_pickaxe": (PICKAXE, palette("#3fb6e8", "#c8f6ff", "#1b3a8a")),
+    "artifact/raikans_fang": (DAGGER, palette("#9aa7bf", "#eef4ff", "#5b6a9a")),
+    "artifact/ring_of_endurance": (RING, palette("#c7962a", "#ffe58a", "#d8283c", glow="#ff9aa6")),
+    "artifact/wind_amulet": (AMULET, palette("#2fae6a", "#a8ffcf", "#13603a", handle="#8a96a8", handle_hi="#dfe6f0")),
+    "artifact/dungeon_wardens_helmet": (HELMET, palette("#5b6a7a", "#b8c8d8", "#3fd6ff")),
+    "artifact/trackers_leggings": (LEGGINGS, palette("#5a4a2a", "#9a7f4f", "#3fd6ff")),
+    "artifact/gatekeepers_necklace": (AMULET, palette("#2f6be0", "#9fd0ff", "#16367a", handle="#c7962a", handle_hi="#ffe58a")),
+    "artifact/high_magicians_ring": (RING, palette("#d0d8e8", "#ffffff", "#7a3fe0", glow="#d2b0ff")),
+    "artifact/kargalgans_staff": (STAFF, palette("#3a2a1c", "#6b4f33", "#d8283c", glow="#ff7a1a")),
+    "artifact/high_knights_greaves": (LEGGINGS, STEEL),
+    "artifact/kamishs_wrath": (DAGGER, palette("#e0a02f", "#fff0a8", "#d8283c", handle="#2a0810", handle_hi="#7a1020", glow="#ffcf3f")),
+    "artifact/orb_of_avarice": (ORB, palette("#7a3fe0", "#d2b0ff", "#2a1050", handle="#c7962a", handle_hi="#ffe58a", glow="#ffffff")),
+    "artifact/black_heart": (CHESTPLATE, palette("#1a1420", "#4a3a5a", "#d8283c", glow="#ff6b78")),
+    "artifact/demon_monarchs_ring": (RING, palette("#4a0f1c", "#ff5c6a", "#ff2d3d", glow="#ffcf3f")),
+    # Mage artifacts
+    "artifact/apprentice_staff": (STAFF, palette("#8a96a8", "#dfe6f0", "#4b5570", handle="#6b4f33", handle_hi="#9a7a52")),
+    "artifact/ash_staff": (STAFF, palette("#2fae6a", "#a8ffcf", "#13603a", handle="#8a7a5a", handle_hi="#d8c8a0")),
+    "artifact/mana_ring": (RING, palette("#8a96a8", "#eef4ff", "#2f6be0", glow="#9fd0ff")),
+    "artifact/clear_mind_earrings": (AMULET, palette("#3fd6ff", "#c8f6ff", "#16367a", handle="#d0d8e8", handle_hi="#ffffff")),
+    "artifact/archmage_mantle": (CHESTPLATE, palette("#3a1a78", "#7a3fe0", "#ffcf3f", glow="#d2b0ff")),
+    "artifact/high_priests_breviary": (AMULET, palette("#e0e0d0", "#ffffff", "#c7962a", handle="#c7962a", handle_hi="#ffe58a")),
+    "artifact/elemental_orb": (ORB, palette("#e02f4a", "#9fd0ff", "#2fae6a", handle="#c7962a", handle_hi="#ffe58a", glow="#ffe58a")),
+    "artifact/demon_kings_staff": (STAFF, palette("#d8283c", "#ff9aa6", "#4a0f1c", handle="#1a1420", handle_hi="#4a3a5a", glow="#ffcf3f")),
+    "artifact/crown_of_bottomless_mana": (HELMET, palette("#c7962a", "#ffe58a", "#3fd6ff", glow="#9ff0ff")),
+    # Rings and amulets for every class
+    "artifact/agile_ring": (RING, palette("#8a96a8", "#eef4ff", "#2fae6a", glow="#a8ffcf")),
+    "artifact/strength_ring": (RING, palette("#7a4a10", "#e0a02f", "#d8283c", glow="#ff9aa6")),
+    "artifact/warden_amulet": (AMULET, palette("#5b6a7a", "#b8c8d8", "#16367a", handle="#8a96a8", handle_hi="#dfe6f0")),
+    "artifact/hunters_amulet": (AMULET, palette("#2fae6a", "#a8ffcf", "#5a4a2a", handle="#6b4f33", handle_hi="#9a7a52")),
+    "artifact/berserker_ring": (RING, palette("#4a0f1c", "#d8283c", "#ff7a1a", glow="#ffcf3f")),
+    "artifact/boss_hunter_ring": (RING, palette("#c7962a", "#ffe58a", "#7a3fe0", glow="#d2b0ff")),
+    "artifact/blood_amulet": (AMULET, palette("#7a1020", "#e02f4a", "#2a0810", handle="#4a3a5a", handle_hi="#8a7a9a")),
+    "artifact/prospectors_necklace": (AMULET, palette("#3fb6e8", "#c8f6ff", "#1b3a8a", handle="#c7962a", handle_hi="#ffe58a")),
+    "artifact/ant_king_ring": (RING, palette("#2a1a10", "#6b4f33", "#d8283c", glow="#ffcf3f")),
+    "artifact/shadow_guard_amulet": (AMULET, palette("#1a1420", "#4a3a5a", "#3fd6ff", handle="#262d4a", handle_hi="#7f93b8")),
     # Magic crystals by gate rank
+    "key/e": (KEY, palette("#8a96a8", "#dfe6f0", "#4b5570", glow="#3fd6ff")),
+    "key/d": (KEY, palette("#2fae6a", "#a8ffcf", "#13603a", glow="#a8ffcf")),
+    "key/c": (KEY, palette("#2f6be0", "#9fd0ff", "#16367a", glow="#9ff0ff")),
+    "key/b": (KEY, palette("#7a3fe0", "#d2b0ff", "#3a1a78", glow="#e0c8ff")),
+    "key/a": (KEY, palette("#e0a02f", "#fff0a8", "#7a4a10", glow="#fff3b0")),
+    "key/s": (KEY, palette("#e02f4a", "#ffb0bc", "#7a1020", glow="#ffd0d8")),
+    "key/castle": (KEY, DEMON),
     "crystal/e": (GEM, palette("#8a96a8", "#dfe6f0", "#4b5570")),
     "crystal/d": (GEM, palette("#2fae6a", "#a8ffcf", "#13603a")),
     "crystal/c": (GEM, palette("#2f6be0", "#9fd0ff", "#16367a")),
@@ -324,6 +479,8 @@ ITEMS = {
     # Shadow Monarch and the System
     "shadow/soul": (SOUL, SHADOW),
     "system_book": (BOOK, palette("#16295a", "#2f6be0", "#3fd6ff", handle="#0a1030", handle_hi="#c8f6ff")),
+    "grimoire": (BOOK, palette("#3a1a78", "#7a3fe0", "#d2b0ff", handle="#1a0a30", handle_hi="#ffcf3f")),
+    "won_pouch": (ORB, palette("#7a4a10", "#e0a02f", "#4a2a08", handle="#c7962a", handle_hi="#ffe58a", glow="#fff3b0")),
 }
 
 
@@ -451,6 +608,90 @@ def assassins_shoes():
     return image
 
 
+def dungeon_wardens_helmet():
+    base = plated("#5b6a7a", "#b8c8d8")
+
+    def pick(face, x, y, width, height):
+        if face == "front" and y == 4 and 1 <= x <= width - 2:
+            return rgb("#3fd6ff")
+        return base(face, x, y, width, height)
+
+    image = Image.new("RGBA", (64, 32), (0, 0, 0, 0))
+    paint(image, HEAD, pick)
+    return image
+
+
+def black_heart():
+    plate = plated("#1a1420", "#4a3a5a")
+
+    def body(face, x, y, width, height):
+        if face == "front" and 2 <= x <= 5 and 3 <= y <= 6:
+            return rgb("#ff6b78") if (x + y) % 2 == 0 else rgb("#d8283c")
+        return plate(face, x, y, width, height)
+
+    image = Image.new("RGBA", (64, 32), (0, 0, 0, 0))
+    paint(image, BODY, body)
+    paint(image, ARM, lambda face, x, y, w, h: None if face == "bottom" or (face != "top" and y > 3) else plate(face, x, y, w, h))
+    return image
+
+
+def archmage_mantle():
+    cloth = plated("#3a1a78", "#7a3fe0")
+
+    def body(face, x, y, width, height):
+        if face == "front" and x in (3, 4):
+            return rgb("#ffcf3f")
+        return cloth(face, x, y, width, height)
+
+    image = Image.new("RGBA", (64, 32), (0, 0, 0, 0))
+    paint(image, BODY, body)
+    paint(image, ARM, lambda face, x, y, w, h: None if face == "bottom" else cloth(face, x, y, w, h))
+    return image
+
+
+def crown_of_bottomless_mana():
+    gold = plated("#c7962a", "#ffe58a")
+
+    def head(face, x, y, width, height):
+        # A circlet: the top rows of the head, with a mana gem in front.
+        if face in ("top", "bottom") or y > 2:
+            return None
+        if face == "front" and y == 1 and x in (3, 4):
+            return rgb("#3fd6ff")
+        return gold(face, x, y, width, height)
+
+    image = Image.new("RGBA", (64, 32), (0, 0, 0, 0))
+    paint(image, HEAD, head)
+    return image
+
+
+def leggings(main, light, rim):
+    """Leggings for the `humanoid_leggings` layer: legs and the waist band."""
+    base = plated(main, light)
+
+    def waist(face, x, y, width, height):
+        if face in ("top", "bottom") or y < height - 3:
+            return None
+        return rgb(rim) if y == height - 3 else base(face, x, y, width, height)
+
+    def leg(face, x, y, width, height):
+        if face == "front" and y == 0:
+            return rgb(rim)
+        return base(face, x, y, width, height)
+
+    image = Image.new("RGBA", (64, 32), (0, 0, 0, 0))
+    paint(image, BODY, waist)
+    paint(image, LEG, leg)
+    return image
+
+
+# Worn looks drawn on the `humanoid_leggings` layer instead of `humanoid`.
+LEGGINGS_LAYERS = {
+    "trackers_leggings": lambda: leggings("#5a4a2a", "#9a7f4f", "#3fd6ff"),
+    "high_knights_greaves": lambda: leggings("#7f93b8", "#d4e4ff", "#3fd6ff"),
+}
+
+
 # Worn looks of the armor artifacts, keyed like their item models.
 EQUIPMENT = {
     "red_knights_helmet": red_knights_helmet,
@@ -458,7 +699,170 @@ EQUIPMENT = {
     "high_knights_gauntlet": lambda: gauntlets("#7f93b8", "#3fd6ff"),
     "archers_gloves": lambda: gauntlets("#6b4a2a", "#3fd6ff"),
     "assassins_shoes": assassins_shoes,
+    "dungeon_wardens_helmet": dungeon_wardens_helmet,
+    "black_heart": black_heart,
+    "archmage_mantle": archmage_mantle,
+    "crown_of_bottomless_mana": crown_of_bottomless_mana,
 }
+
+
+# Dungeon mob skins: one full-body look per dungeon theme. Mobs wear them as
+# armor without armor value, so a zombie body reads as a crypt ghoul, an ice
+# revenant or a charred fiend. Both layers come from one drawing.
+MOB_THEMES = {
+    # theme: (base, light, dark, eyes, pattern)
+    "crypt": ("#c9c3a8", "#efe9d0", "#5a5240", "#ff3b3b", "ribs"),
+    "ice": ("#a9d6ee", "#e8f8ff", "#4a86b0", "#3fe8ff", "cracks"),
+    "nether": ("#2a1a18", "#4a2e28", "#120a08", "#ffb02e", "embers"),
+    "desert": ("#d8c38f", "#f0e0b0", "#9a8458", "#ffe23f", "wraps"),
+    "jungle": ("#3f6b2a", "#6a9a48", "#1f3a14", "#b6ff3f", "vines"),
+    "deep_dark": ("#0f2a33", "#1f4a55", "#061418", "#3fe0e0", "sculk"),
+    "end": ("#241a3a", "#3e2c60", "#120c20", "#ff4fd8", "specks"),
+}
+
+
+def noise(x, y, seed):
+    value = (x * 73856093) ^ (y * 19349663) ^ (seed * 83492791)
+    value = (value ^ (value >> 13)) * 1274126177
+    return (value ^ (value >> 16)) & 0xFF
+
+
+def mob_pattern(kind, base, light, dark, accent, seed):
+    def pick(face, x, y, width, height):
+        n = noise(x + width * 7, y + height * 3, seed + len(face))
+        if kind == "ribs" and face in ("front", "back") and width == 8 and y % 3 == 1 and 1 <= x <= 6:
+            return rgb(dark)
+        if kind == "cracks" and n < 28:
+            return rgb(dark)
+        if kind == "embers" and n < 34:
+            return rgb(accent if n < 12 else "#ff5a1a")
+        if kind == "wraps" and y % 3 == 0:
+            return rgb(dark)
+        if kind == "vines" and (x + y // 3) % 4 == 0:
+            return rgb(dark)
+        if kind == "sculk" and n < 30:
+            return rgb(accent if n < 10 else dark)
+        if kind == "specks" and n < 20:
+            return rgb(accent if n < 6 else light)
+        if face == "top" or y == 0:
+            return rgb(light)
+        return rgb(base)
+
+    return pick
+
+
+def mob_face(kind, base, light, dark, eyes):
+    pattern = mob_pattern(kind, base, light, dark, eyes, 3)
+
+    def pick(face, x, y, width, height):
+        if face == "front":
+            if y in (3, 4) and x in (1, 2, 5, 6):
+                return rgb(eyes) if y == 3 else rgb(dark)
+            if y == 6 and 2 <= x <= 5:
+                return rgb(dark)
+        return pattern(face, x, y, width, height)
+
+    return pick
+
+
+def mob_skin(theme):
+    base, light, dark, eyes, kind = MOB_THEMES[theme]
+    body = Image.new("RGBA", (64, 32), (0, 0, 0, 0))
+    paint(body, HEAD, mob_face(kind, base, light, dark, eyes))
+    paint(body, BODY, mob_pattern(kind, base, light, dark, eyes, 5))
+    paint(body, ARM, mob_pattern(kind, base, light, dark, eyes, 7))
+    paint(body, LEG, mob_pattern(kind, base, light, dark, eyes, 11))
+    legs = Image.new("RGBA", (64, 32), (0, 0, 0, 0))
+    paint(legs, BODY, lower(3, mob_pattern(kind, base, light, dark, eyes, 13)))
+    paint(legs, LEG, mob_pattern(kind, base, light, dark, eyes, 17))
+    return body, legs
+
+
+# Facade signs above the doors of the city's key buildings. Each is a wide
+# board model an item frame shows about four blocks wide, with the title
+# rendered in a bold sans font and an icon of what the building offers.
+SIGN_FONTS = [
+    "/usr/share/fonts/TTF/DejaVuSansCondensed-Bold.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+]
+SIGNS = {
+    # name: (title, subtitle, accent, icon template, icon palette)
+    "association": (
+        "АССОЦИАЦИЯ",
+        "Задания · стартовый набор",
+        "#3fd6ff",
+        BOOK,
+        palette("#16295a", "#2f6be0", "#3fd6ff", handle="#0a1030", handle_hi="#c8f6ff"),
+    ),
+    "merchant": (
+        "ТОРГОВЕЦ",
+        "Снаряжение · заказы мастеру",
+        "#ffcf3f",
+        SWORD,
+        palette("#8aa0c8", "#eef4ff", "#3a5fb0"),
+    ),
+    "guild": (
+        "ДОМ ГИЛЬДИЙ",
+        "Гильдии охотников",
+        "#9b6bff",
+        CHEST,
+        SHADOW,
+    ),
+}
+SIGN_SIZE = (256, 64)
+
+
+def sign_board(title, subtitle, accent, icon_template, icon_colours):
+    from PIL import ImageDraw, ImageFont
+
+    font_path = next((path for path in SIGN_FONTS if Path(path).is_file()), None)
+    if font_path is None:
+        raise SystemExit("no DejaVu Sans Bold font found for the city signs")
+    width, height = SIGN_SIZE
+    image = Image.new("RGBA", SIGN_SIZE, rgb("#0d1638"))
+    pen = ImageDraw.Draw(image)
+    # Double frame: a dark outline and a glowing inner line in the accent.
+    pen.rectangle([0, 0, width - 1, height - 1], outline=rgb(OUTLINE), width=2)
+    pen.rectangle([3, 3, width - 4, height - 4], outline=rgb(accent), width=2)
+    badge = draw(icon_template, icon_colours).resize((44, 44), Image.NEAREST)
+    image.paste(badge, (10, 10), badge)
+    left = 62
+    room = width - left - 10
+
+    def fitted(text, size):
+        # Shrinks the font until the line fits between the badge and the frame.
+        while size > 8:
+            font = ImageFont.truetype(font_path, size)
+            if pen.textlength(text, font=font) <= room:
+                return font
+            size -= 1
+        return ImageFont.truetype(font_path, size)
+
+    pen.text((left, 9), title, font=fitted(title, 26), fill=rgb("#eef4ff"))
+    pen.text((left, 40), subtitle, font=fitted(subtitle, 13), fill=rgb(accent))
+    return image
+
+
+def sign_model(name):
+    """A thin 48x12 board, about four blocks wide in an item frame."""
+    texture = f"{NAMESPACE}:item/sign/{name}"
+    face = {"uv": [0, 0, 16, 16], "texture": "#board"}
+    return {
+        "textures": {"board": texture, "particle": texture},
+        "elements": [
+            {
+                "from": [-16, 2, 7.5],
+                "to": [32, 14, 8.5],
+                "faces": {"north": face, "south": face},
+            }
+        ],
+        "display": {
+            "fixed": {"rotation": [0, 180, 0], "scale": [2.75, 2.75, 2.75]},
+            "gui": {"scale": [0.33, 0.33, 0.33]},
+        },
+    }
 
 
 # Menu button icons, drawn from shapes and outlined automatically.
@@ -647,7 +1051,7 @@ def build():
             assets / "models" / "item" / f"{item}.json",
             {
                 "parent": "minecraft:item/handheld"
-                if template in (SWORD, DAGGER, PICKAXE)
+                if template in (SWORD, DAGGER, PICKAXE, STAFF)
                 else "minecraft:item/generated",
                 "textures": {"layer0": f"{NAMESPACE}:item/{item}"},
             },
@@ -663,6 +1067,39 @@ def build():
         write_json(
             assets / "equipment" / f"{name}.json",
             {"layers": {"humanoid": [{"texture": f"{NAMESPACE}:{name}"}]}},
+        )
+    for name, draw_layer in LEGGINGS_LAYERS.items():
+        layer = assets / "textures" / "entity" / "equipment" / "humanoid_leggings" / f"{name}.png"
+        layer.parent.mkdir(parents=True, exist_ok=True)
+        draw_layer().save(layer)
+        write_json(
+            assets / "equipment" / f"{name}.json",
+            {"layers": {"humanoid_leggings": [{"texture": f"{NAMESPACE}:{name}"}]}},
+        )
+    for theme in MOB_THEMES:
+        name = f"mob_{theme}"
+        body, legs = mob_skin(theme)
+        for kind, image in (("humanoid", body), ("humanoid_leggings", legs)):
+            layer = assets / "textures" / "entity" / "equipment" / kind / f"{name}.png"
+            layer.parent.mkdir(parents=True, exist_ok=True)
+            image.save(layer)
+        write_json(
+            assets / "equipment" / f"{name}.json",
+            {
+                "layers": {
+                    "humanoid": [{"texture": f"{NAMESPACE}:{name}"}],
+                    "humanoid_leggings": [{"texture": f"{NAMESPACE}:{name}"}],
+                }
+            },
+        )
+    for name, (title, subtitle, accent, icon_template, icon_colours) in SIGNS.items():
+        texture = assets / "textures" / "item" / "sign" / f"{name}.png"
+        texture.parent.mkdir(parents=True, exist_ok=True)
+        sign_board(title, subtitle, accent, icon_template, icon_colours).save(texture)
+        write_json(assets / "models" / "item" / "sign" / f"{name}.json", sign_model(name))
+        write_json(
+            assets / "items" / "sign" / f"{name}.json",
+            {"model": {"type": "minecraft:model", "model": f"{NAMESPACE}:item/sign/{name}"}},
         )
     for item, draw_icon in UI_ICONS.items():
         texture = assets / "textures" / "item" / f"{item}.png"
@@ -719,7 +1156,9 @@ def build():
                 archive.writestr(info, file.read_bytes())
     digest = hashlib.sha1(ZIP.read_bytes()).hexdigest()
     print(
-        f"{len(ITEMS)} items, {len(UI_ICONS)} menu icons, {len(EQUIPMENT)} armor layers, "
+        f"{len(ITEMS)} items, {len(UI_ICONS)} menu icons, "
+        f"{len(EQUIPMENT) + len(LEGGINGS_LAYERS)} armor layers, {len(MOB_THEMES)} mob skins, "
+        f"{len(SIGNS)} signs, "
         f"{len(RANK_GLYPHS)} rank badges, {len(SOUNDS)} sounds -> {ZIP} (sha1 {digest})"
     )
 

@@ -1,8 +1,8 @@
-//! The personal System shop: ten slots rolled per hunter per Moscow day.
+//! The personal System shop: ten slots rolled per hunter every 20 minutes.
 //!
 //! Each slot independently rolls a category from the shop table, then a
 //! uniform item from that category's catalog. The roll is saved with the
-//! hunter, so reconnecting or restarting cannot reroll the day's slots.
+//! hunter, so reconnecting or restarting cannot reroll the current slots.
 //!
 //! Prices are paid in system points, which only personal mob kills, boss pools,
 //! and dungeon rewards produce, so trading cannot fund the shop. Every purchase,
@@ -19,6 +19,25 @@ use uuid::Uuid;
 use crate::item::artifact::{self, ArtifactId, Rarity};
 use crate::item::binding;
 use crate::item::potion::{self, BuffPotion};
+
+/// Duration of a shop window in seconds.
+pub const WINDOW_SECONDS: u64 = 20 * 60;
+
+/// Returns the fixed shop window containing a Unix timestamp.
+#[must_use]
+pub const fn window_at(unix_seconds: u64) -> u64 {
+    unix_seconds / WINDOW_SECONDS
+}
+
+/// Returns the current shop window.
+#[must_use]
+pub fn current_window() -> u64 {
+    window_at(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs()),
+    )
+}
 
 /// How many offers the shop has.
 pub const SLOTS: usize = 10;
@@ -150,14 +169,14 @@ fn roll_day() -> [Offer; SLOTS] {
     array::from_fn(|_| roll_offer(rand::random_range(0..1_000), rand::random_range(0..64)))
 }
 
-/// One hunter's shop for one Moscow day.
+/// One hunter's shop for one 20-minute window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShopDay {
-    /// Moscow day index the slots below belong to.
+    /// Window index. The field name is retained for existing saved data.
     pub day: u64,
-    /// Slots already bought that day.
+    /// Slots already bought in this window.
     pub purchased: [bool; SLOTS],
-    /// The day's rolled offers; `None` until the first roll.
+    /// The window's rolled offers; `None` until the first roll.
     #[serde(default)]
     pub offers: Option<[Offer; SLOTS]>,
 }
@@ -171,7 +190,7 @@ impl Default for ShopDay {
 impl ShopDay {
     /// Returns the state of a hunter who has bought nothing yet.
     ///
-    /// The day is deliberately not a real day index, so the first observation
+    /// The window is deliberately not a real index, so the first observation
     /// rolls the slots exactly once.
     #[must_use]
     pub const fn unset() -> Self {
@@ -182,17 +201,17 @@ impl ShopDay {
         }
     }
 
-    /// Rolls today's slots once and reports whether anything changed.
+    /// Rolls the current window's slots once and reports whether anything changed.
     ///
-    /// A day saved before slots were rolled (an older save) gets its slots on
-    /// first use without losing today's purchase flags.
+    /// A state without offers gets its slots on first use without losing
+    /// purchase flags if it already belongs to the requested window.
     pub fn roll_over(&mut self, today: u64) -> bool {
         self.roll_over_with(today, roll_day)
     }
 
-    /// Re-rolls a hunter's assortment for `today` and resets today's purchases.
+    /// Re-rolls a hunter's assortment and resets the window's purchases.
     ///
-    /// Reserved for operator maintenance; normal players receive one daily roll.
+    /// Reserved for operator maintenance.
     pub fn refresh(&mut self, today: u64) {
         self.day = u64::MAX;
         self.roll_over_with(today, roll_day);
@@ -210,16 +229,25 @@ impl ShopDay {
         true
     }
 
-    /// Returns today's offer in `slot`, once the day is rolled.
+    /// Returns the offer in `slot`, once the window is rolled.
     #[must_use]
     pub fn offer(&self, slot: usize) -> Option<Offer> {
         self.offers?.get(slot).copied()
     }
 
-    /// Returns whether `slot` was already bought today.
+    /// Returns whether `slot` was already bought in this window.
     #[must_use]
     pub fn bought(&self, slot: usize) -> bool {
         self.purchased.get(slot).copied().unwrap_or(false)
+    }
+
+    /// Checks that a queued purchase still refers to the same available offer.
+    #[must_use]
+    pub fn permits_purchase(&self, expected: Self, window: u64, slot: usize, offer: Offer) -> bool {
+        *self == expected
+            && self.day == window
+            && self.offer(slot) == Some(offer)
+            && !self.bought(slot)
     }
 
     /// Marks `slot` as bought, refusing an unknown or already bought slot.
@@ -241,8 +269,10 @@ pub enum ShopError {
     UnknownSlot,
     /// The hunter has no loaded session.
     NoSession,
-    /// The slot was already bought today.
+    /// The slot was already bought in this window.
     AlreadyBought,
+    /// The displayed or queued assortment is no longer current.
+    Stale,
     /// A financial write owns the balance right now.
     Busy,
     /// The hunter cannot afford the price.
@@ -260,7 +290,8 @@ impl ShopError {
         match self {
             Self::UnknownSlot => "Такого слота в магазине нет.",
             Self::NoSession => "Сессия охотника не загружена.",
-            Self::AlreadyBought => "Этот слот уже куплен сегодня.",
+            Self::AlreadyBought => "Этот слот уже куплен в текущем обновлении.",
+            Self::Stale => "Ассортимент изменился. Проверьте магазин и попробуйте снова.",
             Self::Busy => "Дождитесь завершения другой финансовой операции.",
             Self::InsufficientPoints => "Недостаточно очков Системы.",
             Self::InventoryFull => "Освободите место в инвентаре для покупки.",
@@ -272,6 +303,14 @@ impl ShopError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_changes_at_twenty_minute_boundaries() {
+        assert_eq!(window_at(1199), 0);
+        assert_eq!(window_at(1200), 1);
+        assert_eq!(window_at(2399), 1);
+        assert_eq!(window_at(2400), 2);
+    }
 
     #[test]
     fn the_table_covers_exactly_one_thousand_per_mille() {
@@ -319,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn the_day_is_rolled_once_and_kept_until_the_next_day() {
+    fn the_window_is_rolled_once_and_kept_until_the_next_window() {
         let fixed = [roll_offer(0, 0); SLOTS];
         let other = [roll_offer(400, 1); SLOTS];
         let mut day = ShopDay::default();
@@ -336,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_refresh_clears_daily_purchases_and_rolls_a_current_day() {
+    fn operator_refresh_clears_purchases_and_rolls_a_current_window() {
         let mut day = ShopDay::default();
         day.roll_over_with(5, || [roll_offer(0, 0); SLOTS]);
         assert!(day.mark(3));
@@ -373,12 +412,43 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_day_round_trips() {
+    fn a_saved_window_round_trips() {
         let mut day = ShopDay::default();
         day.roll_over(9);
+        assert!(day.mark(3));
         let json = serde_json::to_string(&day).expect("serialize");
-        let restored: ShopDay = serde_json::from_str(&json).expect("deserialize");
+        let mut restored: ShopDay = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored, day);
+        assert!(!restored.roll_over(9));
+        assert!(restored.bought(3));
+        assert!(restored.roll_over(10));
+        assert!(!restored.bought(3));
+    }
+
+    #[test]
+    fn queued_purchase_rejects_expired_or_changed_assortment() {
+        let mut shop = ShopDay::unset();
+        let offer = roll_offer(0, 0);
+        shop.roll_over_with(9, || [offer; SLOTS]);
+        let displayed = shop;
+        assert!(shop.permits_purchase(displayed, 9, 0, offer));
+        assert!(!shop.permits_purchase(displayed, 10, 0, offer));
+        assert!(shop.mark(0));
+        assert!(!shop.permits_purchase(displayed, 9, 0, offer));
+        shop.roll_over_with(10, || [offer; SLOTS]);
+        assert!(!shop.permits_purchase(displayed, 10, 0, offer));
+    }
+
+    #[test]
+    fn old_daily_save_rolls_into_current_window() {
+        let mut shop = ShopDay::unset();
+        shop.roll_over_with(20_000, || [roll_offer(0, 0); SLOTS]);
+        assert!(shop.mark(0));
+        let json = serde_json::to_string(&shop).expect("serialize");
+        let mut restored: ShopDay = serde_json::from_str(&json).expect("deserialize");
+        assert!(restored.roll_over_with(1_440_000, || [roll_offer(400, 0); SLOTS]));
+        assert!(!restored.bought(0));
+        assert_eq!(restored.offer(0), Some(roll_offer(400, 0)));
     }
 
     #[test]

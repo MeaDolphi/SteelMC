@@ -6,9 +6,15 @@ mod class;
 pub use auction::{AuctionRequest, LotView};
 mod organization;
 pub use organization::{BoardView, GroupPayout};
+pub use persistence::StarterError;
+pub use rewards::GateClear;
+mod enchants;
 mod persistence;
+mod rewards;
+mod spells;
 
 use std::io;
+use std::mem;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -17,7 +23,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use glam::DVec3;
 use rustc_hash::{FxHashMap, FxHashSet};
 use steel_core::entity::LivingEntity;
-use steel_core::player::player_inventory::Prediction;
 use steel_core::player::{Player, PlayerInput};
 use steel_core::server::Server;
 use steel_core::world::World;
@@ -26,17 +31,27 @@ use steel_utils::Identifier;
 use steel_utils::locks::SyncMutex;
 use uuid::Uuid;
 
+use crate::castle;
+use crate::city;
 use crate::combat_reward::HunterReward;
 use crate::daily;
+use crate::dungeon::Gate;
+use crate::dungeon::mobs::MobClass;
 use crate::dungeon::mobs::MobLabel;
 use crate::dungeon::runtime::{self, DungeonRuntime, RunDeath};
 use crate::guild::{Guild, GuildError, GuildRegistry, GuildRole};
+use crate::island::{self, IslandRuntime};
+use crate::item::artifact::{self, ArtifactId};
 use crate::item::crystal::CrystalSaleError;
 use crate::item::enchantment::Enchantment;
+use crate::item::{material, pouch};
+use crate::merchant;
 use crate::notice::Notice;
 use crate::organization::Event;
+use crate::organization::rank_multiplier;
 use crate::party::{Party, PartyError, PartyExit, PartyRuntime};
 use crate::player_data::{PlayerDataStorage, SoloLevelingPlayerData};
+use crate::quest_book::Goal;
 use crate::rank::HunterRank;
 use crate::resource_pack::{self, ServedPack};
 use crate::session::{HunterSession, QuestUpdate, SessionRegistry, SidebarChange};
@@ -46,6 +61,15 @@ use crate::shop::ShopDay;
 use crate::sidebar::{ContractScope, SidebarView};
 use crate::stats::{HunterStat, HunterStats, LevelUp};
 use steel_core::entity::{AlliedMode, SharedEntity};
+
+/// Percent chance that each fighter of the Ant King gets its ring.
+const ANT_KING_RING_PERCENT: u32 = 5;
+/// Won for an island nest of an E-rank zone.
+const ISLAND_NEST_WON: u64 = 200;
+/// Won every fighter of the Ant King receives.
+const ISLAND_KING_WON: u64 = 5_000;
+/// Won per Demon Castle floor, times the floor number.
+const CASTLE_FLOOR_WON: u64 = 20;
 
 /// Where the artifact being enchanted lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,12 +81,25 @@ pub enum EnchantTarget {
 }
 
 /// An item maker action requested from inside a menu callback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum EnchantAction {
     /// Open the artifact picker of the item maker.
     OpenMenu,
     /// Lay one enchantment on the chosen artifact.
-    Apply(Enchantment, EnchantTarget),
+    Apply(
+        Enchantment,
+        EnchantTarget,
+        Arc<SyncMutex<Option<EnchantTarget>>>,
+    ),
+}
+
+/// Deferred gate-menu actions that run after the inventory callback releases its lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateMenuAction {
+    /// Open the requested page.
+    OpenPage(usize),
+    /// Teleport near the committed gate, without entering it.
+    Teleport(u64),
 }
 
 /// Storage and live sessions shared by Solo Leveling hooks and commands.
@@ -72,6 +109,9 @@ pub struct SoloLevelingState {
     sessions: SessionRegistry,
     dungeon_runtime: SyncMutex<DungeonRuntime>,
     shadow_runtime: SyncMutex<ShadowRuntime>,
+    island: SyncMutex<IslandRuntime>,
+    island_travel: SyncMutex<Vec<(Uuid, bool)>>,
+    castle_ranking: SyncMutex<castle::RankingFile>,
     party_runtime: SyncMutex<PartyRuntime>,
     guilds: SyncMutex<GuildRegistry>,
     active_guild_banks: SyncMutex<FxHashSet<String>>,
@@ -80,9 +120,15 @@ pub struct SoloLevelingState {
     organization_boards: SyncMutex<organization::Boards>,
     organization_events: SyncMutex<Vec<(Vec<Uuid>, Event)>>,
     storms: SyncMutex<Vec<abilities::Storm>>,
+    spell_runtime: SyncMutex<spells::SpellRuntime>,
+    enchant_runtime: SyncMutex<enchants::EnchantRuntime>,
     crystal_sales: SyncMutex<FxHashSet<Uuid>>,
     enchant_actions: SyncMutex<FxHashMap<Uuid, EnchantAction>>,
     gear_menus: SyncMutex<FxHashSet<Uuid>>,
+    auction_sell_menus: SyncMutex<FxHashSet<Uuid>>,
+    buyback_menus: SyncMutex<FxHashSet<Uuid>>,
+    deferred_menus: SyncMutex<FxHashMap<Uuid, usize>>,
+    gate_menu_actions: SyncMutex<FxHashMap<Uuid, GateMenuAction>>,
     /// The running server, for menus that list online hunters.
     server: SyncMutex<Weak<Server>>,
     /// Latest server tick, for menus that act on tick-stamped state.
@@ -100,13 +146,20 @@ impl SoloLevelingState {
         let guilds = GuildRegistry::empty();
         let boards =
             organization::Boards::load(storage.base_dir().join("organization_boards.json"))?;
+        let castle_ranking =
+            castle::RankingFile::load(&storage.base_dir().join("castle_ranking.json"))?;
         let mut dungeon_runtime = DungeonRuntime::default();
         dungeon_runtime.load_region_records(storage.base_dir().join("instance_regions.json"))?;
+        dungeon_runtime
+            .load_legacy_gate_cleanups(storage.base_dir().join("legacy_gate_cleanups.json"))?;
         Ok(Self {
             storage,
             sessions: SessionRegistry::new(),
             dungeon_runtime: SyncMutex::new(dungeon_runtime),
             shadow_runtime: SyncMutex::new(ShadowRuntime::default()),
+            island: SyncMutex::new(IslandRuntime::new()),
+            island_travel: SyncMutex::new(Vec::new()),
+            castle_ranking: SyncMutex::new(castle_ranking),
             party_runtime: SyncMutex::new(PartyRuntime::default()),
             guilds: SyncMutex::new(guilds),
             active_guild_banks: SyncMutex::new(FxHashSet::default()),
@@ -115,9 +168,15 @@ impl SoloLevelingState {
             organization_boards: SyncMutex::new(boards),
             organization_events: SyncMutex::new(Vec::new()),
             storms: SyncMutex::new(Vec::new()),
+            spell_runtime: SyncMutex::new(spells::SpellRuntime::default()),
+            enchant_runtime: SyncMutex::new(enchants::EnchantRuntime::default()),
             crystal_sales: SyncMutex::new(FxHashSet::default()),
             enchant_actions: SyncMutex::new(FxHashMap::default()),
             gear_menus: SyncMutex::new(FxHashSet::default()),
+            auction_sell_menus: SyncMutex::new(FxHashSet::default()),
+            buyback_menus: SyncMutex::new(FxHashSet::default()),
+            deferred_menus: SyncMutex::new(FxHashMap::default()),
+            gate_menu_actions: SyncMutex::new(FxHashMap::default()),
             server: SyncMutex::new(Weak::new()),
             current_tick: AtomicU64::new(0),
             resource_pack: SyncMutex::new(None),
@@ -135,6 +194,12 @@ impl SoloLevelingState {
         session.class = data.class;
         session.saved_gear = data.gear.clone();
         session.gear = data.gear.items();
+        session.deferred_inventory = data.deferred_inventory;
+        session.starter = data.starter;
+        session.merchant = data.merchant;
+        session.castle = data.castle;
+        session.spells = data.spells;
+        session.quests = data.quests;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
@@ -250,30 +315,132 @@ impl SoloLevelingState {
         })?
     }
 
+    /// Advances the shared island infestation and serves travel requests.
+    pub fn tick_island(&self, server: &Arc<Server>, tick: u64) {
+        let travels = mem::take(&mut *self.island_travel.lock());
+        for (uuid, to_island) in travels {
+            let Some(player) = server
+                .get_players()
+                .into_iter()
+                .find(|player| player.gameprofile.id() == uuid)
+            else {
+                continue;
+            };
+            if to_island {
+                let rank = self.hunter_rank(uuid).unwrap_or(HunterRank::E);
+                island::travel_to(server, player, rank);
+            } else if let Some(city) = server
+                .worlds
+                .values()
+                .find(|world| city::is_city_world(world))
+                && let Err(error) = server.queue_player_world_selection(player, city)
+            {
+                log::warn!("sololeveling: could not evacuate hunter {uuid}: {error}");
+            }
+        }
+        self.island.lock().tick(server, tick);
+    }
+
+    /// Asks to move a hunter to the island, or back to the city.
+    pub fn request_island_travel(&self, uuid: Uuid, to_island: bool) {
+        self.island_travel.lock().push((uuid, to_island));
+    }
+
+    /// Remembers that `hunter` hit something on the island, for the King's reward.
+    pub fn record_island_fighter(&self, hunter: Uuid) {
+        self.island.lock().record_fighter(hunter);
+    }
+
+    /// Settles a death in the island world and pays the hunters; returns
+    /// whether the entity was an island mob.
+    pub fn observe_island_death(
+        &self,
+        world: &World,
+        entity_id: i32,
+        hunter: Option<Uuid>,
+    ) -> bool {
+        if !island::is_island_world(world) {
+            return false;
+        }
+        if let Some(hunter) = hunter {
+            self.island.lock().record_fighter(hunter);
+        }
+        let Some(kill) = self.island.lock().on_death(world, entity_id) else {
+            return false;
+        };
+        let mut roll = || rand::random_range(0..100);
+        match &kill {
+            island::IslandKill::Ant(rank) => {
+                if let Some(hunter) = hunter {
+                    self.credit_dungeon_mob(hunter, *rank);
+                    self.record_goal(hunter, Goal::Ant, 1);
+                }
+            }
+            island::IslandKill::Nest { zone, .. } => {
+                if let Some(hunter) = hunter {
+                    self.credit_dungeon_boss(vec![hunter], zone.rank());
+                    let bounty = ISLAND_NEST_WON * rank_multiplier(zone.rank());
+                    self.credit_won(hunter, bounty);
+                    self.notify(hunter, &format!("Награда за гнездо: +{bounty} Won."));
+                    self.record_goal(hunter, Goal::Nest, 1);
+                    self.record_organization_event(vec![hunter], Event::Nest);
+                }
+            }
+            island::IslandKill::King { hunters } => {
+                self.credit_dungeon_boss(hunters.clone(), HunterRank::S);
+                for fighter in hunters {
+                    let rank = self.hunter_rank(*fighter).unwrap_or(HunterRank::C);
+                    for stack in island::king_loot(rank) {
+                        self.queue_system_loot(*fighter, stack);
+                    }
+                    self.credit_won(*fighter, ISLAND_KING_WON);
+                    self.notify(
+                        *fighter,
+                        &format!("Награда за Короля муравьёв: +{ISLAND_KING_WON} Won."),
+                    );
+                    self.record_goal(*fighter, Goal::AntKing, 1);
+                    if rand::random_range(0..100) < ANT_KING_RING_PERCENT {
+                        self.queue_system_loot(
+                            *fighter,
+                            artifact::stack(ArtifactId::AntKingRing, None),
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(hunter) = hunter {
+            for stack in island::kill_loot(&kill, &mut roll) {
+                self.queue_system_loot(hunter, stack);
+            }
+        }
+        true
+    }
+
     /// Advances live gate and dungeon orchestration at the server tick boundary.
     ///
     /// The runtime lock is released before any deferred run action runs, so
     /// instance bookkeeping and session mutation never nest in both directions.
     pub fn tick_dungeons(&self, server: &Arc<Server>, tick: u64) {
-        let (actions, loot) = {
+        let (actions, loot, gate_write) = {
             let mut runtime = self.dungeon_runtime.lock();
             let actions = runtime.tick(self, server, tick);
-            (actions, runtime.take_pending_loot())
+            let gate_write = runtime.begin_gate_persistence();
+            (actions, runtime.take_pending_loot(), gate_write)
         };
+        if let Some(gate_write) = gate_write {
+            let revision = gate_write.revision;
+            if let Err(error) = self.queue_gate_registry_snapshot(gate_write) {
+                log::error!("sololeveling: could not queue gate registry write: {error}");
+                self.dungeon_runtime.lock().fail_gate_persistence(revision);
+            }
+        }
         for action in &actions {
             runtime::apply_action(self, server, action);
         }
         for (recipient, stack) in loot {
-            if let Some(player) = server
-                .get_players()
-                .into_iter()
-                .find(|player| player.gameprofile.id() == recipient)
-            {
-                self.notify_loot(recipient, &stack);
-                player.add_item_or_drop(stack, Prediction::ServerOnly);
-            }
+            self.queue_system_loot(recipient, stack);
         }
-        self.shadow_runtime.lock().tick();
+        self.shadow_runtime.lock().tick(tick);
         if tick.is_multiple_of(20) {
             self.follow_owners_across_worlds(server);
         }
@@ -341,6 +508,7 @@ impl SoloLevelingState {
         let mut guilds = self.guilds.lock();
         guilds.create(name, guildmaster)?;
         drop(guilds);
+        self.record_goal(guildmaster, Goal::GuildJoined, 1);
         self.queue_guild_save(Some(guildmaster))
             .map_err(|_| GuildError::Storage)
     }
@@ -351,6 +519,7 @@ impl SoloLevelingState {
         let mut guilds = self.guilds.lock();
         guilds.add_recruit(inviter, recruit)?;
         drop(guilds);
+        self.record_goal(recruit, Goal::GuildJoined, 1);
         self.queue_guild_save(Some(inviter))
             .map_err(|_| GuildError::Storage)
     }
@@ -457,16 +626,91 @@ impl SoloLevelingState {
         self.guilds.lock().guild_of(player).cloned()
     }
 
+    /// Opens the hunter's next Demon Castle floor next to them, paid by a
+    /// castle key or by today's free entry; returns the floor.
+    pub fn request_castle_floor(&self, uuid: Uuid, keyed: bool) -> Result<u32, &'static str> {
+        let now = merchant::unix_now();
+        let progress = self
+            .sessions
+            .with_mut(uuid, |session| session.castle)
+            .ok_or("Сессия охотника не найдена.")?;
+        if !keyed && progress.free_entry_in(now) > 0 {
+            return Err("Бесплатный вход ещё не восстановился: нужен ключ Замка демонов.");
+        }
+        let floor = progress.next_floor.max(1);
+        // The runtime lock is never taken inside a session closure: the
+        // runtime itself reads sessions while it holds its lock.
+        if !self.dungeon_runtime.lock().request_key_gate(
+            uuid,
+            castle::rank_for_floor(floor),
+            Some(floor),
+        ) {
+            return Err("Врата по предыдущему ключу ещё открываются.");
+        }
+        self.sessions.with_mut(uuid, |session| {
+            session.castle.enter();
+            if !keyed {
+                session.castle.free_at = now;
+            }
+        });
+        if let Err(error) = self.save_session(uuid) {
+            log::warn!("sololeveling: could not save castle entry of {uuid}: {error}");
+        }
+        Ok(floor)
+    }
+
+    /// Records a cleared castle floor for every survivor and the weekly ranking.
+    pub fn record_castle_clear(&self, survivors: &[(Uuid, String)], floor: u32) {
+        let week = castle::week_of(daily::today());
+        for (uuid, name) in survivors {
+            let won = CASTLE_FLOOR_WON * u64::from(floor);
+            self.credit_won(*uuid, won);
+            self.notify(*uuid, &format!("Замок демонов, этаж {floor}: +{won} Won."));
+            self.sessions
+                .with_mut(*uuid, |session| session.castle.clear(floor));
+            if let Err(error) = self.save_session(*uuid) {
+                log::warn!("sololeveling: could not save castle progress of {uuid}: {error}");
+            }
+            let mut ranking = self.castle_ranking.lock();
+            ranking.ranking.record(week, *uuid, name, floor);
+            if let Err(error) = ranking.save() {
+                log::warn!("sololeveling: could not save the castle ranking: {error}");
+            }
+        }
+    }
+
+    /// Returns a hunter's climb and this week's ranking.
+    pub fn castle_view(
+        &self,
+        uuid: Uuid,
+    ) -> Option<(castle::CastleProgress, Vec<castle::RankingEntry>)> {
+        let progress = self.sessions.with_mut(uuid, |session| session.castle)?;
+        let week = castle::week_of(daily::today());
+        Some((
+            progress,
+            self.castle_ranking.lock().ranking.top(week).to_vec(),
+        ))
+    }
+
+    /// Asks for a gate of `rank` next to a hunter who used a dungeon key;
+    /// `false` while the hunter's previous key gate is still being placed.
+    pub fn request_key_gate(&self, player_uuid: Uuid, rank: HunterRank) -> bool {
+        self.dungeon_runtime
+            .lock()
+            .request_key_gate(player_uuid, rank, None)
+    }
+
     /// Asks for a prototype gate next to a hunter who just joined.
     pub fn request_test_gate(&self, player_uuid: Uuid) {
         self.dungeon_runtime.lock().request_test_gate(player_uuid);
     }
 
-    /// Returns today's shop of a hunter, rolling and saving it on first look.
+    /// Returns the current shop, rolling and saving it on first look.
     pub fn shop_day(&self, uuid: Uuid) -> Option<ShopDay> {
-        let today = daily::today();
+        let window = crate::shop::current_window();
         let (rolled, day) = self.sessions.with_mut(uuid, |session| {
-            (session.shop.roll_over(today), session.shop)
+            let rolled = !session.economic_busy && session.shop.roll_over(window);
+            (rolled, session.shop)
         })?;
         if rolled && let Err(error) = self.save_session(uuid) {
             log::warn!("sololeveling: failed to persist the shop slots of {uuid}: {error}");
@@ -488,6 +732,11 @@ impl SoloLevelingState {
     ) -> bool {
         let mut runtime = self.dungeon_runtime.lock();
         let was_dungeon_mob = runtime.is_active_dungeon_mob(world, entity_id);
+        let materials = hunter.and_then(|hunter| {
+            runtime
+                .material_source(world, entity_id, hunter)
+                .map(|(class, rank)| (hunter, class, rank))
+        });
         let reward = hunter.and_then(|hunter| {
             runtime
                 .ordinary_mob_rank(world, entity_id, hunter)
@@ -500,6 +749,30 @@ impl SoloLevelingState {
         drop(runtime);
         if let Some((hunter, rank)) = reward {
             self.credit_dungeon_mob(hunter, rank);
+        }
+        if let Some((hunter, rank)) = reward {
+            self.record_goal(hunter, Goal::MobKill, 1);
+            if rand::random_range(0..100) < pouch::MOB_POUCH_PERCENT {
+                self.queue_system_loot(hunter, pouch::stack(pouch::mob_amount(rank)));
+            }
+        }
+        // Materials go to the credited hunter only, like the mob reward.
+        if let Some((hunter, class, rank)) = materials {
+            if !matches!(class, MobClass::Warrior | MobClass::Guard) {
+                self.record_goal(hunter, Goal::EliteKill, 1);
+            }
+            let stacks = material::roll_mob(class, rank, || rand::random_range(0..100));
+            let count: u32 = stacks
+                .iter()
+                .map(|stack| u32::try_from(stack.count).unwrap_or(0))
+                .sum();
+            for stack in stacks {
+                self.queue_system_loot(hunter, stack);
+            }
+            self.record_goal(hunter, Goal::Material, count);
+            for _ in 0..count {
+                self.record_organization_event(vec![hunter], Event::Material(rank));
+            }
         }
         was_dungeon_mob
     }
@@ -520,6 +793,7 @@ impl SoloLevelingState {
             }
             Some(session.shadows.arise(entity.clone()).name.clone())
         })??;
+        self.record_goal(player_uuid, Goal::ShadowRaise, 1);
         if let Err(error) = self.save_session(player_uuid) {
             log::warn!(
                 "sololeveling: failed to persist summoned shadow for {player_uuid}: {error}"
@@ -660,10 +934,16 @@ impl SoloLevelingState {
     }
 
     /// Defers one enchantment chosen in the item maker menu.
-    pub fn defer_enchantment(&self, uuid: Uuid, enchantment: Enchantment, target: EnchantTarget) {
+    pub fn defer_enchantment(
+        &self,
+        uuid: Uuid,
+        enchantment: Enchantment,
+        target: EnchantTarget,
+        completion: Arc<SyncMutex<Option<EnchantTarget>>>,
+    ) {
         self.enchant_actions
             .lock()
-            .insert(uuid, EnchantAction::Apply(enchantment, target));
+            .insert(uuid, EnchantAction::Apply(enchantment, target, completion));
     }
 
     /// Takes a pending item maker action.
@@ -679,6 +959,60 @@ impl SoloLevelingState {
     /// Takes a pending equipment menu request.
     pub fn take_gear_menu(&self, uuid: Uuid) -> bool {
         self.gear_menus.lock().remove(&uuid)
+    }
+
+    /// Defers the auction item picker until its callback releases the inventory.
+    pub fn defer_auction_sell_menu(&self, uuid: Uuid) {
+        self.auction_sell_menus.lock().insert(uuid);
+    }
+
+    /// Defers the merchant buyback until its callback releases the inventory.
+    pub fn defer_buyback_menu(&self, uuid: Uuid) {
+        self.buyback_menus.lock().insert(uuid);
+    }
+
+    /// Takes a pending merchant buyback request.
+    pub fn take_buyback_menu(&self, uuid: Uuid) -> bool {
+        self.buyback_menus.lock().remove(&uuid)
+    }
+
+    /// Takes a pending auction item picker request.
+    pub fn take_auction_sell_menu(&self, uuid: Uuid) -> bool {
+        self.auction_sell_menus.lock().remove(&uuid)
+    }
+
+    /// Defers reopening the System deferred-inventory menu until its callback releases locks.
+    pub fn defer_deferred_menu_open(&self, uuid: Uuid, page: usize) {
+        self.deferred_menus.lock().insert(uuid, page);
+    }
+
+    /// Takes a pending deferred-inventory menu request.
+    pub fn take_deferred_menu(&self, uuid: Uuid) -> Option<usize> {
+        self.deferred_menus.lock().remove(&uuid)
+    }
+
+    /// Returns committed gates for a menu, or `None` while persistence blocks access.
+    pub fn active_gates(&self) -> Option<Vec<Gate>> {
+        let runtime = self.dungeon_runtime.lock();
+        (!runtime.gate_persistence_blocks_actions()).then(|| runtime.committed_gates())
+    }
+
+    /// Returns one committed, still active gate.
+    pub fn committed_gate(&self, id: u64) -> Option<Gate> {
+        let runtime = self.dungeon_runtime.lock();
+        (!runtime.gate_persistence_blocks_actions())
+            .then(|| runtime.committed_gate(id).cloned())
+            .flatten()
+    }
+
+    /// Defers a gate menu operation until after the current menu callback returns.
+    pub fn defer_gate_menu_action(&self, uuid: Uuid, action: GateMenuAction) {
+        self.gate_menu_actions.lock().insert(uuid, action);
+    }
+
+    /// Takes one pending gate menu action.
+    pub fn take_gate_menu_action(&self, uuid: Uuid) -> Option<GateMenuAction> {
+        self.gate_menu_actions.lock().remove(&uuid)
     }
 
     /// Takes a pending menu-triggered crystal sale request.
@@ -706,13 +1040,6 @@ impl SoloLevelingState {
         }
     }
 
-    /// Captures tracked dungeon drops for deferred contribution-based delivery.
-    pub fn capture_raid_loot(&self, world: &World, entity_id: i32, drops: &mut Vec<ItemStack>) {
-        self.dungeon_runtime
-            .lock()
-            .capture_raid_loot(world, entity_id, drops);
-    }
-
     /// Retains a nearby dungeon mob killed directly by a hunter.
     pub fn arise_from_player_kill(
         &self,
@@ -726,6 +1053,7 @@ impl SoloLevelingState {
             .with_mut(hunter.gameprofile.id(), |session| {
                 ShadowRuntime::arise_from_player_kill(hunter, world, entity, label, session)
             })??;
+        self.record_goal(hunter.gameprofile.id(), Goal::ShadowRaise, 1);
         if let Err(error) = self.save_session(hunter.gameprofile.id()) {
             log::warn!(
                 "sololeveling: failed to persist arisen shadow for {}: {error}",
@@ -937,13 +1265,18 @@ mod tests {
 
     use super::{SoloLevelingPlayerData, SoloLevelingState};
     use crate::abilities::AbilityCooldowns;
+    use crate::castle::CastleProgress;
     use crate::class::ClassChoice;
     use crate::economy::{SystemPoints, Won};
     use crate::gear::SavedGear;
+    use crate::merchant::MerchantRecord;
     use crate::organization::OrganizationBook;
     use crate::quest::SystemQuest;
+    use crate::quest_book::QuestBook;
     use crate::shadow::ShadowRoster;
     use crate::shop::ShopDay;
+    use crate::spell::SpellBook;
+    use crate::starter::StarterKit;
     use crate::stats::{HunterStat, HunterStats};
 
     #[test]
@@ -968,6 +1301,12 @@ mod tests {
                 cooldowns: AbilityCooldowns::default(),
                 class: ClassChoice::default(),
                 gear: SavedGear::default(),
+                deferred_inventory: Vec::new(),
+                starter: StarterKit::default(),
+                merchant: MerchantRecord::default(),
+                castle: CastleProgress::default(),
+                spells: SpellBook::default(),
+                quests: QuestBook::default(),
             },
         );
 

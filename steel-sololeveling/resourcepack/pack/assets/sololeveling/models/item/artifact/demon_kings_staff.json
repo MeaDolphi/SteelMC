@@ -1,0 +1,6 @@
+{
+  "parent": "minecraft:item/handheld",
+  "textures": {
+    "layer0": "sololeveling:item/artifact/demon_kings_staff"
+  }
+}

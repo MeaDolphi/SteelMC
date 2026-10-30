@@ -1,0 +1,6 @@
+{
+  "parent": "minecraft:item/generated",
+  "textures": {
+    "layer0": "sololeveling:item/artifact/trackers_leggings"
+  }
+}

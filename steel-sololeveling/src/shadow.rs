@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use steel_utils::Identifier;
 use uuid::Uuid;
 
+use crate::dungeon::generator::THEMES;
+use crate::dungeon::mobs::{MobClass, creature_name};
+
 /// Highest level a retained shadow can reach.
 pub const MAX_SHADOW_LEVEL: u16 = 100;
 /// Maximum distance from a player kill at which its soul can be retained.
@@ -77,6 +80,9 @@ pub struct ShadowOrigin {
     /// Whether the source mob's role draws hostile aggro when summoned.
     #[serde(default)]
     pub is_tank: bool,
+    /// Whether the source mob was a broodmother.
+    #[serde(default)]
+    pub is_broodmother: Option<bool>,
 }
 
 impl ShadowOrigin {
@@ -212,9 +218,40 @@ impl Shadow {
 
 /// The persisted roster owned by one hunter.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredShadowRoster")]
 pub struct ShadowRoster {
     /// Shadows in roster order.
     pub shadows: Vec<Shadow>,
+}
+
+#[derive(Deserialize)]
+struct StoredShadowRoster {
+    shadows: Vec<Shadow>,
+}
+
+impl From<StoredShadowRoster> for ShadowRoster {
+    fn from(stored: StoredShadowRoster) -> Self {
+        let mut shadows = stored.shadows;
+        for shadow in &mut shadows {
+            let Some(origin) = &mut shadow.origin else {
+                continue;
+            };
+            if origin.is_broodmother.is_some() {
+                continue;
+            }
+            let is_broodmother = shadow.entity_type == Identifier::vanilla_static("zombie")
+                && THEMES.iter().any(|theme| {
+                    origin.title
+                        == format!(
+                            "{} {}",
+                            creature_name(*theme),
+                            MobClass::Broodmother.display_name()
+                        )
+                });
+            origin.is_broodmother = Some(is_broodmother);
+        }
+        Self { shadows }
+    }
 }
 
 impl ShadowRoster {
@@ -339,6 +376,7 @@ mod tests {
             armor: 0,
             equipment: Vec::new(),
             is_tank: true,
+            is_broodmother: Some(false),
         };
         let mut roster = ShadowRoster::default();
         let first = roster
@@ -361,5 +399,50 @@ mod tests {
                 .as_ref()
                 .is_some_and(|origin| origin.is_tank)
         );
+    }
+
+    #[test]
+    fn legacy_broodmother_detection_requires_exact_zombie_origin_and_is_saved() {
+        let origin = ShadowOrigin {
+            title: "Упырь Матка роя".to_owned(),
+            max_health: 20,
+            attack_damage: 2,
+            movement_speed: 1,
+            armor: 0,
+            equipment: Vec::new(),
+            is_tank: false,
+            is_broodmother: None,
+        };
+        let mut roster = ShadowRoster::default();
+        roster.arise_from(Identifier::vanilla_static("zombie"), Some(origin.clone()));
+        roster.arise_from(Identifier::vanilla_static("skeleton"), Some(origin.clone()));
+        let mut misleading = origin.clone();
+        misleading.title = "Другой Упырь Матка роя".to_owned();
+        roster.arise_from(Identifier::vanilla_static("zombie"), Some(misleading));
+        let mut explicit = origin;
+        explicit.is_broodmother = Some(false);
+        roster.arise_from(Identifier::vanilla_static("zombie"), Some(explicit));
+
+        let mut data = serde_json::to_value(&roster).expect("serialize roster");
+        for shadow in data["shadows"]
+            .as_array_mut()
+            .expect("shadows")
+            .iter_mut()
+            .take(3)
+        {
+            shadow["origin"]
+                .as_object_mut()
+                .expect("origin")
+                .remove("is_broodmother");
+        }
+        let restored: ShadowRoster = serde_json::from_value(data).expect("legacy roster");
+        let flags: Vec<_> = restored
+            .shadows
+            .iter()
+            .map(|shadow| shadow.origin.as_ref().expect("origin").is_broodmother)
+            .collect();
+        assert_eq!(flags, [Some(true), Some(false), Some(false), Some(false)]);
+        let persisted = serde_json::to_value(&restored).expect("save migrated roster");
+        assert_eq!(persisted["shadows"][0]["origin"]["is_broodmother"], true);
     }
 }

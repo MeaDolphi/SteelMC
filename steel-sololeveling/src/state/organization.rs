@@ -76,7 +76,7 @@ impl Boards {
 }
 
 /// What the board shows one hunter.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoardView {
     /// The hunter's own rank.
     pub rank: HunterRank,
@@ -90,10 +90,12 @@ pub struct BoardView {
     pub leader: bool,
     /// The hunter's guild contracts, if they are in a guild.
     pub guild: Option<GuildView>,
+    /// Whether the free Association starter kit is still unclaimed.
+    pub starter_claimable: bool,
 }
 
 /// What the board shows about the hunter's guild.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuildView {
     /// Highest contract rank the guild may take.
     pub rank: HunterRank,
@@ -164,15 +166,20 @@ impl SoloLevelingState {
     /// Captures what the board shows `uuid`.
     pub fn organization_view(&self, uuid: Uuid) -> Option<BoardView> {
         let today = daily::today();
-        let (rank, book) = self.sessions.with_mut(uuid, |session| {
+        let (rank, book, starter_claimable) = self.sessions.with_mut(uuid, |session| {
             session.organization.roll_over(today);
-            (session.stats.rank(), session.organization.clone())
+            (
+                session.stats.rank(),
+                session.organization.clone(),
+                session.starter.claimable(),
+            )
         })?;
         let party = self.party_of(uuid);
         Some(BoardView {
             rank,
             book,
             today,
+            starter_claimable,
             leader: party.as_ref().is_some_and(|party| party.leader() == uuid),
             group: party.map_or_else(Vec::new, |party| party.contracts().to_vec()),
             guild: self.guilds.lock().guild_of(uuid).map(|guild| {
@@ -212,7 +219,7 @@ impl SoloLevelingState {
             .map_err(|_| OrganizationError::Storage)
     }
 
-    /// Cancels a guild contract; the day's allowance stays spent.
+    /// Cancels a guild contract, restoring today's allowance if applicable.
     pub fn cancel_guild_contract(
         &self,
         actor: Uuid,
@@ -223,7 +230,7 @@ impl SoloLevelingState {
         let mut guilds = self.guilds.lock();
         let contract = officer_guild(&mut guilds, actor)?
             .organization
-            .cancel(index)?;
+            .cancel(index, daily::today())?;
         drop(guilds);
         self.queue_guild_save(Some(actor))
             .map_err(|_| OrganizationError::Storage)?;
@@ -329,6 +336,9 @@ impl SoloLevelingState {
         let today = daily::today();
         self.sessions
             .with_mut(uuid, |session| {
+                if session.economic_busy {
+                    return Err(OrganizationError::Storage);
+                }
                 let rank = session.stats.rank();
                 session.organization.accept(template, rank, today)
             })
@@ -337,7 +347,7 @@ impl SoloLevelingState {
         Ok(())
     }
 
-    /// Cancels a personal contract without restoring today's allowance.
+    /// Cancels a personal contract, restoring today's allowance if applicable.
     pub fn cancel_personal_contract(
         &self,
         uuid: Uuid,
@@ -345,7 +355,12 @@ impl SoloLevelingState {
     ) -> Result<Contract, OrganizationError> {
         let contract = self
             .sessions
-            .with_mut(uuid, |session| session.organization.cancel(index))
+            .with_mut(uuid, |session| {
+                if session.economic_busy {
+                    return Err(OrganizationError::Storage);
+                }
+                session.organization.cancel(index, daily::today())
+            })
             .ok_or(OrganizationError::NoSession)??;
         self.queue_organization_save(uuid);
         Ok(contract)
@@ -396,7 +411,7 @@ impl SoloLevelingState {
             });
         }
         party.contracts.push(GroupContract {
-            contract: Contract::new(template),
+            contract: Contract::accepted(template, 1, today),
             participants: members.clone(),
             pending_turn_in: false,
         });
@@ -421,7 +436,18 @@ impl SoloLevelingState {
         if party.contracts[index].pending_turn_in {
             return Err(OrganizationError::Storage);
         }
-        Ok(party.contracts.remove(index).contract)
+        let group = party.contracts.remove(index);
+        drop(parties);
+        let today = daily::today();
+        for participant in group.participants {
+            self.sessions.with_mut(participant, |session| {
+                session
+                    .organization
+                    .release_cancelled(group.contract, today);
+            });
+            self.queue_organization_save(participant);
+        }
+        Ok(group.contract)
     }
 
     /// Queues an event that personal and group contracts may count.
@@ -635,6 +661,23 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_group_contract_releases_each_participants_allowance() {
+        let (state, directory) = state();
+        let leader = hunter(&state, 1);
+        let member = hunter(&state, 1);
+        party(&state, leader, &[member]);
+        state.accept_group_contract(leader, BOSS_E).expect("accept");
+        state.cancel_group_contract(leader, 0).expect("cancel");
+        state
+            .accept_personal_contract(member, BOSS_E)
+            .expect("member retakes");
+        state
+            .accept_personal_contract(leader, BOSS_E)
+            .expect("leader retakes");
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
     fn a_shared_event_counts_once_and_leavers_forfeit_their_share() {
         let (state, directory) = state();
         let leader = hunter(&state, 1);
@@ -690,7 +733,7 @@ mod tests {
             state.turn_in_personal_contract(uuid, 0),
             Err(OrganizationError::NotComplete)
         );
-        state.record_organization_event(vec![uuid], Event::Boss);
+        state.record_organization_event(vec![uuid], Event::Boss(HunterRank::E));
         assert_eq!(state.apply_organization_events().len(), 1);
         let queued = state
             .turn_in_personal_contract(uuid, 0)
@@ -744,14 +787,14 @@ mod tests {
             vec![recruit],
             vec![recruit],
         ] {
-            state.record_organization_event(hunters, Event::Boss);
+            state.record_organization_event(hunters, Event::Boss(HunterRank::E));
         }
         state.apply_organization_events();
         assert_eq!(
             state.turn_in_guild_contract(officer, 0),
             Err(OrganizationError::NotComplete)
         );
-        state.record_organization_event(vec![recruit], Event::Boss);
+        state.record_organization_event(vec![recruit], Event::Boss(HunterRank::E));
         state.apply_organization_events();
 
         // The recruit goes offline before the officer turns the contract in.

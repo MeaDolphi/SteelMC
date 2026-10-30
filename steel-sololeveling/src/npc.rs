@@ -18,6 +18,7 @@ use text_components::format::Color;
 use text_components::{Modifier as _, TextComponent};
 
 use crate::city;
+use crate::island;
 
 /// Ticks between checks that every post has its character.
 const CHECK_INTERVAL_TICKS: u64 = 100;
@@ -32,37 +33,78 @@ const SPAWN_DISTANCE: f64 = 48.0;
 pub enum NpcRole {
     /// Hands out and accepts Organization contracts.
     OrganizationAgent,
+    /// Hands out the Association starter kit.
+    AssociationClerk,
+    /// Runs the city merchant's showcases and crafting orders.
+    Merchant,
+    /// Sends hunters to the infested island.
+    IslandDispatcher,
+    /// Brings hunters back from the island to the city.
+    IslandEvacuation,
 }
 
 struct Post {
     role: NpcRole,
+    /// World the character stands in.
+    world: fn(&World) -> bool,
     position: DVec3,
     yaw: f32,
     name: &'static str,
     description: &'static str,
 }
 
-const POSTS: [Post; 1] = [Post {
-    role: NpcRole::OrganizationAgent,
-    position: city::ORGANIZATION_AGENT_POS,
-    yaw: city::ORGANIZATION_AGENT_YAW,
-    name: "Агент Организации",
-    description: "Контракты для охотников",
-}];
+const POSTS: [Post; 5] = [
+    Post {
+        world: city::is_city_world,
+        role: NpcRole::OrganizationAgent,
+        position: city::ORGANIZATION_AGENT_POS,
+        yaw: city::FACING_DOOR_YAW,
+        name: "Агент Организации",
+        description: "Контракты для охотников",
+    },
+    Post {
+        world: city::is_city_world,
+        role: NpcRole::AssociationClerk,
+        position: city::ASSOCIATION_CLERK_POS,
+        yaw: city::FACING_EAST_YAW,
+        name: "Служащий Ассоциации",
+        description: "Стартовый набор охотника",
+    },
+    Post {
+        world: city::is_city_world,
+        role: NpcRole::Merchant,
+        position: city::MERCHANT_POS,
+        yaw: city::FACING_DOOR_YAW,
+        name: "Городской торговец",
+        description: "Снаряжение и заказы",
+    },
+    Post {
+        world: city::is_city_world,
+        role: NpcRole::IslandDispatcher,
+        position: city::ISLAND_DISPATCHER_POS,
+        yaw: 0.0,
+        name: "Диспетчер острова",
+        description: "Зачистка острова, с ранга C",
+    },
+    Post {
+        world: island::is_island_world,
+        role: NpcRole::IslandEvacuation,
+        position: island::EVACUATION_POS,
+        yaw: 180.0,
+        name: "Эвакуация",
+        description: "Вернуться в город",
+    },
+];
 
 /// Makes sure every city post has its character.
 pub fn tick(server: &Arc<Server>, tick: u64) {
     if !tick.is_multiple_of(CHECK_INTERVAL_TICKS) {
         return;
     }
-    let Some(world) = server
-        .worlds
-        .values()
-        .find(|world| city::is_city_world(world))
-    else {
-        return;
-    };
     for post in &POSTS {
+        let Some(world) = server.worlds.values().find(|world| (post.world)(world)) else {
+            continue;
+        };
         let standing = characters_at(world, post);
         if let Some((first, extra)) = standing.split_first() {
             // A post holds one character; extras come from an older save.
@@ -81,12 +123,14 @@ pub fn tick(server: &Arc<Server>, tick: u64) {
 /// Returns the role of `target` when it is one of the city characters.
 #[must_use]
 pub fn role_of(world: &World, target: &dyn Entity) -> Option<NpcRole> {
-    if !city::is_city_world(world) || target.entity_type() != &vanilla_entities::MANNEQUIN {
+    if target.entity_type() != &vanilla_entities::MANNEQUIN {
         return None;
     }
     POSTS
         .iter()
-        .find(|post| target.position().distance(post.position) <= POST_RADIUS)
+        .find(|post| {
+            (post.world)(world) && target.position().distance(post.position) <= POST_RADIUS
+        })
         .map(|post| post.role)
 }
 

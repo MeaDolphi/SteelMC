@@ -4,10 +4,21 @@
 //! queued snapshot cannot undo a payment that completed in the meantime.
 
 mod account;
+mod buyback;
+mod crafting;
+mod deferred;
 mod enchant;
 mod gear;
+mod merchant;
+mod starter;
 use account::load_account;
 pub(crate) use account::{AccountUpdate, CommitReport, PreparedCommit};
+use deferred::DeferredTransfer;
+pub use starter::StarterError;
+use starter::StarterTransfer;
+
+use crate::item::artifact::ArtifactId;
+use crate::merchant::MerchantOffer;
 
 use std::{
     collections::VecDeque,
@@ -33,7 +44,7 @@ use super::organization::GroupPayout;
 use super::{EnchantTarget, SoloLevelingState};
 use crate::{
     combat_reward::HunterReward,
-    daily,
+    dungeon::{GateRegistrySnapshot, GateRegistryWrite},
     economy::PaymentError,
     gear::GearTransfer,
     guild::{GuildError, GuildRegistry},
@@ -41,14 +52,20 @@ use crate::{
     item::enchantment::Enchantment,
     organization::{Contract, GroupContract, OrganizationError},
     player_data::SoloLevelingPlayerData,
+    quest_book::Goal,
     rank::HunterRank,
     shop::{Offer, ShopError},
     shop_menu::ShopMenuKind,
     sound::SystemSound,
 };
+use steel_utils::locks::SyncMutex;
 
 const fn guild_document_key() -> Identifier {
     Identifier::new_static("sololeveling", "guilds/registry")
+}
+
+const fn gate_registry_document_key() -> Identifier {
+    Identifier::new_static("sololeveling", "gates/registry")
 }
 
 #[derive(Debug)]
@@ -77,6 +94,7 @@ enum Request {
         uuid: Uuid,
         slot: usize,
         offer: Offer,
+        shop: crate::shop::ShopDay,
         from_menu: bool,
     },
     ShopRefresh {
@@ -93,15 +111,38 @@ enum Request {
     CrystalSale {
         uuid: Uuid,
     },
+    Buyback {
+        uuid: Uuid,
+        slot: usize,
+        seen: ItemStack,
+    },
     Enchant {
         uuid: Uuid,
         enchantment: Enchantment,
         target: EnchantTarget,
+        completion: Arc<SyncMutex<Option<EnchantTarget>>>,
     },
     Gear {
         uuid: Uuid,
         transfer: GearTransfer,
     },
+    Deferred {
+        uuid: Uuid,
+        transfer: DeferredTransfer,
+    },
+    Starter {
+        uuid: Uuid,
+        transfer: StarterTransfer,
+    },
+    Merchant {
+        uuid: Uuid,
+        offer: MerchantOffer,
+    },
+    Crafting {
+        uuid: Uuid,
+        output: ArtifactId,
+    },
+    GateRegistry(GateRegistryWrite),
     Auction(AuctionRequest),
     AuctionDeliver {
         hunter: Uuid,
@@ -133,6 +174,7 @@ pub(super) struct Persistence {
     document_expected: FxHashMap<Identifier, Option<Vec<u8>>>,
     guild_document_failed: bool,
     guild_transaction_pending: bool,
+    gate_document_failed: bool,
     busy: bool,
     quiescing: bool,
 }
@@ -201,6 +243,43 @@ impl SoloLevelingState {
             self.queue_guild_save(None)
                 .map_err(|error| format!("failed to queue guild import: {error}"))?;
         }
+        Ok(())
+    }
+
+    /// Loads the durable active-gate registry before the first gameplay tick.
+    pub async fn load_gate_registry(&self, server: &Server) -> Result<(), String> {
+        let key = gate_registry_document_key();
+        let bytes = server
+            .player_data_storage
+            .load_extension(&key)
+            .await
+            .map_err(|error| format!("failed to load gate registry: {error}"))?;
+        let snapshot = bytes
+            .as_deref()
+            .map(serde_json::from_slice::<GateRegistrySnapshot>)
+            .transpose()
+            .map_err(|error| format!("failed to decode gate registry: {error}"))?
+            .unwrap_or_default();
+        self.dungeon_runtime
+            .lock()
+            .restore_gate_registry(snapshot)
+            .map_err(|error| format!("failed to restore gate registry: {error}"))?;
+        self.persistence.lock().document_expected.insert(key, bytes);
+        Ok(())
+    }
+
+    /// Queues a changed gate registry without waiting on disk during a game tick.
+    pub(crate) fn queue_gate_registry_snapshot(
+        &self,
+        snapshot: GateRegistryWrite,
+    ) -> io::Result<()> {
+        let mut persistence = self.persistence.lock();
+        if persistence.quiescing || persistence.gate_document_failed {
+            return Err(io::Error::other("gate registry storage is unavailable"));
+        }
+        persistence
+            .requests
+            .push_back(Request::GateRegistry(snapshot));
         Ok(())
     }
 
@@ -318,7 +397,7 @@ impl SoloLevelingState {
             self.release_shop_purchase(uuid);
             return;
         };
-        snapshot.shop.refresh(daily::today());
+        snapshot.shop.refresh(crate::shop::current_window());
         let shop = snapshot.shop;
         let prepared = PreparedCommit::prepare(
             self,
@@ -362,6 +441,7 @@ impl SoloLevelingState {
         uuid: Uuid,
         slot: usize,
         offer: Offer,
+        shop: crate::shop::ShopDay,
         from_menu: bool,
     ) -> bool {
         if player.connection.closed() {
@@ -382,8 +462,10 @@ impl SoloLevelingState {
         };
         let snapshot = self.sessions.with_mut(uuid, |session| {
             let mut snapshot = session.saved_data(uuid);
-            snapshot.shop.roll_over(daily::today());
-            if snapshot.shop.offer(slot) != Some(offer) || snapshot.shop.bought(slot) {
+            if !snapshot
+                .shop
+                .permits_purchase(shop, crate::shop::current_window(), slot, offer)
+            {
                 return Err("Этот слот магазина уже недоступен.");
             }
             if !snapshot.system_points.debit(offer.price) {
@@ -594,6 +676,7 @@ impl SoloLevelingState {
                         "Организация авантюристов купила {} кристалл(ов) за {} Won.",
                         sale.count, sale.total
                     )));
+                    state.record_goal(uuid, Goal::CrystalSale, 1);
                 } else {
                     log::error!("sololeveling: crystal sale transaction failed: {result:?}");
                     state
@@ -652,7 +735,6 @@ impl SoloLevelingState {
             return;
         }
         let balance = snapshot.won;
-        let book = snapshot.organization.clone();
         let state_server = Arc::clone(server);
         self.submit_commit(
             server,
@@ -661,7 +743,11 @@ impl SoloLevelingState {
                 vec![snapshot],
                 vec![
                     AccountUpdate::Won { uuid, balance },
-                    AccountUpdate::Organization { uuid, book },
+                    AccountUpdate::Organization {
+                        uuid,
+                        index,
+                        contract,
+                    },
                 ],
             ),
             move |state, report| {
@@ -669,6 +755,8 @@ impl SoloLevelingState {
                     state
                         .sessions
                         .with_mut(uuid, |session| session.economic_busy = false);
+                } else if let Err(error) = state.save_session(uuid) {
+                    log::warn!("sololeveling: failed to persist concurrent contract changes for {uuid}: {error}");
                 }
                 if let Some(player) = state_server
                     .get_players()
@@ -819,16 +907,21 @@ impl SoloLevelingState {
         player: &Player,
         slot: usize,
         from_menu: bool,
+        displayed: Option<crate::shop::ShopDay>,
     ) -> Result<Offer, ShopError> {
         let uuid = player.gameprofile.id();
-        let today = daily::today();
-        let offer = self
+        self.shop_day(uuid).ok_or(ShopError::NoSession)?;
+        let (offer, shop) = self
             .sessions
             .with_mut(uuid, |session| {
                 if session.economic_busy {
                     return Err(ShopError::Busy);
                 }
-                session.shop.roll_over(today);
+                if session.shop.day != crate::shop::current_window()
+                    || displayed.is_some_and(|view| view != session.shop)
+                {
+                    return Err(ShopError::Stale);
+                }
                 let offer = session.shop.offer(slot).ok_or(ShopError::UnknownSlot)?;
                 if session.shop.bought(slot) {
                     return Err(ShopError::AlreadyBought);
@@ -837,7 +930,7 @@ impl SoloLevelingState {
                     return Err(ShopError::InsufficientPoints);
                 }
                 session.economic_busy = true;
-                Ok(offer)
+                Ok((offer, session.shop))
             })
             .ok_or(ShopError::NoSession)??;
 
@@ -852,6 +945,7 @@ impl SoloLevelingState {
             uuid,
             slot,
             offer,
+            shop,
             from_menu,
         });
         Ok(offer)
@@ -1091,6 +1185,13 @@ impl SoloLevelingState {
         Ok(())
     }
 
+    /// Queues experience and system points for one hunter.
+    pub(super) fn award(&self, uuid: Uuid, reward: HunterReward) {
+        self.persistence.lock().requests.push_back(Request::Award {
+            rewards: vec![(uuid, reward)],
+        });
+    }
+
     /// Reward sources enqueue Won mutations in the same lane as payments.
     pub fn credit_won(&self, uuid: Uuid, amount: u64) {
         self.persistence
@@ -1102,7 +1203,10 @@ impl SoloLevelingState {
     /// Awards only the qualifying killer/owner, never the rest of the party.
     pub fn credit_dungeon_mob(&self, uuid: Uuid, rank: HunterRank) {
         self.persistence.lock().requests.push_back(Request::Award {
-            rewards: vec![(uuid, HunterReward::for_mob(rank))],
+            rewards: vec![(
+                uuid,
+                self.enchanted_reward(uuid, HunterReward::for_mob(rank)),
+            )],
         });
     }
 
@@ -1144,9 +1248,15 @@ impl SoloLevelingState {
         if rewards.is_empty() {
             return;
         }
-        self.persistence.lock().requests.push_back(Request::Award {
-            rewards: survivors.into_iter().zip(rewards).collect(),
-        });
+        let rewards = survivors
+            .into_iter()
+            .zip(rewards)
+            .map(|(uuid, reward)| (uuid, self.enchanted_reward(uuid, reward)))
+            .collect();
+        self.persistence
+            .lock()
+            .requests
+            .push_back(Request::Award { rewards });
     }
 
     /// Starts at most one I/O operation without awaiting it on the game tick.
@@ -1304,6 +1414,7 @@ impl SoloLevelingState {
                 uuid,
                 slot,
                 offer,
+                shop,
                 from_menu,
             } => {
                 let Some(player) = server
@@ -1314,7 +1425,7 @@ impl SoloLevelingState {
                     self.release_shop_purchase(uuid);
                     return;
                 };
-                if !self.begin_shop_purchase(server, player, uuid, slot, offer, from_menu) {
+                if !self.begin_shop_purchase(server, player, uuid, slot, offer, shop, from_menu) {
                     self.persistence.lock().busy = false;
                 }
             }
@@ -1334,10 +1445,24 @@ impl SoloLevelingState {
                     self.persistence.lock().busy = false;
                 }
             }
+            Request::Buyback { uuid, slot, seen } => {
+                let Some(player) = server
+                    .get_players()
+                    .into_iter()
+                    .find(|player| player.gameprofile.id() == uuid)
+                else {
+                    self.release_shop_purchase(uuid);
+                    return;
+                };
+                if !self.begin_buyback(server, player, uuid, slot, &seen) {
+                    self.persistence.lock().busy = false;
+                }
+            }
             Request::Enchant {
                 uuid,
                 enchantment,
                 target,
+                completion,
             } => {
                 let Some(player) = server
                     .get_players()
@@ -1347,7 +1472,7 @@ impl SoloLevelingState {
                     self.release_shop_purchase(uuid);
                     return;
                 };
-                if !self.begin_enchantment(server, player, uuid, enchantment, target) {
+                if !self.begin_enchantment(server, player, uuid, enchantment, target, completion) {
                     self.persistence.lock().busy = false;
                 }
             }
@@ -1363,6 +1488,105 @@ impl SoloLevelingState {
                 if !self.begin_gear_transfer(server, player, uuid, transfer) {
                     self.persistence.lock().busy = false;
                 }
+            }
+            Request::Deferred { uuid, transfer } => {
+                let Some(player) = server
+                    .get_players()
+                    .into_iter()
+                    .find(|player| player.gameprofile.id() == uuid)
+                else {
+                    let DeferredTransfer::Deliver(stack) = transfer else {
+                        self.release_shop_purchase(uuid);
+                        return;
+                    };
+                    if !self.begin_offline_deferred_delivery(server, uuid, stack) {
+                        self.persistence.lock().busy = false;
+                    }
+                    return;
+                };
+                if !self.begin_deferred_transfer(server, player, uuid, transfer) {
+                    self.persistence.lock().busy = false;
+                }
+            }
+            Request::Starter { uuid, transfer } => {
+                let Some(player) = server
+                    .get_players()
+                    .into_iter()
+                    .find(|player| player.gameprofile.id() == uuid)
+                else {
+                    self.release_shop_purchase(uuid);
+                    return;
+                };
+                if !self.begin_starter_transfer(server, player, uuid, transfer) {
+                    self.persistence.lock().busy = false;
+                }
+            }
+            Request::Merchant { uuid, offer } => {
+                let Some(player) = server
+                    .get_players()
+                    .into_iter()
+                    .find(|player| player.gameprofile.id() == uuid)
+                else {
+                    self.release_shop_purchase(uuid);
+                    return;
+                };
+                if !self.begin_merchant_purchase(server, player, uuid, offer) {
+                    self.persistence.lock().busy = false;
+                }
+            }
+            Request::Crafting { uuid, output } => {
+                let Some(player) = server
+                    .get_players()
+                    .into_iter()
+                    .find(|player| player.gameprofile.id() == uuid)
+                else {
+                    self.release_shop_purchase(uuid);
+                    return;
+                };
+                if !self.begin_crafting(server, player, uuid, output) {
+                    self.persistence.lock().busy = false;
+                }
+            }
+            Request::GateRegistry(write) => {
+                let replacement = match serde_json::to_vec(&write.snapshot) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        log::error!("sololeveling: could not encode gate registry: {error}");
+                        self.persistence.lock().gate_document_failed = true;
+                        self.persistence.lock().busy = false;
+                        self.dungeon_runtime
+                            .lock()
+                            .fail_gate_persistence(write.revision);
+                        return;
+                    }
+                };
+                let expected = self
+                    .persistence
+                    .lock()
+                    .document_expected
+                    .get(&gate_registry_document_key())
+                    .cloned()
+                    .flatten();
+                let prepared =
+                    PreparedCommit::document(gate_registry_document_key(), expected, replacement);
+                let completion_server = Arc::clone(server);
+                self.submit_commit(server, Ok(prepared), move |state, report| {
+                    if report.committed {
+                        state
+                            .dungeon_runtime
+                            .lock()
+                            .commit_gate_persistence(&completion_server, write.revision);
+                    } else {
+                        log::error!(
+                            "sololeveling: gate registry persistence failed; gate changes are disabled"
+                        );
+                        state.persistence.lock().gate_document_failed = true;
+                        state
+                            .dungeon_runtime
+                            .lock()
+                            .fail_gate_persistence(write.revision);
+                    }
+                });
             }
             Request::TurnInPersonal {
                 uuid,
@@ -1887,6 +2111,9 @@ impl SoloLevelingState {
                 }
                 if persistence.guild_document_failed {
                     return Err("Guild registry storage failed".to_owned());
+                }
+                if persistence.gate_document_failed {
+                    return Err("Gate registry storage failed".to_owned());
                 }
                 persistence.requests.is_empty() && !persistence.busy
             };

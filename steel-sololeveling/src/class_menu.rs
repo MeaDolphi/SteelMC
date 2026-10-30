@@ -2,7 +2,8 @@
 //!
 //! The top row shows the current class and the change rules; the middle row
 //! holds one button per class. A click picks the class at once: the choice
-//! touches only the account, never the inventory the click has locked.
+//! touches only the account, never the inventory the click has locked. A
+//! Mage also gets a button that hands out a lost grimoire on the next tick.
 
 use std::sync::Arc;
 
@@ -18,11 +19,14 @@ use uuid::Uuid;
 
 use crate::class::{self, HunterClass};
 use crate::item::{named, with_lore};
+use crate::rank::HunterRank;
 use crate::state::SoloLevelingState;
 
 const MENU_SLOTS: usize = 27;
 const INFO_SLOT: usize = 4;
-const FIRST_CLASS_SLOT: usize = 10;
+const FIRST_CLASS_SLOT: usize = 11;
+/// Button that hands a Mage a new grimoire.
+const GRIMOIRE_SLOT: usize = 22;
 
 /// Opens the class menu for an online hunter.
 pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
@@ -58,14 +62,29 @@ fn icon(class: HunterClass) -> ItemRef {
         HunterClass::Assassin => &vanilla_items::IRON_HOE,
         HunterClass::Ranger => &vanilla_items::BOW,
         HunterClass::Mage => &vanilla_items::BLAZE_ROD,
-        HunterClass::Healer => &vanilla_items::GOLDEN_APPLE,
     }
 }
 
 fn menu_items(state: &SoloLevelingState, uuid: Uuid) -> Vec<ItemStack> {
     let mut items = vec![ItemStack::empty(); MENU_SLOTS];
     let current = state.class_of(uuid);
-    let first_pick = current.is_none();
+    let (rank, free_change) = state
+        .with_session_mut(uuid, |session| {
+            (session.stats.rank(), session.class.free_change)
+        })
+        .unwrap_or((HunterRank::E, false));
+    let first_pick = current.is_none() || free_change;
+    if current == Some(HunterClass::Mage) {
+        items[GRIMOIRE_SLOT] = with_lore(
+            named(
+                ItemStack::new(&vanilla_items::BOOK),
+                TextComponent::plain("Гримуар Системы").color(Color::LightPurple),
+            ),
+            vec![
+                TextComponent::plain("Клик — получить гримуар, если его нет.").color(Color::Yellow),
+            ],
+        );
+    }
     items[INFO_SLOT] = with_lore(
         named(
             ItemStack::new(&vanilla_items::NETHER_STAR),
@@ -77,7 +96,16 @@ fn menu_items(state: &SoloLevelingState, uuid: Uuid) -> Vec<ItemStack> {
         ),
         vec![
             TextComponent::plain("Выбор доступен с ранга D.").color(Color::Gray),
-            TextComponent::plain("Первый выбор — бесплатно.").color(Color::Gray),
+            TextComponent::plain(if free_change {
+                "Класс Целителя упразднён: следующий выбор бесплатный."
+            } else {
+                "Первый выбор — бесплатно."
+            })
+            .color(if free_change {
+                Color::Green
+            } else {
+                Color::Gray
+            }),
             TextComponent::plain(format!(
                 "Смена — раз в 7 дней за {} Won.",
                 class::CHANGE_PRICE
@@ -106,10 +134,16 @@ fn menu_items(state: &SoloLevelingState, uuid: Uuid) -> Vec<ItemStack> {
                     Color::Aqua
                 }),
             ),
-            vec![
-                TextComponent::plain(class.describe()).color(Color::Gray),
-                TextComponent::plain(action.0).color(action.1),
-            ],
+            class
+                .describe(rank)
+                .into_iter()
+                .map(|line| TextComponent::plain(line).color(Color::Gray))
+                .chain([
+                    TextComponent::plain("Бонусы растут с рангом: на S вдвое.")
+                        .color(Color::DarkGray),
+                    TextComponent::plain(action.0).color(action.1),
+                ])
+                .collect(),
         );
     }
     items
@@ -144,6 +178,12 @@ impl MenuKind for ClassMenuKind {
         if !self.buttons.contains(slot) {
             return ClickOutcome::Fallthrough;
         }
+        if slot - self.buttons.start() == GRIMOIRE_SLOT {
+            if self.state.class_of(player.gameprofile.id()) == Some(HunterClass::Mage) {
+                self.state.request_grimoire(player.gameprofile.id());
+            }
+            return ClickOutcome::Consume;
+        }
         let Some(chosen) = class_at(slot - self.buttons.start()) else {
             return ClickOutcome::Consume;
         };
@@ -176,7 +216,7 @@ impl MenuKind for ClassMenuKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{FIRST_CLASS_SLOT, INFO_SLOT, MENU_SLOTS, class_at};
+    use super::{FIRST_CLASS_SLOT, GRIMOIRE_SLOT, INFO_SLOT, MENU_SLOTS, class_at};
     use crate::class;
 
     #[test]
@@ -187,5 +227,6 @@ mod tests {
             assert_eq!(class_at(slot), Some(expected));
         }
         assert_eq!(class_at(INFO_SLOT), None);
+        assert_eq!(class_at(GRIMOIRE_SLOT), None);
     }
 }

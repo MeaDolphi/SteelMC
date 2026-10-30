@@ -53,6 +53,21 @@ impl AbilityCooldowns {
         );
     }
 
+    /// Shortens the cooldowns started since `before` by `reduction`, at most
+    /// by half; the Focus enchantment calls this after abilities trigger.
+    pub fn shorten_started(&mut self, before: &Self, now: u64, reduction: f32) {
+        if reduction <= 0.0 {
+            return;
+        }
+        let keep = 1.0 - f64::from(reduction.min(0.5));
+        for (key, deadline) in &mut self.0 {
+            if before.0.get(key) != Some(deadline) && *deadline > now {
+                let left = (*deadline - now) as f64 * keep;
+                *deadline = now + left as u64;
+            }
+        }
+    }
+
     /// Forgets cooldowns that already ran out, keeping the saved file small.
     pub fn prune(&mut self, now: u64) {
         self.0.retain(|_, deadline| *deadline > now);

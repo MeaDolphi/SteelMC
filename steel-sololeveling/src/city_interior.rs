@@ -6,6 +6,10 @@
 //! entities (beds, chests, barrels, lecterns, banners) are avoided: worldgen
 //! writes plain block states, and those blocks would be broken without their
 //! block entity.
+//!
+//! A building fills lot columns 7 to 27; its door is in the middle of the
+//! north wall, so x 17 is the axis of every hall and z grows away from the
+//! street.
 
 use steel_registry::blocks::BlockRef;
 use steel_registry::blocks::block_state_ext::BlockStateExt as _;
@@ -16,14 +20,17 @@ use steel_utils::BlockStateId;
 use crate::city::District;
 
 /// First interior column of a building, just inside its west/north wall.
-pub const INTERIOR_MIN: i32 = 15;
+pub const INTERIOR_MIN: i32 = 8;
 /// Last interior column of a building, just inside its east/south wall.
-pub const INTERIOR_MAX: i32 = 49;
+pub const INTERIOR_MAX: i32 = 26;
+/// Column of the door axis and of the halls built around it.
+pub const AXIS: i32 = 17;
 /// Column of the ladder shaft that connects every storey.
-pub const LADDER_COLUMN: (i32, i32) = (31, 49);
-/// Spot on the ground floor of the Association lobby kept free for the
-/// Organization agent.
-pub const AGENT_SPOT: (i32, i32) = (31, 25);
+pub const LADDER_COLUMN: (i32, i32) = (AXIS, INTERIOR_MAX);
+/// Spot behind the main counter kept free for the building's character.
+pub const COUNTER_SPOT: (i32, i32) = (AXIS, 14);
+/// Spot at the side desk of the Association lobby, for the starter clerk.
+pub const CLERK_SPOT: (i32, i32) = (10, 11);
 
 /// One storey of a building and the height above its floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,8 +99,8 @@ pub fn interior_state(
     if (x, z) == LADDER_COLUMN {
         return Some(ladder());
     }
-    // Keep the ladder reachable from the corridor in front of it.
-    if (x - LADDER_COLUMN.0).abs() <= 1 && z >= LADDER_COLUMN.1 - 2 {
+    // Keep the ladder and the doorway reachable.
+    if (x - AXIS).abs() <= 1 && (z >= INTERIOR_MAX - 2 || (storey.level == 0 && z <= 9)) {
         return None;
     }
     match district {
@@ -106,58 +113,67 @@ pub fn interior_state(
     }
 }
 
-/// Hunter Association: a lobby with the Organization reception, and offices
-/// above it.
+/// Returns whether `(x, z)` is on the main counter in front of
+/// [`COUNTER_SPOT`]: a U open to the back.
+const fn on_counter(x: i32, z: i32) -> bool {
+    let front = z == COUNTER_SPOT.1 - 1 && x >= AXIS - 3 && x <= AXIS + 3;
+    let side = (x - AXIS).abs() == 3 && z >= COUNTER_SPOT.1 - 1 && z <= COUNTER_SPOT.1 + 1;
+    front || side
+}
+
+/// Returns the counter block at `rel`: the body, then a slab top.
+fn counter(rel: i32, top: BlockRef, slab: BlockRef) -> Option<BlockStateId> {
+    match rel {
+        0 => Some(block(top)),
+        1 => Some(block(slab)),
+        _ => None,
+    }
+}
+
+/// Hunter Association: a lobby with the Organization counter and the starter
+/// clerk, offices above it.
 fn association(x: i32, z: i32, storey: Storey) -> Option<BlockStateId> {
     if storey.level > 0 {
-        return office(x, z, storey);
+        return office(x, z, storey.rel);
     }
     let rel = storey.rel;
-    // Pillars of the hall.
-    if matches!(x, 20 | 42) && matches!(z, 20 | 40) {
-        return Some(block(&vanilla_blocks::QUARTZ_PILLAR));
-    }
-    if (x, z) == AGENT_SPOT || (x, z) == (AGENT_SPOT.0, AGENT_SPOT.1 + 1) {
+    if (x, z) == COUNTER_SPOT || (x, z) == CLERK_SPOT {
         return None;
     }
-    // Carpet runner from the door to the reception.
-    if rel == 0 && (30..=32).contains(&x) && (15..=22).contains(&z) {
-        return Some(block(&vanilla_blocks::BLUE_CARPET));
-    }
-    // U-shaped reception counter around the agent.
-    let counter =
-        (z == 23 && (26..=36).contains(&x)) || (matches!(x, 26 | 36) && (23..=27).contains(&z));
-    if counter {
-        return match rel {
-            0 => Some(block(&vanilla_blocks::SMOOTH_QUARTZ)),
-            1 => Some(block(&vanilla_blocks::QUARTZ_SLAB)),
-            _ => None,
-        };
+    if on_counter(x, z) {
+        return counter(
+            rel,
+            &vanilla_blocks::SMOOTH_QUARTZ,
+            &vanilla_blocks::QUARTZ_SLAB,
+        );
     }
     // Rank boards behind the agent.
-    if z == 29 && (27..=35).contains(&x) && (0..=2).contains(&rel) {
+    if z == COUNTER_SPOT.1 + 3 && (AXIS - 3..=AXIS + 3).contains(&x) && (0..=2).contains(&rel) {
         return Some(if rel == 1 && x % 2 == 1 {
             block(&vanilla_blocks::CYAN_STAINED_GLASS)
         } else {
             block(&vanilla_blocks::POLISHED_BLACKSTONE)
         });
     }
+    // The clerk's desk, facing the door side.
+    if x == CLERK_SPOT.0 + 1 && (CLERK_SPOT.1 - 1..=CLERK_SPOT.1 + 1).contains(&z) && rel == 0 {
+        return Some(top_slab(&vanilla_blocks::BIRCH_SLAB));
+    }
     if rel != 0 {
-        return bookshelf_walls(x, z, rel, 30);
+        return pillars(x, z, rel, &vanilla_blocks::QUARTZ_PILLAR);
     }
-    // Waiting benches facing the reception.
-    if matches!(z, 17 | 20) && ((18..=25).contains(&x) || (37..=44).contains(&x)) {
-        return Some(facing(&vanilla_blocks::QUARTZ_STAIRS, Direction::North));
+    // Carpet runner from the door to the counter.
+    if (x - AXIS).abs() <= 1 && (10..COUNTER_SPOT.1 - 1).contains(&z) {
+        return Some(block(&vanilla_blocks::BLUE_CARPET));
     }
-    // Plants in the corners of the hall.
-    if matches!(x, INTERIOR_MIN | INTERIOR_MAX) && matches!(z, INTERIOR_MIN | 28) {
+    // Waiting benches in the back of the hall.
+    if z == 21 && ((9..=13).contains(&x) || (21..=25).contains(&x)) {
+        return Some(facing(&vanilla_blocks::QUARTZ_STAIRS, Direction::South));
+    }
+    if matches!(x, INTERIOR_MIN | INTERIOR_MAX) && matches!(z, INTERIOR_MIN | 18) {
         return Some(block(&vanilla_blocks::POTTED_FERN));
     }
-    // Briefing tables with maps in the back of the hall.
-    if matches!(z, 36 | 37) && matches!(x, 20 | 21 | 41 | 42) {
-        return Some(block(&vanilla_blocks::CARTOGRAPHY_TABLE));
-    }
-    bookshelf_walls(x, z, rel, 30)
+    pillars(x, z, rel, &vanilla_blocks::QUARTZ_PILLAR)
 }
 
 /// Hunter guild: a mess hall with a smithy, and barracks above it.
@@ -166,22 +182,24 @@ fn guild(x: i32, z: i32, storey: Storey) -> Option<BlockStateId> {
     if storey.level > 0 {
         return barracks(x, z, rel);
     }
-    // Long tables with benches along both sides.
-    for table_x in [22, 40] {
-        if (20..=40).contains(&z) {
-            if x == table_x && rel == 0 {
+    // Two long tables with benches along both sides.
+    for table_x in [12, 22] {
+        if (12..=22).contains(&z) && rel == 0 {
+            if x == table_x {
                 return Some(top_slab(&vanilla_blocks::DARK_OAK_SLAB));
             }
-            if x == table_x - 1 && rel == 0 && z % 2 == 0 {
-                return Some(facing(&vanilla_blocks::DARK_OAK_STAIRS, Direction::West));
-            }
-            if x == table_x + 1 && rel == 0 && z % 2 == 0 {
-                return Some(facing(&vanilla_blocks::DARK_OAK_STAIRS, Direction::East));
+            if (x - table_x).abs() == 1 && z % 2 == 0 {
+                let side = if x < table_x {
+                    Direction::West
+                } else {
+                    Direction::East
+                };
+                return Some(facing(&vanilla_blocks::DARK_OAK_STAIRS, side));
             }
         }
     }
     // Smithy along the east wall.
-    if x == INTERIOR_MAX && (18..=44).contains(&z) && rel == 0 {
+    if x == INTERIOR_MAX && (10..=22).contains(&z) && rel == 0 {
         return Some(match z % 4 {
             0 => block(&vanilla_blocks::ANVIL),
             1 => block(&vanilla_blocks::SMITHING_TABLE),
@@ -190,49 +208,68 @@ fn guild(x: i32, z: i32, storey: Storey) -> Option<BlockStateId> {
         });
     }
     // Training dummies along the west wall.
-    if x == 17 && matches!(z, 22 | 28 | 34 | 40) {
+    if x == INTERIOR_MIN && matches!(z, 12 | 17 | 22) {
         return match rel {
             0 | 1 => Some(block(&vanilla_blocks::HAY_BLOCK)),
             2 => Some(facing(&vanilla_blocks::CARVED_PUMPKIN, Direction::East)),
             _ => None,
         };
     }
-    // Weapon racks: iron bars on the north wall beside the door.
-    if z == INTERIOR_MIN && !(29..=33).contains(&x) && (1..=2).contains(&rel) && x % 3 == 0 {
+    // Weapon racks on the north wall beside the door.
+    if z == INTERIOR_MIN && (x - AXIS).abs() > 2 && (1..=2).contains(&rel) && x % 3 == 0 {
         return Some(block(&vanilla_blocks::IRON_BARS));
     }
     None
 }
 
-/// Market hall: stalls with produce, and storage above.
+/// City merchant: a shop counter, stalls of goods along the walls, and
+/// storage above.
 fn market(x: i32, z: i32, storey: Storey, variant: u64) -> Option<BlockStateId> {
     let rel = storey.rel;
     if storey.level > 0 {
         return storage(x, z, rel, variant);
     }
-    // Two rows of stalls left and right of the central aisle.
-    let stall_x = (18..=27).contains(&x) || (35..=46).contains(&x);
-    let stall_z = (z - 19).rem_euclid(9);
-    if !stall_x || !(19..=46).contains(&z) {
+    if (x, z) == COUNTER_SPOT {
         return None;
     }
-    match (stall_z, rel) {
-        // Counter facing the aisle.
-        (0, 0) => Some(top_slab(&vanilla_blocks::SPRUCE_SLAB)),
-        // Goods behind the counter.
-        (2, 0) => Some(produce(x, z, variant)),
-        (2, 1) if x % 3 == 0 => Some(produce(x + 1, z, variant)),
-        // Awning posts and roof.
-        (0 | 2, 1 | 2) if matches!(x, 18 | 27 | 35 | 46) => {
-            Some(block(&vanilla_blocks::SPRUCE_FENCE))
-        }
-        (0..=2, 3) => Some(if (x + z) % 2 == 0 {
-            block(&vanilla_blocks::RED_WOOL)
-        } else {
-            block(&vanilla_blocks::WHITE_WOOL)
-        }),
-        _ => None,
+    if on_counter(x, z) {
+        return counter(
+            rel,
+            &vanilla_blocks::STRIPPED_SPRUCE_WOOD,
+            &vanilla_blocks::SPRUCE_SLAB,
+        );
     }
+    // Workshop wall behind the merchant: where orders are made.
+    if z == COUNTER_SPOT.1 + 3 && (AXIS - 3..=AXIS + 3).contains(&x) && rel == 0 {
+        return Some(match x.rem_euclid(4) {
+            0 => block(&vanilla_blocks::SMITHING_TABLE),
+            1 => block(&vanilla_blocks::LOOM),
+            2 => block(&vanilla_blocks::FLETCHING_TABLE),
+            _ => block(&vanilla_blocks::CRAFTING_TABLE),
+        });
+    }
+    // Stalls along the side walls, under striped awnings.
+    if matches!(x, INTERIOR_MIN | INTERIOR_MAX) && (10..=23).contains(&z) {
+        return match rel {
+            0 => Some(produce(x, z, variant)),
+            1 if z % 3 == 0 => Some(produce(x + 1, z, variant)),
+            3 => Some(if z % 2 == 0 {
+                block(&vanilla_blocks::RED_WOOL)
+            } else {
+                block(&vanilla_blocks::WHITE_WOOL)
+            }),
+            _ => None,
+        };
+    }
+    // Display stands of armor and weapons in the front of the shop.
+    if matches!(x, 11 | 23) && matches!(z, 10 | 12) && rel <= 1 {
+        return Some(if rel == 0 {
+            block(&vanilla_blocks::POLISHED_ANDESITE)
+        } else {
+            block(&vanilla_blocks::IRON_BARS)
+        });
+    }
+    None
 }
 
 fn produce(x: i32, z: i32, variant: u64) -> BlockStateId {
@@ -254,190 +291,139 @@ fn produce(x: i32, z: i32, variant: u64) -> BlockStateId {
 /// Civic building: a library with reading tables on every storey.
 fn civic(x: i32, z: i32, storey: Storey) -> Option<BlockStateId> {
     let rel = storey.rel;
-    // Rows of shelves in the west half.
-    if (17..=27).contains(&x) && (18..=46).contains(&z) && z % 4 == 2 && rel <= 2 {
+    if (10..=24).contains(&x) && (x - AXIS).abs() > 2 && (12..=22).contains(&z) && z % 4 == 0 {
+        return (rel <= 2).then(|| block(&vanilla_blocks::BOOKSHELF));
+    }
+    if rel == 0 && x == AXIS && matches!(z, 14 | 18) {
+        return Some(top_slab(&vanilla_blocks::OAK_SLAB));
+    }
+    if rel == 0 && (x - AXIS).abs() == 1 && matches!(z, 14 | 18) {
+        return Some(facing(
+            &vanilla_blocks::OAK_STAIRS,
+            if x < AXIS {
+                Direction::West
+            } else {
+                Direction::East
+            },
+        ));
+    }
+    if matches!(x, INTERIOR_MIN | INTERIOR_MAX) && (9..=24).contains(&z) && rel <= 3 {
         return Some(block(&vanilla_blocks::BOOKSHELF));
-    }
-    // Reading tables with chairs in the east half.
-    if (36..=46).contains(&x) && (19..=45).contains(&z) && rel == 0 {
-        let cell_x = (x - 36).rem_euclid(5);
-        let cell_z = (z - 19).rem_euclid(6);
-        return match (cell_x, cell_z) {
-            (1 | 2, 1) => Some(top_slab(&vanilla_blocks::SPRUCE_SLAB)),
-            (1 | 2, 0) => Some(facing(&vanilla_blocks::SPRUCE_STAIRS, Direction::North)),
-            (1 | 2, 2) => Some(facing(&vanilla_blocks::SPRUCE_STAIRS, Direction::South)),
-            _ => None,
-        };
-    }
-    if rel == 0 && matches!(x, INTERIOR_MIN | INTERIOR_MAX) && z % 8 == 0 {
-        return Some(block(&vanilla_blocks::POTTED_AZALEA_BUSH));
     }
     None
 }
 
-/// Apartment block: a lobby on the ground floor and four flats on every
-/// storey above it, off a central corridor.
+/// Residential building: two flats per storey.
 fn residential(x: i32, z: i32, storey: Storey, variant: u64) -> Option<BlockStateId> {
     let rel = storey.rel;
-    if storey.level == 0 {
-        if rel == 0 && (30..=32).contains(&x) {
-            return Some(block(&vanilla_blocks::GRAY_CARPET));
-        }
-        if rel == 0 && matches!(x, 17 | 45) && z % 6 == 0 {
-            return Some(block(&vanilla_blocks::POTTED_FERN));
-        }
-        // Letter boxes on the walls of the lobby.
-        if matches!(x, INTERIOR_MIN | INTERIOR_MAX) && (20..=30).contains(&z) && rel == 1 {
-            return Some(facing(
-                &vanilla_blocks::SPRUCE_TRAPDOOR,
-                if x == INTERIOR_MIN {
-                    Direction::East
-                } else {
-                    Direction::West
-                },
-            ));
-        }
+    // A wall splits each storey into an east and a west flat, with a doorway
+    // off the central corridor.
+    if (x - AXIS).abs() == 2 && z >= 12 {
+        let doorway = matches!(z, 15 | 16) && rel <= 1;
+        return (!doorway).then(|| block(&vanilla_blocks::SPRUCE_PLANKS));
+    }
+    if (x - AXIS).abs() < 2 {
         return None;
     }
-    // Corridor walls with a door gap into every flat.
-    if matches!(x, 29 | 33) {
-        let door = matches!(z, 23 | 41) && rel <= 1;
-        return (!door).then(|| block(&vanilla_blocks::WHITE_CONCRETE));
-    }
-    if (30..=32).contains(&x) {
-        return (rel == 0).then(|| block(&vanilla_blocks::GRAY_CARPET));
-    }
-    // Wall between the north and south flat on each side.
-    if z == 32 {
-        return Some(block(&vanilla_blocks::WHITE_CONCRETE));
-    }
-    // Flat-local coordinates, mirrored so every flat opens on the corridor.
-    let east = x > 32;
-    let south = z > 32;
-    let fx = if east { x - 34 } else { 28 - x };
-    let fz = if south { z - 33 } else { 31 - z };
-    flat(
-        fx,
-        fz,
-        rel,
-        variant ^ u64::from(east) ^ (u64::from(south) << 1),
-    )
+    let fx = if x < AXIS {
+        x - INTERIOR_MIN
+    } else {
+        INTERIOR_MAX - x
+    };
+    flat(fx, z, rel, variant)
 }
 
-/// Furnishes one flat; `fx` grows away from the corridor and `fz` away from
-/// the wall between flats.
-fn flat(fx: i32, fz: i32, rel: i32, variant: u64) -> Option<BlockStateId> {
-    if rel > 0 {
-        // Shelf above the kitchen.
-        return (rel == 2 && fz == 15 && (2..=6).contains(&fx))
-            .then(|| block(&vanilla_blocks::BOOKSHELF));
-    }
-    let rug = [
-        &vanilla_blocks::RED_CARPET,
-        &vanilla_blocks::LIGHT_BLUE_CARPET,
-        &vanilla_blocks::GREEN_CARPET,
-        &vanilla_blocks::YELLOW_CARPET,
-    ][(variant % 4) as usize];
-    match (fx, fz) {
-        // Bed in the far corner: foot and pillow.
-        (11 | 12, 2) => Some(block(&vanilla_blocks::RED_WOOL)),
-        (11 | 12, 1) => Some(block(&vanilla_blocks::WHITE_WOOL)),
-        (13, 1) => Some(block(&vanilla_blocks::POTTED_OAK_SAPLING)),
-        // Wardrobe.
-        (13, 5 | 6) => Some(block(&vanilla_blocks::SPRUCE_PLANKS)),
-        // Kitchen along the outer wall: counter, sink and stove.
-        (2..=6, 15) => Some(match fx {
-            2 => block(&vanilla_blocks::WATER_CAULDRON),
-            4 => block(&vanilla_blocks::SMOOTH_STONE),
-            _ => top_slab(&vanilla_blocks::SMOOTH_STONE_SLAB),
+/// One flat, mirrored so `fx` counts from its outer wall.
+fn flat(fx: i32, z: i32, rel: i32, variant: u64) -> Option<BlockStateId> {
+    match (fx, z, rel) {
+        // Kitchen along the outer wall.
+        (0, 10..=13, 0) => Some(if z % 2 == 0 {
+            block(&vanilla_blocks::SMOKER)
+        } else {
+            block(&vanilla_blocks::CRAFTING_TABLE)
         }),
         // Dining table with two chairs.
-        (5, 10) => Some(block(&vanilla_blocks::OAK_FENCE)),
-        (4, 10) => Some(facing(&vanilla_blocks::OAK_STAIRS, Direction::West)),
-        (6, 10) => Some(facing(&vanilla_blocks::OAK_STAIRS, Direction::East)),
-        // Rug in the middle of the room.
-        (8..=10, 7..=9) => Some(block(rug)),
+        (3, 11, 0) => Some(top_slab(&vanilla_blocks::OAK_SLAB)),
+        (3, 10 | 12, 0) => Some(facing(&vanilla_blocks::OAK_STAIRS, Direction::North)),
+        // Bed made of a wool mattress.
+        (0..=1, 22..=24, 0) => Some(if variant.is_multiple_of(2) {
+            block(&vanilla_blocks::LIGHT_BLUE_WOOL)
+        } else {
+            block(&vanilla_blocks::RED_WOOL)
+        }),
+        // Wardrobe and a plant.
+        (0, 18..=19, 0..=1) => Some(block(&vanilla_blocks::SPRUCE_PLANKS)),
+        (5, 24, 0) => Some(block(&vanilla_blocks::POTTED_OXEYE_DAISY)),
         _ => None,
     }
 }
 
-/// Offices: desks with chairs in a grid and shelves on the walls.
-fn office(x: i32, z: i32, storey: Storey) -> Option<BlockStateId> {
-    let rel = storey.rel;
-    if (19..=45).contains(&x) && (18..=44).contains(&z) && rel == 0 {
-        let cell_x = (x - 19).rem_euclid(7);
-        let cell_z = (z - 18).rem_euclid(7);
-        return match (cell_x, cell_z) {
-            (1 | 2, 1) => Some(top_slab(&vanilla_blocks::DARK_OAK_SLAB)),
-            (1, 2) => Some(facing(&vanilla_blocks::DARK_OAK_STAIRS, Direction::South)),
-            (3, 1) => Some(block(&vanilla_blocks::POTTED_FERN)),
-            _ => None,
-        };
+/// Upper office storey with desks in rows.
+fn office(x: i32, z: i32, rel: i32) -> Option<BlockStateId> {
+    if rel != 0 || (x - AXIS).abs() <= 1 {
+        return None;
     }
-    bookshelf_walls(x, z, rel, INTERIOR_MIN)
+    let column = (x - INTERIOR_MIN).rem_euclid(5) == 1;
+    let row = (z - INTERIOR_MIN).rem_euclid(5);
+    if column && row == 2 {
+        return Some(top_slab(&vanilla_blocks::BIRCH_SLAB));
+    }
+    if column && row == 3 {
+        return Some(facing(&vanilla_blocks::BIRCH_STAIRS, Direction::North));
+    }
+    None
 }
 
-/// Barracks: rows of bunks with lockers between them.
+/// Guild barracks: rows of bunks.
 fn barracks(x: i32, z: i32, rel: i32) -> Option<BlockStateId> {
-    if !(18..=46).contains(&z) || rel > 0 {
+    if (x - AXIS).abs() <= 1 || !(10..=22).contains(&z) || z % 3 != 1 {
         return None;
     }
-    let along_west = (17..=18).contains(&x);
-    let along_east = (44..=45).contains(&x);
-    if !along_west && !along_east {
+    if !matches!(x, INTERIOR_MIN..=10 | 24..=INTERIOR_MAX) {
         return None;
     }
-    let pillow = if along_west { x == 17 } else { x == 45 };
-    Some(match (z - 18).rem_euclid(4) {
-        0 | 1 if pillow => block(&vanilla_blocks::WHITE_WOOL),
-        0 | 1 => block(&vanilla_blocks::BLUE_WOOL),
-        2 => block(&vanilla_blocks::SPRUCE_PLANKS),
-        _ => return None,
-    })
+    match rel {
+        0 | 2 => Some(block(&vanilla_blocks::GRAY_WOOL)),
+        1 => Some(block(&vanilla_blocks::DARK_OAK_FENCE)),
+        _ => None,
+    }
 }
 
-/// Storage: stacks of crates and sacks along the walls.
+/// Storage floor: stacks of goods along the walls.
 fn storage(x: i32, z: i32, rel: i32, variant: u64) -> Option<BlockStateId> {
-    let near_wall = x <= 18 || x >= 46 || z <= 18;
-    if !near_wall || rel > 1 {
+    let wall = matches!(x, INTERIOR_MIN | INTERIOR_MAX) || z == INTERIOR_MIN;
+    if !wall || rel > 1 || (x - AXIS).abs() <= 2 {
         return None;
     }
-    let pick = (x as u64)
-        .wrapping_mul(7)
-        .wrapping_add((z as u64).wrapping_mul(13))
-        .wrapping_add(variant)
-        % 5;
-    match pick {
-        0 => None,
-        1 | 2 => Some(block(&vanilla_blocks::SPRUCE_PLANKS)),
-        3 => Some(block(&vanilla_blocks::HAY_BLOCK)),
-        _ => (rel == 0).then(|| block(&vanilla_blocks::BROWN_WOOL)),
-    }
+    Some(produce(x, z + rel, variant))
 }
 
-/// Bookshelves lining the side walls, from `from_z` to the back wall.
-fn bookshelf_walls(x: i32, z: i32, rel: i32, from_z: i32) -> Option<BlockStateId> {
-    (matches!(x, INTERIOR_MIN | INTERIOR_MAX) && z >= from_z && rel <= 2)
-        .then(|| block(&vanilla_blocks::BOOKSHELF))
+/// Pillars in the four corners of a hall.
+fn pillars(x: i32, z: i32, rel: i32, pillar: BlockRef) -> Option<BlockStateId> {
+    (matches!(x, 9 | 25) && matches!(z, 9 | 24) && rel <= 4).then(|| block(pillar))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AGENT_SPOT, LADDER_COLUMN, Storey, interior_state, ladder};
-    use crate::city::District;
     use steel_registry::init_vanilla_registry;
 
+    use super::{
+        AXIS, CLERK_SPOT, COUNTER_SPOT, INTERIOR_MAX, INTERIOR_MIN, LADDER_COLUMN, Storey,
+        interior_state, ladder,
+    };
+    use crate::city::District;
+
     #[test]
-    fn storeys_follow_the_six_block_floor_spacing() {
+    fn storeys_are_six_blocks_tall() {
         assert_eq!(Storey::at(4, 3), Storey { level: 0, rel: 0 });
-        assert_eq!(Storey::at(9, 3), Storey { level: 0, rel: 5 });
         assert_eq!(Storey::at(11, 3), Storey { level: 1, rel: 0 });
         assert_eq!(Storey::at(17, 3), Storey { level: 2, rel: 0 });
     }
 
     #[test]
-    fn every_building_keeps_its_ladder_and_the_agent_spot_free() {
+    fn characters_doors_and_ladder_stay_free() {
         init_vanilla_registry();
+        let ground = Storey { level: 0, rel: 0 };
         for district in [
             District::Association,
             District::Guild,
@@ -445,39 +431,35 @@ mod tests {
             District::Civic,
             District::Residential,
         ] {
-            for level in 0..3 {
-                let storey = Storey { level, rel: 0 };
-                assert_eq!(
-                    interior_state(district, LADDER_COLUMN.0, LADDER_COLUMN.1, storey, 0),
-                    Some(ladder())
-                );
+            for rel in 0..=1 {
+                let storey = Storey { level: 0, rel };
+                for z in INTERIOR_MIN..=9 {
+                    for x in AXIS - 1..=AXIS + 1 {
+                        assert_eq!(interior_state(district, x, z, storey, 0), None);
+                    }
+                }
             }
-        }
-        for rel in 0..4 {
-            let storey = Storey { level: 0, rel };
             assert_eq!(
-                interior_state(District::Association, AGENT_SPOT.0, AGENT_SPOT.1, storey, 0),
+                interior_state(district, LADDER_COLUMN.0, LADDER_COLUMN.1, ground, 0),
+                Some(ladder())
+            );
+            assert_eq!(
+                interior_state(district, AXIS, INTERIOR_MAX - 1, ground, 0),
                 None
             );
         }
-    }
-
-    #[test]
-    fn the_ground_floor_door_opens_onto_free_space() {
-        init_vanilla_registry();
-        for district in [
-            District::Association,
-            District::Guild,
-            District::Market,
-            District::Civic,
-            District::Residential,
-        ] {
-            for x in 30..=32 {
-                for rel in 1..=2 {
-                    let storey = Storey { level: 0, rel };
-                    assert_eq!(interior_state(district, x, 15, storey, 0), None);
-                }
+        for spot in [COUNTER_SPOT, CLERK_SPOT] {
+            for rel in 0..=1 {
+                let storey = Storey { level: 0, rel };
+                assert_eq!(
+                    interior_state(District::Association, spot.0, spot.1, storey, 0),
+                    None
+                );
             }
         }
+        assert_eq!(
+            interior_state(District::Market, COUNTER_SPOT.0, COUNTER_SPOT.1, ground, 0),
+            None
+        );
     }
 }

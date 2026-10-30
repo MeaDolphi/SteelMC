@@ -2,12 +2,15 @@
 //!
 //! Every action is queued as an [`AuctionRequest`], so the serialized
 //! persistence lane checks prices and balances exactly as `/auction` does.
-//! Selling lists the main-hand stack: the lane reads the hand when it runs,
-//! never inside the click that holds the inventory lock.
+//! Selling starts with a picker of inventory stacks, opened on the next player
+//! tick because a click holds the inventory lock; the lane checks that the
+//! chosen slot still holds the same stack when it runs.
 
 use std::sync::{Arc, Weak};
 
+use steel_core::inventory::container::Container as _;
 use steel_core::inventory::prelude::*;
+use steel_core::player::player_inventory::PlayerInventory;
 use steel_registry::vanilla_items;
 use text_components::Modifier as _;
 use text_components::TextComponent;
@@ -17,7 +20,7 @@ use uuid::Uuid;
 use crate::auction::{
     COMMISSION_PERCENT, LotKind, MAX_ACTIVE_LOTS, MAX_DURATION_HOURS, MIN_DURATION_HOURS,
 };
-use crate::item::append_lore;
+use crate::item::{append_lore, binding};
 use crate::state::{AuctionRequest, LotView, SoloLevelingState};
 use crate::ui::{self, After};
 
@@ -97,10 +100,10 @@ fn board_items(
     items[NEXT_SLOT] = ui::next_page();
     items[SELL_SLOT] = ui::button(
         &vanilla_items::EMERALD,
-        "Выставить предмет из руки",
+        "Выставить предмет",
         Color::Green,
         &[
-            "Выставляется стак в главной руке.",
+            "Выберите стак из инвентаря.",
             "Личные предметы выставить нельзя.",
             &format!("Комиссия {COMMISSION_PERCENT}%, до {MAX_ACTIVE_LOTS} лотов."),
         ],
@@ -203,8 +206,9 @@ fn board_click(
             open_board(player, Arc::clone(state), 0, !mine);
             return After::Replaced;
         }
+        // The picker reads the inventory, which this click has locked.
         SELL_SLOT => {
-            open_sell(player, Arc::clone(state));
+            state.defer_auction_sell_menu(viewer);
             return After::Replaced;
         }
         lot_slot if lot_slot < LOTS_PER_PAGE => {
@@ -289,14 +293,58 @@ fn board_click(
 const FIXED_SLOT: usize = 11;
 const BIDDING_SLOT: usize = 15;
 
-/// Asks how to sell, then the price and the duration.
-fn open_sell(player: &Player, state: Arc<SoloLevelingState>) {
+/// Opens the picker of inventory stacks that can be listed.
+///
+/// It reads the inventory, so the caller runs outside any menu callback.
+pub fn open_picker(player: &Player, state: Arc<SoloLevelingState>) {
+    let choices: Vec<(usize, ItemStack)> = {
+        let inventory = player.inventory.lock();
+        (0..PlayerInventory::INVENTORY_SIZE)
+            .map(|slot| (slot, inventory.get_item(slot).clone()))
+            .filter(|(_, stack)| !stack.is_empty() && binding::bound_owner(stack).is_none())
+            .collect()
+    };
+    if choices.is_empty() {
+        ui::tell(
+            player,
+            "В инвентаре нет предметов, которые можно выставить.",
+            Color::Red,
+        );
+        return;
+    }
+    let items = choices
+        .iter()
+        .map(|(_, stack)| {
+            append_lore(
+                stack.clone(),
+                vec![TextComponent::plain("Клик — выставить на аукцион.").color(Color::Yellow)],
+            )
+        })
+        .collect();
+    ui::open_buttons(
+        player,
+        TextComponent::plain("Выберите предмет").color(Color::Gold),
+        if choices.len() > 27 { 6 } else { 3 },
+        items,
+        Box::new(move |player, index, _| {
+            let Some(chosen) = choices.get(index).cloned() else {
+                return After::Keep;
+            };
+            open_sell(player, Arc::clone(&state), chosen);
+            After::Replaced
+        }),
+    );
+}
+
+/// Asks how to sell the chosen stack, then the price and the duration.
+fn open_sell(player: &Player, state: Arc<SoloLevelingState>, chosen: (usize, ItemStack)) {
     let mut items = vec![ItemStack::empty(); 27];
-    items[4] = ui::button(
-        &vanilla_items::PAPER,
-        "Продажа предмета из главной руки",
-        Color::Gold,
-        &["Возьмите предмет в руку перед подтверждением."],
+    items[4] = append_lore(
+        chosen.1.clone(),
+        vec![
+            TextComponent::plain("Этот предмет будет выставлен.").color(Color::Gold),
+            TextComponent::plain("Не перемещайте его до подтверждения.").color(Color::Gray),
+        ],
     );
     items[FIXED_SLOT] = ui::button(
         &vanilla_items::GOLD_NUGGET,
@@ -322,6 +370,7 @@ fn open_sell(player: &Player, state: Arc<SoloLevelingState>) {
                 _ => return After::Keep,
             };
             let price_state = Arc::clone(&state);
+            let chosen = chosen.clone();
             ui::pick_amount(
                 player,
                 if kind == LotKind::FixedPrice {
@@ -335,6 +384,7 @@ fn open_sell(player: &Player, state: Arc<SoloLevelingState>) {
                 MAX_MENU_PRICE,
                 Arc::new(move |player, price| {
                     let hours_state = Arc::clone(&price_state);
+                    let chosen = chosen.clone();
                     ui::pick_amount(
                         player,
                         "Срок лота",
@@ -349,6 +399,7 @@ fn open_sell(player: &Player, state: Arc<SoloLevelingState>) {
                                     player,
                                     AuctionRequest::List {
                                         player: handle,
+                                        chosen: Some(chosen.clone()),
                                         kind,
                                         price,
                                         hours,

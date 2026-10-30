@@ -17,7 +17,7 @@ use steel_utils::types::InteractionHand;
 use text_components::format::Color;
 use text_components::{Modifier as _, TextComponent};
 
-use super::{binding, chest, potion, shadow};
+use super::{binding, chest, key, potion, pouch, shadow};
 use crate::state::SoloLevelingState;
 
 /// Handles a right-click on a themed item; `None` means "not a themed item".
@@ -34,6 +34,15 @@ pub fn use_item(
             &TextComponent::plain("Этот предмет принадлежит другому охотнику.").color(Color::Red),
         );
         return Some(InteractionResult::Fail);
+    }
+
+    if let Some(amount) = pouch::amount(stack) {
+        consume_one(player, hand);
+        state.credit_won(owner, amount);
+        player.send_message(
+            &TextComponent::plain(format!("Кошель открыт: +{amount} Won.")).color(Color::Gold),
+        );
+        return Some(InteractionResult::Success);
     }
 
     if let Some(buff) = potion::BuffPotion::of(stack) {
@@ -62,6 +71,58 @@ pub fn use_item(
         player.send_message(
             &TextComponent::plain(format!("{name} присоединился к вашей армии теней."))
                 .color(Color::LightPurple),
+        );
+        return Some(InteractionResult::Success);
+    }
+
+    if key::is_castle_key(stack) {
+        return Some(match state.request_castle_floor(owner, true) {
+            Ok(floor) => {
+                consume_one(player, hand);
+                player.send_message(
+                    &TextComponent::plain(format!(
+                        "Замок демонов: врата на этаж {floor} открываются рядом с вами…"
+                    ))
+                    .color(Color::DarkRed),
+                );
+                InteractionResult::Success
+            }
+            Err(message) => {
+                player.send_message(&TextComponent::plain(message).color(Color::Red));
+                InteractionResult::Fail
+            }
+        });
+    }
+
+    if let Some(rank) = key::rank(stack) {
+        let Some(hunter) = state.hunter_rank(owner) else {
+            return Some(InteractionResult::Fail);
+        };
+        if hunter < rank {
+            player.send_message(
+                &TextComponent::plain(format!(
+                    "Ключ ранга {} доступен охотникам ранга {} и выше.",
+                    rank.name(),
+                    rank.name()
+                ))
+                .color(Color::Red),
+            );
+            return Some(InteractionResult::Fail);
+        }
+        if !state.request_key_gate(owner, rank) {
+            player.send_message(
+                &TextComponent::plain("Врата по предыдущему ключу ещё открываются.")
+                    .color(Color::Red),
+            );
+            return Some(InteractionResult::Fail);
+        }
+        consume_one(player, hand);
+        player.send_message(
+            &TextComponent::plain(format!(
+                "Система открывает врата ранга {} рядом с вами…",
+                rank.name()
+            ))
+            .color(Color::LightPurple),
         );
         return Some(InteractionResult::Success);
     }

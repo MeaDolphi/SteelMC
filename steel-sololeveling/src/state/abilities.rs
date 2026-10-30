@@ -54,6 +54,28 @@ pub(super) struct Storm {
     next_pulse: u64,
 }
 
+impl Storm {
+    /// Starts a storm of `owner` at `center` that pulses at once.
+    pub(super) const fn new(
+        owner: Uuid,
+        world: Identifier,
+        center: DVec3,
+        radius: f64,
+        damage: f32,
+        until: u64,
+    ) -> Self {
+        Self {
+            owner,
+            world,
+            center,
+            radius,
+            damage,
+            until,
+            next_pulse: 0,
+        }
+    }
+}
+
 fn equipped(entity: &dyn LivingEntity, slot: EquipmentSlot) -> ItemStack {
     let mut stack = ItemStack::empty();
     entity.with_equipment_slot(slot, &mut |item| stack = item.clone());
@@ -90,16 +112,51 @@ impl SoloLevelingState {
         if weapon_slot != (artifact.category == Category::Weapon) {
             return &[];
         }
+        self.slot_abilities_of(entity, &stack)
+    }
+
+    /// Returns the abilities of a held `stack` its holder may use.
+    fn slot_abilities_of(&self, entity: &Player, stack: &ItemStack) -> &'static [Ability] {
+        let Some(artifact) = artifact::held(stack) else {
+            return &[];
+        };
+        let stack = stack.clone();
         let usable = self
             .hunter_rank(entity.gameprofile.id())
-            .is_some_and(|rank| artifact::usable_by(&stack, rank));
+            .is_some_and(|rank| artifact::usable_by(&stack, rank))
+            && gear::wearable(&stack, self.class_of(entity.gameprofile.id()));
         if usable { artifact.abilities } else { &[] }
     }
 
+    /// Returns the outgoing magic-damage bonus of the held weapon and the
+    /// System gear of `player`, as a fraction.
+    ///
+    /// A Mage staff also counts from the off hand, where it sits while the
+    /// grimoire is in the main hand.
+    pub(super) fn magic_focus(&self, player: &Player) -> f32 {
+        let off_hand = equipped(player, EquipmentSlot::OffHand);
+        let off_hand_staff = if artifact::of(&off_hand).is_some_and(|id| id.spell_gear().is_some())
+        {
+            self.slot_abilities_of(player, &off_hand)
+        } else {
+            &[]
+        };
+        self.slot_abilities(player, EquipmentSlot::MainHand)
+            .iter()
+            .chain(off_hand_staff)
+            .copied()
+            .chain(self.gear_abilities(player))
+            .map(|ability| match ability {
+                Ability::MagicFocus { percent } => percent,
+                _ => 0.0,
+            })
+            .sum()
+    }
+
     /// Returns the abilities of the System gear `player` can use.
-    fn gear_abilities(&self, player: &Player) -> Vec<Ability> {
+    pub(super) fn gear_abilities(&self, player: &Player) -> Vec<Ability> {
         self.with_session_mut(player.gameprofile.id(), |session| {
-            gear::abilities(&session.gear, session.stats.rank())
+            gear::abilities(&session.gear, session.stats.rank(), session.class.class)
         })
         .unwrap_or_default()
     }
@@ -118,7 +175,7 @@ impl SoloLevelingState {
     fn refresh_gear(&self, player: &Player) {
         let uuid = player.gameprofile.id();
         let periodic = player.tick_count() % 100 == 0;
-        let Some((items, rank, previous)) = self
+        let Some((items, rank, class, strength, previous)) = self
             .with_session_mut(uuid, |session| {
                 if !session.gear_dirty && !periodic {
                     return None;
@@ -127,6 +184,8 @@ impl SoloLevelingState {
                 Some((
                     session.gear.clone(),
                     session.stats.rank(),
+                    session.class.class,
+                    session.stats.strength,
                     mem::take(&mut session.gear_applied),
                 ))
             })
@@ -134,7 +193,7 @@ impl SoloLevelingState {
         else {
             return;
         };
-        let bonuses = gear::modifiers(&items, rank);
+        let bonuses = gear::modifiers(&items, rank, class, strength);
         let applied = bonuses
             .iter()
             .map(|(attribute, modifier)| (*attribute, modifier.id.clone()))
@@ -186,12 +245,12 @@ impl SoloLevelingState {
                     .lock()
                     .get_value(vanilla_attributes::ARMOR)
                     .is_some_and(|armor| armor > 0.0);
-                damage = abilities::outgoing_damage(
-                    self.slot_abilities(attacker, EquipmentSlot::MainHand),
-                    strength,
-                    armored,
-                    damage,
-                );
+                // Rings and amulets add their damage abilities to the weapon's.
+                let mut held = self
+                    .slot_abilities(attacker, EquipmentSlot::MainHand)
+                    .to_vec();
+                held.extend(self.gear_abilities(attacker));
+                damage = abilities::outgoing_damage(&held, strength, armored, damage);
             }
         }
         if let Some(player) = victim.as_player() {
@@ -232,7 +291,13 @@ impl SoloLevelingState {
         }
         let now = abilities::now_millis();
         let Some(effects) = self.with_session_mut(uuid, |session| {
-            abilities::on_hit(&held, &mut session.cooldowns, &mut session.abilities, now)
+            let before = session.cooldowns.clone();
+            let result =
+                abilities::on_hit(&held, &mut session.cooldowns, &mut session.abilities, now);
+            session
+                .cooldowns
+                .shorten_started(&before, now, session.enchant.summary.focus);
+            result
         }) else {
             return;
         };
@@ -258,17 +323,19 @@ impl SoloLevelingState {
         {
             return;
         }
+        let summary = self.enchant_summary(attacker.gameprofile.id());
         let mut health = attacker.get_health();
         for enchantment in artifact::enchantments_of(&weapon) {
             match enchantment.effect() {
                 Effect::Lifesteal => {
-                    health = (health + amount.max(0.0) * enchantment::LIFESTEAL_FRACTION)
-                        .min(attacker.get_max_health());
+                    health = (health
+                        + summary.healed(amount.max(0.0) * enchantment::LIFESTEAL_FRACTION))
+                    .min(attacker.get_max_health());
                 }
                 Effect::Recoil => {
                     health = (health - enchantment::RECOIL_DAMAGE).max(1.0);
                 }
-                Effect::Attribute { .. } => {}
+                Effect::Attribute { .. } | Effect::Mechanic => {}
             }
         }
         if (health - attacker.get_health()).abs() > f32::EPSILON {
@@ -292,7 +359,17 @@ impl SoloLevelingState {
         let now = abilities::now_millis();
         let Some((health, shield)) = self
             .with_session_mut(uuid, |session| {
-                abilities::on_lethal(&gear, &mut session.cooldowns, &mut session.abilities, now)
+                let before = session.cooldowns.clone();
+                let result = abilities::on_lethal(
+                    &gear,
+                    &mut session.cooldowns,
+                    &mut session.abilities,
+                    now,
+                );
+                session
+                    .cooldowns
+                    .shorten_started(&before, now, session.enchant.summary.focus);
+                result
             })
             .flatten()
         else {

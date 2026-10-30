@@ -48,6 +48,9 @@ impl MeleeAttackGoal {
         entity: &SharedEntity,
         target: &SharedEntity,
     ) {
+        if mob.allied_owner().is_some() && !mob.allied_may_fight(target.as_ref()) {
+            return;
+        }
         let Some(target_living) = target.as_living_entity() else {
             return;
         };

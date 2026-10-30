@@ -118,6 +118,11 @@ pub trait GameplayHooks: Send + Sync {
         false
     }
 
+    /// Whether a mob should retarget to a new attacker while its hurt-by goal runs.
+    fn should_retarget_hurt_mob(&self, _world: &World, _mob_id: i32, _attacker_id: i32) -> bool {
+        false
+    }
+
     /// Called after vanilla rolls a living entity's loot but before it spawns.
     ///
     /// Implementations may drain or replace `drops` to route a special
@@ -129,6 +134,11 @@ pub trait GameplayHooks: Send + Sync {
         _source: &DamageSource,
         _drops: &mut Vec<ItemStack>,
     ) {
+    }
+
+    /// Returns whether items spawned directly by a mob should be suppressed.
+    fn suppress_mob_drops(&self, _world: &World, _entity_id: i32) -> bool {
+        false
     }
 
     /// Called once after successful vanilla death processing for every living entity.

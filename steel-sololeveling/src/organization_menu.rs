@@ -21,6 +21,7 @@ use crate::organization::{
     Contract, GROUP_LIMIT, GUILD_LIMIT, GUILD_SCALE, OBJECTIVES, Objective, OrganizationError,
     PERSONAL_LIMIT, RANKS, Template,
 };
+use crate::starter_menu;
 use crate::state::{BoardView, SoloLevelingState};
 
 const COLUMNS: usize = 9;
@@ -29,6 +30,10 @@ const PERSONAL_COLUMN: usize = 6;
 const GROUP_COLUMN: usize = 7;
 const GUILD_COLUMN: usize = 8;
 const HELP_SLOT: usize = 8;
+/// Objective columns shown on one page of the board.
+const OFFER_COLUMNS: usize = 6;
+/// Button that turns the board to its other page of objectives.
+const PAGE_SLOT: usize = 53;
 
 /// Opens the board for a hunter standing at it.
 pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
@@ -51,7 +56,8 @@ pub fn open_view(player: &Player, state: Arc<SoloLevelingState>) {
 
 fn build(container_id: u8, player: &Player, state: Arc<SoloLevelingState>, at_board: bool) -> Menu {
     let view = state.organization_view(player.gameprofile.id());
-    let container = SimpleContainer::from_items(menu_items(view.as_ref(), at_board)).into_shared();
+    let container =
+        SimpleContainer::from_items(menu_items(view.as_ref(), at_board, 0)).into_shared();
     let mut builder = MenuBuilder::new(&vanilla_menu_types::GENERIC_9X6, container_id);
     let buttons = builder.section_all(Arc::clone(&container));
     builder.player_inventory(&player.inventory);
@@ -60,6 +66,8 @@ fn build(container_id: u8, player: &Player, state: Arc<SoloLevelingState>, at_bo
         buttons,
         container,
         at_board,
+        page: 0,
+        view,
     })
 }
 
@@ -67,6 +75,7 @@ fn build(container_id: u8, player: &Player, state: Arc<SoloLevelingState>, at_bo
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Button {
     Offer(Template),
+    Page,
     Personal(usize),
     Group(usize),
     Guild(usize),
@@ -83,9 +92,13 @@ enum Action {
     Guild,
 }
 
-fn button_at(slot: usize) -> Option<Button> {
+fn button_at(slot: usize, page: usize) -> Option<Button> {
     let (row, column) = (slot / COLUMNS, slot % COLUMNS);
-    if let Some(objective) = OBJECTIVES.get(column) {
+    if slot == PAGE_SLOT {
+        return Some(Button::Page);
+    }
+    if column < OFFER_COLUMNS {
+        let objective = OBJECTIVES.get(page * OFFER_COLUMNS + column)?;
         let rank = *RANKS.get(row)?;
         return Some(Button::Offer(Template {
             objective: *objective,
@@ -100,14 +113,25 @@ fn button_at(slot: usize) -> Option<Button> {
     }
 }
 
-fn menu_items(view: Option<&BoardView>, at_board: bool) -> Vec<ItemStack> {
+/// Pages the board needs for every objective.
+const PAGES: usize = OBJECTIVES.len().div_ceil(OFFER_COLUMNS);
+
+fn menu_items(view: Option<&BoardView>, at_board: bool, page: usize) -> Vec<ItemStack> {
     let mut items = vec![ItemStack::empty(); SLOTS];
     let Some(view) = view else {
         return items;
     };
     for (slot, item) in items.iter_mut().enumerate() {
-        *item = match button_at(slot) {
-            Some(Button::Offer(_)) if !at_board => ItemStack::empty(),
+        *item = match button_at(slot, page) {
+            Some(Button::Offer(_) | Button::Page) if !at_board => ItemStack::empty(),
+            Some(Button::Page) => with_lore(
+                named(
+                    ItemStack::new(&vanilla_items::ARROW),
+                    TextComponent::plain(format!("Страница {} / {PAGES}", page + 1))
+                        .color(Color::Yellow),
+                ),
+                vec![TextComponent::plain("Клик — другие задания.").color(Color::Gray)],
+            ),
             Some(Button::Offer(template)) => offer_item(view, template),
             Some(Button::Personal(index)) => view.book.contracts.get(index).map_or_else(
                 || free_slot("Свободный личный слот"),
@@ -138,6 +162,13 @@ fn objective_icon(objective: Objective) -> ItemRef {
         Objective::Boss => &vanilla_items::ZOMBIE_HEAD,
         Objective::RankedDungeon => &vanilla_items::COMPASS,
         Objective::Dungeons => &vanilla_items::MAP,
+        Objective::RedGate => &vanilla_items::REDSTONE,
+        Objective::CleanGate => &vanilla_items::TOTEM_OF_UNDYING,
+        Objective::FastGate => &vanilla_items::CLOCK,
+        Objective::CrystalHaul => &vanilla_items::AMETHYST_SHARD,
+        Objective::TrophyHaul => &vanilla_items::LEATHER,
+        Objective::Nests => &vanilla_items::SPIDER_EYE,
+        Objective::Castle => &vanilla_items::NETHER_BRICK,
     }
 }
 
@@ -251,6 +282,16 @@ fn help_item(view: &BoardView) -> ItemStack {
                 "Гильдии: до {GUILD_LIMIT} заданий, цель и оплата ×{GUILD_SCALE}."
             )),
             TextComponent::plain("Гильдийными управляют мастер и офицеры."),
+            TextComponent::plain(if view.starter_claimable {
+                "Клик — получить стартовый набор Ассоциации!"
+            } else {
+                "Клик — помощь Ассоциации и городской торговец."
+            })
+            .color(if view.starter_claimable {
+                Color::Green
+            } else {
+                Color::Yellow
+            }),
         ],
     )
 }
@@ -261,6 +302,10 @@ struct OrganizationMenuKind {
     container: Shared<SimpleContainer>,
     /// Whether the hunter opened the board itself, rather than the read-only list.
     at_board: bool,
+    /// Page of objectives the board shows.
+    page: usize,
+    /// Last state drawn into the container.
+    view: Option<BoardView>,
 }
 
 // SAFETY: This Solo Leveling-owned key uniquely identifies the concrete menu kind.
@@ -269,6 +314,19 @@ unsafe impl DowncastType for OrganizationMenuKind {
 }
 
 impl OrganizationMenuKind {
+    fn redraw(&mut self, guard: &mut ContainerLockGuard, view: Option<BoardView>) {
+        let container_id = ContainerId::from_arc(&self.container);
+        if let Some(container) = guard.get_typed_mut::<SimpleContainer>(container_id) {
+            for (index, item) in menu_items(view.as_ref(), self.at_board, self.page)
+                .into_iter()
+                .enumerate()
+            {
+                container.set_item(index, item);
+            }
+            self.view = view;
+        }
+    }
+
     fn act(
         &self,
         button: Button,
@@ -333,11 +391,25 @@ impl OrganizationMenuKind {
                 let contract = state.cancel_group_contract(uuid, index)?;
                 format!("Групповое задание отменено: {}.", contract.template.title())
             }
+            // Turning the page happens before any action reaches here.
+            (Button::Page, _) => String::new(),
         })
     }
 }
 
 impl MenuKind for OrganizationMenuKind {
+    fn on_tick(
+        &mut self,
+        _behavior: &mut MenuBehavior,
+        guard: &mut ContainerLockGuard,
+        player: &Player,
+    ) {
+        let view = self.state.organization_view(player.gameprofile.id());
+        if self.view != view {
+            self.redraw(guard, view);
+        }
+    }
+
     fn on_slot_clicked(
         &mut self,
         _behavior: &mut MenuBehavior,
@@ -366,15 +438,23 @@ impl MenuKind for OrganizationMenuKind {
         if !self.buttons.contains(slot) {
             return ClickOutcome::Fallthrough;
         }
-        let Some(target) = button_at(slot - self.buttons.start()) else {
+        if self.at_board && slot - self.buttons.start() == HELP_SLOT {
+            starter_menu::open(player, Arc::clone(&self.state));
+            return ClickOutcome::Consume;
+        }
+        let Some(target) = button_at(slot - self.buttons.start(), self.page) else {
             return ClickOutcome::Consume;
         };
-        let result = if self.at_board {
+        let result = if target == Button::Page {
+            self.page = (self.page + 1) % PAGES;
+            Ok(String::new())
+        } else if self.at_board {
             self.act(target, action, player)
         } else {
             Err(OrganizationError::NotAtBoard)
         };
         match result {
+            Ok(message) if message.is_empty() => {}
             Ok(message) => {
                 player.send_message(&TextComponent::plain(message).color(Color::Green));
             }
@@ -384,15 +464,7 @@ impl MenuKind for OrganizationMenuKind {
         }
 
         let view = self.state.organization_view(player.gameprofile.id());
-        let container_id = ContainerId::from_arc(&self.container);
-        if let Some(container) = guard.get_typed_mut::<SimpleContainer>(container_id) {
-            for (index, item) in menu_items(view.as_ref(), self.at_board)
-                .into_iter()
-                .enumerate()
-            {
-                container.set_item(index, item);
-            }
-        }
+        self.redraw(guard, view);
         ClickOutcome::Consume
     }
 }
@@ -406,28 +478,42 @@ mod tests {
     #[test]
     fn slots_map_to_offers_and_contract_columns() {
         assert_eq!(
-            button_at(0),
+            button_at(0, 0),
             Some(Button::Offer(Template {
                 objective: Objective::Mobs,
                 rank: HunterRank::E,
             }))
         );
         assert_eq!(
-            button_at(5 * 9 + 4),
+            button_at(5 * 9 + 4, 0),
             Some(Button::Offer(Template {
                 objective: Objective::Dungeons,
                 rank: HunterRank::S,
             }))
         );
-        assert_eq!(button_at(6), Some(Button::Personal(0)));
-        assert_eq!(button_at(2 * 9 + 6), Some(Button::Personal(2)));
-        assert_eq!(button_at(3 * 9 + 6), None);
-        assert_eq!(button_at(9 + 7), Some(Button::Group(1)));
-        assert_eq!(button_at(2 * 9 + 7), None);
-        assert_eq!(button_at(5), None);
-        assert_eq!(button_at(8), None);
-        assert_eq!(button_at(9 + 8), Some(Button::Guild(0)));
-        assert_eq!(button_at(2 * 9 + 8), Some(Button::Guild(1)));
-        assert_eq!(button_at(3 * 9 + 8), None);
+        assert_eq!(button_at(6, 0), Some(Button::Personal(0)));
+        assert_eq!(button_at(2 * 9 + 6, 0), Some(Button::Personal(2)));
+        assert_eq!(button_at(3 * 9 + 6, 0), None);
+        assert_eq!(button_at(9 + 7, 0), Some(Button::Group(1)));
+        assert_eq!(button_at(2 * 9 + 7, 0), None);
+        assert_eq!(
+            button_at(5, 0),
+            Some(Button::Offer(Template {
+                objective: Objective::RedGate,
+                rank: HunterRank::E,
+            }))
+        );
+        assert_eq!(
+            button_at(5, 1),
+            Some(Button::Offer(Template {
+                objective: Objective::Castle,
+                rank: HunterRank::E,
+            }))
+        );
+        assert_eq!(button_at(53, 0), Some(Button::Page));
+        assert_eq!(button_at(8, 0), None);
+        assert_eq!(button_at(9 + 8, 0), Some(Button::Guild(0)));
+        assert_eq!(button_at(2 * 9 + 8, 0), Some(Button::Guild(1)));
+        assert_eq!(button_at(3 * 9 + 8, 0), None);
     }
 }

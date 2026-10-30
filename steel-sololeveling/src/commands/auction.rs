@@ -154,6 +154,7 @@ fn place(
     }
     state.request_auction(AuctionRequest::List {
         player: Arc::downgrade(&player),
+        chosen: None,
         kind,
         price,
         hours,

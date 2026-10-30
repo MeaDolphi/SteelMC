@@ -17,7 +17,8 @@ use text_components::TextComponent;
 use text_components::format::Color;
 use uuid::Uuid;
 
-use crate::dungeon::mobs::{MobLabel, MobRarity};
+use crate::dungeon::mobs::{MobLabel, MobRarity, clear_health_line};
+use crate::dungeon::skills::{BROOD_COOLDOWN_TICKS, hatch_shadow};
 use crate::item::nbt;
 use crate::session::HunterSession;
 use crate::shadow::{
@@ -41,6 +42,30 @@ struct ActiveShadow {
     owner: Uuid,
     shadow_id: Uuid,
     entity: SharedEntity,
+    brood: Option<ShadowBrood>,
+}
+
+#[derive(Default)]
+struct ShadowBrood {
+    ready_tick: Option<u64>,
+    larvae: Vec<SharedEntity>,
+}
+
+impl ShadowBrood {
+    fn discard(&mut self) {
+        for larva in self.larvae.drain(..) {
+            Self::clear_health_line(&larva);
+            larva.set_removed(RemovalReason::Discarded);
+        }
+    }
+
+    fn clear_health_line(larva: &SharedEntity) {
+        if let Some(world) = larva.level()
+            && let Some(living) = larva.as_living_entity()
+        {
+            clear_health_line(&world, living);
+        }
+    }
 }
 
 /// Ephemeral data that must disappear on server restart.
@@ -63,8 +88,24 @@ impl fmt::Debug for ShadowRuntime {
 
 impl ShadowRuntime {
     /// Removes runtime entries whose entities were discarded outside a death hook.
-    pub fn tick(&mut self) {
-        self.active.retain(|_, active| !active.entity.is_removed());
+    pub fn tick(&mut self, tick: u64) {
+        self.active.retain(|_, active| {
+            if active.entity.is_removed()
+                || active
+                    .entity
+                    .as_living_entity()
+                    .is_none_or(LivingEntity::is_dead_or_dying)
+            {
+                if let Some(brood) = &mut active.brood {
+                    brood.discard();
+                }
+                return false;
+            }
+            if let Some(brood) = &mut active.brood {
+                brood.tick(&active.entity, active.owner, tick);
+            }
+            true
+        });
     }
 
     /// Retains a nearby mob the player just killed, with an immediate soul effect.
@@ -172,7 +213,10 @@ impl ShadowRuntime {
             .filter_map(|(id, active)| (active.owner == owner).then_some(*id))
             .collect();
         for id in &ids {
-            if let Some(active) = self.active.remove(id) {
+            if let Some(mut active) = self.active.remove(id) {
+                if let Some(brood) = &mut active.brood {
+                    brood.discard();
+                }
                 active.entity.set_removed(RemovalReason::Discarded);
             }
         }
@@ -192,6 +236,13 @@ impl ShadowRuntime {
             if let Some(mob) = active.entity.as_mob() {
                 mob.set_allied_mode(mode);
             }
+            if let Some(brood) = &active.brood {
+                for larva in &brood.larvae {
+                    if let Some(mob) = larva.as_mob() {
+                        mob.set_allied_mode(mode);
+                    }
+                }
+            }
         }
     }
 
@@ -200,6 +251,13 @@ impl ShadowRuntime {
         for active in self.active.values().filter(|active| active.owner == owner) {
             if let Some(mob) = active.entity.as_mob() {
                 mob.set_allied_focus(Some(target));
+            }
+            if let Some(brood) = &active.brood {
+                for larva in &brood.larvae {
+                    if let Some(mob) = larva.as_mob() {
+                        mob.set_allied_focus(Some(target));
+                    }
+                }
             }
         }
     }
@@ -236,7 +294,10 @@ impl ShadowRuntime {
         }) else {
             return false;
         };
-        if let Some(active) = self.active.remove(&entity_id) {
+        if let Some(mut active) = self.active.remove(&entity_id) {
+            if let Some(brood) = &mut active.brood {
+                brood.discard();
+            }
             active.entity.set_removed(RemovalReason::Discarded);
         }
         true
@@ -244,7 +305,10 @@ impl ShadowRuntime {
 
     /// Removes a dead body and returns the persistent shadow that must rebuild.
     pub fn observe_death(&mut self, entity_uuid: Uuid) -> Option<(Uuid, Uuid, u16)> {
-        let active = self.active.remove(&entity_uuid)?;
+        let mut active = self.active.remove(&entity_uuid)?;
+        if let Some(brood) = &mut active.brood {
+            brood.discard();
+        }
         let maximum_health = active
             .entity
             .as_living_entity()
@@ -261,11 +325,25 @@ impl ShadowRuntime {
         victim: &dyn LivingEntity,
         world: &World,
     ) -> Option<(Uuid, Uuid, u64)> {
-        let active = self.active.get(&killer_uuid)?;
+        let (active, killer) = self.kill_source(killer_uuid)?;
         let reward = victim
-            .experience_reward(world, Some(active.entity.as_ref()))
+            .experience_reward(world, Some(killer.as_ref()))
             .max(0) as u64;
         Some((active.owner, active.shadow_id, reward))
+    }
+
+    fn kill_source(&self, killer_uuid: Uuid) -> Option<(&ActiveShadow, &SharedEntity)> {
+        if let Some(active) = self.active.get(&killer_uuid) {
+            return Some((active, &active.entity));
+        }
+        self.active.values().find_map(|active| {
+            let brood = active.brood.as_ref()?;
+            brood
+                .larvae
+                .iter()
+                .find(|larva| larva.uuid() == killer_uuid)
+                .map(|larva| (active, larva))
+        })
     }
 
     /// Allocates one point and refreshes the matching active body.
@@ -329,9 +407,66 @@ impl ShadowRuntime {
                 owner: hunter.gameprofile.id(),
                 shadow_id: shadow.id,
                 entity,
+                brood: shadow
+                    .origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.is_broodmother == Some(true))
+                    .then(ShadowBrood::default),
             },
         );
         Ok(())
+    }
+}
+
+impl ShadowBrood {
+    fn tick(&mut self, mother: &SharedEntity, owner: Uuid, tick: u64) {
+        self.larvae.retain(|larva| {
+            let live = !larva.is_removed()
+                && larva
+                    .as_living_entity()
+                    .is_some_and(|living| !living.is_dead_or_dying());
+            if !live {
+                Self::clear_health_line(larva);
+            }
+            live
+        });
+        let ready_tick = *self.ready_tick.get_or_insert(tick + 40);
+        if tick < ready_tick || self.larvae.len() >= 2 {
+            return;
+        }
+        let Some(mob) = mother.as_mob() else {
+            return;
+        };
+        if mob.allied_mode() == AlliedMode::Passive
+            || mob
+                .target()
+                .is_none_or(|target| !mob.allied_may_fight(target.as_ref()))
+        {
+            return;
+        }
+        let Some(world) = mother.level() else {
+            return;
+        };
+        self.ready_tick = Some(tick + BROOD_COOLDOWN_TICKS);
+        let position = mother.position();
+        let mut occupied = self
+            .larvae
+            .iter()
+            .map(|larva| larva.position())
+            .collect::<Vec<_>>();
+        occupied.push(position);
+        while self.larvae.len() < 2 {
+            let Some(larva) = hatch_shadow(&world, position, &occupied) else {
+                break;
+            };
+            larva.set_runtime_allied_owner(Some(owner));
+            if let Some(larva_mob) = larva.as_mob() {
+                larva_mob.set_allied_mode(mob.allied_mode());
+                larva_mob.set_allied_focus(mob.allied_focus().as_ref());
+            }
+            occupied.push(larva.position());
+            self.larvae.push(larva);
+        }
     }
 }
 
@@ -373,6 +508,7 @@ fn capture_origin(entity: &dyn LivingEntity, label: Option<&MobLabel>) -> Shadow
         armor: origin_stats.3,
         equipment,
         is_tank: label.is_some_and(|label| label.is_tank),
+        is_broodmother: Some(label.is_some_and(|label| label.is_broodmother)),
     }
 }
 
@@ -483,5 +619,107 @@ fn apply_upgrade(entity: &dyn Entity, stat: ShadowStat) {
     living.set_base_attribute_value(attribute, current + increment);
     if stat == ShadowStat::Health {
         living.set_health(living.get_max_health());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Weak};
+
+    use glam::DVec3;
+    use steel_core::entity::entities::{EndermiteEntity, ZombieEntity};
+    use steel_core::entity::{AlliedMode, SharedEntity};
+    use steel_registry::{init_vanilla_registry, vanilla_entities};
+    use uuid::Uuid;
+
+    use super::{ActiveShadow, ShadowBrood, ShadowRuntime, capture_origin};
+    use crate::dungeon::generator::Theme;
+    use crate::dungeon::mobs::{MobClass, MobLabel};
+
+    fn active_brood() -> (ShadowRuntime, Uuid, Uuid, SharedEntity) {
+        init_vanilla_registry();
+        let owner = Uuid::new_v4();
+        let shadow_id = Uuid::new_v4();
+        let mother: SharedEntity = Arc::new(ZombieEntity::new(
+            &vanilla_entities::ZOMBIE,
+            1,
+            DVec3::ZERO,
+            Weak::new(),
+        ));
+        let larva: SharedEntity = Arc::new(EndermiteEntity::new(
+            &vanilla_entities::ENDERMITE,
+            2,
+            DVec3::ZERO,
+            Weak::new(),
+        ));
+        mother.set_runtime_allied_owner(Some(owner));
+        larva.set_runtime_allied_owner(Some(owner));
+        let mut runtime = ShadowRuntime::default();
+        runtime.active.insert(
+            mother.uuid(),
+            ActiveShadow {
+                owner,
+                shadow_id,
+                entity: mother,
+                brood: Some(ShadowBrood {
+                    ready_tick: None,
+                    larvae: vec![Arc::clone(&larva)],
+                }),
+            },
+        );
+        (runtime, owner, shadow_id, larva)
+    }
+
+    #[test]
+    fn broodmother_origin_survives_serialization() {
+        init_vanilla_registry();
+        let mother = ZombieEntity::new(&vanilla_entities::ZOMBIE, 1, DVec3::ZERO, Weak::new());
+        let label = MobLabel::mob(Theme::Crypt, MobClass::Broodmother);
+        let origin = capture_origin(&mother, Some(&label));
+        let data = serde_json::to_string(&origin).expect("serialize origin");
+        let restored =
+            serde_json::from_str::<crate::shadow::ShadowOrigin>(&data).expect("deserialize origin");
+        assert_eq!(restored.is_broodmother, Some(true));
+        let guard = MobLabel::mob(Theme::Crypt, MobClass::Guard);
+        assert_eq!(
+            capture_origin(&mother, Some(&guard)).is_broodmother,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn brood_follows_orders_and_dismissal_discards_it() {
+        let (mut runtime, owner, shadow_id, larva) = active_brood();
+        assert_eq!(runtime.active_shadows(owner), vec![shadow_id]);
+        runtime.set_mode(owner, AlliedMode::Passive);
+        assert_eq!(
+            larva.as_mob().expect("mob").allied_mode(),
+            AlliedMode::Passive
+        );
+        assert!(runtime.dismiss(owner, shadow_id));
+        assert!(larva.is_removed());
+    }
+
+    #[test]
+    fn brood_is_discarded_on_recall_and_mother_death() {
+        let (mut runtime, owner, _, larva) = active_brood();
+        assert_eq!(runtime.recall(owner), 1);
+        assert!(larva.is_removed());
+
+        let (mut runtime, _, _, larva) = active_brood();
+        let mother = *runtime.active.keys().next().expect("mother");
+        assert!(runtime.observe_death(mother).is_some());
+        assert!(larva.is_removed());
+    }
+
+    #[test]
+    fn larva_kills_are_credited_to_the_owning_shadow() {
+        let (mut runtime, owner, shadow_id, larva) = active_brood();
+        let (active, killer) = runtime.kill_source(larva.uuid()).expect("larva source");
+        assert_eq!((active.owner, active.shadow_id), (owner, shadow_id));
+        assert_eq!(killer.uuid(), larva.uuid());
+        assert!(runtime.kill_source(Uuid::new_v4()).is_none());
+        assert!(runtime.dismiss(owner, shadow_id));
+        assert!(runtime.kill_source(larva.uuid()).is_none());
     }
 }

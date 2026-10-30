@@ -82,8 +82,9 @@ impl EndermiteEntity {
             goal_selector.add_goal(8, RandomLookAroundGoal::new());
 
             let mut target_selector = mob_base.target_selector().lock();
-            target_selector.add_goal(1, HurtByTargetGoal::new().set_alert_others(empty()));
-            target_selector.add_goal(2, NearestAttackableTargetGoal::new_for_tank_taunt());
+            // Tank taunts must replace retaliation so the first attacker does not hold aggro.
+            target_selector.add_goal(1, NearestAttackableTargetGoal::new_for_tank_taunt());
+            target_selector.add_goal(2, HurtByTargetGoal::new().set_alert_others(empty()));
             target_selector.add_goal(
                 3,
                 NearestAttackableTargetGoal::new_for_players(true, |_, _| true),
@@ -394,5 +395,21 @@ mod tests {
 
         assert!(loaded.player_spawned());
         assert_eq!(loaded.lifetime(), 1234);
+    }
+
+    #[test]
+    fn endermite_tank_taunt_preempts_retaliation_and_player_targets() {
+        init_vanilla_registry();
+        let endermite =
+            EndermiteEntity::new(&vanilla_entities::ENDERMITE, 1, DVec3::ZERO, Weak::new());
+
+        assert_eq!(
+            endermite
+                .mob_base()
+                .target_selector()
+                .lock()
+                .available_goal_priorities(),
+            [1, 2, 3]
+        );
     }
 }

@@ -16,17 +16,20 @@ use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
 use crate::auction_menu;
+use crate::castle_menu;
 use crate::class_menu;
+use crate::deferred_inventory_menu;
 use crate::guild_menu;
 use crate::hunter_stats_menu;
 use crate::item::{named, with_lore};
 use crate::organization_menu;
 use crate::party_menu;
 use crate::pay_menu;
+use crate::quest_menu;
 use crate::shadow_menu;
 use crate::shop_menu;
 use crate::sound::SystemSound;
-use crate::state::SoloLevelingState;
+use crate::state::{GateMenuAction, SoloLevelingState};
 
 const MENU_SLOTS: usize = 27;
 const PROFILE_SLOT: usize = 4;
@@ -46,10 +49,15 @@ enum Category {
     Class,
     Pay,
     Gear,
+    Deferred,
+    Gates,
+    Castle,
+    Errands,
+    Path,
 }
 
 /// Categories and the menu slot each one sits in.
-const CATEGORIES: [(usize, Category); 12] = [
+const CATEGORIES: [(usize, Category); 17] = [
     (10, Category::Hunter),
     (11, Category::Shop),
     (12, Category::Contracts),
@@ -62,6 +70,11 @@ const CATEGORIES: [(usize, Category); 12] = [
     (21, Category::Class),
     (20, Category::Pay),
     (24, Category::Gear),
+    (25, Category::Deferred),
+    (26, Category::Gates),
+    (19, Category::Castle),
+    (17, Category::Errands),
+    (18, Category::Path),
 ];
 
 fn category_at(slot: usize) -> Option<Category> {
@@ -85,6 +98,11 @@ impl Category {
             Self::Class => &vanilla_items::IRON_SWORD,
             Self::Pay => &vanilla_items::GOLD_NUGGET,
             Self::Gear => &vanilla_items::ARMOR_STAND,
+            Self::Deferred => &vanilla_items::CHEST,
+            Self::Gates => &vanilla_items::ENDER_EYE,
+            Self::Castle => &vanilla_items::NETHER_BRICK,
+            Self::Errands => &vanilla_items::PAPER,
+            Self::Path => &vanilla_items::FILLED_MAP,
         }
     }
 
@@ -102,13 +120,18 @@ impl Category {
             Self::Class => "Класс",
             Self::Pay => "Перевод Won",
             Self::Gear => "Снаряжение",
+            Self::Deferred => "Хранилище",
+            Self::Gates => "Врата",
+            Self::Castle => "Замок демонов",
+            Self::Errands => "Поручения Системы",
+            Self::Path => "Путь охотника",
         }
     }
 
     const fn hints(self) -> &'static [&'static str] {
         match self {
             Self::Hunter => &["Распределить очки характеристик."],
-            Self::Shop => &["Десять товаров дня за очки Системы."],
+            Self::Shop => &["Десять товаров за очки Системы; обновление каждые 20 минут."],
             Self::Contracts => &[
                 "Взятые задания Организации и прогресс.",
                 "Брать и сдавать — у доски Организации.",
@@ -119,7 +142,7 @@ impl Category {
             ],
             Self::Party => &["Состав группы, приглашения", "и выход из группы."],
             Self::Shadows => &["Армия, призыв, отзыв", "и прокачка теней."],
-            Self::Auction => &["Покупка, ставки и продажа", "предмета из руки."],
+            Self::Auction => &["Покупка, ставки и продажа", "любого предмета из инвентаря."],
             Self::Crystals => &["Продать все магические кристаллы", "Организации за Won."],
             Self::Enchanting => &[
                 "Выбрать артефакт и зачаровать его.",
@@ -131,6 +154,14 @@ impl Category {
                 "Шлем, броня, перчатки, кольца, амулет:",
                 "бонусы артефактов без надевания.",
             ],
+            Self::Deferred => &["Отложенные награды Системы."],
+            Self::Gates => &["Активные врата и путь к ним."],
+            Self::Castle => &[
+                "Бесконечная башня этажей:",
+                "прогресс, вход и рейтинг недели.",
+            ],
+            Self::Errands => &["Три поручения дня и три", "испытания недели с наградами."],
+            Self::Path => &["Разовые достижения охотника", "с наградой в Won."],
         }
     }
 
@@ -236,6 +267,13 @@ impl MainMenuKind {
             Category::Class => class_menu::open(player, Arc::clone(state)),
             Category::Pay => pay_menu::open(player, Arc::clone(state)),
             Category::Gear => state.defer_gear_menu(uuid),
+            Category::Deferred => {
+                deferred_inventory_menu::open(player, Arc::clone(state), 0);
+            }
+            Category::Gates => state.defer_gate_menu_action(uuid, GateMenuAction::OpenPage(0)),
+            Category::Castle => castle_menu::open(player, Arc::clone(state)),
+            Category::Errands => quest_menu::open_errands(player, state),
+            Category::Path => quest_menu::open_path(player, state),
         }
     }
 }

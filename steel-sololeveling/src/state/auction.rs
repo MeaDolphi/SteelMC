@@ -31,6 +31,7 @@ use super::persistence::{AccountUpdate, CommitReport, PreparedCommit};
 use crate::auction::{AuctionError, Ledger, Lot, LotKind};
 use crate::item::{binding, nbt};
 use crate::player_data::SoloLevelingPlayerData;
+use crate::quest_book::Goal;
 
 /// How often lot expiry and pending deliveries are checked, in ticks.
 pub const MAINTENANCE_INTERVAL_TICKS: u64 = 20;
@@ -65,10 +66,13 @@ impl AuctionState {
 /// One queued auction operation.
 #[derive(Debug)]
 pub enum AuctionRequest {
-    /// Escrows the stack in the hunter's main hand.
+    /// Escrows a stack from the hunter's inventory.
     List {
         /// Hunter listing the stack.
         player: Weak<Player>,
+        /// Inventory slot chosen in the menu with the stack seen there;
+        /// `None` lists the main hand.
+        chosen: Option<(usize, ItemStack)>,
         /// How the lot accepts buyers.
         kind: LotKind,
         /// Fixed price, or the lowest first bid.
@@ -288,6 +292,7 @@ impl SoloLevelingState {
         match request {
             AuctionRequest::List {
                 player,
+                chosen,
                 kind,
                 price,
                 hours,
@@ -295,7 +300,7 @@ impl SoloLevelingState {
                 let Some(player) = player.upgrade() else {
                     return false;
                 };
-                self.list_lot(server, &player, kind, price, hours)
+                self.list_lot(server, &player, chosen, kind, price, hours)
             }
             AuctionRequest::Buy { player, lot } => {
                 let Some(player) = player.upgrade() else {
@@ -401,18 +406,22 @@ impl SoloLevelingState {
         )
     }
 
-    /// Escrows the main-hand stack and lists it.
+    /// Escrows the chosen stack, or the main-hand one, and lists it.
     fn list_lot(
         self: &Arc<Self>,
         server: &Arc<Server>,
         player: &Arc<Player>,
+        chosen: Option<(usize, ItemStack)>,
         kind: LotKind,
         price: u64,
         hours: u64,
     ) -> bool {
-        let Some(held) = main_hand_stack(player) else {
-            refuse(player, "Возьмите предмет в руку.");
-            return false;
+        let (held, chosen_slot) = match listing_source(player, chosen) {
+            Ok(source) => source,
+            Err(message) => {
+                refuse(player, message);
+                return false;
+            }
         };
         if binding::bound_owner(&held).is_some() {
             refuse(player, "Личный предмет нельзя выставить на аукцион.");
@@ -445,13 +454,13 @@ impl SoloLevelingState {
                 return false;
             }
         };
-        // A durable transaction cannot own the equipped hand, so the stack is
-        // parked in storage first; the move alone never changes what is owned.
+        // A durable transaction cannot own the equipped hand, so a held stack
+        // is parked in storage first; the move alone never changes what is owned.
         let Ok(bytes) = serde_json::to_vec(&ledger) else {
             refuse(player, "Не удалось выставить лот.");
             return false;
         };
-        let Some(slot) = park_main_hand_stack(player) else {
+        let Some(slot) = chosen_slot.or_else(|| park_main_hand_stack(player)) else {
             refuse(player, "Освободите место в инвентаре.");
             return false;
         };
@@ -502,6 +511,7 @@ impl SoloLevelingState {
     /// Charges a buyer and sells a fixed-price lot.
     fn buy_lot(self: &Arc<Self>, server: &Arc<Server>, player: &Arc<Player>, lot: u64) -> bool {
         let hunter = player.gameprofile.id();
+        let seller = self.auction.lock().ledger.lot(lot).map(|lot| lot.seller);
         let plan = {
             let auction = self.auction.lock();
             let mut ledger = auction.ledger.clone();
@@ -521,6 +531,7 @@ impl SoloLevelingState {
             return false;
         };
         let buyer = Arc::clone(player);
+        let sale_state = Arc::clone(self);
         self.commit_auction(
             server,
             ledger,
@@ -530,6 +541,9 @@ impl SoloLevelingState {
             move |_, report| {
                 if report.committed {
                     announce(&buyer, format!("Лот #{lot} куплен за {price} Won."));
+                    if let Some(seller) = seller {
+                        sale_state.record_goal(seller, Goal::AuctionSale, 1);
+                    }
                 } else {
                     refuse(&buyer, "Покупка не сохранилась: деньги не списаны.");
                 }
@@ -689,6 +703,28 @@ impl SoloLevelingState {
 struct Charge {
     snapshot: SoloLevelingPlayerData,
     update: AccountUpdate,
+}
+
+/// Returns the stack to list and its storage slot, unless it is held and
+/// must be parked first.
+fn listing_source(
+    player: &Player,
+    chosen: Option<(usize, ItemStack)>,
+) -> Result<(ItemStack, Option<usize>), &'static str> {
+    let Some((slot, seen)) = chosen else {
+        return main_hand_stack(player)
+            .map(|held| (held, None))
+            .ok_or("Возьмите предмет в руку.");
+    };
+    let inventory = player.inventory.lock();
+    let current = inventory.get_item(slot).clone();
+    // The price was picked over several menus; the slot may hold something
+    // else by now.
+    if current.is_empty() || current != seen {
+        return Err("Выбранный предмет сдвинулся: выберите его заново.");
+    }
+    let held = slot == usize::from(inventory.get_selected_slot());
+    Ok((current, (!held).then_some(slot)))
 }
 
 /// Returns a copy of the stack in the hunter's main hand.

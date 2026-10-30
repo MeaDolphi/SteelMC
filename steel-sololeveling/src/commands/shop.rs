@@ -45,7 +45,7 @@ pub fn register(
                             ))
                         })?;
                         buy_state
-                            .request_shop_purchase(player, slot, false)
+                            .request_shop_purchase(player, slot, false, None)
                             .map_err(purchase_error)?;
                         player.send_message(
                             &TextComponent::plain("Покупка обрабатывается.").color(Color::Gold),

@@ -22,8 +22,9 @@ use steel_utils::Identifier;
 use text_components::format::Color;
 use text_components::{Modifier as _, TextComponent};
 
+use crate::class::HunterClass;
 use crate::identifier::from_sololeveling;
-use crate::item::artifact::{self, Ability};
+use crate::item::artifact::{self, Ability, ArtifactId};
 use crate::item::{named, nbt, with_lore};
 use crate::rank::HunterRank;
 use crate::state::SoloLevelingState;
@@ -158,23 +159,67 @@ impl SavedGear {
 
 /// Returns the abilities of the gear `items` a hunter of `rank` can use.
 #[must_use]
-pub fn abilities(items: &[ItemStack], rank: HunterRank) -> Vec<Ability> {
+pub fn abilities(
+    items: &[ItemStack],
+    rank: HunterRank,
+    class: Option<HunterClass>,
+) -> Vec<Ability> {
     items
         .iter()
-        .filter(|stack| artifact::usable_by(stack, rank))
+        .filter(|stack| artifact::usable_by(stack, rank) && wearable(stack, class))
         .filter_map(artifact::held)
         .flat_map(|artifact| artifact.abilities.iter().copied())
         .collect()
 }
 
-/// Returns the attribute bonuses of the gear `items` a hunter of `rank` can
-/// use, each with an id unique to its gear slot.
+/// Returns whether a hunter of `class` may wear `stack`.
+///
+/// Specialization armor belongs to its classes; everything else, the
+/// universal starter armor included, fits every hunter.
 #[must_use]
-pub fn modifiers(items: &[ItemStack], rank: HunterRank) -> Vec<(AttributeRef, AttributeModifier)> {
+pub fn wearable(stack: &ItemStack, class: Option<HunterClass>) -> bool {
+    artifact::of(stack)
+        .and_then(ArtifactId::allowed_classes)
+        .is_none_or(|classes| class.is_some_and(|class| classes.contains(&class)))
+}
+
+/// Returns whether a hunter with `strength` meets the Strength requirement of
+/// `stack`; a piece below it can be worn but grants nothing.
+#[must_use]
+pub fn strong_enough(stack: &ItemStack, strength: u32) -> bool {
+    artifact::of(stack).is_none_or(|id| strength >= id.required_strength())
+}
+
+/// Returns the magic-damage bonus of the gear `items` a hunter of `class`
+/// and `strength` wears, as a fraction.
+#[must_use]
+pub fn magic_bonus(items: &[ItemStack], class: Option<HunterClass>, strength: u32) -> f32 {
+    items
+        .iter()
+        .filter(|stack| wearable(stack, class) && strong_enough(stack, strength))
+        .filter_map(artifact::of)
+        .map(ArtifactId::magic_bonus)
+        .sum()
+}
+
+/// Returns the attribute bonuses of the gear `items` a hunter of `rank`,
+/// `class` and `strength` can use, each with an id unique to its gear slot.
+#[must_use]
+pub fn modifiers(
+    items: &[ItemStack],
+    rank: HunterRank,
+    class: Option<HunterClass>,
+    strength: u32,
+) -> Vec<(AttributeRef, AttributeModifier)> {
     items
         .iter()
         .enumerate()
-        .filter(|(_, stack)| artifact::of(stack).is_some() && artifact::usable_by(stack, rank))
+        .filter(|(_, stack)| {
+            artifact::of(stack).is_some()
+                && artifact::usable_by(stack, rank)
+                && wearable(stack, class)
+                && strong_enough(stack, strength)
+        })
         .flat_map(|(index, stack)| {
             stack
                 .get(ATTRIBUTE_MODIFIERS)
@@ -361,10 +406,10 @@ mod tests {
         assert_eq!(restored, items);
 
         // The unbound legendary helmet needs rank A; the bound shoes do not.
-        assert_eq!(abilities(&items, HunterRank::D).len(), 0);
-        assert_ne!(abilities(&items, HunterRank::A).len(), 0);
-        let low = modifiers(&items, HunterRank::D);
+        assert_eq!(abilities(&items, HunterRank::D, None).len(), 0);
+        assert_ne!(abilities(&items, HunterRank::A, None).len(), 0);
+        let low = modifiers(&items, HunterRank::D, None, 0);
         assert!(!low.is_empty(), "the shoes still give their bonus");
-        assert!(modifiers(&items, HunterRank::A).len() > low.len());
+        assert!(modifiers(&items, HunterRank::A, None, 0).len() > low.len());
     }
 }

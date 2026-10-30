@@ -1,4 +1,4 @@
-//! The daily cycle of the personal shop and daily quests.
+//! The daily cycle of daily quests.
 //!
 //! One rule decides the boundary for every daily counter: the Moscow day. The
 //! zone has kept a fixed UTC+3 offset all year since 2014, so no calendar table

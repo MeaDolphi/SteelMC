@@ -81,8 +81,9 @@ impl ZombieEntity {
             goal_selector.add_goal(8, RandomLookAroundGoal::new());
 
             let mut target_selector = mob_base.target_selector().lock();
-            target_selector.add_goal(1, HurtByTargetGoal::new().set_alert_others(empty()));
-            target_selector.add_goal(2, NearestAttackableTargetGoal::new_for_tank_taunt());
+            // Tank taunts must replace retaliation so the first attacker does not hold aggro.
+            target_selector.add_goal(1, NearestAttackableTargetGoal::new_for_tank_taunt());
+            target_selector.add_goal(2, HurtByTargetGoal::new().set_alert_others(empty()));
             target_selector.add_goal(
                 3,
                 NearestAttackableTargetGoal::new_for_players(true, |_, _| true),
@@ -258,6 +259,10 @@ impl PathfinderMob for ZombieEntity {}
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Weak};
+
+    use steel_registry::item_stack::ItemStack;
+    use steel_registry::vanilla_items;
     use steel_registry::{init_vanilla_registry, vanilla_attributes, vanilla_entities};
     use steel_utils::{BlockPos, ChunkPos, Downcast as _};
 
@@ -265,7 +270,19 @@ mod tests {
     use crate::entity::monster::DEFAULT_XP_REWARD;
     use crate::entity::registry::init_entities;
     use crate::entity::{Entity, LivingEntity, Mob, SharedEntity, spawn_mob};
-    use crate::test_support::{fresh_test_world, insert_ready_full_chunk};
+    use crate::gameplay_hooks::GameplayHooks;
+    use crate::test_support::{
+        fresh_test_world, fresh_test_world_with_gameplay_hooks, insert_ready_full_chunk,
+    };
+    use crate::world::World;
+
+    struct SuppressMobDrops;
+
+    impl GameplayHooks for SuppressMobDrops {
+        fn suppress_mob_drops(&self, _world: &World, _entity_id: i32) -> bool {
+            true
+        }
+    }
 
     #[test]
     fn spawning_a_zombie_uses_vanilla_attributes_and_reward() {
@@ -301,5 +318,49 @@ mod tests {
         assert!(spawned.as_monster().is_some());
         assert!(spawned.as_pathfinder_mob().is_some());
         assert!(!zombie.is_removed());
+    }
+
+    #[test]
+    fn zombie_tank_taunt_preempts_retaliation_and_player_targets() {
+        init_vanilla_registry();
+        let zombie =
+            ZombieEntity::new(&vanilla_entities::ZOMBIE, 1, glam::DVec3::ZERO, Weak::new());
+
+        assert_eq!(
+            zombie
+                .mob_base()
+                .target_selector()
+                .lock()
+                .available_goal_priorities(),
+            [1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn mob_item_spawns_obey_the_gameplay_drop_suppression_hook() {
+        init_vanilla_registry();
+        init_entities();
+        let world_fixture = fresh_test_world_with_gameplay_hooks(
+            "zombie_drops_suppressed",
+            Arc::new(SuppressMobDrops),
+        );
+        let world = &world_fixture.world;
+        insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+        let zombie = Arc::new(ZombieEntity::new(
+            &vanilla_entities::ZOMBIE,
+            1,
+            glam::DVec3::new(8.0, 65.0, 8.0),
+            Arc::downgrade(world),
+        ));
+        let zombie_entity: SharedEntity = Arc::<ZombieEntity>::clone(&zombie);
+        world
+            .try_add_entity(zombie_entity)
+            .expect("test zombie should attach to the loaded chunk");
+
+        assert!(
+            zombie
+                .spawn_at_location(ItemStack::new(&vanilla_items::DIAMOND), 0.0)
+                .is_none()
+        );
     }
 }

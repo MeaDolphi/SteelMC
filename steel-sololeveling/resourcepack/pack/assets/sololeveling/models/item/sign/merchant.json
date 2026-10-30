@@ -1,0 +1,61 @@
+{
+  "textures": {
+    "board": "sololeveling:item/sign/merchant",
+    "particle": "sololeveling:item/sign/merchant"
+  },
+  "elements": [
+    {
+      "from": [
+        -16,
+        2,
+        7.5
+      ],
+      "to": [
+        32,
+        14,
+        8.5
+      ],
+      "faces": {
+        "north": {
+          "uv": [
+            0,
+            0,
+            16,
+            16
+          ],
+          "texture": "#board"
+        },
+        "south": {
+          "uv": [
+            0,
+            0,
+            16,
+            16
+          ],
+          "texture": "#board"
+        }
+      }
+    }
+  ],
+  "display": {
+    "fixed": {
+      "rotation": [
+        0,
+        180,
+        0
+      ],
+      "scale": [
+        2.75,
+        2.75,
+        2.75
+      ]
+    },
+    "gui": {
+      "scale": [
+        0.33,
+        0.33,
+        0.33
+      ]
+    }
+  }
+}

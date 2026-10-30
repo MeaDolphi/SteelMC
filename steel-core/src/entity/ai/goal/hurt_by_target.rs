@@ -135,6 +135,16 @@ impl Goal for HurtByTargetGoal {
     }
 
     fn can_continue_to_use(&mut self, mob: &dyn PathfinderMob) -> bool {
+        if let (Some(current), Some(attacker), Some(world)) =
+            (mob.target(), mob.last_hurt_by_mob(), mob.level())
+            && current.uuid() != attacker.uuid()
+            && world
+                .gameplay_hooks
+                .should_retarget_hurt_mob(&world, mob.id(), attacker.id())
+        {
+            return false;
+        }
+
         self.target_goal.can_continue_to_use(mob)
     }
 
@@ -170,10 +180,29 @@ mod tests {
 
     use super::*;
     use crate::behavior::init_behaviors;
+    use crate::entity::ai::goal::GoalSelector;
     use crate::entity::entities::{CowEntity, PigEntity};
-    use crate::entity::{Entity, LivingEntity, Mob};
-    use crate::test_support::{fresh_test_world, insert_ready_full_chunk};
+    use crate::entity::{Entity, LivingEntity, Mob, SharedEntity};
+    use crate::gameplay_hooks::GameplayHooks;
+    use crate::test_support::{
+        fresh_test_world, fresh_test_world_with_gameplay_hooks, insert_ready_full_chunk,
+    };
+    use crate::world::World;
     use steel_utils::ChunkPos;
+
+    struct RetargetOwnedMobAttacks;
+
+    impl GameplayHooks for RetargetOwnedMobAttacks {
+        fn should_retarget_hurt_mob(&self, world: &World, _mob_id: i32, attacker_id: i32) -> bool {
+            let Some(attacker_entity) = world.get_entity_by_id(attacker_id) else {
+                return false;
+            };
+            let Some(attacker) = attacker_entity.as_mob() else {
+                return false;
+            };
+            attacker.allied_owner().is_some()
+        }
+    }
 
     #[test]
     fn targets_attacker_and_alerts_unassigned_same_type_mobs() {
@@ -226,5 +255,67 @@ mod tests {
         };
         assert_eq!(hunter_target.uuid(), attacker.uuid());
         assert_eq!(ally_target.uuid(), attacker.uuid());
+    }
+
+    #[test]
+    fn a_new_shadow_attacker_retargets_a_running_hurt_by_goal() {
+        init_vanilla_registry();
+        init_behaviors();
+        let world_fixture = fresh_test_world_with_gameplay_hooks(
+            "hurt_by_target_retargets_shadow",
+            Arc::new(RetargetOwnedMobAttacks),
+        );
+        let world = &world_fixture.world;
+        insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+
+        let victim = Arc::new(PigEntity::new(
+            &vanilla_entities::PIG,
+            1,
+            DVec3::new(8.0, 65.0, 8.0),
+            Arc::downgrade(world),
+        ));
+        let first_attacker: SharedEntity = Arc::new(CowEntity::new(
+            &vanilla_entities::COW,
+            2,
+            DVec3::new(9.0, 65.0, 8.0),
+            Arc::downgrade(world),
+        ));
+        let shadow = Arc::new(PigEntity::new(
+            &vanilla_entities::PIG,
+            3,
+            DVec3::new(10.0, 65.0, 8.0),
+            Arc::downgrade(world),
+        ));
+        shadow.set_allied_owner(Some(uuid::Uuid::new_v4()));
+        let shadow_entity: SharedEntity = shadow;
+        let victim_entity: SharedEntity = Arc::<PigEntity>::clone(&victim);
+        for entity in [
+            Arc::clone(&victim_entity),
+            Arc::clone(&first_attacker),
+            Arc::clone(&shadow_entity),
+        ] {
+            world
+                .try_add_entity(entity)
+                .expect("test entity should attach to the loaded chunk");
+        }
+
+        let mut selector = GoalSelector::new();
+        selector.add_goal(2, HurtByTargetGoal::new());
+
+        victim.advance_tick_count();
+        victim.set_last_hurt_by_mob(Some(&first_attacker));
+        selector.tick(victim.as_ref(), &victim_entity);
+        assert_eq!(
+            victim.target().map(|target| target.uuid()),
+            Some(first_attacker.uuid())
+        );
+
+        victim.advance_tick_count();
+        victim.set_last_hurt_by_mob(Some(&shadow_entity));
+        selector.tick(victim.as_ref(), &victim_entity);
+        assert_eq!(
+            victim.target().map(|target| target.uuid()),
+            Some(shadow_entity.uuid())
+        );
     }
 }

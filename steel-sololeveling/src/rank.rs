@@ -1,7 +1,7 @@
 //! Hunter rank derived from level.
 
 /// A hunter's automatic rank.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HunterRank {
     /// Levels 1 through 9.
     E,

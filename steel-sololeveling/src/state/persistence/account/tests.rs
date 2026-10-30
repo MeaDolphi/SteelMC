@@ -18,7 +18,9 @@ use super::{AccountUpdate, PreparedCommit, load_account};
 use crate::combat_reward::HunterReward;
 use crate::economy::{SystemPoints, Won};
 use crate::guild::GuildRegistry;
+use crate::organization::{Event, Objective, OrganizationError, Template};
 use crate::player_data::{PlayerDataStorage, SoloLevelingPlayerData};
+use crate::rank::HunterRank;
 use crate::state::SoloLevelingState;
 
 fn state(name: &str) -> (SoloLevelingState, PathBuf) {
@@ -39,6 +41,93 @@ fn begin(state: &SoloLevelingState, uuid: Uuid, points: u64) {
         .lock()
         .expected
         .insert(uuid, Some(b"{}".to_vec()));
+}
+
+#[test]
+fn contract_commit_preserves_concurrent_progress_and_daily_allowance() {
+    for committed in [false, true] {
+        let (state, directory) = state("organization-race");
+        let uuid = Uuid::new_v4();
+        begin(&state, uuid, 0);
+        let boss = Template {
+            objective: Objective::Boss,
+            rank: HunterRank::E,
+        };
+        let dungeon = Template {
+            objective: Objective::Dungeons,
+            rank: HunterRank::E,
+        };
+        let extra = Template {
+            objective: Objective::Mobs,
+            rank: HunterRank::E,
+        };
+        let today = crate::daily::today();
+        state.with_session_mut(uuid, |session| {
+            session
+                .organization
+                .accept(boss, HunterRank::E, today)
+                .expect("boss");
+            session
+                .organization
+                .accept(dungeon, HunterRank::E, today)
+                .expect("dungeon");
+            session
+                .organization
+                .accept(extra, HunterRank::E, today)
+                .expect("extra");
+            session.organization.cancel(2, today).expect("cancel extra");
+            session.organization.observe(Event::Boss(HunterRank::E));
+        });
+        let mut snapshot = state
+            .with_session_mut(uuid, |session| session.saved_data(uuid))
+            .expect("session");
+        let contract = snapshot.organization.turn_in(0).expect("complete");
+        let prepared = PreparedCommit::prepare(
+            &state,
+            vec![snapshot],
+            vec![AccountUpdate::Organization {
+                uuid,
+                index: 0,
+                contract,
+            }],
+        )
+        .expect("prepare");
+        assert_eq!(
+            state.cancel_personal_contract(uuid, 0),
+            Err(OrganizationError::Storage)
+        );
+        assert_eq!(
+            state.accept_personal_contract(uuid, extra),
+            Err(OrganizationError::Storage)
+        );
+        state.with_session_mut(uuid, |session| {
+            session.organization.mark_used(extra, today);
+            session.organization.observe(Event::Dungeon(HunterRank::E));
+        });
+        let result = if committed {
+            Ok(TransactionCommit::Committed)
+        } else {
+            Err(io::Error::other("injected"))
+        };
+        prepared.complete(&state, &result);
+        if committed {
+            assert_eq!(
+                state.accept_personal_contract(uuid, extra),
+                Err(OrganizationError::UsedToday)
+            );
+        }
+        state.with_session_mut(uuid, |session| {
+            assert!(session.organization.used_today(extra, today));
+            let index = usize::from(!committed);
+            assert_eq!(session.organization.contracts[index].template, dungeon);
+            assert_eq!(session.organization.contracts[index].progress, 1);
+            assert_eq!(
+                session.organization.contracts.len(),
+                if committed { 1 } else { 2 }
+            );
+        });
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
 }
 
 #[tokio::test]

@@ -13,7 +13,7 @@ use steel_core::inventory::container::Container as _;
 use steel_core::inventory::prelude::*;
 use steel_core::player::player_inventory::PlayerInventory;
 use steel_registry::{vanilla_items, vanilla_menu_types};
-use steel_utils::locks::IntoShared;
+use steel_utils::locks::{IntoShared, SyncMutex};
 use steel_utils::{DowncastType, DowncastTypeKey};
 use text_components::format::Color;
 use text_components::{Modifier as _, TextComponent};
@@ -24,13 +24,15 @@ use crate::item::{append_lore, named, with_lore};
 use crate::state::{EnchantTarget, SoloLevelingState};
 use crate::ui::{After, open_buttons};
 
-const MENU_SLOTS: usize = 27;
+const MENU_SLOTS: usize = 54;
 /// Artifacts the picker can list in its largest chest.
 const PICKER_LIMIT: usize = 54;
 const ITEM_SLOT: usize = 3;
 const INFO_SLOT: usize = 5;
-const POWER_ROW: usize = 10;
-const SIDE_EFFECT_ROW: usize = 19;
+/// First slot of the three rows of powers.
+const POWER_ROW: usize = 9;
+/// First slot of the bottom row of side effects.
+const SIDE_EFFECT_ROW: usize = 45;
 
 /// Opens the picker of artifacts to enchant.
 ///
@@ -142,10 +144,11 @@ fn build(
         artifact,
         applied,
         queued: None,
+        completion: None,
     };
     let items = kind.items(player);
     let container = SimpleContainer::from_items(items).into_shared();
-    let mut builder = MenuBuilder::new(&vanilla_menu_types::GENERIC_9X3, container_id);
+    let mut builder = MenuBuilder::new(&vanilla_menu_types::GENERIC_9X6, container_id);
     kind.buttons = Some(builder.section_all(Arc::clone(&container)));
     kind.container = Some(container);
     builder.player_inventory(&player.inventory);
@@ -153,10 +156,20 @@ fn build(
 }
 
 /// Returns the enchantments a menu offers, each with its menu slot.
+///
+/// Powers fill three rows, simple ones first; side effects take the bottom
+/// row. An item without a kind is offered nothing.
 fn offers(artifact: &Artifact) -> Vec<(usize, Enchantment)> {
-    let fitting = enchantment::ALL
-        .into_iter()
-        .filter(|enchantment| enchantment.fits(artifact.category));
+    let Some(kind) = artifact.id.enchant_kind() else {
+        return Vec::new();
+    };
+    let mut fitting: Vec<Enchantment> = enchantment::ALL
+        .iter()
+        .copied()
+        .filter(|enchantment| enchantment.fits(kind))
+        .collect();
+    fitting.sort_by_key(|enchantment| !enchantment.is_simple());
+    let fitting = fitting.into_iter();
     let powers = fitting
         .clone()
         .filter(|enchantment| !enchantment.is_side_effect());
@@ -172,7 +185,7 @@ fn offers(artifact: &Artifact) -> Vec<(usize, Enchantment)> {
         .collect()
 }
 
-struct EnchantMenuKind {
+pub(crate) struct EnchantMenuKind {
     state: Arc<SoloLevelingState>,
     buttons: Option<Section>,
     container: Option<Shared<SimpleContainer>>,
@@ -181,9 +194,23 @@ struct EnchantMenuKind {
     artifact: &'static Artifact,
     applied: Vec<Enchantment>,
     queued: Option<Enchantment>,
+    completion: Option<Arc<SyncMutex<Option<EnchantTarget>>>>,
 }
 
 impl EnchantMenuKind {
+    fn finish(&mut self, target: EnchantTarget, held: ItemStack) -> bool {
+        let Some(artifact) = artifact::held(&held) else {
+            return false;
+        };
+        self.target = target;
+        self.artifact = artifact;
+        self.applied = artifact::enchantments_of(&held);
+        self.held = held;
+        self.queued = None;
+        self.completion = None;
+        true
+    }
+
     fn items(&self, player: &Player) -> Vec<ItemStack> {
         let mut items = vec![ItemStack::empty(); MENU_SLOTS];
         let used = enchantment::points_used(&self.applied);
@@ -231,7 +258,7 @@ impl EnchantMenuKind {
         } else {
             match enchantment::check(
                 self.artifact.rarity,
-                self.artifact.category,
+                self.artifact.id.enchant_kind(),
                 &self.applied,
                 enchantment,
                 balance,
@@ -250,6 +277,12 @@ impl EnchantMenuKind {
                 }),
             ),
             vec![
+                TextComponent::plain(if enchantment.is_simple() {
+                    "Простое зачарование"
+                } else {
+                    "Особое зачарование"
+                })
+                .color(Color::DarkGray),
                 TextComponent::plain(enchantment.describe()).color(Color::Gray),
                 TextComponent::plain(format!("Очки: {:+}", enchantment.cost()))
                     .color(Color::DarkAqua),
@@ -267,6 +300,50 @@ unsafe impl DowncastType for EnchantMenuKind {
 }
 
 impl MenuKind for EnchantMenuKind {
+    fn on_tick(
+        &mut self,
+        _behavior: &mut MenuBehavior,
+        guard: &mut ContainerLockGuard,
+        player: &Player,
+    ) {
+        let Some(target) = self
+            .completion
+            .as_ref()
+            .and_then(|completion| *completion.lock())
+        else {
+            return;
+        };
+        let held = match target {
+            EnchantTarget::Inventory(slot) => {
+                let id = ContainerId::from_arc(&player.inventory);
+                let Some(inventory) = guard.get_typed::<PlayerInventory>(id) else {
+                    return;
+                };
+                inventory.get_item(slot).clone()
+            }
+            EnchantTarget::Gear(index) => self
+                .state
+                .with_session_mut(player.gameprofile.id(), |session| {
+                    session.gear.get(index).cloned()
+                })
+                .flatten()
+                .unwrap_or_else(ItemStack::empty),
+        };
+        if !self.finish(target, held) {
+            player.close_container();
+            return;
+        }
+        let items = self.items(player);
+        if let Some(container) = self.container.as_ref() {
+            let id = ContainerId::from_arc(container);
+            if let Some(container) = guard.get_typed_mut::<SimpleContainer>(id) {
+                for (index, item) in items.into_iter().enumerate() {
+                    container.set_item(index, item);
+                }
+            }
+        }
+    }
+
     fn on_slot_clicked(
         &mut self,
         _behavior: &mut MenuBehavior,
@@ -303,9 +380,15 @@ impl MenuKind for EnchantMenuKind {
         }
         // The click owns the inventory lock, so the request runs on the next
         // player tick, which reads the real artifact again.
-        self.state
-            .defer_enchantment(player.gameprofile.id(), enchantment, self.target);
+        let completion = Arc::new(SyncMutex::new(None));
+        self.state.defer_enchantment(
+            player.gameprofile.id(),
+            enchantment,
+            self.target,
+            Arc::clone(&completion),
+        );
         self.queued = Some(enchantment);
+        self.completion = Some(completion);
         if let Some(container) = self.container.as_ref() {
             let id = ContainerId::from_arc(container);
             let items = self.items(player);
@@ -321,20 +404,78 @@ impl MenuKind for EnchantMenuKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{MENU_SLOTS, offers};
-    use crate::item::artifact::ALL;
+    use std::sync::Arc;
+
+    use steel_utils::locks::SyncMutex;
+
+    use super::{EnchantMenuKind, MENU_SLOTS, POWER_ROW, SIDE_EFFECT_ROW, offers};
+    use crate::item::artifact::{
+        self, ALL, ArtifactId, IMPROVED, MAGE_SHOP, SPECIALIZATION, STARTER,
+    };
+    use crate::item::enchantment::Enchantment;
+    use crate::state::{EnchantTarget, SoloLevelingState};
+
+    #[test]
+    fn completion_refreshes_snapshot_and_allows_another_attempt() {
+        let directory = std::env::temp_dir().join(format!("enchant-menu-{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(SoloLevelingState::new(directory.clone()).expect("state"));
+        let id = ArtifactId::AssassinsShoes;
+        let enchantment = Enchantment::Protection;
+        let mut menu = EnchantMenuKind {
+            state,
+            buttons: None,
+            container: None,
+            held: artifact::stack(id, None),
+            target: EnchantTarget::Inventory(0),
+            artifact: id.artifact(),
+            applied: Vec::new(),
+            queued: Some(enchantment),
+            completion: Some(Arc::new(SyncMutex::new(None))),
+        };
+
+        // A failed transaction retains the old artifact but releases the queued row.
+        assert!(menu.finish(EnchantTarget::Inventory(4), artifact::stack(id, None)));
+        assert_eq!(menu.target, EnchantTarget::Inventory(4));
+        assert!(menu.applied.is_empty());
+        assert!(menu.queued.is_none());
+        assert!(menu.completion.is_none());
+        let available = menu.offer_item(enchantment, u64::MAX);
+
+        // A committed transaction must render the newly applied enchantment.
+        menu.queued = Some(enchantment);
+        assert!(menu.finish(
+            EnchantTarget::Inventory(4),
+            artifact::enchanted_stack(id, None, &[enchantment]),
+        ));
+        assert_eq!(menu.applied, [enchantment]);
+        assert!(menu.queued.is_none());
+        assert_ne!(available, menu.offer_item(enchantment, u64::MAX));
+        drop(menu);
+        std::fs::remove_dir_all(directory).expect("remove state directory");
+    }
 
     #[test]
     fn every_offer_has_its_own_slot() {
-        for id in ALL {
-            let slots: Vec<usize> = offers(id.artifact())
-                .iter()
-                .map(|(slot, _)| *slot)
-                .collect();
-            assert!(slots.iter().all(|slot| *slot < MENU_SLOTS));
-            let mut unique = slots.clone();
-            unique.dedup();
-            assert_eq!(unique.len(), slots.len());
+        for id in ALL
+            .into_iter()
+            .chain(STARTER)
+            .chain(SPECIALIZATION)
+            .chain(IMPROVED)
+            .chain(MAGE_SHOP)
+        {
+            let offered = offers(id.artifact());
+            for (slot, enchantment) in &offered {
+                let row = if enchantment.is_side_effect() {
+                    SIDE_EFFECT_ROW..MENU_SLOTS
+                } else {
+                    POWER_ROW..SIDE_EFFECT_ROW - 9
+                };
+                assert!(row.contains(slot), "{id:?} {enchantment:?} at {slot}");
+            }
+            let mut slots: Vec<usize> = offered.iter().map(|(slot, _)| *slot).collect();
+            slots.sort_unstable();
+            slots.dedup();
+            assert_eq!(slots.len(), offered.len());
         }
     }
 }

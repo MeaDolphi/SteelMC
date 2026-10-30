@@ -33,8 +33,8 @@ use crate::entity::{
 };
 use crate::inventory::equipment::EquipmentSlot;
 use crate::test_support::{
-    TestWorld, fresh_test_world, fresh_test_world_with_dimension_type, insert_ready_full_chunk,
-    test_world,
+    TestPlayerBuilder, TestWorld, fresh_test_world, fresh_test_world_with_dimension_type,
+    insert_ready_full_chunk, test_world,
 };
 use crate::world::{LevelReader, World};
 use steel_registry::vanilla_dimension_types;
@@ -643,6 +643,27 @@ fn mob_do_hurt_target_applies_attack_damage_and_records_target() {
         .last_hurt_mob()
         .expect("successful mob attack should record target");
     assert!(Arc::ptr_eq(&stored_target, &target_entity));
+}
+
+#[test]
+fn allied_mob_cannot_melee_an_unrelated_player() {
+    init_vanilla_registry();
+    init_behaviors();
+    let world = fresh_test_world("allied_melee_player");
+    let mob = Arc::new(DespawnTestMob::with_entity_type(
+        1,
+        DVec3::ZERO,
+        &vanilla_entities::ZOMBIE,
+        None,
+        false,
+    ));
+    mob.set_allied_owner(Some(uuid::Uuid::new_v4()));
+    let mob_entity: SharedEntity = Arc::<DespawnTestMob>::clone(&mob);
+    let player = TestPlayerBuilder::new(Arc::clone(&world.world), "Other", 2).build();
+    let target: SharedEntity = player;
+
+    assert!(!mob.do_hurt_target(&mob_entity, &world.world, &target));
+    assert!(mob.last_hurt_mob().is_none());
 }
 
 #[test]

@@ -1,0 +1,14 @@
+{
+  "layers": {
+    "humanoid": [
+      {
+        "texture": "sololeveling:mob_crypt"
+      }
+    ],
+    "humanoid_leggings": [
+      {
+        "texture": "sololeveling:mob_crypt"
+      }
+    ]
+  }
+}

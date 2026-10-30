@@ -14,7 +14,6 @@ use steel_core::entity::SharedEntity;
 use steel_core::entity::damage::DamageSource;
 use steel_core::gameplay_hooks::{BlockMutationCause, GameplayHooks};
 use steel_core::player::Player;
-use steel_core::player::player_inventory::Prediction;
 use steel_core::server::Server;
 use steel_core::world::World;
 use steel_registry::blocks::block_state_ext::BlockStateExt;
@@ -26,26 +25,34 @@ use text_components::format::Color;
 use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
+use crate::auction_menu;
 use crate::city;
+use crate::deferred_inventory_menu;
 use crate::dungeon::instance;
 use crate::dungeon::is_instance_world;
 use crate::dungeon::mobs;
 use crate::dungeon::runtime::TEST_GATE_ON_JOIN;
 use crate::enchant_menu;
+use crate::gate_menu;
 use crate::gear;
+use crate::island;
 use crate::item;
 use crate::item::chest::ChestKind;
 use crate::item::crystal::CrystalSaleError;
 use crate::main_menu;
+use crate::merchant_menu;
 use crate::npc;
 use crate::organization::Event;
 use crate::organization_menu;
 use crate::quest::{PENALTY_DELAY_SECONDS, PENALTY_MIN_RANK, SystemQuest};
+use crate::quest_book::Goal;
 use crate::session::HunterSession;
 use crate::session::QuestUpdate;
 use crate::sidebar;
 use crate::sound::SystemSound;
-use crate::state::{EnchantAction, SoloLevelingState};
+use crate::spell_menu;
+use crate::starter_menu;
+use crate::state::{EnchantAction, GateMenuAction, SoloLevelingState};
 
 /// Solo Leveling's [`GameplayHooks`] implementation.
 ///
@@ -75,6 +82,7 @@ impl GameplayHooks for SoloLevelingHooks {
         Box::pin(async move {
             state.load_guilds(&server).await?;
             state.load_auction(&server).await?;
+            state.load_gate_registry(&server).await?;
             let Some(city_world) = server.worlds.server_default_world() else {
                 return Err("Solo Leveling city world is not loaded".to_owned());
             };
@@ -113,8 +121,11 @@ impl GameplayHooks for SoloLevelingHooks {
         self.state.tick_guild_payouts();
         self.state.tick_auction(server, tick_count);
         self.state.tick_dungeons(server, tick_count);
+        self.state.tick_island(server, tick_count);
         self.state.tick_organization(server);
         self.state.tick_storms(server);
+        self.state.tick_spells(server);
+        self.state.tick_enchant_effects(server);
         npc::tick(server, tick_count);
     }
 
@@ -125,7 +136,8 @@ impl GameplayHooks for SoloLevelingHooks {
         match self.state.take_prepared_player(player_uuid) {
             Some(data) => {
                 data.stats.apply_to(&mut player.attributes().lock());
-                data.class.apply_to(&mut player.attributes().lock());
+                data.class
+                    .apply_to(&mut player.attributes().lock(), data.stats.rank());
                 self.state.begin_session(player_uuid, data);
                 if let Some((_, view)) = self.state.sidebar_update(player_uuid) {
                     sidebar::show(player, &view);
@@ -178,8 +190,13 @@ impl GameplayHooks for SoloLevelingHooks {
         self.state.tick_artifacts(player);
         self.state.tick_class(player);
         item::menu_book::keep_in_place(player);
-        if player.tick_count() % 20 == 0 && !is_instance_world(&player.get_world()) {
-            item::loot::unmark_inventory(player);
+        if player.tick_count() % 20 == 0 {
+            if is_instance_world(&player.get_world()) {
+                // The free starter-weapon swap ends with the first run.
+                self.state.close_starter_swap(player_uuid);
+            } else {
+                item::loot::unmark_inventory(player);
+            }
         }
         if let Some(notice) = self.state.take_notice(player_uuid) {
             notice.show(player);
@@ -188,20 +205,40 @@ impl GameplayHooks for SoloLevelingHooks {
             Some(EnchantAction::OpenMenu) => {
                 enchant_menu::open_picker(player, Arc::clone(&self.state));
             }
-            Some(EnchantAction::Apply(enchantment, target)) => {
-                match self.state.request_enchantment(player, enchantment, target) {
+            Some(EnchantAction::Apply(enchantment, target, completion)) => {
+                match self.state.request_enchantment(
+                    player,
+                    enchantment,
+                    target,
+                    Arc::clone(&completion),
+                ) {
                     Ok(()) => player.send_message(&TextComponent::plain(format!(
                         "Зачарование «{}» обрабатывается.",
                         enchantment.display_name()
                     ))),
-                    Err(error) => player
-                        .send_message(&TextComponent::plain(error.message()).color(Color::Red)),
+                    Err(error) => {
+                        *completion.lock() = Some(target);
+                        player
+                            .send_message(&TextComponent::plain(error.message()).color(Color::Red));
+                    }
                 }
             }
             None => {}
         }
+        if self.state.take_buyback_menu(player_uuid) {
+            merchant_menu::open_buyback(player, Arc::clone(&self.state));
+        }
+        if self.state.take_auction_sell_menu(player_uuid) {
+            auction_menu::open_picker(player, Arc::clone(&self.state));
+        }
         if self.state.take_gear_menu(player_uuid) {
             gear::open(player, Arc::clone(&self.state));
+        }
+        if let Some(page) = self.state.take_deferred_menu(player_uuid) {
+            deferred_inventory_menu::open(player, Arc::clone(&self.state), page);
+        }
+        if let Some(action) = self.state.take_gate_menu_action(player_uuid) {
+            self.handle_gate_menu_action(player, action);
         }
         if self.state.take_crystal_sale(player_uuid) {
             match self.state.sell_crystals(player) {
@@ -226,7 +263,7 @@ impl GameplayHooks for SoloLevelingHooks {
             player.last_client_input(),
         );
         if let Some(update) = update {
-            announce_quest(player, update);
+            announce_quest(&self.state, player, update);
         }
 
         let due = self
@@ -271,7 +308,7 @@ impl GameplayHooks for SoloLevelingHooks {
         if self.state.is_organization_board(&world.key, pos) {
             return false;
         }
-        if city::is_city_world(world) {
+        if city::is_city_world(world) || island::is_island_world(world) {
             return false;
         }
         // Dungeons are sealed rooms: a hunter may only extract the crystals built
@@ -285,7 +322,7 @@ impl GameplayHooks for SoloLevelingHooks {
     fn allow_block_place(&self, world: &World, _player: &Player, _pos: BlockPos) -> bool {
         // Nothing may be built inside a dungeon, including the walls a hunter
         // cannot break.
-        !is_instance_world(world) && !city::is_city_world(world)
+        !is_instance_world(world) && !city::is_city_world(world) && !island::is_island_world(world)
     }
 
     fn allow_block_mutation(
@@ -296,7 +333,7 @@ impl GameplayHooks for SoloLevelingHooks {
         new_state: BlockStateId,
         cause: BlockMutationCause,
     ) -> bool {
-        if city::is_city_world(world) {
+        if city::is_city_world(world) || island::is_island_world(world) {
             return allows_protected_block_mutation(old_state, new_state, cause);
         }
         !is_instance_world(world) || allows_instance_block_mutation(old_state, new_state, cause)
@@ -317,9 +354,27 @@ impl GameplayHooks for SoloLevelingHooks {
             return;
         };
         drops.clear();
+        let (extra, essence) = self.state.enchant_mining(player);
         let mut crystals = item::crystal::stack(rank);
-        crystals.set_count(1 + self.state.crystal_bonus(player));
+        let mined = 1 + self.state.crystal_bonus(player) + extra;
+        crystals.set_count(mined);
         drops.push(crystals);
+        self.state.record_goal(
+            player.gameprofile.id(),
+            Goal::Crystal,
+            u32::try_from(mined).unwrap_or(1),
+        );
+        for _ in 0..mined {
+            self.state
+                .record_organization_event(vec![player.gameprofile.id()], Event::Crystal(rank));
+        }
+        if essence {
+            drops.push(item::material::stack(
+                item::material::Material::StableEssence,
+                item::material::Quality::for_rank(rank),
+                1,
+            ));
+        }
     }
 
     fn on_player_use_item(
@@ -333,10 +388,34 @@ impl GameplayHooks for SoloLevelingHooks {
             main_menu::open(player, Arc::clone(&self.state));
             return Some(InteractionResult::Success);
         }
+        // The grimoire works from either hand, so a Mage staff can sit in
+        // the other one.
+        if item::grimoire::is_grimoire(stack) {
+            if player.is_crouching() {
+                spell_menu::open(player, Arc::clone(&self.state));
+            } else {
+                self.state.queue_cast(player.gameprofile.id());
+            }
+            return Some(InteractionResult::Success);
+        }
         item::consume::use_item(&self.state, player, stack, hand)
     }
 
-    fn allow_item_drop(&self, _player: &Player, stack: &ItemStack) -> bool {
+    fn allow_item_drop(&self, player: &Player, stack: &ItemStack) -> bool {
+        // The drop key on the grimoire, or on a Mage staff held with the
+        // grimoire in the off hand, cycles the prepared spells instead.
+        let staff_with_grimoire = item::artifact::of(stack)
+            .is_some_and(|id| id.spell_gear().is_some())
+            && item::grimoire::is_grimoire(
+                player
+                    .inventory
+                    .lock()
+                    .get_item_in_hand(InteractionHand::OffHand),
+            );
+        if item::grimoire::is_grimoire(stack) || staff_with_grimoire {
+            self.state.cycle_spell(player);
+            return false;
+        }
         // The System book is permanent; personal rewards cannot be passed on.
         !item::menu_book::is_menu_book(stack) && item::binding::may_drop(stack)
     }
@@ -344,7 +423,11 @@ impl GameplayHooks for SoloLevelingHooks {
     fn keep_item_on_death(&self, player: &Player, stack: &ItemStack) -> bool {
         // Items that may never leave their owner survive every death; inside
         // a run, everything but the run's own mob drops does.
-        !self.allow_item_drop(player, stack)
+        // Death drops may run under the inventory lock, so this never asks
+        // the drop hook, which reads the off hand.
+        item::grimoire::is_grimoire(stack)
+            || item::menu_book::is_menu_book(stack)
+            || !item::binding::may_drop(stack)
             || (is_instance_world(&player.get_world()) && !item::loot::is_marked(stack))
     }
 
@@ -370,6 +453,20 @@ impl GameplayHooks for SoloLevelingHooks {
             match role {
                 npc::NpcRole::OrganizationAgent => {
                     organization_menu::open(player, Arc::clone(&self.state));
+                }
+                npc::NpcRole::AssociationClerk => {
+                    starter_menu::open(player, Arc::clone(&self.state));
+                }
+                npc::NpcRole::Merchant => {
+                    merchant_menu::open(player, Arc::clone(&self.state));
+                }
+                npc::NpcRole::IslandDispatcher => {
+                    self.state
+                        .request_island_travel(player.gameprofile.id(), true);
+                }
+                npc::NpcRole::IslandEvacuation => {
+                    self.state
+                        .request_island_travel(player.gameprofile.id(), false);
                 }
             }
         }
@@ -460,13 +557,33 @@ impl GameplayHooks for SoloLevelingHooks {
             .are_dungeon_mobs_allied(world, attacker_id, candidate_id)
     }
 
+    fn should_retarget_hurt_mob(&self, world: &World, mob_id: i32, attacker_id: i32) -> bool {
+        let Some(mob_entity) = world.get_entity_by_id(mob_id) else {
+            return false;
+        };
+        let Some(mob) = mob_entity.as_mob() else {
+            return false;
+        };
+        let Some(attacker_entity) = world.get_entity_by_id(attacker_id) else {
+            return false;
+        };
+        let Some(attacker) = attacker_entity.as_mob() else {
+            return false;
+        };
+        mob.allied_owner().is_none()
+            && self.state.dungeon_mob_label(world, mob_id).is_some()
+            && attacker.allied_owner().is_some()
+    }
+
     fn prevent_death(
         &self,
         _world: &World,
         entity: &dyn LivingEntity,
         source: &DamageSource,
     ) -> bool {
-        self.state.artifact_prevent_death(entity, source)
+        self.state.spell_prevent_death(entity)
+            || self.state.artifact_prevent_death(entity, source)
+            || self.state.shadow_guard_prevent_death(entity)
     }
 
     fn on_living_entity_loot(
@@ -476,11 +593,19 @@ impl GameplayHooks for SoloLevelingHooks {
         _source: &DamageSource,
         drops: &mut Vec<ItemStack>,
     ) {
-        self.state.capture_raid_loot(world, entity_id, drops);
-        // Instance mob drops are what a hunter loses when they die in a run.
-        if is_instance_world(world) {
-            drops.iter_mut().for_each(item::loot::mark);
+        // The System pays every reward itself, so vanilla loot tables (rotten
+        // flesh and the like) never drop. A mob that just died may already be
+        // gone from the entity index, so only a found player keeps its loot.
+        let is_player = world
+            .get_entity_by_id(entity_id)
+            .is_some_and(|entity| entity.as_player().is_some());
+        if !is_player {
+            drops.clear();
         }
+    }
+
+    fn suppress_mob_drops(&self, _world: &World, _entity_id: i32) -> bool {
+        true
     }
 
     fn on_living_entity_death(
@@ -492,9 +617,11 @@ impl GameplayHooks for SoloLevelingHooks {
         mobs::clear_health_line(world, entity);
         self.state.observe_shadow_death(entity.uuid());
         let Some(killer) = source.causing_entity() else {
-            let _ = self
-                .state
-                .observe_dungeon_mob_death(world, entity.id(), None);
+            if !self.state.observe_island_death(world, entity.id(), None) {
+                let _ = self
+                    .state
+                    .observe_dungeon_mob_death(world, entity.id(), None);
+            }
             return;
         };
         let hunter = credited_hunter(killer);
@@ -506,8 +633,12 @@ impl GameplayHooks for SoloLevelingHooks {
                 .is_none_or(|mob| mob.allied_owner().is_none())
         {
             let zombie = entity.entity_type() == &vanilla_entities::ZOMBIE;
+            let rank = self.state.instance_rank(world);
             self.state
-                .record_organization_event(vec![hunter], Event::Kill { zombie });
+                .record_organization_event(vec![hunter], Event::Kill { zombie, rank });
+        }
+        if self.state.observe_island_death(world, entity.id(), hunter) {
+            return;
         }
         // The run may end with this death, so the nameplate is read first.
         let label = self.state.dungeon_mob_label(world, entity.id());
@@ -531,6 +662,51 @@ impl GameplayHooks for SoloLevelingHooks {
 }
 
 impl SoloLevelingHooks {
+    fn handle_gate_menu_action(&self, player: &Player, action: GateMenuAction) {
+        match action {
+            GateMenuAction::OpenPage(page) => {
+                gate_menu::open(player, Arc::clone(&self.state), page);
+            }
+            GateMenuAction::Teleport(id) => {
+                if is_instance_world(&player.get_world()) {
+                    player.send_message(
+                        &TextComponent::plain("Навигация по вратам недоступна в подземелье.")
+                            .color(Color::Red),
+                    );
+                    return;
+                }
+                let Some(gate) = self.state.committed_gate(id) else {
+                    player.send_message(
+                        &TextComponent::plain("Эти врата уже недоступны.").color(Color::Red),
+                    );
+                    return;
+                };
+                let world = player.get_world();
+                if gate.world != world.key {
+                    player.send_message(
+                        &TextComponent::plain(format!(
+                            "Врата находятся в мире {}:{}.",
+                            gate.world.namespace, gate.world.path
+                        ))
+                        .color(Color::Yellow),
+                    );
+                    return;
+                }
+                let destination = glam::DVec3::new(
+                    f64::from(gate.entrance.x()) + 0.5,
+                    f64::from(gate.entrance.y()) + 1.0,
+                    f64::from(gate.entrance.z()) - 2.5,
+                );
+                if let Err(error) = player.teleport_to(destination) {
+                    player.send_message(
+                        &TextComponent::plain(format!("Не удалось перенестись к вратам: {error}"))
+                            .color(Color::Red),
+                    );
+                }
+            }
+        }
+    }
+
     /// Turns a hit involving a hunter into orders for their shadows: they
     /// defend a hunter who is struck and join the fight the hunter starts.
     /// Hunters never send shadows at other players.
@@ -620,9 +796,9 @@ const fn allows_player_damage(
 }
 
 /// Hands out the daily reward and reports a failed day.
-fn announce_quest(player: &Player, update: QuestUpdate) {
+fn announce_quest(state: &SoloLevelingState, player: &Player, update: QuestUpdate) {
     if update.completed {
-        player.add_item_or_drop(ChestKind::Normal.stack(), Prediction::ServerOnly);
+        state.request_system_loot(player, ChestKind::Normal.stack());
         SystemSound::Quest.play(player);
         player.send_message(
             &TextComponent::plain("Ежедневное задание выполнено: получен обычный сундук.")
