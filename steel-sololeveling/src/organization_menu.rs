@@ -30,10 +30,38 @@ const PERSONAL_COLUMN: usize = 6;
 const GROUP_COLUMN: usize = 7;
 const GUILD_COLUMN: usize = 8;
 const HELP_SLOT: usize = 8;
-/// Objective columns shown on one page of the board.
+/// Objective columns shown on the board.
 const OFFER_COLUMNS: usize = 6;
-/// Button that turns the board to its other page of objectives.
-const PAGE_SLOT: usize = 53;
+/// Offer slots of the board: six columns of six rows.
+const OFFER_SLOTS: usize = 36;
+/// Ticks between board offer rerolls: twenty minutes, and every hunter sees
+/// the same board of one bucket.
+pub const OFFER_REFRESH_TICKS: u64 = 20 * 60 * 20;
+
+/// Returns the offer bucket of `tick`: the board rerolls when the bucket changes.
+#[must_use]
+pub const fn offer_bucket(tick: u64) -> u64 {
+    tick / OFFER_REFRESH_TICKS
+}
+
+/// Returns the offers of `bucket`: a shuffled mix of every objective and rank.
+fn rolled_offers(bucket: u64) -> Vec<Template> {
+    let mut offers: Vec<Template> = OBJECTIVES
+        .into_iter()
+        .flat_map(|objective| RANKS.map(|rank| Template { objective, rank }))
+        .collect();
+    // Seeded Fisher-Yates: one bucket, one board, no player-specific rolls.
+    let mut rng = bucket.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    for index in (1..offers.len()).rev() {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        let other = usize::try_from(rng % (index as u64 + 1)).unwrap_or(0);
+        offers.swap(index, other);
+    }
+    offers.truncate(OFFER_SLOTS);
+    offers
+}
 
 /// Opens the board for a hunter standing at it.
 pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
@@ -55,9 +83,11 @@ pub fn open_view(player: &Player, state: Arc<SoloLevelingState>) {
 }
 
 fn build(container_id: u8, player: &Player, state: Arc<SoloLevelingState>, at_board: bool) -> Menu {
+    let bucket = offer_bucket(state.current_tick());
+    let offers = rolled_offers(bucket);
     let view = state.organization_view(player.gameprofile.id());
     let container =
-        SimpleContainer::from_items(menu_items(view.as_ref(), at_board, 0)).into_shared();
+        SimpleContainer::from_items(menu_items(view.as_ref(), at_board, &offers)).into_shared();
     let mut builder = MenuBuilder::new(&vanilla_menu_types::GENERIC_9X6, container_id);
     let buttons = builder.section_all(Arc::clone(&container));
     builder.player_inventory(&player.inventory);
@@ -66,7 +96,8 @@ fn build(container_id: u8, player: &Player, state: Arc<SoloLevelingState>, at_bo
         buttons,
         container,
         at_board,
-        page: 0,
+        bucket,
+        offers,
         view,
     })
 }
@@ -75,7 +106,6 @@ fn build(container_id: u8, player: &Player, state: Arc<SoloLevelingState>, at_bo
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Button {
     Offer(Template),
-    Page,
     Personal(usize),
     Group(usize),
     Guild(usize),
@@ -92,18 +122,12 @@ enum Action {
     Guild,
 }
 
-fn button_at(slot: usize, page: usize) -> Option<Button> {
+fn button_at(slot: usize, offers: &[Template]) -> Option<Button> {
     let (row, column) = (slot / COLUMNS, slot % COLUMNS);
-    if slot == PAGE_SLOT {
-        return Some(Button::Page);
-    }
     if column < OFFER_COLUMNS {
-        let objective = OBJECTIVES.get(page * OFFER_COLUMNS + column)?;
-        let rank = *RANKS.get(row)?;
-        return Some(Button::Offer(Template {
-            objective: *objective,
-            rank,
-        }));
+        return offers
+            .get(row * OFFER_COLUMNS + column)
+            .map(|template| Button::Offer(*template));
     }
     match column {
         PERSONAL_COLUMN if row < PERSONAL_LIMIT => Some(Button::Personal(row)),
@@ -113,25 +137,14 @@ fn button_at(slot: usize, page: usize) -> Option<Button> {
     }
 }
 
-/// Pages the board needs for every objective.
-const PAGES: usize = OBJECTIVES.len().div_ceil(OFFER_COLUMNS);
-
-fn menu_items(view: Option<&BoardView>, at_board: bool, page: usize) -> Vec<ItemStack> {
+fn menu_items(view: Option<&BoardView>, at_board: bool, offers: &[Template]) -> Vec<ItemStack> {
     let mut items = vec![ItemStack::empty(); SLOTS];
     let Some(view) = view else {
         return items;
     };
     for (slot, item) in items.iter_mut().enumerate() {
-        *item = match button_at(slot, page) {
-            Some(Button::Offer(_) | Button::Page) if !at_board => ItemStack::empty(),
-            Some(Button::Page) => with_lore(
-                named(
-                    ItemStack::new(&vanilla_items::ARROW),
-                    TextComponent::plain(format!("Страница {} / {PAGES}", page + 1))
-                        .color(Color::Yellow),
-                ),
-                vec![TextComponent::plain("Клик — другие задания.").color(Color::Gray)],
-            ),
+        *item = match button_at(slot, offers) {
+            Some(Button::Offer(_)) if !at_board => ItemStack::empty(),
             Some(Button::Offer(template)) => offer_item(view, template),
             Some(Button::Personal(index)) => view.book.contracts.get(index).map_or_else(
                 || free_slot("Свободный личный слот"),
@@ -278,6 +291,7 @@ fn help_item(view: &BoardView) -> ItemStack {
                 "До {PERSONAL_LIMIT} личных и {GROUP_LIMIT} групповых заданий."
             )),
             TextComponent::plain("Каждое задание — раз в день."),
+            TextComponent::plain("Предложения обновляются каждые 20 минут."),
             TextComponent::plain("Групповыми заданиями управляет лидер."),
             TextComponent::plain(format!(
                 "Гильдии: до {GUILD_LIMIT} заданий, цель и оплата ×{GUILD_SCALE}."
@@ -303,8 +317,10 @@ struct OrganizationMenuKind {
     container: Shared<SimpleContainer>,
     /// Whether the hunter opened the board itself, rather than the read-only list.
     at_board: bool,
-    /// Page of objectives the board shows.
-    page: usize,
+    /// Offer bucket the board was rolled from.
+    bucket: u64,
+    /// Offers of the current bucket, in board order.
+    offers: Vec<Template>,
     /// Last state drawn into the container.
     view: Option<BoardView>,
 }
@@ -318,7 +334,7 @@ impl OrganizationMenuKind {
     fn redraw(&mut self, guard: &mut ContainerLockGuard, view: Option<BoardView>) {
         let container_id = ContainerId::from_arc(&self.container);
         if let Some(container) = guard.get_typed_mut::<SimpleContainer>(container_id) {
-            for (index, item) in menu_items(view.as_ref(), self.at_board, self.page)
+            for (index, item) in menu_items(view.as_ref(), self.at_board, &self.offers)
                 .into_iter()
                 .enumerate()
             {
@@ -392,8 +408,6 @@ impl OrganizationMenuKind {
                 let contract = state.cancel_group_contract(uuid, index)?;
                 format!("Групповое задание отменено: {}.", contract.template.title())
             }
-            // Turning the page happens before any action reaches here.
-            (Button::Page, _) => String::new(),
         })
     }
 }
@@ -405,8 +419,14 @@ impl MenuKind for OrganizationMenuKind {
         guard: &mut ContainerLockGuard,
         player: &Player,
     ) {
+        let bucket = offer_bucket(self.state.current_tick());
+        let rerolled = bucket != self.bucket;
+        if rerolled {
+            self.bucket = bucket;
+            self.offers = rolled_offers(bucket);
+        }
         let view = self.state.organization_view(player.gameprofile.id());
-        if self.view != view {
+        if rerolled || self.view != view {
             self.redraw(guard, view);
         }
     }
@@ -443,13 +463,10 @@ impl MenuKind for OrganizationMenuKind {
             starter_menu::open(player, Arc::clone(&self.state));
             return ClickOutcome::Consume;
         }
-        let Some(target) = button_at(slot - self.buttons.start(), self.page) else {
+        let Some(target) = button_at(slot - self.buttons.start(), &self.offers) else {
             return ClickOutcome::Consume;
         };
-        let result = if target == Button::Page {
-            self.page = (self.page + 1) % PAGES;
-            Ok(String::new())
-        } else if self.at_board {
+        let result = if self.at_board {
             self.act(target, action, player)
         } else {
             Err(OrganizationError::NotAtBoard)
@@ -472,49 +489,71 @@ impl MenuKind for OrganizationMenuKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{Button, button_at};
-    use crate::organization::{Objective, Template};
-    use crate::rank::HunterRank;
+    use super::{Button, OFFER_SLOTS, button_at, offer_bucket, rolled_offers};
+    use crate::organization::{OBJECTIVES, RANKS, Template};
+
+    #[test]
+    fn offers_are_deterministic_per_bucket_and_reroll_between_buckets() {
+        let first = rolled_offers(7);
+        assert_eq!(first, rolled_offers(7), "one bucket, one board");
+        assert_ne!(first, rolled_offers(8), "the next bucket rerolls");
+        assert_eq!(first.len(), OFFER_SLOTS);
+    }
+
+    #[test]
+    fn offers_are_a_mixed_subset_without_duplicates() {
+        for bucket in 0..10 {
+            let offers = rolled_offers(bucket);
+            let mut unique = offers.clone();
+            unique.sort_by_key(|template| (template.objective as u8, template.rank as u8));
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                OFFER_SLOTS,
+                "bucket {bucket} repeats an offer"
+            );
+            assert!(
+                offers
+                    .iter()
+                    .any(|template| template.objective != offers[0].objective),
+                "bucket {bucket} must mix objectives, not page them"
+            );
+        }
+        let total = OBJECTIVES.len() * RANKS.len();
+        assert!(
+            OFFER_SLOTS < total,
+            "the board must be a subset of all offers"
+        );
+    }
 
     #[test]
     fn slots_map_to_offers_and_contract_columns() {
+        let offers = rolled_offers(3);
+        assert_eq!(button_at(0, &offers), Some(Button::Offer(offers[0])));
         assert_eq!(
-            button_at(0, 0),
-            Some(Button::Offer(Template {
-                objective: Objective::Mobs,
-                rank: HunterRank::E,
-            }))
+            button_at(5 * 9 + 5, &offers),
+            Some(Button::Offer(offers[35]))
         );
+        assert_eq!(button_at(6, &offers), Some(Button::Personal(0)));
+        assert_eq!(button_at(2 * 9 + 6, &offers), Some(Button::Personal(2)));
+        assert_eq!(button_at(3 * 9 + 6, &offers), None);
+        assert_eq!(button_at(9 + 7, &offers), Some(Button::Group(1)));
+        assert_eq!(button_at(2 * 9 + 7, &offers), None);
+        assert_eq!(button_at(8, &offers), None);
+        assert_eq!(button_at(9 + 8, &offers), Some(Button::Guild(0)));
+        assert_eq!(button_at(2 * 9 + 8, &offers), Some(Button::Guild(1)));
+        assert_eq!(button_at(3 * 9 + 8, &offers), None);
+    }
+
+    #[test]
+    fn the_bucket_changes_every_twenty_minutes() {
         assert_eq!(
-            button_at(5 * 9 + 4, 0),
-            Some(Button::Offer(Template {
-                objective: Objective::Dungeons,
-                rank: HunterRank::S,
-            }))
+            offer_bucket(0),
+            offer_bucket(super::OFFER_REFRESH_TICKS - 1)
         );
-        assert_eq!(button_at(6, 0), Some(Button::Personal(0)));
-        assert_eq!(button_at(2 * 9 + 6, 0), Some(Button::Personal(2)));
-        assert_eq!(button_at(3 * 9 + 6, 0), None);
-        assert_eq!(button_at(9 + 7, 0), Some(Button::Group(1)));
-        assert_eq!(button_at(2 * 9 + 7, 0), None);
-        assert_eq!(
-            button_at(5, 0),
-            Some(Button::Offer(Template {
-                objective: Objective::RedGate,
-                rank: HunterRank::E,
-            }))
+        assert_ne!(
+            offer_bucket(super::OFFER_REFRESH_TICKS - 1),
+            offer_bucket(super::OFFER_REFRESH_TICKS)
         );
-        assert_eq!(
-            button_at(5, 1),
-            Some(Button::Offer(Template {
-                objective: Objective::Castle,
-                rank: HunterRank::E,
-            }))
-        );
-        assert_eq!(button_at(53, 0), Some(Button::Page));
-        assert_eq!(button_at(8, 0), None);
-        assert_eq!(button_at(9 + 8, 0), Some(Button::Guild(0)));
-        assert_eq!(button_at(2 * 9 + 8, 0), Some(Button::Guild(1)));
-        assert_eq!(button_at(3 * 9 + 8, 0), None);
     }
 }

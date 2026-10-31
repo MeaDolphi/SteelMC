@@ -605,7 +605,10 @@ impl BossFight {
     ) -> Option<BossAbilityAction> {
         let boss = world.get_entity_by_id(self.boss_id)?;
         let living = boss.as_living_entity()?;
-        if let Some(progress) = health_fraction(&boss)
+        // Progress updates may only follow an announce: the vanilla client
+        // crashes on an update for a boss bar it was never shown.
+        if self.shown_progress.is_some()
+            && let Some(progress) = health_fraction(&boss)
             && self.shown_progress != Some(progress)
         {
             self.shown_progress = Some(progress);

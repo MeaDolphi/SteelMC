@@ -1753,6 +1753,21 @@ impl DungeonRuntime {
                         }
                     }
                 }
+                // The fight just happened here, so the frame chunks are
+                // loaded: remove the frame right away instead of waiting for
+                // the asynchronous cleanup, and retire the tombstone when the
+                // site is verified clear.
+                if let Some(world) = server.worlds.get(&gate.world) {
+                    remove_gate_frame(world, &gate);
+                    if gate_frame_is_clear(world, &gate) && self.gates.acknowledge_gate_cleanup(id)
+                    {
+                        log::info!(
+                            "sololeveling: removed the gate frame in {} at {:?}",
+                            gate.world,
+                            gate.entrance
+                        );
+                    }
+                }
                 log::info!(
                     "sololeveling: gate break cleared in {} at {:?}",
                     gate.world,

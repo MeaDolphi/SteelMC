@@ -317,16 +317,24 @@ pub fn place_gate_frame(world: &Arc<World>, entrance: BlockPos, style: FrameStyl
 }
 
 /// Restores a gate entrance to air, leaving any other block untouched.
+///
+/// Removal accepts every known frame style, not only the style the registry
+/// expects: wave explosions and legacy records both leave frames whose blocks
+/// no longer match the expected style exactly.
 pub fn remove_gate_frame(world: &Arc<World>, gate: &Gate) {
-    let style = FrameStyle::from_gate(gate);
     for pos in gate_frame_positions(gate.entrance) {
-        let _ = world.set_block_if_unchanged_with_cause(
-            pos,
-            frame_block(style, gate.entrance, pos),
-            vanilla_blocks::AIR.default_state(),
-            UpdateFlags::UPDATE_ALL,
-            BlockMutationCause::System,
-        );
+        let state = world.get_block_state(pos);
+        let is_frame_block = [FrameStyle::Normal, FrameStyle::Red, FrameStyle::Castle]
+            .into_iter()
+            .any(|style| state == frame_block(style, gate.entrance, pos));
+        if is_frame_block {
+            let _ = world.set_block_with_cause(
+                pos,
+                vanilla_blocks::AIR.default_state(),
+                UpdateFlags::UPDATE_ALL,
+                BlockMutationCause::System,
+            );
+        }
     }
 }
 
