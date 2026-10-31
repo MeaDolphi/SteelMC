@@ -76,7 +76,10 @@ impl SpiderEntity {
         {
             let mut goal_selector = mob_base.goal_selector().lock();
             goal_selector.add_goal(1, LeapAtTargetGoal::new(0.4f32));
-            goal_selector.add_goal(2, MeleeAttackGoal::new(1.0, false));
+            // Vanilla `Spider.SpiderAttackGoal` passes `true`: the spider keeps
+            // attacking while the target lives, instead of stopping whenever
+            // navigation completes and waiting out the can-use cooldown.
+            goal_selector.add_goal(2, MeleeAttackGoal::new(1.0, true));
             goal_selector.add_goal(7, WaterAvoidingRandomStrollGoal::new(1.0));
             goal_selector.add_goal(8, LookAtPlayerGoal::new(8.0));
             goal_selector.add_goal(8, RandomLookAroundGoal::new());
@@ -331,5 +334,52 @@ mod tests {
         assert!(spider.is_climbing());
         spider.set_climbing(false);
         assert!(!spider.is_climbing());
+    }
+
+    /// Scale used by the Solo Leveling island spiders; the vanilla SCALE
+    /// attribute multiplies the hitbox like any other scaled mob.
+    const ISLAND_SPIDER_SCALE: f64 = 1.8;
+
+    #[test]
+    fn scaled_spider_reaches_by_vanilla_attack_reach_from_its_hitbox() {
+        init_vanilla_registry();
+        let vanilla_spider =
+            SpiderEntity::new(&vanilla_entities::SPIDER, 1, glam::DVec3::ZERO, Weak::new());
+        let scaled_spider =
+            SpiderEntity::new(&vanilla_entities::SPIDER, 2, glam::DVec3::ZERO, Weak::new());
+        scaled_spider
+            .attributes()
+            .lock()
+            .set_base_value(vanilla_attributes::SCALE, ISLAND_SPIDER_SCALE);
+        LivingEntity::refresh_dirty_attributes(&scaled_spider);
+        let expected_width = f64::from(
+            vanilla_entities::SPIDER
+                .dimensions
+                .scale(ISLAND_SPIDER_SCALE as f32)
+                .width,
+        );
+        assert!(
+            (scaled_spider.bounding_box().width() - expected_width).abs() < 1.0e-9,
+            "the attack reach must come from the scaled hitbox, not the vanilla one"
+        );
+
+        // Vanilla reach is `sqrt(2.04) - 0.6` horizontal inflation of the
+        // attacker's own box: spider half-width 0.7 (1.26 scaled), pig
+        // half-width 0.45. At 2.1 blocks only the scaled spider connects.
+        let target = crate::entity::entities::PigEntity::new(
+            &vanilla_entities::PIG,
+            3,
+            glam::DVec3::new(2.1, 0.0, 0.0),
+            Weak::new(),
+        );
+
+        assert!(
+            !vanilla_spider.is_within_melee_attack_range(&target),
+            "an unscaled spider must stay out of reach at this distance"
+        );
+        assert!(
+            scaled_spider.is_within_melee_attack_range(&target),
+            "a spider at scale {ISLAND_SPIDER_SCALE} must reach via its scaled hitbox"
+        );
     }
 }

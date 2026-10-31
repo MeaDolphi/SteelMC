@@ -18,8 +18,8 @@ use steel_utils::locks::SyncMutex;
 use steel_utils::{BlockPos, BlockStateId, DowncastType, DowncastTypeKey};
 
 use crate::entity::ai::goal::{
-    HurtByTargetGoal, LookAtPlayerGoal, NearestAttackableTargetGoal, RandomLookAroundGoal,
-    SwellGoal, WaterAvoidingRandomStrollGoal,
+    HurtByTargetGoal, LookAtPlayerGoal, MeleeAttackGoal, NearestAttackableTargetGoal,
+    RandomLookAroundGoal, SwellGoal, WaterAvoidingRandomStrollGoal,
 };
 use crate::entity::damage::DamageSource;
 use crate::entity::monster::DEFAULT_XP_REWARD;
@@ -78,6 +78,9 @@ impl CreeperEntity {
         {
             let mut goal_selector = mob_base.goal_selector().lock();
             goal_selector.add_goal(2, SwellGoal::new());
+            // Vanilla keeps its harmless melee goal so the creeper walks any
+            // target down to the swell range, not just players it can see.
+            goal_selector.add_goal(4, MeleeAttackGoal::new(1.0, false));
             goal_selector.add_goal(5, WaterAvoidingRandomStrollGoal::new(1.0));
             goal_selector.add_goal(6, LookAtPlayerGoal::new(8.0));
             goal_selector.add_goal(6, RandomLookAroundGoal::new());
@@ -307,6 +310,17 @@ impl Mob for CreeperEntity {
         &self.mob_base
     }
 
+    /// Vanilla `Creeper.doHurtTarget` deals no melee damage; the melee goal
+    /// only closes the distance so `SwellGoal` can light the fuse.
+    fn do_hurt_target(
+        &self,
+        _entity: &SharedEntity,
+        _world: &World,
+        _target: &SharedEntity,
+    ) -> bool {
+        true
+    }
+
     fn tick_goal_selectors(&self, entity: &SharedEntity) {
         PathfinderMob::tick_pathfinder_goal_selectors(self, entity);
     }
@@ -336,6 +350,7 @@ mod tests {
     use steel_utils::{BlockPos, ChunkPos, Downcast as _};
 
     use super::CreeperEntity;
+    use crate::behavior::init_behaviors;
     use crate::entity::monster::DEFAULT_XP_REWARD;
     use crate::entity::registry::init_entities;
     use crate::entity::{Entity, LivingEntity, Mob, SharedEntity, spawn_mob};
@@ -408,5 +423,191 @@ mod tests {
         creeper.set_ignited(true);
         assert!(creeper.is_powered());
         assert!(creeper.is_ignited());
+    }
+
+    #[test]
+    fn creeper_swells_at_non_player_target() {
+        init_vanilla_registry();
+        init_behaviors();
+        let world_fixture = fresh_test_world("creeper_swell_mob_target");
+        let world = &world_fixture.world;
+        insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+
+        let creeper = std::sync::Arc::new(CreeperEntity::new(
+            &vanilla_entities::CREEPER,
+            1,
+            glam::DVec3::new(8.0, 64.0, 8.0),
+            std::sync::Arc::downgrade(world),
+        ));
+        // An allied-owned fighter (a Solo Leveling "shadow") is still an
+        // ordinary living mob to the creeper; vanilla `SwellGoal` reacts to
+        // any attack target, not just players.
+        let shadow: SharedEntity = std::sync::Arc::new(crate::entity::entities::PigEntity::new(
+            &vanilla_entities::PIG,
+            2,
+            glam::DVec3::new(9.5, 64.0, 8.0),
+            std::sync::Arc::downgrade(world),
+        ));
+        shadow
+            .as_mob()
+            .expect("shadow is a mob")
+            .set_allied_owner(Some(uuid::Uuid::new_v4()));
+        let creeper_entity: SharedEntity = std::sync::Arc::<CreeperEntity>::clone(&creeper);
+        for entity in [
+            std::sync::Arc::clone(&creeper_entity),
+            std::sync::Arc::clone(&shadow),
+        ] {
+            world
+                .try_add_entity(entity)
+                .expect("test entity should attach to the loaded chunk");
+        }
+
+        // The shadow hurts the creeper, so vanilla `HurtByTargetGoal` picks it.
+        creeper.advance_tick_count();
+        creeper.set_last_hurt_by_mob(Some(&shadow));
+        creeper
+            .mob_base()
+            .target_selector()
+            .lock()
+            .tick(creeper.as_ref(), &creeper_entity);
+        assert_eq!(
+            creeper.target().map(|target| target.uuid()),
+            Some(shadow.uuid()),
+            "the creeper must target the non-player attacker"
+        );
+
+        for _ in 0..4 {
+            creeper
+                .mob_base()
+                .goal_selector()
+                .lock()
+                .tick(creeper.as_ref(), &creeper_entity);
+        }
+        assert!(
+            creeper.swell_dir() > 0,
+            "the creeper must swell at any living target in range, not only players"
+        );
+    }
+
+    #[test]
+    fn creeper_does_not_swell_beyond_vanilla_start_range() {
+        init_vanilla_registry();
+        init_behaviors();
+        let world_fixture = fresh_test_world("creeper_swell_start_range");
+        let world = &world_fixture.world;
+        insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+
+        let creeper = std::sync::Arc::new(CreeperEntity::new(
+            &vanilla_entities::CREEPER,
+            1,
+            glam::DVec3::new(8.0, 64.0, 8.0),
+            std::sync::Arc::downgrade(world),
+        ));
+        // 4 blocks away: outside vanilla `SwellGoal`'s 3-block start radius.
+        let target: SharedEntity = std::sync::Arc::new(crate::entity::entities::PigEntity::new(
+            &vanilla_entities::PIG,
+            2,
+            glam::DVec3::new(12.0, 64.0, 8.0),
+            std::sync::Arc::downgrade(world),
+        ));
+        let creeper_entity: SharedEntity = std::sync::Arc::<CreeperEntity>::clone(&creeper);
+        for entity in [
+            std::sync::Arc::clone(&creeper_entity),
+            std::sync::Arc::clone(&target),
+        ] {
+            world
+                .try_add_entity(entity)
+                .expect("test entity should attach to the loaded chunk");
+        }
+        assert!(creeper.set_target(Some(&target)));
+
+        for _ in 0..40 {
+            creeper
+                .mob_base()
+                .goal_selector()
+                .lock()
+                .tick(creeper.as_ref(), &creeper_entity);
+        }
+        assert_eq!(
+            creeper.swell_dir(),
+            -1,
+            "vanilla SwellGoal only starts within 3 blocks of the target"
+        );
+        assert!(!creeper.is_removed());
+    }
+
+    #[test]
+    fn ignited_creeper_swells_and_explodes_without_target() {
+        init_vanilla_registry();
+        init_behaviors();
+        let world_fixture = fresh_test_world("creeper_ignited_swell");
+        let world = &world_fixture.world;
+        insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+
+        let creeper = std::sync::Arc::new(CreeperEntity::new(
+            &vanilla_entities::CREEPER,
+            1,
+            glam::DVec3::new(8.0, 64.0, 8.0),
+            std::sync::Arc::downgrade(world),
+        ));
+        let creeper_entity: SharedEntity = std::sync::Arc::<CreeperEntity>::clone(&creeper);
+        world
+            .try_add_entity(std::sync::Arc::clone(&creeper_entity))
+            .expect("test entity should attach to the loaded chunk");
+
+        creeper.set_ignited(true);
+        for _ in 0..35 {
+            creeper
+                .mob_base()
+                .goal_selector()
+                .lock()
+                .tick(creeper.as_ref(), &creeper_entity);
+        }
+
+        assert!(
+            creeper.is_removed(),
+            "vanilla Creeper.tick forces the fuse while ignited until it explodes"
+        );
+    }
+
+    #[test]
+    fn creeper_melee_attack_is_harmless_like_vanilla() {
+        init_vanilla_registry();
+        init_behaviors();
+        let world_fixture = fresh_test_world("creeper_harmless_melee");
+        let world = &world_fixture.world;
+        insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+
+        let creeper = std::sync::Arc::new(CreeperEntity::new(
+            &vanilla_entities::CREEPER,
+            1,
+            glam::DVec3::new(8.0, 64.0, 8.0),
+            std::sync::Arc::downgrade(world),
+        ));
+        let pig = std::sync::Arc::new(crate::entity::entities::PigEntity::new(
+            &vanilla_entities::PIG,
+            2,
+            glam::DVec3::new(9.0, 64.0, 8.0),
+            std::sync::Arc::downgrade(world),
+        ));
+        let creeper_entity: SharedEntity = std::sync::Arc::<CreeperEntity>::clone(&creeper);
+        let pig_entity: SharedEntity =
+            std::sync::Arc::<crate::entity::entities::PigEntity>::clone(&pig);
+        for entity in [
+            std::sync::Arc::clone(&creeper_entity),
+            std::sync::Arc::clone(&pig_entity),
+        ] {
+            world
+                .try_add_entity(entity)
+                .expect("test entity should attach to the loaded chunk");
+        }
+
+        let pig_health_before = LivingEntity::get_health(pig.as_ref());
+        assert!(creeper.do_hurt_target(&creeper_entity, world, &pig_entity));
+        assert_eq!(
+            LivingEntity::get_health(pig.as_ref()),
+            pig_health_before,
+            "vanilla Creeper.doHurtTarget never damages the target"
+        );
     }
 }

@@ -1,6 +1,7 @@
 //! Dungeon-instance allocation and rank-scaled combat rules.
 
 pub mod boss;
+pub mod castle_tower;
 pub mod generator;
 pub mod instance;
 pub mod mobs;
@@ -872,6 +873,12 @@ pub enum Footprint {
     Arena,
     /// The spiral penalty tower.
     Tower,
+    /// The Demon Castle tower climbed during one run.
+    Castle {
+        /// Highest floor built; erasure covers the whole buildable height, so
+        /// this is a diagnostic, not the source of truth for cleanup.
+        floors: u32,
+    },
 }
 
 /// Allocates non-overlapping regions and reuses released slots.

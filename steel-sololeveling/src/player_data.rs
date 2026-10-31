@@ -72,6 +72,10 @@ pub struct SoloLevelingPlayerData {
     /// Item NBT compounds held by the System when inventory delivery overflowed.
     #[serde(default)]
     pub deferred_inventory: Vec<Vec<u8>>,
+    /// Personal class items the hunter's current class cannot use, held until
+    /// a class makes them usable again.
+    #[serde(default)]
+    pub class_vault: Vec<Vec<u8>>,
     /// The one-time Association starter kit.
     #[serde(default)]
     pub starter: StarterKit,
@@ -107,6 +111,7 @@ impl SoloLevelingPlayerData {
             class: ClassChoice::default(),
             gear: SavedGear::default(),
             deferred_inventory: Vec::new(),
+            class_vault: Vec::new(),
             starter: StarterKit::default(),
             merchant: MerchantRecord::default(),
             castle: CastleProgress::default(),
@@ -374,5 +379,21 @@ mod tests {
         let restored: SoloLevelingPlayerData =
             serde_json::from_slice(&bytes).expect("account should deserialize");
         assert_eq!(restored.deferred_inventory, [unsupported]);
+    }
+
+    #[test]
+    fn class_vault_defaults_for_old_saves_and_preserves_raw_entries() {
+        let uuid = Uuid::new_v4();
+        let legacy = serde_json::json!({ "uuid": uuid });
+        let mut data: SoloLevelingPlayerData =
+            serde_json::from_value(legacy).expect("legacy account should load");
+        assert_eq!(data.class_vault, Vec::<Vec<u8>>::new());
+
+        let unsupported = vec![0xff, 0x00, 0x7f];
+        data.class_vault.push(unsupported.clone());
+        let bytes = serde_json::to_vec(&data).expect("account should serialize");
+        let restored: SoloLevelingPlayerData =
+            serde_json::from_slice(&bytes).expect("account should deserialize");
+        assert_eq!(restored.class_vault, [unsupported]);
     }
 }

@@ -1,6 +1,7 @@
 //! Hunter classes applied to live players.
 
 use std::mem;
+use std::sync::Arc;
 
 use steel_core::entity::damage::DamageSource;
 use steel_core::entity::{Entity as _, LivingEntity};
@@ -16,10 +17,12 @@ use uuid::Uuid;
 use super::SoloLevelingState;
 use crate::abilities;
 use crate::class::{self, ClassError, HunterClass, RANGER_STARTER_ARROWS};
+use crate::class_menu;
 use crate::gear;
 use crate::item::binding;
 use crate::item::enchantment::ItemKind;
 use crate::item::serial::{self, SerialId};
+use crate::item::{grimoire, nbt};
 use crate::quest_book::Goal;
 use crate::rank::HunterRank;
 use crate::ui;
@@ -57,9 +60,15 @@ impl SoloLevelingState {
                 let rank = session.stats.rank();
                 let price = session.class.choose(class, rank, now, &mut session.won)?;
                 session.class_rank = Some(rank);
+                session.class_vault_due = true;
                 if class == HunterClass::Mage {
                     session.spells.learn_starting();
-                    session.magic.grimoire_due = true;
+                    // A grimoire waiting in the class vault comes back with
+                    // the reconcile; only a hunter with none stored owes a
+                    // fresh book, so the two never collide.
+                    session.magic.grimoire_due = !session.class_vault.iter().any(|entry| {
+                        nbt::decode(entry).is_ok_and(|stack| grimoire::is_grimoire(&stack))
+                    });
                 }
                 Ok((price, session.class, rank))
             })
@@ -225,7 +234,7 @@ impl SoloLevelingState {
     }
 
     /// Pays owed lifesteal and keeps the class bonuses in step with the rank.
-    pub fn tick_class(&self, player: &Player) {
+    pub fn tick_class(self: &Arc<Self>, player: &Player) {
         let uuid = player.gameprofile.id();
         let Some((choice, rank, rank_changed, heal)) = self.with_session_mut(uuid, |session| {
             let rank = session.stats.rank();
@@ -242,10 +251,28 @@ impl SoloLevelingState {
         if heal > 0.0 {
             let _ = self.heal_hunter(player, heal);
         }
+        self.tick_class_vault(player);
         self.give_ranger_kit(player);
         self.tick_mana(player);
         self.tick_enchantments(player);
         self.tick_quests(player);
+    }
+
+    /// Queues the owed class-vault reconcile and reopens the vault menu once
+    /// a finished withdrawal has released the inventory.
+    fn tick_class_vault(self: &Arc<Self>, player: &Player) {
+        let uuid = player.gameprofile.id();
+        let Some((reconcile, menu)) = self.with_session_mut(uuid, |session| {
+            (session.class_vault_due, session.class_vault_menu_due)
+        }) else {
+            return;
+        };
+        if reconcile {
+            self.request_class_vault_reconcile(player);
+        }
+        if menu && !player.inventory_transaction_active() {
+            class_menu::open_vault(player, Arc::clone(self), 0);
+        }
     }
 
     /// Hands a newly chosen Ranger their bound starter bow and arrows.

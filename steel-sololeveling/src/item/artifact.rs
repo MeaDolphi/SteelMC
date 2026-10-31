@@ -1633,12 +1633,10 @@ pub fn enchanted_stack(
     if !modifiers.modifiers.is_empty() {
         stack.set(ATTRIBUTE_MODIFIERS, modifiers);
     }
+    // Everything the System hands out is unbreakable: boss drops, shop
+    // copies and crafted tiers alike.
+    stack.set(UNBREAKABLE, ());
     if id.is_starter() || id.line().is_some() || id.is_improved() {
-        // Serial gear keeps its vanilla look; only the free, bound starter
-        // kit never breaks, merchant copies wear like any tool.
-        if id.is_starter() && owner.is_some() {
-            stack.set(UNBREAKABLE, ());
-        }
         if let Some(color) = id.dye() {
             stack.set(DYED_COLOR, DyedItemColor::new(color));
         }

@@ -5,6 +5,7 @@
 
 mod account;
 mod buyback;
+mod class_vault;
 mod crafting;
 mod deferred;
 mod enchant;
@@ -13,6 +14,7 @@ mod merchant;
 mod starter;
 use account::load_account;
 pub(crate) use account::{AccountUpdate, CommitReport, PreparedCommit};
+use class_vault::ClassVaultTransfer;
 use deferred::DeferredTransfer;
 pub use starter::StarterError;
 use starter::StarterTransfer;
@@ -178,6 +180,13 @@ enum Request {
     Deferred {
         uuid: Uuid,
         transfer: DeferredTransfer,
+    },
+    ClassVaultReconcile {
+        uuid: Uuid,
+    },
+    ClassVault {
+        uuid: Uuid,
+        transfer: ClassVaultTransfer,
     },
     Starter {
         uuid: Uuid,
@@ -1702,6 +1711,37 @@ impl SoloLevelingState {
                     return;
                 };
                 if !self.begin_deferred_transfer(server, player, uuid, transfer) {
+                    self.persistence.lock().busy = false;
+                }
+            }
+            Request::ClassVaultReconcile { uuid } => {
+                let Some(player) = server
+                    .get_players()
+                    .into_iter()
+                    .find(|player| player.gameprofile.id() == uuid)
+                else {
+                    // The player is between join and spawn: the join tick owes
+                    // the flag again, so the reconcile is re-queued there.
+                    self.sessions
+                        .with_mut(uuid, |session| session.class_vault_due = true);
+                    self.persistence.lock().busy = false;
+                    return;
+                };
+                if !self.begin_class_vault_reconcile(server, player, uuid) {
+                    self.persistence.lock().busy = false;
+                }
+            }
+            Request::ClassVault { uuid, transfer } => {
+                let Some(player) = server
+                    .get_players()
+                    .into_iter()
+                    .find(|player| player.gameprofile.id() == uuid)
+                else {
+                    self.release_shop_purchase(uuid);
+                    return;
+                };
+                let ClassVaultTransfer::Withdraw { index, expected } = transfer;
+                if !self.begin_class_vault_withdrawal(server, player, uuid, index, expected) {
                     self.persistence.lock().busy = false;
                 }
             }

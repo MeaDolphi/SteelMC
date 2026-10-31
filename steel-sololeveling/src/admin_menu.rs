@@ -865,6 +865,7 @@ mod tests {
                 class: ClassChoice::default(),
                 gear: SavedGear::default(),
                 deferred_inventory: Vec::new(),
+                class_vault: Vec::new(),
                 starter: StarterKit::default(),
                 merchant: MerchantRecord::default(),
                 castle: CastleProgress::default(),

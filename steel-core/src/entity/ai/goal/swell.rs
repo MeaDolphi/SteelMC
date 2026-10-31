@@ -8,8 +8,11 @@ use crate::entity::{LivingEntity, PathfinderMob, SharedEntity};
 use steel_utils::Downcast as _;
 
 const MAX_SWELL: i32 = 30;
-const EXPLOSION_RADIUS: f64 = 3.0;
-const EXPLOSION_DAMAGE: f32 = 43.0;
+/// Vanilla `SwellGoal.canUse` starts swelling only when the target is closer
+/// than 3 blocks; line of sight is checked per-tick, not at start.
+const SWELL_START_DISTANCE_SQR: f64 = 9.0;
+/// Vanilla keeps the fuse lit while the target stays within 7 blocks.
+const SWELL_KEEP_DISTANCE_SQR: f64 = 49.0;
 
 /// Creeper-specific AI goal that swells up and explodes near a target.
 pub struct SwellGoal {
@@ -23,13 +26,6 @@ impl SwellGoal {
         Self { target: None }
     }
 
-    fn is_target_valid(mob: &dyn PathfinderMob, target: &SharedEntity) -> bool {
-        let Some(living) = target.as_living_entity() else {
-            return false;
-        };
-        LivingEntity::is_alive(living) && mob.has_line_of_sight_cached(target.as_ref())
-    }
-
     fn creeper(mob: &dyn PathfinderMob) -> Option<&CreeperEntity> {
         mob.as_entity_event_source().downcast_ref::<CreeperEntity>()
     }
@@ -41,36 +37,39 @@ impl Goal for SwellGoal {
     }
 
     fn can_use(&mut self, mob: &dyn PathfinderMob) -> bool {
+        let Some(creeper) = Self::creeper(mob) else {
+            return false;
+        };
+        // Vanilla also keeps the goal while the fuse is already burning, so an
+        // ignited creeper cannot be interrupted by target selection churn.
+        if creeper.swell_dir() > 0 || creeper.is_ignited() {
+            self.target = mob.target();
+            return true;
+        }
+
         let Some(target) = mob.target() else {
             return false;
         };
-        if !Self::is_target_valid(mob, &target) {
+        let Some(living) = target.as_living_entity() else {
+            return false;
+        };
+        if LivingEntity::is_dead_or_dying(living)
+            || mob.position().distance_squared(target.position()) >= SWELL_START_DISTANCE_SQR
+        {
             return false;
         }
-        if Self::creeper(mob).is_none() {
-            return false;
-        }
+
         self.target = Some(target);
         true
     }
 
-    fn can_continue_to_use(&mut self, mob: &dyn PathfinderMob) -> bool {
-        let Some(target) = &self.target else {
-            return false;
-        };
-        Self::creeper(mob).is_some() && Self::is_target_valid(mob, target)
-    }
-
     fn start(&mut self, mob: &dyn PathfinderMob) {
-        if let Some(creeper) = Self::creeper(mob) {
-            creeper.set_swell_dir(-1);
-        }
+        // Vanilla `SwellGoal.start` stops navigation and captures the target.
+        mob.mob_base().navigation().lock().stop();
+        self.target = mob.target();
     }
 
-    fn stop(&mut self, mob: &dyn PathfinderMob) {
-        if let Some(creeper) = Self::creeper(mob) {
-            creeper.set_swell_dir(-1);
-        }
+    fn stop(&mut self, _mob: &dyn PathfinderMob) {
         self.target = None;
     }
 
@@ -82,27 +81,31 @@ impl Goal for SwellGoal {
         let Some(creeper) = Self::creeper(mob) else {
             return;
         };
-        let Some(target) = &self.target else {
-            return;
+
+        let target_alive = self.target.as_ref().is_some_and(|target| {
+            target
+                .as_living_entity()
+                .is_some_and(LivingEntity::is_alive)
+        });
+        let in_keep_range = self.target.as_ref().is_some_and(|target| {
+            mob.position().distance_squared(target.position()) <= SWELL_KEEP_DISTANCE_SQR
+                && mob.has_line_of_sight_cached(target.as_ref())
+        });
+
+        // Vanilla `Creeper.tick` forces the fuse while the creeper is ignited.
+        let inflating = creeper.is_ignited() || (target_alive && in_keep_range);
+        let swell = creeper.swell_dir();
+        let next_swell = if inflating {
+            swell + 1
+        } else {
+            (swell - 1).max(-1)
         };
 
-        let distance_sqr = mob.position().distance_squared(target.position());
-        let swell = creeper.swell_dir();
-        let mut next_swell = swell;
-
-        if distance_sqr <= EXPLOSION_RADIUS * EXPLOSION_RADIUS
-            && mob.has_line_of_sight_cached(target.as_ref())
-        {
-            next_swell += 1;
-            if next_swell >= MAX_SWELL {
-                creeper.explode(entity);
-                return;
-            }
-        } else {
-            next_swell -= 1;
+        if next_swell >= MAX_SWELL {
+            creeper.explode(entity);
+            return;
         }
 
-        next_swell = next_swell.clamp(-1, MAX_SWELL);
         if next_swell != swell {
             creeper.set_swell_dir(next_swell);
         }

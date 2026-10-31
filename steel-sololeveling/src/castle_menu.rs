@@ -1,6 +1,6 @@
-//! The Demon Castle page of the System: the hunter's climb, the free entry
-//! that returns every ten minutes, and the weekly ranking of the highest
-//! cleared floor.
+//! The Demon Castle page of the System: the hunter's climb up the tower
+//! floors, the free entry that returns every ten minutes, and the weekly
+//! ranking of the highest cleared floor.
 
 use std::sync::Arc;
 
@@ -66,7 +66,9 @@ pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
                 FREE_ENTRY_SECONDS / 60
             )),
             line("Дальше — «Ключ Замка демонов» (ПКМ ключом)."),
-            line("Врата этажа откроются рядом с вами в главном мире."),
+            line("Чёрный портал откроется рядом с вами в главном мире."),
+            line("Башня бесконечна: этаж за этажом, пока не падёте или не выйдете сами."),
+            line("За каждый зачищенный этаж — Won, материалы и запись в рейтинге."),
         ],
     );
     let mut lines: Vec<TextComponent> = ranking
@@ -104,7 +106,7 @@ pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
             match state_for_click.request_castle_floor(player.gameprofile.id(), false) {
                 Ok(floor) => player.send_message(
                     &TextComponent::plain(format!(
-                        "Замок демонов: врата на этаж {floor} открываются рядом с вами…"
+                        "Замок демонов: чёрный портал на этаж {floor} открывается рядом с вами…"
                     ))
                     .color(Color::DarkRed),
                 ),

@@ -142,6 +142,7 @@ pub(super) fn footprint_chunks(
         }
         Some(Footprint::Arena) => penalty_arena_chunks(region),
         Some(Footprint::Tower) => super::tower::tower_chunks(region),
+        Some(Footprint::Castle { .. }) => super::castle_tower::tower_chunks(region),
         None => {
             let (min, max) = legacy_box(region);
             let mut chunks = chunks_covering(min, max);
@@ -241,26 +242,59 @@ fn gate_is_dry_at(
     frames_stand_on_land && opening_is_dry
 }
 
-/// Returns the frame block of a gate: quartz for a normal gate, red glass for
-/// a red gate.
+/// The look of one gate entrance frame.
 ///
 /// The block is derived from the gate instead of being stored, so a gate can
 /// never disagree with the frame standing in the world.
-fn gate_frame_block(red: bool) -> BlockStateId {
-    if red {
-        vanilla_blocks::RED_STAINED_GLASS.default_state()
-    } else {
-        vanilla_blocks::QUARTZ_BLOCK.default_state()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameStyle {
+    /// An ordinary gate: quartz blocks.
+    Normal,
+    /// A red gate: red stained glass.
+    Red,
+    /// A Demon Castle portal: polished blackstone bricks with crying obsidian
+    /// corners, so the castle gate never masquerades as an ordinary gate.
+    Castle,
+}
+
+impl FrameStyle {
+    /// Returns the frame style a gate is built with.
+    #[must_use]
+    pub const fn from_gate(gate: &Gate) -> Self {
+        if gate.floor.is_some() {
+            Self::Castle
+        } else if gate.red {
+            Self::Red
+        } else {
+            Self::Normal
+        }
+    }
+}
+
+/// Returns the frame block of `style` at one frame position of the frame
+/// based at `entrance`.
+fn frame_block(style: FrameStyle, entrance: BlockPos, pos: BlockPos) -> BlockStateId {
+    match style {
+        FrameStyle::Red => vanilla_blocks::RED_STAINED_GLASS.default_state(),
+        FrameStyle::Normal => vanilla_blocks::QUARTZ_BLOCK.default_state(),
+        FrameStyle::Castle => {
+            let on_side_column = pos.x() == entrance.x() - 1 || pos.x() == entrance.x() + 2;
+            let on_end_row = pos.y() == entrance.y() || pos.y() == entrance.y() + 4;
+            if on_side_column && on_end_row {
+                vanilla_blocks::CRYING_OBSIDIAN.default_state()
+            } else {
+                vanilla_blocks::POLISHED_BLACKSTONE_BRICKS.default_state()
+            }
+        }
     }
 }
 
 /// Places a gate frame without replacing blocks built after its site was chosen.
-pub fn place_gate_frame(world: &Arc<World>, entrance: BlockPos, red: bool) -> bool {
-    let block = gate_frame_block(red);
+pub fn place_gate_frame(world: &Arc<World>, entrance: BlockPos, style: FrameStyle) -> bool {
     let positions = gate_frame_positions(entrance);
     if positions.iter().any(|pos| {
         let state = world.get_block_state(*pos);
-        !state.is_air() && state != block
+        !state.is_air() && state != frame_block(style, entrance, *pos)
     }) || !(1..4).all(|height| {
         (0..2).all(|offset| {
             world
@@ -276,7 +310,7 @@ pub fn place_gate_frame(world: &Arc<World>, entrance: BlockPos, red: bool) -> bo
     }
     let mut failed = 0;
     for pos in positions {
-        set_fixture(world, pos, block, &mut failed);
+        set_fixture(world, pos, frame_block(style, entrance, pos), &mut failed);
     }
     warn_unwritten("gate frame", entrance, failed);
     failed == 0
@@ -284,11 +318,11 @@ pub fn place_gate_frame(world: &Arc<World>, entrance: BlockPos, red: bool) -> bo
 
 /// Restores a gate entrance to air, leaving any other block untouched.
 pub fn remove_gate_frame(world: &Arc<World>, gate: &Gate) {
-    let block = gate_frame_block(gate.red);
+    let style = FrameStyle::from_gate(gate);
     for pos in gate_frame_positions(gate.entrance) {
         let _ = world.set_block_if_unchanged_with_cause(
             pos,
-            block,
+            frame_block(style, gate.entrance, pos),
             vanilla_blocks::AIR.default_state(),
             UpdateFlags::UPDATE_ALL,
             BlockMutationCause::System,
@@ -299,10 +333,10 @@ pub fn remove_gate_frame(world: &Arc<World>, gate: &Gate) {
 /// Returns whether a legacy gate frame exactly matches its expected pattern.
 #[must_use]
 pub fn gate_frame_matches(world: &Arc<World>, gate: &Gate) -> bool {
-    let block = gate_frame_block(gate.red);
+    let style = FrameStyle::from_gate(gate);
     gate_frame_positions(gate.entrance)
         .into_iter()
-        .all(|pos| world.get_block_state(pos) == block)
+        .all(|pos| world.get_block_state(pos) == frame_block(style, gate.entrance, pos))
         && (1..4).all(|height| {
             (0..2).all(|offset| {
                 world
@@ -373,6 +407,7 @@ pub fn erase_footprint(world: &Arc<World>, region: InstanceRegion, footprint: Op
         }
         Some(Footprint::Arena) => clear_box_of(world, arena_box(region), &mut failed),
         Some(Footprint::Tower) => super::tower::erase_tower(world, region, &mut failed),
+        Some(Footprint::Castle { .. }) => super::castle_tower::erase_castle(world, region),
         None => {
             clear_box_of(world, legacy_box(region), &mut failed);
             clear_box_of(world, arena_box(region), &mut failed);
@@ -409,7 +444,7 @@ pub fn open_dungeon_exit(
     layout: &DungeonLayout,
 ) -> BlockPos {
     let entrance = exit_entrance(region, layout);
-    place_gate_frame(world, entrance, false);
+    place_gate_frame(world, entrance, FrameStyle::Normal);
     entrance
 }
 
@@ -731,8 +766,8 @@ mod tests {
     use steel_utils::{BlockPos, ChunkPos};
 
     use super::{
-        INSTANCE_FLOOR_Y, at, dungeon_chunks, gate_frame_chunks, gate_is_dry_at, opening_contains,
-        penalty_arena_chunks,
+        FrameStyle, INSTANCE_FLOOR_Y, at, dungeon_chunks, frame_block, gate_frame_chunks,
+        gate_is_dry_at, opening_contains, penalty_arena_chunks,
     };
     use crate::dungeon::{DungeonLayout, Footprint, InstanceRegion};
 
@@ -780,6 +815,33 @@ mod tests {
                 }
             }
         ));
+    }
+
+    #[test]
+    fn the_castle_portal_never_masquerades_as_a_gate() {
+        init_vanilla_registry();
+        let entrance = BlockPos::new(10, 64, 0);
+        let corner = BlockPos::new(entrance.x() - 1, entrance.y(), entrance.z());
+        let body = BlockPos::new(entrance.x(), entrance.y(), entrance.z());
+
+        let quartz = frame_block(FrameStyle::Normal, entrance, body);
+        let red = frame_block(FrameStyle::Red, entrance, body);
+        let castle = frame_block(FrameStyle::Castle, entrance, body);
+        let castle_corner = frame_block(FrameStyle::Castle, entrance, corner);
+
+        assert_eq!(quartz, vanilla_blocks::QUARTZ_BLOCK.default_state());
+        assert_eq!(red, vanilla_blocks::RED_STAINED_GLASS.default_state());
+        assert_eq!(
+            castle,
+            vanilla_blocks::POLISHED_BLACKSTONE_BRICKS.default_state()
+        );
+        assert_eq!(
+            castle_corner,
+            vanilla_blocks::CRYING_OBSIDIAN.default_state()
+        );
+        assert_ne!(castle, quartz);
+        assert_ne!(castle, red);
+        assert_ne!(castle_corner, castle);
     }
 
     #[test]

@@ -2,11 +2,15 @@
 //!
 //! The top row shows the current class and the change rules; the middle row
 //! holds one button per class. A click picks the class at once: the choice
-//! touches only the account, never the inventory the click has locked. A
-//! Mage also gets a button that hands out a lost grimoire on the next tick.
+//! touches only the account, never the inventory the click has locked. The
+//! bottom row hands a lost grimoire to a Mage, opens the class vault and
+//! starts the Second Awakening trial. A Mage also gets a button that hands
+//! out a lost grimoire on the next tick.
 
+use std::ops::Range;
 use std::sync::Arc;
 
+use steel_core::entity::Entity;
 use steel_core::inventory::container::Container as _;
 use steel_core::inventory::prelude::*;
 use steel_registry::items::ItemRef;
@@ -18,23 +22,143 @@ use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
 use crate::class::{self, HunterClass};
-use crate::item::{named, with_lore};
+use crate::dungeon::is_instance_world;
+use crate::item::{append_lore, named, with_lore};
 use crate::rank::HunterRank;
+use crate::sound::SystemSound;
 use crate::state::SoloLevelingState;
+use crate::ui::{After, open_guarded_buttons};
 
 const MENU_SLOTS: usize = 27;
 const INFO_SLOT: usize = 4;
 const FIRST_CLASS_SLOT: usize = 11;
 /// Button that hands a Mage a new grimoire.
 const GRIMOIRE_SLOT: usize = 22;
+/// Button that opens the class vault.
+const VAULT_SLOT: usize = 20;
 /// Button that starts the Second Awakening trial.
 const AWAKENING_SLOT: usize = 24;
+/// Vault menu page size.
+const VAULT_PAGE_SIZE: usize = 45;
 
 /// Opens the class menu for an online hunter.
 pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
     player.open_menu(
         TextComponent::plain("Класс охотника").color(Color::DarkAqua),
         move |context| build(context.container_id, context.player, state),
+    );
+}
+
+fn vault_page_range(length: usize, page: usize) -> Range<usize> {
+    let start = page.saturating_mul(VAULT_PAGE_SIZE).min(length);
+    start..start.saturating_add(VAULT_PAGE_SIZE).min(length)
+}
+
+/// Opens one page of the hunter's class vault.
+///
+/// Frozen items are listed for review and cannot leave; items the current
+/// class may use are withdrawn with one click.
+pub fn open_vault(player: &Player, state: Arc<SoloLevelingState>, page: usize) {
+    let uuid = player.gameprofile.id();
+    // Opening the menu, from the tick or a click, settles a pending reopen.
+    state.with_session_mut(uuid, |session| session.class_vault_menu_due = false);
+    if player
+        .level()
+        .is_some_and(|world| is_instance_world(&world))
+    {
+        player.send_message(
+            &TextComponent::plain("Хранилище недоступно в подземелье.").color(Color::Red),
+        );
+        return;
+    }
+    SystemSound::Open.play(player);
+    let current = state.class_of(uuid);
+    let entries = state.class_vault_items(uuid);
+    let page_count = entries.len().div_ceil(VAULT_PAGE_SIZE).max(1);
+    let page = page.min(page_count - 1);
+    let range = vault_page_range(entries.len(), page);
+    let mut contents = vec![ItemStack::empty(); 54];
+    for (slot, (_, _, item)) in entries[range.clone()].iter().enumerate() {
+        let frozen = class::is_class_frozen(item, uuid, current);
+        let line = if frozen {
+            TextComponent::plain("Заморожено: не подходит вашему классу.").color(Color::Red)
+        } else {
+            TextComponent::plain("Нажмите, чтобы забрать.").color(Color::Green)
+        };
+        contents[slot] = append_lore(item.clone(), vec![line]);
+    }
+    if page > 0 {
+        contents[45] = named(
+            ItemStack::new(&vanilla_items::ARROW),
+            TextComponent::plain("Предыдущая страница").color(Color::Gold),
+        );
+    }
+    if page + 1 < page_count {
+        contents[53] = named(
+            ItemStack::new(&vanilla_items::ARROW),
+            TextComponent::plain("Следующая страница").color(Color::Gold),
+        );
+    }
+    let frozen_count = entries
+        .iter()
+        .filter(|(_, _, item)| class::is_class_frozen(item, uuid, current))
+        .count();
+    contents[49] = with_lore(
+        named(
+            ItemStack::new(&vanilla_items::CHEST),
+            TextComponent::plain("Хранилище класса").color(Color::Aqua),
+        ),
+        vec![
+            TextComponent::plain(
+                "Личные предметы, не подходящие вашему классу, ждут здесь подходящего класса.",
+            )
+            .color(Color::Gray),
+            TextComponent::plain(format!(
+                "Страница {} из {} · хранится {} · заморожено {}",
+                page + 1,
+                page_count,
+                entries.len(),
+                frozen_count
+            ))
+            .color(Color::Gray),
+        ],
+    );
+    let selected: Vec<_> = entries
+        .into_iter()
+        .skip(range.start)
+        .take(range.len())
+        .collect();
+    open_guarded_buttons(
+        player,
+        TextComponent::plain("Хранилище класса").color(Color::Aqua),
+        6,
+        contents,
+        Box::new(move |player, slot, _| {
+            if player
+                .level()
+                .is_some_and(|world| is_instance_world(&world))
+            {
+                player.send_message(
+                    &TextComponent::plain("Хранилище недоступно в подземелье.").color(Color::Red),
+                );
+                return After::Keep;
+            }
+            if slot == 45 && page > 0 {
+                open_vault(player, Arc::clone(&state), page - 1);
+            } else if slot == 53 && page + 1 < page_count {
+                open_vault(player, Arc::clone(&state), page + 1);
+            } else if let Some((index, bytes, item)) = selected.get(slot) {
+                if class::is_class_frozen(item, player.gameprofile.id(), current) {
+                    player.send_message(
+                        &TextComponent::plain("Этот предмет не подходит вашему классу.")
+                            .color(Color::Red),
+                    );
+                } else {
+                    state.request_class_vault_withdrawal(player, *index, bytes.clone());
+                }
+            }
+            After::Keep
+        }),
     );
 }
 
@@ -67,6 +191,22 @@ fn icon(class: HunterClass) -> ItemRef {
     }
 }
 
+/// Builds the button that opens the class vault.
+fn vault_button(stored: usize) -> ItemStack {
+    with_lore(
+        named(
+            ItemStack::new(&vanilla_items::CHEST),
+            TextComponent::plain("Хранилище класса").color(Color::Aqua),
+        ),
+        vec![
+            TextComponent::plain("Личные предметы, не подходящие вашему классу, хранятся здесь.")
+                .color(Color::Gray),
+            TextComponent::plain(format!("Сейчас хранится: {stored}.")).color(Color::Gray),
+            TextComponent::plain("Клик — открыть.").color(Color::Yellow),
+        ],
+    )
+}
+
 fn menu_items(state: &SoloLevelingState, uuid: Uuid) -> Vec<ItemStack> {
     let mut items = vec![ItemStack::empty(); MENU_SLOTS];
     let current = state.class_of(uuid);
@@ -80,6 +220,7 @@ fn menu_items(state: &SoloLevelingState, uuid: Uuid) -> Vec<ItemStack> {
         })
         .unwrap_or((HunterRank::E, false, false));
     let first_pick = current.is_none() || free_change;
+    items[VAULT_SLOT] = vault_button(state.class_vault_items(uuid).len());
     if current == Some(HunterClass::Mage) {
         items[GRIMOIRE_SLOT] = with_lore(
             named(
@@ -197,9 +338,23 @@ impl MenuKind for ClassMenuKind {
             return ClickOutcome::Fallthrough;
         }
         if slot - self.buttons.start() == GRIMOIRE_SLOT {
-            if self.state.class_of(player.gameprofile.id()) == Some(HunterClass::Mage) {
-                self.state.request_grimoire(player.gameprofile.id());
+            let uuid = player.gameprofile.id();
+            if self.state.class_of(uuid) == Some(HunterClass::Mage) {
+                if self.state.class_vault_has_grimoire(uuid) {
+                    player.send_message(
+                        &TextComponent::plain(
+                            "Ваш гримуар в Хранилище класса — заберите его оттуда.",
+                        )
+                        .color(Color::Yellow),
+                    );
+                } else {
+                    self.state.request_grimoire(uuid);
+                }
             }
+            return ClickOutcome::Consume;
+        }
+        if slot - self.buttons.start() == VAULT_SLOT {
+            open_vault(player, Arc::clone(&self.state), 0);
             return ClickOutcome::Consume;
         }
         if slot - self.buttons.start() == AWAKENING_SLOT {
@@ -248,7 +403,10 @@ impl MenuKind for ClassMenuKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{AWAKENING_SLOT, FIRST_CLASS_SLOT, GRIMOIRE_SLOT, INFO_SLOT, MENU_SLOTS, class_at};
+    use super::{
+        AWAKENING_SLOT, FIRST_CLASS_SLOT, GRIMOIRE_SLOT, INFO_SLOT, MENU_SLOTS, VAULT_SLOT,
+        class_at, vault_page_range,
+    };
     use crate::class;
 
     #[test]
@@ -260,6 +418,18 @@ mod tests {
         }
         assert_eq!(class_at(INFO_SLOT), None);
         assert_eq!(class_at(GRIMOIRE_SLOT), None);
+        assert_eq!(class_at(VAULT_SLOT), None);
         assert_eq!(class_at(AWAKENING_SLOT), None);
+    }
+
+    #[test]
+    fn vault_menu_pages_select_each_stored_index_once() {
+        let first = vault_page_range(91, 0);
+        let second = vault_page_range(91, 1);
+        let third = vault_page_range(91, 2);
+        assert_eq!(first, 0..45);
+        assert_eq!(second, 45..90);
+        assert_eq!(third, 90..91);
+        assert!(first.end <= second.start && second.end <= third.start);
     }
 }

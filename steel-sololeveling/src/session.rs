@@ -72,6 +72,14 @@ pub struct HunterSession {
     pub(crate) saved_gear: SavedGear,
     /// Raw NBT entries, including entries this version cannot decode.
     pub(crate) deferred_inventory: Vec<Vec<u8>>,
+    /// Personal class items the current class cannot use; raw NBT entries,
+    /// including entries this version cannot decode.
+    pub(crate) class_vault: Vec<Vec<u8>>,
+    /// A class change or join owes a class-vault reconcile; the player tick
+    /// queues it once the inventory is free of transactions.
+    pub(crate) class_vault_due: bool,
+    /// A finished vault withdrawal owes reopening the vault menu.
+    pub(crate) class_vault_menu_due: bool,
     /// The one-time Association starter kit.
     pub starter: StarterKit,
     /// Personal city-merchant purchases of the current period.
@@ -145,6 +153,9 @@ impl HunterSession {
             gear: Vec::new(),
             saved_gear: SavedGear { slots: Vec::new() },
             deferred_inventory: Vec::new(),
+            class_vault: Vec::new(),
+            class_vault_due: false,
+            class_vault_menu_due: false,
             starter: StarterKit {
                 weapon: None,
                 swap_closed: false,
@@ -196,6 +207,7 @@ impl HunterSession {
             class: self.class,
             gear: SavedGear::from_items_preserving(&self.gear, &self.saved_gear),
             deferred_inventory: self.deferred_inventory.clone(),
+            class_vault: self.class_vault.clone(),
             starter: self.starter,
             merchant: self.merchant,
             castle: self.castle,

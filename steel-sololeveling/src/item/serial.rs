@@ -1701,11 +1701,10 @@ pub fn enchanted_stack(
     if !modifiers.modifiers.is_empty() {
         stack.set(ATTRIBUTE_MODIFIERS, modifiers);
     }
-    // Serial gear keeps its vanilla look; only the free, bound starter kit
-    // never breaks, merchant copies wear like any tool.
-    if id.is_starter() && owner.is_some() {
-        stack.set(UNBREAKABLE, ());
-    }
+    // Serial gear keeps its vanilla look and never wears out: every tier,
+    // from the free starter kit to merchant and made-to-order copies, is
+    // forged unbreakable.
+    stack.set(UNBREAKABLE, ());
     if let Some(color) = id.dye() {
         stack.set(DYED_COLOR, DyedItemColor::new(color));
     }
@@ -1911,13 +1910,19 @@ mod tests {
     }
 
     #[test]
-    fn starter_kit_is_bound_unbreakable() {
+    fn serial_stacks_of_all_tiers_are_unbreakable() {
         init_vanilla_registry();
         let owner = Uuid::new_v4();
+        for id in ALL {
+            // Every serial item is unbreakable, whether the personal copy
+            // bound to its owner or a transferable merchant copy.
+            for stack in [stack(id, Some(owner)), stack(id, None)] {
+                assert!(stack.has(UNBREAKABLE), "{id:?} should be unbreakable");
+            }
+        }
         for id in STARTER {
             let stack = stack(id, Some(owner));
             assert_eq!(binding::bound_owner(&stack), Some(owner));
-            assert!(stack.has(UNBREAKABLE), "{id:?} should be unbreakable");
             let lore = format!("{:?}", stack.get(LORE));
             assert!(
                 !lore.contains("Без привязки"),

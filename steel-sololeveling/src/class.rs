@@ -9,6 +9,11 @@
 //! A hunter picks a class from rank D. The first pick is free; afterwards the
 //! class may change once per seven days for [`CHANGE_PRICE`] Won.
 //!
+//! A class change moves every personal class item the new class cannot use
+//! (see [`is_class_frozen`]) into the hunter's class vault; a class that may
+//! use them takes them back. Transferable copies always stay in the
+//! inventory.
+//!
 //! The constants below are the rank-D values; [`rank_scale`] grows them with
 //! the hunter's rank up to twice as much at S, so a class keeps pace with the
 //! gates it is fighting.
@@ -16,10 +21,13 @@
 use serde::{Deserialize, Serialize};
 use steel_core::entity::attribute::{AttributeMap, AttributeModifier, AttributeModifierOperation};
 use steel_registry::attribute::AttributeRef;
+use steel_registry::item_stack::ItemStack;
 use steel_registry::vanilla_attributes;
+use uuid::Uuid;
 
 use crate::economy::Won;
 use crate::identifier::from_sololeveling;
+use crate::item::{binding, grimoire, serial};
 use crate::rank::HunterRank;
 
 /// Lowest hunter rank that may pick a class.
@@ -489,6 +497,32 @@ pub fn is_behind(target: glam::DVec3, target_look: glam::DVec3, attacker: glam::
     to_attacker.length_squared() > f64::EPSILON && look.dot(to_attacker) < 0.0
 }
 
+/// Returns the class restriction a personal class item carries, if any.
+///
+/// Serial class armor names its classes in the catalog; the grimoire is the
+/// Mage's personal spell book and follows the same rule even though the book
+/// itself stores no class list.
+#[must_use]
+pub fn item_class_lock(stack: &ItemStack) -> Option<&'static [HunterClass]> {
+    if grimoire::is_grimoire(stack) {
+        return Some(&[HunterClass::Mage]);
+    }
+    serial::of(stack).and_then(serial::SerialId::allowed_classes)
+}
+
+/// Returns whether `stack` is a personal class item that `class` cannot use.
+///
+/// Only items bound to `owner` freeze: transferable copies of another class's
+/// gear stay in the inventory, and an item bound to someone else is never
+/// touched. A hunter without a class freezes everything class-bound, so legacy
+/// saves (the removed Healer) still lose their grimoire.
+#[must_use]
+pub fn is_class_frozen(stack: &ItemStack, owner: Uuid, class: Option<HunterClass>) -> bool {
+    binding::bound_owner(stack) == Some(owner)
+        && item_class_lock(stack)
+            .is_some_and(|allowed| class.is_none_or(|chosen| !allowed.contains(&chosen)))
+}
+
 #[cfg(test)]
 mod tests {
     use glam::DVec3;
@@ -636,5 +670,50 @@ mod tests {
         let look = DVec3::new(0.0, 0.0, 1.0);
         assert!(is_behind(target, look, DVec3::new(0.0, 0.0, -2.0)));
         assert!(!is_behind(target, look, DVec3::new(0.0, 0.0, 2.0)));
+    }
+
+    #[test]
+    fn the_grimoire_freezes_for_every_class_but_the_mage() {
+        steel_registry::init_vanilla_registry();
+        let owner = Uuid::new_v4();
+        let book = grimoire::stack(owner);
+        assert_eq!(item_class_lock(&book), Some(&[HunterClass::Mage][..]));
+        assert!(is_class_frozen(&book, owner, Some(HunterClass::Fighter)));
+        assert!(is_class_frozen(&book, owner, Some(HunterClass::Tanker)));
+        // A hunter without a class (a legacy Healer save) freezes it too.
+        assert!(is_class_frozen(&book, owner, None));
+        assert!(!is_class_frozen(&book, owner, Some(HunterClass::Mage)));
+        // Someone else's grimoire is never touched.
+        assert!(!is_class_frozen(
+            &book,
+            Uuid::new_v4(),
+            Some(HunterClass::Fighter)
+        ));
+    }
+
+    #[test]
+    fn transferable_class_gear_and_unbound_stay_in_the_inventory() {
+        steel_registry::init_vanilla_registry();
+        let owner = Uuid::new_v4();
+        // A transferable robe of another class never freezes.
+        let tradable = serial::stack(serial::SerialId::RobeChestplate, None);
+        assert!(!is_class_frozen(
+            &tradable,
+            owner,
+            Some(HunterClass::Fighter)
+        ));
+        // A personal robe freezes for the wrong class and returns for the Mage.
+        let personal = serial::stack(serial::SerialId::RobeChestplate, Some(owner));
+        assert!(is_class_frozen(
+            &personal,
+            owner,
+            Some(HunterClass::Fighter)
+        ));
+        assert!(!is_class_frozen(&personal, owner, Some(HunterClass::Mage)));
+        // The bound starter kit has no class lock and never freezes.
+        let sword = serial::stack(serial::SerialId::HunterSword, Some(owner));
+        assert_eq!(item_class_lock(&sword), None);
+        assert!(!is_class_frozen(&sword, owner, Some(HunterClass::Mage)));
+        assert!(!is_class_frozen(&sword, owner, None));
     }
 }

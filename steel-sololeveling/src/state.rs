@@ -203,6 +203,10 @@ impl SoloLevelingState {
         session.saved_gear = data.gear.clone();
         session.gear = data.gear.items();
         session.deferred_inventory = data.deferred_inventory;
+        session.class_vault = data.class_vault;
+        // The join reconcile heals a crash between a persisted class change
+        // and its vault freeze, and drains legacy states.
+        session.class_vault_due = true;
         session.starter = data.starter;
         session.merchant = data.merchant;
         session.castle = data.castle;
@@ -1536,6 +1540,7 @@ mod tests {
                 class: ClassChoice::default(),
                 gear: SavedGear::default(),
                 deferred_inventory: Vec::new(),
+                class_vault: Vec::new(),
                 starter: StarterKit::default(),
                 merchant: MerchantRecord::default(),
                 castle: CastleProgress::default(),
@@ -1602,6 +1607,7 @@ mod tests {
             class: ClassChoice::default(),
             gear: SavedGear::default(),
             deferred_inventory: Vec::new(),
+            class_vault: Vec::new(),
             starter: StarterKit::default(),
             merchant: MerchantRecord::default(),
             castle: CastleProgress::default(),
