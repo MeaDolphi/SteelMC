@@ -169,6 +169,7 @@ fn objective_icon(objective: Objective) -> ItemRef {
         Objective::TrophyHaul => &vanilla_items::LEATHER,
         Objective::Nests => &vanilla_items::SPIDER_EYE,
         Objective::Castle => &vanilla_items::NETHER_BRICK,
+        Objective::CityDefense => &vanilla_items::SHIELD,
     }
 }
 

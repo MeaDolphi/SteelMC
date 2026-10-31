@@ -323,6 +323,13 @@ impl Blueprint {
     pub fn generate(seed: u64, combat_rooms: u8) -> Self {
         let mut rng = SplitMix(seed);
         let theme = THEMES[usize::try_from(rng.next() % THEMES.len() as u64).unwrap_or(0)];
+        Self::generate_with_theme(seed, combat_rooms, theme)
+    }
+
+    /// Generates the dungeon of `seed` with a fixed `theme`.
+    #[must_use]
+    pub fn generate_with_theme(seed: u64, combat_rooms: u8, theme: Theme) -> Self {
+        let mut rng = SplitMix(seed);
         let path = main_path(&mut rng, usize::from(combat_rooms) + 2);
         let mut cells: Vec<((i32, i32), RoomRole)> = path
             .iter()
@@ -853,7 +860,7 @@ mod tests {
 
     use rustc_hash::FxHashSet;
 
-    use super::{Blueprint, CELL, GRID_RADIUS, Part, RoomRole, THEMES};
+    use super::{Blueprint, CELL, GRID_RADIUS, Part, RoomRole, THEMES, Theme};
     use crate::rank::HunterRank;
 
     fn air_columns(blueprint: &Blueprint) -> FxHashSet<(i32, i32)> {
@@ -1007,5 +1014,13 @@ mod tests {
             .map(|seed| format!("{:?}", Blueprint::generate(seed, 2).theme))
             .collect();
         assert_eq!(themes.len(), THEMES.len());
+    }
+
+    #[test]
+    fn red_gates_always_generate_an_ice_theme() {
+        for seed in 0..50 {
+            let layout = crate::dungeon::DungeonLayout::for_gate(seed, true);
+            assert_eq!(layout.blueprint.theme, Theme::Ice);
+        }
     }
 }

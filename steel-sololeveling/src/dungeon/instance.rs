@@ -1,7 +1,9 @@
 //! Block and entity fixtures for gates and dungeon/penalty instances.
+use std::f64::consts::TAU;
 use std::sync::Arc;
 
 use glam::DVec3;
+use rand::RngExt as _;
 use steel_core::entity::{SharedEntity, spawn_mob};
 use steel_core::gameplay_hooks::BlockMutationCause;
 use steel_core::world::World;
@@ -539,6 +541,32 @@ pub(super) fn spawn_class_mob(
     })
 }
 
+/// Spawns one mob for a gate-break wave near the gate frame.
+///
+/// The mob appears on dry ground within [`GATE_BREAK_SPAWN_RADIUS`] of the
+/// entrance, using the gate's own rank scaling.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "spawn radius is small and fits i32"
+)]
+pub fn spawn_city_break_mob(
+    world: &Arc<World>,
+    gate_entrance: BlockPos,
+    wave: DungeonWave,
+    rank: HunterRank,
+    theme: Theme,
+) -> Option<SpawnedMob> {
+    let mut rng = rand::rng();
+    let angle = rng.random_range(0.0..TAU);
+    let distance = rng.random_range(2.0..=super::GATE_BREAK_SPAWN_RADIUS as f64);
+    let x = (f64::from(gate_entrance.x()) + 0.5 + distance * angle.cos()).round() as i32;
+    let z = (f64::from(gate_entrance.z()) + 0.5 + distance * angle.sin()).round() as i32;
+    let surface = world.safe_surface_position(x, z)?;
+    let roll = rng.random::<u64>();
+    let class = MobClass::from_roll(roll ^ (roll >> 29));
+    spawn_class_mob(world, theme, surface, class, wave, rank)
+}
+
 /// Returns the `index`-th spawn spot of a room, cycling through its spots.
 fn spawn_position(region: InstanceRegion, room: &Room, index: usize) -> BlockPos {
     let (x, z) = room
@@ -576,9 +604,18 @@ pub fn spawn_dungeon_boss(
     let room = layout.blueprint.boss_room();
     // The boss waits at the far side of its room; the exit appears at the centre.
     let position = at(region, (room.center.0, 0, room.center.1 + room.half.1 - 3));
-    let kind = BossKind::from_seed(layout.seed);
+    let kind = if red {
+        BossKind::for_red_gate()
+    } else {
+        BossKind::from_seed(layout.seed)
+    };
     let boss = boss_for_gate(kind, rank, red);
-    let entity = spawn_mob(world, &vanilla_entities::ZOMBIE, position).ok()?;
+    let entity_type = if kind == BossKind::Archer {
+        &vanilla_entities::SKELETON
+    } else {
+        &vanilla_entities::ZOMBIE
+    };
+    let entity = spawn_mob(world, entity_type, position).ok()?;
     let living = entity.as_living_entity()?;
     boss.apply_to(living);
     let label = boss_label(kind, rank, red);

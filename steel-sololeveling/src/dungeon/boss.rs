@@ -61,7 +61,7 @@ const AURA_INTERVAL_TICKS: u64 = 20;
 /// Target search range of every boss, far wider than a vanilla zombie's.
 const BOSS_FOLLOW_RANGE: f64 = 48.0;
 /// Attack damage of a vanilla zombie, the base every boss multiplier scales.
-const ZOMBIE_ATTACK_DAMAGE: f64 = 3.0;
+pub(crate) const ZOMBIE_ATTACK_DAMAGE: f64 = 3.0;
 /// Leather dye of the archmage's robes.
 const ARCHMAGE_ROBE: i32 = 0x5B_2A86;
 /// Leather dye of the assassin's garb.
@@ -76,10 +76,15 @@ pub enum BossKind {
     Archmage,
     /// A fast killer that steps through shadows and poisons.
     Assassin,
+    /// A ranged elite that commands red gates (Baruka from the ice forest).
+    Archer,
 }
 
 /// Every archetype, in roll order.
 pub const BOSS_KINDS: [BossKind; 3] = [BossKind::Warlord, BossKind::Archmage, BossKind::Assassin];
+
+/// Leather dye of the archer's winter garb.
+const ARCHER_GARB: i32 = 0xA3_1F1F;
 
 impl BossKind {
     /// Returns the archetype a dungeon seed rolls.
@@ -95,7 +100,14 @@ impl BossKind {
             Self::Warlord => "Вождь-берсерк",
             Self::Archmage => "Архимаг",
             Self::Assassin => "Теневой убийца",
+            Self::Archer => "Лучник-элитка",
         }
+    }
+
+    /// Returns the archetype that guards every red gate.
+    #[must_use]
+    pub const fn for_red_gate() -> Self {
+        Self::Archer
     }
 
     /// Returns the abilities a boss of this kind uses at `rank`, by priority.
@@ -121,6 +133,8 @@ impl BossKind {
             (Self::Archmage, _) => &[Blink, FrostNova, Meteor, ArcaneBolt],
             (Self::Assassin, 0) => &[VenomBlades, ShadowStep],
             (Self::Assassin, _) => &[VenomBlades, SmokeBomb, ShadowStep],
+            // The archer relies on its skeleton bow AI; the fight only tracks the boss bar.
+            (Self::Archer, _) => &[],
         }
     }
 
@@ -132,6 +146,8 @@ impl BossKind {
             // The archmage fights with spells and avoids melee.
             Self::Archmage => (0.75, 0.6, 0.7, 0.85),
             Self::Assassin => (0.6, 1.1, 1.35, 0.75),
+            // The archer is fragile and slow but keeps its distance.
+            Self::Archer => (0.6, 0.8, 0.5, 0.9),
         }
     }
 }
@@ -392,6 +408,10 @@ impl DungeonBoss {
             BossKind::Assassin => (
                 ItemStack::new(self.gear.sword()),
                 dyed_leather(ASSASSIN_GARB),
+            ),
+            BossKind::Archer => (
+                ItemStack::new(&vanilla_items::BOW),
+                dyed_leather(ARCHER_GARB),
             ),
         };
         let mut equipment = vec![(EquipmentSlot::MainHand, weapon)];
@@ -990,6 +1010,9 @@ impl Cast<'_> {
 
 #[cfg(test)]
 mod tests {
+    use steel_core::inventory::equipment::EquipmentSlot;
+    use steel_registry::vanilla_items;
+
     use super::{BOSS_KINDS, BossAbility, BossFight, BossGear, BossKind, boss_for_gate};
     use crate::rank::HunterRank;
 
@@ -1094,6 +1117,21 @@ mod tests {
         assert_eq!(
             fight.choose_ability(42, 10.0),
             Some(BossAbility::ShadowStep)
+        );
+    }
+
+    #[test]
+    fn red_gate_boss_is_the_archer_with_a_bow_and_no_melee_abilities() {
+        let boss = boss_for_gate(BossKind::for_red_gate(), HunterRank::C, true);
+        assert_eq!(boss.kind, BossKind::Archer);
+        assert!(boss.abilities.is_empty());
+        assert!(boss.speed_multiplier < 1.0);
+        assert!(boss.scale >= 1.0);
+        let equipment = boss.equipment();
+        assert!(
+            equipment.iter().any(
+                |(slot, item)| *slot == EquipmentSlot::MainHand && item.is(&vanilla_items::BOW)
+            )
         );
     }
 }

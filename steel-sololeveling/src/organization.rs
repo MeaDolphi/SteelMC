@@ -48,10 +48,12 @@ pub enum Objective {
     Nests,
     /// Clear Demon Castle floors.
     Castle,
+    /// Defend the city during a gate break.
+    CityDefense,
 }
 
 /// Every objective, in board order.
-pub const OBJECTIVES: [Objective; 12] = [
+pub const OBJECTIVES: [Objective; 13] = [
     Objective::Mobs,
     Objective::Zombies,
     Objective::Boss,
@@ -64,6 +66,7 @@ pub const OBJECTIVES: [Objective; 12] = [
     Objective::TrophyHaul,
     Objective::Nests,
     Objective::Castle,
+    Objective::CityDefense,
 ];
 
 /// Every rank, in board order.
@@ -88,6 +91,7 @@ impl Objective {
             }
             Self::Dungeons | Self::Nests | Self::Castle => 3,
             Self::TrophyHaul => 8,
+            Self::CityDefense => 5,
         }
     }
 
@@ -103,6 +107,7 @@ impl Objective {
             Self::Nests | Self::Castle => 400,
             Self::Dungeons => 500,
             Self::RedGate => 600,
+            Self::CityDefense => 700,
         }
     }
 }
@@ -141,6 +146,7 @@ impl Template {
             Objective::TrophyHaul => format!("[{rank}] Трофеи"),
             Objective::Nests => format!("[{rank}] Гнёзда"),
             Objective::Castle => format!("[{rank}] Замок"),
+            Objective::CityDefense => format!("[{rank}] Защита города"),
         }
     }
 
@@ -164,6 +170,9 @@ impl Template {
             }
             Objective::Nests => format!("[{rank}] Уничтожить {target} гнезда на острове"),
             Objective::Castle => format!("[{rank}] Пройти {target} этажа Замка демонов"),
+            Objective::CityDefense => {
+                format!("[{rank}] Защитить город от прорыва врат ({target} волн)")
+            }
         }
     }
 }
@@ -214,6 +223,8 @@ pub enum Event {
     Nest,
     /// The hunter cleared a Demon Castle floor.
     CastleFloor,
+    /// The hunter helped clear a wave of a gate break in the city.
+    CityDefense(HunterRank),
 }
 
 /// An accepted contract and its progress.
@@ -312,6 +323,7 @@ fn counts(template: Template, event: Event) -> bool {
         (Objective::RedGate, Event::Gate { rank, red, .. }) => rank == template.rank && red,
         (Objective::CleanGate, Event::Gate { rank, clean, .. }) => rank == template.rank && clean,
         (Objective::FastGate, Event::Gate { rank, fast, .. }) => rank == template.rank && fast,
+        (Objective::CityDefense, Event::CityDefense(rank)) => rank == template.rank,
         _ => false,
     }
 }
@@ -942,5 +954,17 @@ mod tests {
                 .expect("deserialize");
         assert_eq!(contract.scale, 1);
         assert_eq!(contract.target(), 1);
+    }
+
+    #[test]
+    fn city_defense_contract_counts_only_matching_rank_waves() {
+        let mut contract = Contract::new(template(Objective::CityDefense, HunterRank::C));
+        assert!(!contract.observe(Event::CityDefense(HunterRank::D)));
+        assert!(!contract.observe(Event::CityDefense(HunterRank::B)));
+        for _ in 0..4 {
+            assert!(!contract.observe(Event::CityDefense(HunterRank::C)));
+        }
+        assert!(contract.observe(Event::CityDefense(HunterRank::C)));
+        assert_eq!(contract.progress, 5);
     }
 }

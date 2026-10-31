@@ -1,7 +1,9 @@
 //! Hunter rank derived from level.
 
+use serde::{Deserialize, Serialize};
+
 /// A hunter's automatic rank.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum HunterRank {
     /// Levels 1 through 9.
     E,

@@ -24,7 +24,7 @@ use crate::player_data::{PaymentDurability, PlayerDataStorage, SoloLevelingPlaye
 use crate::quest::{PENALTY_DELAY_SECONDS, PENALTY_MIN_RANK, SystemQuest};
 use crate::quest_book::QuestBook;
 use crate::rank::HunterRank;
-use crate::shadow::ShadowRoster;
+use crate::shadow::{EliteShadowRoster, ShadowRoster};
 use crate::shop::ShopDay;
 use crate::sidebar::SidebarView;
 use crate::spell::{MagicState, SpellBook};
@@ -54,6 +54,8 @@ pub struct HunterSession {
     pub quest: SystemQuest,
     /// Persistent Shadow Monarch roster.
     pub shadows: ShadowRoster,
+    /// Persistent elite-shadow roster.
+    pub elite_shadows: EliteShadowRoster,
     /// Personal-shop offers and purchases for the current 20-minute window.
     pub shop: ShopDay,
     /// Personal Adventurer Organization contracts.
@@ -119,6 +121,7 @@ impl HunterSession {
         won: Won,
         quest: SystemQuest,
         shadows: ShadowRoster,
+        elite_shadows: EliteShadowRoster,
     ) -> Self {
         Self {
             stats,
@@ -127,6 +130,7 @@ impl HunterSession {
             economic_busy: false,
             quest,
             shadows,
+            elite_shadows,
             shop: ShopDay::unset(),
             organization: OrganizationBook::new(),
             cooldowns: AbilityCooldowns::new(),
@@ -135,6 +139,7 @@ impl HunterSession {
                 class: None,
                 changed_at: 0,
                 free_change: false,
+                evolved: false,
             },
             gear: Vec::new(),
             saved_gear: SavedGear { slots: Vec::new() },
@@ -183,6 +188,7 @@ impl HunterSession {
             system_points: self.system_points,
             quest: self.quest,
             shadows: self.shadows.clone(),
+            elite_shadows: self.elite_shadows.clone(),
             shop: self.shop,
             organization: self.organization.clone(),
             cooldowns: self.cooldowns.clone(),
@@ -444,7 +450,11 @@ impl SessionRegistry {
         self.sessions
             .write()
             .iter_mut()
-            .filter_map(|(owner, session)| session.shadows.recover(health).then_some(*owner))
+            .filter_map(|(owner, session)| {
+                let changed =
+                    session.shadows.recover(health) || session.elite_shadows.recover(health);
+                changed.then_some(*owner)
+            })
             .collect()
     }
 }
@@ -467,6 +477,7 @@ mod tests {
             Won::default(),
             SystemQuest::default(),
             ShadowRoster::default(),
+            EliteShadowRoster::default(),
         );
         for _ in 1..SIDEBAR_UPDATE_INTERVAL_TICKS {
             assert!(!session.tick_sidebar_throttle());
@@ -482,6 +493,7 @@ mod tests {
             Won::default(),
             SystemQuest::default(),
             ShadowRoster::default(),
+            EliteShadowRoster::default(),
         );
         let mut view = SidebarView {
             stats: session.stats,
@@ -518,6 +530,7 @@ mod tests {
                 Won::default(),
                 SystemQuest::default(),
                 ShadowRoster::default(),
+                EliteShadowRoster::default(),
             ),
         );
 
@@ -540,6 +553,7 @@ mod tests {
                 Won::zero(),
                 SystemQuest::default(),
                 ShadowRoster::default(),
+                EliteShadowRoster::default(),
             );
             if owner == sender {
                 session.won.credit(100);
@@ -610,6 +624,7 @@ mod tests {
                 Won::zero(),
                 SystemQuest::default(),
                 ShadowRoster::default(),
+                EliteShadowRoster::default(),
             );
             session.won.credit(100);
             registry.insert(owner, session);
@@ -636,6 +651,7 @@ mod tests {
             Won::default(),
             SystemQuest::new(1),
             ShadowRoster::default(),
+            EliteShadowRoster::default(),
         );
         let empty = PlayerInput::EMPTY;
         let _ = session.observe_quest(1, DVec3::ZERO, empty);
@@ -671,6 +687,7 @@ mod tests {
             Won::default(),
             SystemQuest::new(1),
             ShadowRoster::default(),
+            EliteShadowRoster::default(),
         );
         session.start_day(1, 0);
         let update = session.observe_quest(2, DVec3::ZERO, PlayerInput::EMPTY);
@@ -694,6 +711,7 @@ mod tests {
             Won::default(),
             SystemQuest::new(1),
             ShadowRoster::default(),
+            EliteShadowRoster::default(),
         );
         session.start_day(3, 1_000);
         assert!(session.quest.penalty_pending);
@@ -713,6 +731,7 @@ mod tests {
             Won::default(),
             SystemQuest::new(1),
             ShadowRoster::default(),
+            EliteShadowRoster::default(),
         );
         session.start_day(1, 0);
         let update = session.observe_quest(2, DVec3::ZERO, PlayerInput::EMPTY);
@@ -727,6 +746,7 @@ mod tests {
             Won::default(),
             SystemQuest::default(),
             ShadowRoster::default(),
+            EliteShadowRoster::default(),
         );
 
         let update = session.observe_quest(42, DVec3::ZERO, PlayerInput::EMPTY);

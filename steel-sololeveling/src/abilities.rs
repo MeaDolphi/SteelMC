@@ -135,6 +135,9 @@ pub fn outgoing_damage(
                 let bonus = (f64::from(strength) * per_point).min(maximum);
                 damage += bonus as f32;
             }
+            Ability::SmilingAura { percent } => {
+                damage *= 1.0 + percent;
+            }
             _ => {}
         }
     }

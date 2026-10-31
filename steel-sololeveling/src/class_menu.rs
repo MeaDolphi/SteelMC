@@ -27,6 +27,8 @@ const INFO_SLOT: usize = 4;
 const FIRST_CLASS_SLOT: usize = 11;
 /// Button that hands a Mage a new grimoire.
 const GRIMOIRE_SLOT: usize = 22;
+/// Button that starts the Second Awakening trial.
+const AWAKENING_SLOT: usize = 24;
 
 /// Opens the class menu for an online hunter.
 pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
@@ -68,11 +70,15 @@ fn icon(class: HunterClass) -> ItemRef {
 fn menu_items(state: &SoloLevelingState, uuid: Uuid) -> Vec<ItemStack> {
     let mut items = vec![ItemStack::empty(); MENU_SLOTS];
     let current = state.class_of(uuid);
-    let (rank, free_change) = state
+    let (rank, free_change, evolved) = state
         .with_session_mut(uuid, |session| {
-            (session.stats.rank(), session.class.free_change)
+            (
+                session.stats.rank(),
+                session.class.free_change,
+                session.class.evolved,
+            )
         })
-        .unwrap_or((HunterRank::E, false));
+        .unwrap_or((HunterRank::E, false, false));
     let first_pick = current.is_none() || free_change;
     if current == Some(HunterClass::Mage) {
         items[GRIMOIRE_SLOT] = with_lore(
@@ -135,7 +141,7 @@ fn menu_items(state: &SoloLevelingState, uuid: Uuid) -> Vec<ItemStack> {
                 }),
             ),
             class
-                .describe(rank)
+                .describe(rank, evolved)
                 .into_iter()
                 .map(|line| TextComponent::plain(line).color(Color::Gray))
                 .chain([
@@ -144,6 +150,18 @@ fn menu_items(state: &SoloLevelingState, uuid: Uuid) -> Vec<ItemStack> {
                     TextComponent::plain(action.0).color(action.1),
                 ])
                 .collect(),
+        );
+    }
+    if state.job_change_available(uuid) {
+        items[AWAKENING_SLOT] = with_lore(
+            named(
+                ItemStack::new(&vanilla_items::ENDER_EYE),
+                TextComponent::plain("Второе пробуждение").color(Color::LightPurple),
+            ),
+            vec![
+                TextComponent::plain("Клик — бросить вызов Рыцарю Игрису.").color(Color::Yellow),
+                TextComponent::plain("Доступно с 40 уровня.").color(Color::Gray),
+            ],
         );
     }
     items
@@ -184,6 +202,20 @@ impl MenuKind for ClassMenuKind {
             }
             return ClickOutcome::Consume;
         }
+        if slot - self.buttons.start() == AWAKENING_SLOT {
+            match self.state.start_job_change(player) {
+                Ok(()) => {
+                    player.send_message(
+                        &TextComponent::plain("Второе пробуждение: арена готовится.")
+                            .color(Color::Gold),
+                    );
+                }
+                Err(error) => {
+                    player.send_message(&TextComponent::plain(error).color(Color::Red));
+                }
+            }
+            return ClickOutcome::Consume;
+        }
         let Some(chosen) = class_at(slot - self.buttons.start()) else {
             return ClickOutcome::Consume;
         };
@@ -216,7 +248,7 @@ impl MenuKind for ClassMenuKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{FIRST_CLASS_SLOT, GRIMOIRE_SLOT, INFO_SLOT, MENU_SLOTS, class_at};
+    use super::{AWAKENING_SLOT, FIRST_CLASS_SLOT, GRIMOIRE_SLOT, INFO_SLOT, MENU_SLOTS, class_at};
     use crate::class;
 
     #[test]
@@ -228,5 +260,6 @@ mod tests {
         }
         assert_eq!(class_at(INFO_SLOT), None);
         assert_eq!(class_at(GRIMOIRE_SLOT), None);
+        assert_eq!(class_at(AWAKENING_SLOT), None);
     }
 }

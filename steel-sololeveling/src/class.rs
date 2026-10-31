@@ -56,6 +56,19 @@ pub const RANGER_SPEED: f64 = 0.10;
 /// Mage bonus to magic damage the hunter causes, as a fraction.
 pub const MAGE_MAGIC_BONUS: f32 = 0.50;
 
+/// Extra Fighter melee damage after the Second Awakening.
+pub const EVOLVED_FIGHTER_MELEE_BONUS: f32 = 0.05;
+/// Extra Tanker damage reduction after the Second Awakening.
+pub const EVOLVED_TANKER_REDUCTION_BONUS: f32 = 0.10;
+/// Extra Assassin melee damage after the Second Awakening.
+pub const EVOLVED_ASSASSIN_MELEE_BONUS: f32 = 0.10;
+/// Extra Assassin movement speed after the Second Awakening.
+pub const EVOLVED_ASSASSIN_SPEED: f64 = 0.05;
+/// Extra Ranger projectile damage after the Second Awakening.
+pub const EVOLVED_RANGER_PROJECTILE_BONUS: f32 = 0.15;
+/// Extra Mage magic damage after the Second Awakening.
+pub const EVOLVED_MAGE_MAGIC_BONUS: f32 = 0.20;
+
 /// Returns how much of the rank-D bonuses a hunter of `rank` gets.
 #[must_use]
 pub const fn rank_scale(rank: HunterRank) -> f32 {
@@ -117,6 +130,28 @@ impl HunterClass {
         }
     }
 
+    /// Returns the Russian name after the Second Awakening.
+    #[must_use]
+    pub const fn evolved_name(self) -> &'static str {
+        match self {
+            Self::Fighter => "Берсерк",
+            Self::Tanker => "Крепость",
+            Self::Assassin => "Тень",
+            Self::Ranger => "Снайпер",
+            Self::Mage => "Архимаг",
+        }
+    }
+
+    /// Returns the display name, evolved when `evolved` is true.
+    #[must_use]
+    pub const fn display_name_for(self, evolved: bool) -> &'static str {
+        if evolved {
+            self.evolved_name()
+        } else {
+            self.display_name()
+        }
+    }
+
     /// Returns the stable command argument of the class.
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -139,14 +174,22 @@ impl HunterClass {
 
     /// Returns the Russian summary of the class bonuses at `rank`.
     #[must_use]
-    pub fn describe(self, rank: HunterRank) -> Vec<String> {
+    pub fn describe(self, rank: HunterRank, evolved: bool) -> Vec<String> {
         let scale = rank_scale(rank);
         let wide = f64::from(scale);
-        match self {
+        let mut lines = match self {
             Self::Fighter => vec![
                 format!(
                     "+{}% урона в ближнем бою",
-                    percent(FIGHTER_MELEE_BONUS * scale)
+                    percent(
+                        (FIGHTER_MELEE_BONUS
+                            + if evolved {
+                                EVOLVED_FIGHTER_MELEE_BONUS
+                            } else {
+                                0.0
+                            })
+                            * scale
+                    )
                 ),
                 format!(
                     "+{}% скорости атаки",
@@ -159,17 +202,49 @@ impl HunterClass {
             ],
             Self::Tanker => vec![
                 format!("+{} максимального здоровья", TANKER_MAX_HEALTH * wide),
-                format!("-{}% входящего урона", percent(tanker_reduction(rank))),
+                format!(
+                    "-{}% входящего урона",
+                    percent(
+                        (tanker_reduction(rank)
+                            + if evolved {
+                                EVOLVED_TANKER_REDUCTION_BONUS
+                            } else {
+                                0.0
+                            })
+                        .min(
+                            TANKER_MAX_REDUCTION
+                                + if evolved {
+                                    EVOLVED_TANKER_REDUCTION_BONUS
+                                } else {
+                                    0.0
+                                }
+                        )
+                    )
+                ),
                 format!(
                     "+{}% устойчивости к отбрасыванию",
                     percent(TANKER_KNOCKBACK_RESISTANCE as f32)
                 ),
             ],
             Self::Assassin => vec![
-                format!("+{}% скорости", percent((ASSASSIN_SPEED * wide) as f32)),
+                format!(
+                    "+{}% скорости",
+                    percent(
+                        ((ASSASSIN_SPEED + if evolved { EVOLVED_ASSASSIN_SPEED } else { 0.0 })
+                            * wide) as f32
+                    )
+                ),
                 format!(
                     "+{}% урона в ближнем бою",
-                    percent(ASSASSIN_MELEE_BONUS * scale)
+                    percent(
+                        (ASSASSIN_MELEE_BONUS
+                            + if evolved {
+                                EVOLVED_ASSASSIN_MELEE_BONUS
+                            } else {
+                                0.0
+                            })
+                            * scale
+                    )
                 ),
                 format!(
                     "+{}% урона в спину",
@@ -179,22 +254,45 @@ impl HunterClass {
             Self::Ranger => vec![
                 format!(
                     "+{}% урона снарядами",
-                    percent(RANGER_PROJECTILE_BONUS * scale)
+                    percent(
+                        (RANGER_PROJECTILE_BONUS
+                            + if evolved {
+                                EVOLVED_RANGER_PROJECTILE_BONUS
+                            } else {
+                                0.0
+                            })
+                            * scale
+                    )
                 ),
                 format!("+{}% скорости", percent((RANGER_SPEED * wide) as f32)),
             ],
             Self::Mage => vec![
-                format!("+{}% магического урона", percent(MAGE_MAGIC_BONUS * scale)),
+                format!(
+                    "+{}% магического урона",
+                    percent(
+                        (MAGE_MAGIC_BONUS
+                            + if evolved {
+                                EVOLVED_MAGE_MAGIC_BONUS
+                            } else {
+                                0.0
+                            })
+                            * scale
+                    )
+                ),
                 "Мана и гримуар заклинаний; мана растёт от Интеллекта".to_owned(),
             ],
+        };
+        if evolved {
+            lines.push(format!("Пробуждённый класс: {}", self.evolved_name()));
         }
+        lines
     }
 
     /// Attribute bonuses of the class at `rank`, applied while it is chosen.
     ///
     /// Every class touches the same attributes at every rank, so removing a
     /// class needs no rank.
-    fn attributes(self, rank: HunterRank) -> Vec<ClassModifier> {
+    fn attributes(self, rank: HunterRank, evolved: bool) -> Vec<ClassModifier> {
         let scale = f64::from(rank_scale(rank));
         match self {
             Self::Fighter => vec![(
@@ -216,7 +314,7 @@ impl HunterClass {
             ],
             Self::Assassin => vec![(
                 vanilla_attributes::MOVEMENT_SPEED,
-                ASSASSIN_SPEED * scale,
+                (ASSASSIN_SPEED + if evolved { EVOLVED_ASSASSIN_SPEED } else { 0.0 }) * scale,
                 AttributeModifierOperation::AddMultipliedBase,
             )],
             Self::Ranger => vec![(
@@ -280,6 +378,9 @@ pub struct ClassChoice {
     /// whose removed class was dropped.
     #[serde(default)]
     pub free_change: bool,
+    /// Whether the class has undergone the Second Awakening.
+    #[serde(default)]
+    pub evolved: bool,
 }
 
 /// [`ClassChoice`] as saved, where the class may name a removed class.
@@ -291,6 +392,8 @@ struct SavedClassChoice {
     changed_at: u64,
     #[serde(default)]
     free_change: bool,
+    #[serde(default)]
+    evolved: bool,
 }
 
 impl From<SavedClassChoice> for ClassChoice {
@@ -301,6 +404,7 @@ impl From<SavedClassChoice> for ClassChoice {
             changed_at: saved.changed_at,
             // A class that no longer exists, the Healer, frees the next pick.
             free_change: saved.free_change || (saved.class.is_some() && class.is_none()),
+            evolved: saved.evolved,
         }
     }
 }
@@ -346,7 +450,7 @@ impl ClassChoice {
     /// other classes.
     pub fn apply_to(&self, attributes: &mut AttributeMap, rank: HunterRank) {
         for class in ALL {
-            for (attribute, amount, operation) in class.attributes(rank) {
+            for (attribute, amount, operation) in class.attributes(rank, self.evolved) {
                 let id = from_sololeveling(format!("class/{}", class.name()));
                 if self.class == Some(class) {
                     attributes.set_modifier(
@@ -422,22 +526,35 @@ mod tests {
         assert!((tanker_reduction(HunterRank::D) - 0.20).abs() < 1e-6);
         assert!((tanker_reduction(HunterRank::S) - TANKER_MAX_REDUCTION).abs() < 1e-6);
         assert_eq!(
-            HunterClass::Fighter.describe(HunterRank::S)[0],
+            HunterClass::Fighter.describe(HunterRank::S, false)[0],
             "+50% урона в ближнем бою"
         );
         for class in ALL {
             let at_d: Vec<_> = class
-                .attributes(HunterRank::D)
+                .attributes(HunterRank::D, false)
                 .iter()
                 .map(|(attribute, ..)| attribute.key.clone())
                 .collect();
             let at_s: Vec<_> = class
-                .attributes(HunterRank::S)
+                .attributes(HunterRank::S, false)
                 .iter()
                 .map(|(attribute, ..)| attribute.key.clone())
                 .collect();
             assert_eq!(at_d, at_s, "{class:?} must touch the same attributes");
         }
+    }
+
+    #[test]
+    fn evolved_classes_add_a_second_bonus() {
+        assert!(HunterClass::Fighter.describe(HunterRank::D, true)[0].contains("+30%"));
+        assert!(HunterClass::Mage.describe(HunterRank::D, true)[0].contains("+70%"));
+        let assassin_speed = HunterClass::Assassin.attributes(HunterRank::D, true)[0].1;
+        assert!(
+            (assassin_speed
+                - (ASSASSIN_SPEED + EVOLVED_ASSASSIN_SPEED) * f64::from(rank_scale(HunterRank::D)))
+            .abs()
+                < 1e-9
+        );
     }
 
     #[test]
@@ -461,6 +578,7 @@ mod tests {
             class: Some(HunterClass::Mage),
             changed_at: 100,
             free_change: true,
+            evolved: false,
         };
         let mut won = Won::zero();
         assert_eq!(

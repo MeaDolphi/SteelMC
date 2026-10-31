@@ -93,11 +93,12 @@ impl SoloLevelingState {
             .and_then(|entity| entity.as_player())
         {
             let uuid = attacker.gameprofile.id();
-            let (class, rank, gear_magic) = self
+            let (class, rank, evolved, gear_magic) = self
                 .with_session_mut(uuid, |session| {
                     (
                         session.class.class,
                         session.stats.rank(),
+                        session.class.evolved,
                         gear::magic_bonus(
                             &session.gear,
                             session.class.class,
@@ -105,7 +106,7 @@ impl SoloLevelingState {
                         ),
                     )
                 })
-                .unwrap_or((None, HunterRank::E, 0.0));
+                .unwrap_or((None, HunterRank::E, false, 0.0));
             let scale = class::rank_scale(rank);
             let melee = source.is_direct();
             let magic = is_magic(source);
@@ -116,7 +117,13 @@ impl SoloLevelingState {
                     + self.spell_gear(attacker).magic
                     + self.serial_armor_magic_bonus(attacker)
                     + if class == Some(HunterClass::Mage) {
-                        class::MAGE_MAGIC_BONUS * scale
+                        (class::MAGE_MAGIC_BONUS
+                            + if evolved {
+                                class::EVOLVED_MAGE_MAGIC_BONUS
+                            } else {
+                                0.0
+                            })
+                            * scale
                     } else {
                         0.0
                     }
@@ -124,14 +131,28 @@ impl SoloLevelingState {
                 0.0
             };
             let class_bonus = match class {
-                Some(HunterClass::Fighter) if melee => class::FIGHTER_MELEE_BONUS * scale,
+                Some(HunterClass::Fighter) if melee => {
+                    (class::FIGHTER_MELEE_BONUS
+                        + if evolved {
+                            class::EVOLVED_FIGHTER_MELEE_BONUS
+                        } else {
+                            0.0
+                        })
+                        * scale
+                }
                 Some(HunterClass::Assassin) if melee => {
                     let behind = class::is_behind(
                         victim.position(),
                         victim.look_angle(),
                         attacker.position(),
                     );
-                    class::ASSASSIN_MELEE_BONUS * scale
+                    (class::ASSASSIN_MELEE_BONUS
+                        + if evolved {
+                            class::EVOLVED_ASSASSIN_MELEE_BONUS
+                        } else {
+                            0.0
+                        })
+                        * scale
                         + if behind {
                             class::ASSASSIN_BACKSTAB_BONUS * scale
                         } else {
@@ -139,7 +160,13 @@ impl SoloLevelingState {
                         }
                 }
                 Some(HunterClass::Ranger) if source.is(&DamageTypeTag::IS_PROJECTILE) => {
-                    class::RANGER_PROJECTILE_BONUS * scale
+                    (class::RANGER_PROJECTILE_BONUS
+                        + if evolved {
+                            class::EVOLVED_RANGER_PROJECTILE_BONUS
+                        } else {
+                            0.0
+                        })
+                        * scale
                 }
                 _ => 0.0,
             };
@@ -152,13 +179,19 @@ impl SoloLevelingState {
         damage = self.spell_damage(victim, source, damage);
         damage = self.enchant_damage(victim, source, damage);
         if let Some(player) = victim.as_player() {
-            let tank_rank = self
-                .with_session_mut(player.gameprofile.id(), |session| {
-                    (session.class.class == Some(HunterClass::Tanker)).then(|| session.stats.rank())
-                })
-                .flatten();
-            if let Some(rank) = tank_rank {
-                damage *= 1.0 - class::tanker_reduction(rank);
+            let tank = self.with_session_mut(player.gameprofile.id(), |session| {
+                (session.class.class == Some(HunterClass::Tanker))
+                    .then(|| (session.stats.rank(), session.class.evolved))
+            });
+            if let Some(Some((rank, evolved))) = tank {
+                let reduction = (class::tanker_reduction(rank)
+                    + if evolved {
+                        class::EVOLVED_TANKER_REDUCTION_BONUS
+                    } else {
+                        0.0
+                    })
+                .min(class::TANKER_MAX_REDUCTION + class::EVOLVED_TANKER_REDUCTION_BONUS);
+                damage *= 1.0 - reduction;
             }
         }
         damage

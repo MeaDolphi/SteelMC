@@ -838,7 +838,7 @@ mod tests {
     use crate::quest::SystemQuest;
     use crate::quest_book::QuestBook;
     use crate::rank::HunterRank;
-    use crate::shadow::ShadowRoster;
+    use crate::shadow::{EliteShadowRoster, ShadowRoster};
     use crate::shop::ShopDay;
     use crate::spell::SpellBook;
     use crate::starter::StarterKit;
@@ -858,6 +858,7 @@ mod tests {
                 system_points: SystemPoints::zero(),
                 quest: SystemQuest::default(),
                 shadows: ShadowRoster::default(),
+                elite_shadows: EliteShadowRoster::default(),
                 shop: ShopDay::unset(),
                 organization: OrganizationBook::new(),
                 cooldowns: AbilityCooldowns::default(),

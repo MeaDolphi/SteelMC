@@ -23,7 +23,7 @@ use crate::merchant::MerchantRecord;
 use crate::organization::OrganizationBook;
 use crate::quest::SystemQuest;
 use crate::quest_book::QuestBook;
-use crate::shadow::ShadowRoster;
+use crate::shadow::{EliteShadowRoster, ShadowRoster};
 use crate::shop::ShopDay;
 use crate::spell::SpellBook;
 use crate::starter::StarterKit;
@@ -51,6 +51,9 @@ pub struct SoloLevelingPlayerData {
     /// from these records and are never saved as vanilla world entities.
     #[serde(default)]
     pub shadows: ShadowRoster,
+    /// Persistent elite-shadow roster.
+    #[serde(default)]
+    pub elite_shadows: EliteShadowRoster,
     /// Personal-shop offers and purchases for the current 20-minute window.
     #[serde(default)]
     pub shop: ShopDay,
@@ -97,6 +100,7 @@ impl SoloLevelingPlayerData {
             system_points: SystemPoints::default(),
             quest: SystemQuest::uninitialized(),
             shadows: ShadowRoster::default(),
+            elite_shadows: EliteShadowRoster::default(),
             shop: ShopDay::default(),
             organization: OrganizationBook::new(),
             cooldowns: AbilityCooldowns::default(),

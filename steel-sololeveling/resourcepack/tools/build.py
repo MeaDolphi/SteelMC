@@ -453,6 +453,7 @@ ITEMS = {
     "artifact/prospectors_necklace": (AMULET, palette("#3fb6e8", "#c8f6ff", "#1b3a8a", handle="#c7962a", handle_hi="#ffe58a")),
     "artifact/ant_king_ring": (RING, palette("#2a1a10", "#6b4f33", "#d8283c", glow="#ffcf3f")),
     "artifact/shadow_guard_amulet": (AMULET, palette("#1a1420", "#4a3a5a", "#3fd6ff", handle="#262d4a", handle_hi="#7f93b8")),
+    "artifact/smiling_gods_idol": (AMULET, palette("#2a2a4a", "#6a6aa8", "#ffcf3f", handle="#c7962a", handle_hi="#ffe58a")),
     # Magic crystals by gate rank
     "key/e": (KEY, palette("#8a96a8", "#dfe6f0", "#4b5570", glow="#3fd6ff")),
     "key/d": (KEY, palette("#2fae6a", "#a8ffcf", "#13603a", glow="#a8ffcf")),

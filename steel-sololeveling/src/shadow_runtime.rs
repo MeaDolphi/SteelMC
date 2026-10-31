@@ -20,10 +20,13 @@ use uuid::Uuid;
 use crate::dungeon::mobs::{MobLabel, MobRarity, clear_health_line};
 use crate::dungeon::skills::{BROOD_COOLDOWN_TICKS, hatch_shadow};
 use crate::item::nbt;
+use crate::rank::HunterRank;
 use crate::session::HunterSession;
 use crate::shadow::{
-    ARISE_RANGE, ATTACK_PER_POINT, HEALTH_PER_POINT, SPEED_PER_POINT, Shadow, ShadowGear,
-    ShadowOrigin, ShadowStat, army_limit,
+    ARISE_RANGE, ATTACK_PER_POINT, BOSS_EXTRACTION_ATTEMPTS, BossSource,
+    ELITE_SHADOW_DAMAGE_MULTIPLIER, ELITE_SHADOW_HEALTH_MULTIPLIER, ELITE_SHADOW_SPEED_MULTIPLIER,
+    EliteShadow, ExtractionResult, HEALTH_PER_POINT, MAX_ELITE_SHADOW_SLOTS, SPEED_PER_POINT,
+    Shadow, ShadowGear, ShadowOrigin, ShadowStat, army_limit, attempt_extraction,
 };
 use steel_core::inventory::equipment::EquipmentSlot;
 use steel_registry::item_stack::ItemStack;
@@ -43,6 +46,12 @@ struct ActiveShadow {
     shadow_id: Uuid,
     entity: SharedEntity,
     brood: Option<ShadowBrood>,
+}
+
+struct ActiveEliteShadow {
+    owner: Uuid,
+    shadow_id: Uuid,
+    entity: SharedEntity,
 }
 
 #[derive(Default)]
@@ -72,6 +81,7 @@ impl ShadowBrood {
 #[derive(Default)]
 pub struct ShadowRuntime {
     active: FxHashMap<Uuid, ActiveShadow>,
+    elite_active: FxHashMap<Uuid, ActiveEliteShadow>,
     /// Army-wide orders per owner; runtime-only, so a restart resets to follow.
     modes: FxHashMap<Uuid, AlliedMode>,
 }
@@ -81,6 +91,7 @@ impl fmt::Debug for ShadowRuntime {
         formatter
             .debug_struct("ShadowRuntime")
             .field("active_count", &self.active.len())
+            .field("elite_active_count", &self.elite_active.len())
             .field("modes", &self.modes)
             .finish()
     }
@@ -105,6 +116,13 @@ impl ShadowRuntime {
                 brood.tick(&active.entity, active.owner, tick);
             }
             true
+        });
+        self.elite_active.retain(|_, active| {
+            !active.entity.is_removed()
+                && active
+                    .entity
+                    .as_living_entity()
+                    .is_some_and(|living| !living.is_dead_or_dying())
         });
     }
 
@@ -220,7 +238,150 @@ impl ShadowRuntime {
                 active.entity.set_removed(RemovalReason::Discarded);
             }
         }
+        ids.len() + self.recall_elite(owner)
+    }
+
+    /// Attempts to extract an elite shadow from a freshly defeated boss.
+    ///
+    /// Returns `Some` when the ritual succeeds and the boss joins the elite
+    /// roster; `None` covers both failure and missing prerequisites.
+    ///
+    /// # Panics
+    ///
+    /// Panics only when the elite-roster slot check above is wrong; the slot
+    /// is verified before rolling.
+    #[expect(
+        clippy::unused_self,
+        reason = "kept as an instance method for symmetry with other shadow-runtime operations"
+    )]
+    pub fn extract_boss_shadow(
+        &mut self,
+        hunter: &Player,
+        entity: &dyn LivingEntity,
+        source: BossSource,
+        rank: HunterRank,
+        session: &mut HunterSession,
+    ) -> Option<EliteShadow> {
+        if hunter.get_world().key != entity.level()?.key {
+            return None;
+        }
+        if session.shadows.shadows.is_empty() {
+            return None;
+        }
+        if session.elite_shadows.shadows.len() >= MAX_ELITE_SHADOW_SLOTS {
+            return None;
+        }
+        if attempt_extraction(rank, BOSS_EXTRACTION_ATTEMPTS, || {
+            rand::random_range(0..100)
+        }) == ExtractionResult::Failure
+        {
+            return None;
+        }
+        let origin = capture_origin(entity, None);
+        let elite = EliteShadow::new(entity.entity_type().key.clone(), origin, source);
+        session
+            .elite_shadows
+            .add(elite.clone())
+            .expect("slot was checked above");
+        Some(elite)
+    }
+
+    /// Summons one elite shadow next to its owner.
+    pub fn summon_elite(
+        &mut self,
+        hunter: &Player,
+        session: &HunterSession,
+        name: &str,
+    ) -> Result<(), &'static str> {
+        let Some(shadow) = session.elite_shadows.named(name) else {
+            return Err("Элитная тень с таким именем не найдена.");
+        };
+        if shadow.is_recovering() {
+            return Err("Эта элитная тень ещё восстанавливается после гибели.");
+        }
+        if self
+            .elite_active
+            .values()
+            .any(|active| active.owner == hunter.gameprofile.id() && active.shadow_id == shadow.id)
+        {
+            return Err("Эта элитная тень уже призвана.");
+        }
+        if self
+            .elite_active
+            .values()
+            .filter(|active| active.owner == hunter.gameprofile.id())
+            .count()
+            >= MAX_ELITE_SHADOW_SLOTS
+        {
+            return Err("Достигнут лимит призванных элитных теней.");
+        }
+        self.spawn_elite(hunter, shadow)
+    }
+
+    /// Summons every available elite shadow up to the elite slot limit.
+    pub fn summon_all_elite(&mut self, hunter: &Player, session: &HunterSession) -> usize {
+        let mut summoned = 0;
+        for shadow in &session.elite_shadows.shadows {
+            if self
+                .elite_active
+                .values()
+                .filter(|active| active.owner == hunter.gameprofile.id())
+                .count()
+                >= MAX_ELITE_SHADOW_SLOTS
+            {
+                break;
+            }
+            if self.elite_active.values().any(|active| {
+                active.owner == hunter.gameprofile.id() && active.shadow_id == shadow.id
+            }) {
+                continue;
+            }
+            if shadow.is_recovering() {
+                continue;
+            }
+            if self.spawn_elite(hunter, shadow).is_ok() {
+                summoned += 1;
+            }
+        }
+        summoned
+    }
+
+    /// Removes all elite shadows currently summoned by one hunter.
+    pub fn recall_elite(&mut self, owner: Uuid) -> usize {
+        let ids: Vec<_> = self
+            .elite_active
+            .iter()
+            .filter_map(|(id, active)| (active.owner == owner).then_some(*id))
+            .collect();
+        for id in &ids {
+            if let Some(active) = self.elite_active.remove(id) {
+                active.entity.set_removed(RemovalReason::Discarded);
+            }
+        }
         ids.len()
+    }
+
+    /// Returns the roster ids of the elite shadows one hunter has summoned.
+    #[must_use]
+    pub fn active_elite_shadows(&self, owner: Uuid) -> Vec<Uuid> {
+        self.elite_active
+            .values()
+            .filter(|active| active.owner == owner && !active.entity.is_removed())
+            .map(|active| active.shadow_id)
+            .collect()
+    }
+
+    /// Removes one summoned elite shadow, returning whether it was out.
+    pub fn dismiss_elite(&mut self, owner: Uuid, shadow_id: Uuid) -> bool {
+        let Some(entity_id) = self.elite_active.iter().find_map(|(id, active)| {
+            (active.owner == owner && active.shadow_id == shadow_id).then_some(*id)
+        }) else {
+            return false;
+        };
+        if let Some(active) = self.elite_active.remove(&entity_id) {
+            active.entity.set_removed(RemovalReason::Discarded);
+        }
+        true
     }
 
     /// Returns the army-wide mode a hunter gave their shadows.
@@ -244,6 +405,15 @@ impl ShadowRuntime {
                 }
             }
         }
+        for active in self
+            .elite_active
+            .values()
+            .filter(|active| active.owner == owner)
+        {
+            if let Some(mob) = active.entity.as_mob() {
+                mob.set_allied_mode(mode);
+            }
+        }
     }
 
     /// Points every summoned shadow of one hunter at `target`.
@@ -260,6 +430,15 @@ impl ShadowRuntime {
                 }
             }
         }
+        for active in self
+            .elite_active
+            .values()
+            .filter(|active| active.owner == owner)
+        {
+            if let Some(mob) = active.entity.as_mob() {
+                mob.set_allied_focus(Some(target));
+            }
+        }
     }
 
     /// Returns summoned shadows left in another world than their owner.
@@ -267,14 +446,20 @@ impl ShadowRuntime {
     /// Teleporting inside one world is the ally AI's job; crossing worlds is
     /// done by summoning the body again next to the owner.
     pub fn displaced(&self, owner_world: impl Fn(Uuid) -> Option<Identifier>) -> Vec<(Uuid, Uuid)> {
-        self.active
-            .values()
-            .filter(|active| {
-                let shadow_world = active.entity.level().map(|world| world.key.clone());
-                owner_world(active.owner).is_some_and(|world| Some(world) != shadow_world)
-            })
-            .map(|active| (active.owner, active.shadow_id))
-            .collect()
+        let mut displaced = Vec::new();
+        for active in self.active.values().filter(|active| {
+            let shadow_world = active.entity.level().map(|world| world.key.clone());
+            owner_world(active.owner).is_some_and(|world| Some(world) != shadow_world)
+        }) {
+            displaced.push((active.owner, active.shadow_id));
+        }
+        for active in self.elite_active.values().filter(|active| {
+            let shadow_world = active.entity.level().map(|world| world.key.clone());
+            owner_world(active.owner).is_some_and(|world| Some(world) != shadow_world)
+        }) {
+            displaced.push((active.owner, active.shadow_id));
+        }
+        displaced
     }
 
     /// Returns the roster ids of the shadows one hunter has summoned.
@@ -305,10 +490,19 @@ impl ShadowRuntime {
 
     /// Removes a dead body and returns the persistent shadow that must rebuild.
     pub fn observe_death(&mut self, entity_uuid: Uuid) -> Option<(Uuid, Uuid, u16)> {
-        let mut active = self.active.remove(&entity_uuid)?;
-        if let Some(brood) = &mut active.brood {
-            brood.discard();
+        if let Some(mut active) = self.active.remove(&entity_uuid) {
+            if let Some(brood) = &mut active.brood {
+                brood.discard();
+            }
+            let maximum_health = active
+                .entity
+                .as_living_entity()
+                .map_or(1.0, LivingEntity::get_max_health)
+                .ceil()
+                .clamp(1.0, f32::from(u16::MAX)) as u16;
+            return Some((active.owner, active.shadow_id, maximum_health));
         }
+        let active = self.elite_active.remove(&entity_uuid)?;
         let maximum_health = active
             .entity
             .as_living_entity()
@@ -369,6 +563,29 @@ impl ShadowRuntime {
         Ok(shadow)
     }
 
+    /// Allocates one point and refreshes the matching active elite body.
+    pub fn upgrade_elite(
+        &mut self,
+        owner: Uuid,
+        session: &mut HunterSession,
+        name: &str,
+        stat: ShadowStat,
+    ) -> Result<EliteShadow, &'static str> {
+        let Some(shadow) = session.elite_shadows.named_mut(name) else {
+            return Err("Элитная тень с таким именем не найдена.");
+        };
+        if !shadow.allocate_point(stat) {
+            return Err("У этой элитной тени нет нераспределённых очков.");
+        }
+        let shadow = shadow.clone();
+        for active in self.elite_active.values() {
+            if active.owner == owner && active.shadow_id == shadow.id {
+                apply_upgrade(active.entity.as_ref(), stat);
+            }
+        }
+        Ok(shadow)
+    }
+
     fn spawn(&mut self, hunter: &Player, shadow: &Shadow) -> Result<(), &'static str> {
         let Some(entity_type) = REGISTRY.entity_types.by_key(&shadow.entity_type) else {
             return Err("Тип этой тени больше не зарегистрирован.");
@@ -412,6 +629,50 @@ impl ShadowRuntime {
                     .as_ref()
                     .is_some_and(|origin| origin.is_broodmother == Some(true))
                     .then(ShadowBrood::default),
+            },
+        );
+        Ok(())
+    }
+
+    fn spawn_elite(&mut self, hunter: &Player, shadow: &EliteShadow) -> Result<(), &'static str> {
+        let Some(entity_type) = REGISTRY.entity_types.by_key(&shadow.entity_type) else {
+            return Err("Тип этой элитной тени больше не зарегистрирован.");
+        };
+        let world = hunter.get_world();
+        let entity = spawn_mob(&world, entity_type, BlockPos::from(hunter.position()))
+            .map_err(|_| "Не удалось призвать элитную тень в этой точке.")?;
+        if entity.as_mob().is_none() {
+            entity.set_removed(RemovalReason::Discarded);
+            return Err("Тип сохранённой элитной тени не является мобом.");
+        }
+        entity.set_runtime_allied_owner(Some(hunter.gameprofile.id()));
+        if let Some(mob) = entity.as_mob() {
+            mob.set_allied_mode(self.mode(hunter.gameprofile.id()));
+            mob.set_allied_tank(shadow.origin.is_tank);
+        }
+        entity.set_custom_name(Some(
+            TextComponent::plain(format!(
+                "[Элитная тень] {} · ур. {}",
+                shadow.name, shadow.level
+            ))
+            .color(Color::DarkRed),
+        ));
+        entity.set_custom_name_visible(true);
+        apply_origin(entity.as_ref(), &shadow.origin);
+        apply_elite_stats(entity.as_ref(), shadow);
+        world.send_particles(
+            ParticleData::simple(&vanilla_particle_types::SOUL_FIRE_FLAME),
+            entity.position(),
+            32,
+            DVec3::new(0.4, 0.7, 0.4),
+            0.03,
+        );
+        self.elite_active.insert(
+            entity.uuid(),
+            ActiveEliteShadow {
+                owner: hunter.gameprofile.id(),
+                shadow_id: shadow.id,
+                entity,
             },
         );
         Ok(())
@@ -597,6 +858,30 @@ fn apply_stats(entity: &dyn Entity, shadow: &Shadow) {
     living.set_health(living.get_max_health());
 }
 
+fn apply_elite_stats(entity: &dyn Entity, shadow: &EliteShadow) {
+    let Some(living) = entity.as_living_entity() else {
+        return;
+    };
+    let attributes = living.attributes().lock();
+    let base = |attribute| attributes.get_base_value(attribute).unwrap_or(0.0);
+    let health = base(vanilla_attributes::MAX_HEALTH);
+    let attack = base(vanilla_attributes::ATTACK_DAMAGE);
+    let speed = base(vanilla_attributes::MOVEMENT_SPEED);
+    drop(attributes);
+    let max_health =
+        health * ELITE_SHADOW_HEALTH_MULTIPLIER + f64::from(shadow.health) * HEALTH_PER_POINT;
+    living.set_base_attribute_value(vanilla_attributes::MAX_HEALTH, max_health);
+    living.set_base_attribute_value(
+        vanilla_attributes::ATTACK_DAMAGE,
+        attack * ELITE_SHADOW_DAMAGE_MULTIPLIER + f64::from(shadow.attack) * ATTACK_PER_POINT,
+    );
+    living.set_base_attribute_value(
+        vanilla_attributes::MOVEMENT_SPEED,
+        speed * ELITE_SHADOW_SPEED_MULTIPLIER + f64::from(shadow.speed) * SPEED_PER_POINT,
+    );
+    living.set_health(living.get_max_health());
+}
+
 fn apply_upgrade(entity: &dyn Entity, stat: ShadowStat) {
     let Some(living) = entity.as_living_entity() else {
         return;
@@ -635,6 +920,7 @@ mod tests {
     use super::{ActiveShadow, ShadowBrood, ShadowRuntime, capture_origin};
     use crate::dungeon::generator::Theme;
     use crate::dungeon::mobs::{MobClass, MobLabel};
+    use crate::shadow::ShadowOrigin;
 
     fn active_brood() -> (ShadowRuntime, Uuid, Uuid, SharedEntity) {
         init_vanilla_registry();
@@ -677,8 +963,7 @@ mod tests {
         let label = MobLabel::mob(Theme::Crypt, MobClass::Broodmother);
         let origin = capture_origin(&mother, Some(&label));
         let data = serde_json::to_string(&origin).expect("serialize origin");
-        let restored =
-            serde_json::from_str::<crate::shadow::ShadowOrigin>(&data).expect("deserialize origin");
+        let restored = serde_json::from_str::<ShadowOrigin>(&data).expect("deserialize origin");
         assert_eq!(restored.is_broodmother, Some(true));
         let guard = MobLabel::mob(Theme::Crypt, MobClass::Guard);
         assert_eq!(

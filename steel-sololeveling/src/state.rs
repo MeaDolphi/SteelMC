@@ -27,8 +27,8 @@ use steel_core::player::{Player, PlayerInput};
 use steel_core::server::Server;
 use steel_core::world::World;
 use steel_registry::item_stack::ItemStack;
-use steel_utils::Identifier;
 use steel_utils::locks::SyncMutex;
+use steel_utils::{BlockPos, Identifier};
 use uuid::Uuid;
 
 use crate::castle;
@@ -55,7 +55,9 @@ use crate::quest_book::Goal;
 use crate::rank::HunterRank;
 use crate::resource_pack::{self, ServedPack};
 use crate::session::{HunterSession, QuestUpdate, SessionRegistry, SidebarChange};
-use crate::shadow::{RECOVERY_HEALTH_PER_MINUTE, Shadow, ShadowStat, army_limit};
+use crate::shadow::{
+    BossSource, EliteShadow, RECOVERY_HEALTH_PER_MINUTE, Shadow, ShadowStat, army_limit,
+};
 use crate::shadow_runtime::ShadowRuntime;
 use crate::shop::ShopDay;
 use crate::sidebar::{ContractScope, SidebarView};
@@ -186,7 +188,13 @@ impl SoloLevelingState {
 
     /// Starts or replaces a player's live session.
     pub fn begin_session(&self, player_uuid: Uuid, data: SoloLevelingPlayerData) {
-        let mut session = HunterSession::new(data.stats, data.won, data.quest, data.shadows);
+        let mut session = HunterSession::new(
+            data.stats,
+            data.won,
+            data.quest,
+            data.shadows,
+            data.elite_shadows,
+        );
         session.system_points = data.system_points;
         session.shop = data.shop;
         session.organization = data.organization;
@@ -359,22 +367,20 @@ impl SoloLevelingState {
     }
 
     /// Settles a death in the island world and pays the hunters; returns
-    /// whether the entity was an island mob.
+    /// the kind of island kill, or `None` if the entity was not an island mob.
     pub fn observe_island_death(
         &self,
         world: &World,
         entity_id: i32,
         hunter: Option<Uuid>,
-    ) -> bool {
+    ) -> Option<island::IslandKill> {
         if !island::is_island_world(world) {
-            return false;
+            return None;
         }
         if let Some(hunter) = hunter {
             self.island.lock().record_fighter(hunter);
         }
-        let Some(kill) = self.island.lock().on_death(world, entity_id) else {
-            return false;
-        };
+        let kill = self.island.lock().on_death(world, entity_id)?;
         let mut roll = || rand::random_range(0..100);
         match &kill {
             island::IslandKill::Ant(rank) => {
@@ -423,7 +429,29 @@ impl SoloLevelingState {
         if let Err(error) = self.queue_island_save() {
             log::warn!("sololeveling: could not queue island save after island death: {error}");
         }
-        true
+        Some(kill)
+    }
+
+    /// Returns whether `entity_id` in `world` is the living dungeon boss of its run.
+    pub fn is_dungeon_boss(&self, world: &World, entity_id: i32) -> bool {
+        self.dungeon_runtime.lock().boss_entity(world) == Some(entity_id)
+    }
+
+    /// Returns a dungeon boss source for `entity_id` when it is the run's boss.
+    pub fn dungeon_boss_source(&self, world: &World, entity_id: i32) -> Option<BossSource> {
+        let runtime = self.dungeon_runtime.lock();
+        if runtime.boss_entity(world) != Some(entity_id) {
+            return None;
+        }
+        let rank = runtime.instance_rank(world)?;
+        let label = runtime.mob_label(world, entity_id)?;
+        let archetype = label.name;
+        let red = archetype.starts_with("Кровавый ");
+        Some(BossSource::Dungeon {
+            rank,
+            archetype,
+            red,
+        })
     }
 
     /// Advances live gate and dungeon orchestration at the server tick boundary.
@@ -816,6 +844,16 @@ impl SoloLevelingState {
         self.dungeon_runtime.lock().instance_rank(world)
     }
 
+    /// Records `amount` crystals mined in the mine run occupying `world` and `pos`.
+    ///
+    /// Returns `true` when the block was inside an active mine and its drops
+    /// should be suppressed.
+    pub fn record_mine_crystal(&self, world: &World, pos: BlockPos, amount: u32) -> bool {
+        self.dungeon_runtime
+            .lock()
+            .record_mine_crystal(world, pos, amount)
+    }
+
     /// Adds the shadow of a summon item to a hunter's roster.
     ///
     /// Returns the new shadow's name, or `None` when the army is already at its
@@ -958,6 +996,11 @@ impl SoloLevelingState {
             .lock()
             .upgrade()
             .map_or_else(Vec::new, |server| server.get_players())
+    }
+
+    /// Returns the running server, if one has been observed.
+    pub(crate) fn server(&self) -> Option<Arc<Server>> {
+        self.server.lock().upgrade()
     }
 
     /// Defers opening the item maker until the menu callback's locks are released.
@@ -1120,6 +1163,11 @@ impl SoloLevelingState {
         self.shadow_runtime.lock().recall(player_uuid)
     }
 
+    /// Recalls every elite shadow currently summoned by this player.
+    pub fn recall_elite_shadows(&self, player_uuid: Uuid) -> usize {
+        self.shadow_runtime.lock().recall_elite(player_uuid)
+    }
+
     /// Returns the roster ids of the player's currently summoned shadows.
     pub fn active_shadows(&self, player_uuid: Uuid) -> Vec<Uuid> {
         self.shadow_runtime.lock().active_shadows(player_uuid)
@@ -1162,16 +1210,33 @@ impl SoloLevelingState {
             else {
                 continue;
             };
-            let Some(name) = self
+            let (name, is_elite) = if let Some(name) = self
                 .shadows(owner)
                 .and_then(|roster| roster.into_iter().find(|shadow| shadow.id == shadow_id))
                 .map(|shadow| shadow.name)
-            else {
+            {
+                (name, false)
+            } else if let Some(name) = self
+                .elite_shadows(owner)
+                .and_then(|roster| roster.into_iter().find(|shadow| shadow.id == shadow_id))
+                .map(|shadow| shadow.name)
+            {
+                (name, true)
+            } else {
                 continue;
             };
-            self.dismiss_shadow(owner, shadow_id);
-            if let Err(error) = self.summon_shadow(hunter, &name) {
-                log::debug!("sololeveling: shadow {name} could not follow {owner}: {error}");
+            if is_elite {
+                self.dismiss_elite_shadow(owner, shadow_id);
+                if let Err(error) = self.summon_elite_shadow(hunter, &name) {
+                    log::debug!(
+                        "sololeveling: elite shadow {name} could not follow {owner}: {error}"
+                    );
+                }
+            } else {
+                self.dismiss_shadow(owner, shadow_id);
+                if let Err(error) = self.summon_shadow(hunter, &name) {
+                    log::debug!("sololeveling: shadow {name} could not follow {owner}: {error}");
+                }
             }
         }
     }
@@ -1212,16 +1277,25 @@ impl SoloLevelingState {
             return;
         };
         let changed = self.sessions.with_mut(owner, |session| {
-            let Some(shadow) = session
+            if let Some(shadow) = session
                 .shadows
                 .shadows
                 .iter_mut()
                 .find(|shadow| shadow.id == shadow_id)
-            else {
-                return false;
-            };
-            shadow.begin_recovery(maximum_health);
-            true
+            {
+                shadow.begin_recovery(maximum_health);
+                return true;
+            }
+            if let Some(shadow) = session
+                .elite_shadows
+                .shadows
+                .iter_mut()
+                .find(|shadow| shadow.id == shadow_id)
+            {
+                shadow.begin_recovery(maximum_health);
+                return true;
+            }
+            false
         });
         if changed == Some(true)
             && let Err(error) = self.save_session(owner)
@@ -1257,6 +1331,113 @@ impl SoloLevelingState {
             log::warn!("sololeveling: failed to persist shadow progression for {owner}: {error}");
         }
         reward
+    }
+
+    /// Attempts to extract an elite shadow from a dungeon boss defeated by `hunter`.
+    pub fn extract_dungeon_boss_shadow(
+        &self,
+        hunter: &Player,
+        entity: &dyn LivingEntity,
+        rank: HunterRank,
+        archetype: String,
+        red: bool,
+    ) -> Option<EliteShadow> {
+        let source = BossSource::Dungeon {
+            rank,
+            archetype,
+            red,
+        };
+        let elite = self
+            .sessions
+            .with_mut(hunter.gameprofile.id(), |session| {
+                self.shadow_runtime
+                    .lock()
+                    .extract_boss_shadow(hunter, entity, source, rank, session)
+            })??;
+        self.record_goal(hunter.gameprofile.id(), Goal::ShadowRaise, 1);
+        if let Err(error) = self.save_session(hunter.gameprofile.id()) {
+            log::warn!(
+                "sololeveling: failed to persist elite shadow for {}: {error}",
+                hunter.gameprofile.id()
+            );
+        }
+        Some(elite)
+    }
+
+    /// Attempts to extract an elite shadow from an island nest or the Ant King.
+    pub fn extract_island_boss_shadow(
+        &self,
+        hunter: &Player,
+        entity: &dyn LivingEntity,
+        source: BossSource,
+        rank: HunterRank,
+    ) -> Option<EliteShadow> {
+        let elite = self
+            .sessions
+            .with_mut(hunter.gameprofile.id(), |session| {
+                self.shadow_runtime
+                    .lock()
+                    .extract_boss_shadow(hunter, entity, source, rank, session)
+            })??;
+        self.record_goal(hunter.gameprofile.id(), Goal::ShadowRaise, 1);
+        if let Err(error) = self.save_session(hunter.gameprofile.id()) {
+            log::warn!(
+                "sololeveling: failed to persist elite shadow for {}: {error}",
+                hunter.gameprofile.id()
+            );
+        }
+        Some(elite)
+    }
+
+    /// Summons one named elite shadow for the player.
+    pub fn summon_elite_shadow(&self, hunter: &Player, name: &str) -> Result<(), &'static str> {
+        let mut runtime = self.shadow_runtime.lock();
+        self.sessions
+            .with_mut(hunter.gameprofile.id(), |session| {
+                runtime.summon_elite(hunter, session, name)
+            })
+            .unwrap_or(Err("Сессия охотника не загружена."))
+    }
+
+    /// Summons every available elite shadow up to the elite slot limit.
+    pub fn summon_all_elite_shadows(&self, hunter: &Player) -> Option<usize> {
+        let mut runtime = self.shadow_runtime.lock();
+        self.sessions.with_mut(hunter.gameprofile.id(), |session| {
+            runtime.summon_all_elite(hunter, session)
+        })
+    }
+
+    /// Returns the roster ids of the player's currently summoned elite shadows.
+    pub fn active_elite_shadows(&self, player_uuid: Uuid) -> Vec<Uuid> {
+        self.shadow_runtime.lock().active_elite_shadows(player_uuid)
+    }
+
+    /// Recalls one summoned elite shadow, returning whether it was out.
+    pub fn dismiss_elite_shadow(&self, player_uuid: Uuid, shadow_id: Uuid) -> bool {
+        self.shadow_runtime
+            .lock()
+            .dismiss_elite(player_uuid, shadow_id)
+    }
+
+    /// Returns a snapshot of the player's persistent elite roster.
+    pub fn elite_shadows(&self, player_uuid: Uuid) -> Option<Vec<EliteShadow>> {
+        self.sessions
+            .with_mut(player_uuid, |session| session.elite_shadows.shadows.clone())
+    }
+
+    /// Spends an elite shadow point and applies it to a currently active body.
+    pub fn upgrade_elite_shadow(
+        &self,
+        player_uuid: Uuid,
+        name: &str,
+        stat: ShadowStat,
+    ) -> Result<EliteShadow, &'static str> {
+        let mut runtime = self.shadow_runtime.lock();
+        self.sessions
+            .with_mut(player_uuid, |session| {
+                runtime.upgrade_elite(player_uuid, session, name, stat)
+            })
+            .unwrap_or(Err("Сессия охотника не загружена."))
     }
 
     /// Resolves a death while a hunter is inside a Solo Leveling instance.
@@ -1307,7 +1488,8 @@ mod tests {
     use crate::organization::OrganizationBook;
     use crate::quest::SystemQuest;
     use crate::quest_book::QuestBook;
-    use crate::shadow::ShadowRoster;
+    use crate::rank::HunterRank;
+    use crate::shadow::{BossSource, EliteShadow, EliteShadowRoster, ShadowOrigin, ShadowRoster};
     use crate::shop::ShopDay;
     use crate::spell::SpellBook;
     use crate::starter::StarterKit;
@@ -1330,6 +1512,7 @@ mod tests {
                 system_points: SystemPoints::zero(),
                 quest: SystemQuest::default(),
                 shadows: ShadowRoster::default(),
+                elite_shadows: EliteShadowRoster::default(),
                 shop: ShopDay::unset(),
                 organization: OrganizationBook::new(),
                 cooldowns: AbilityCooldowns::default(),
@@ -1354,6 +1537,70 @@ mod tests {
                 .allocate_point(player_uuid, HunterStat::Agility)
                 .is_none()
         );
+
+        fs::remove_dir_all(directory).expect("cleanup should succeed");
+    }
+
+    fn sample_elite_shadow() -> EliteShadow {
+        EliteShadow::new(
+            steel_utils::Identifier::vanilla_static("zombie"),
+            ShadowOrigin {
+                title: "Вождь-берсерк".to_owned(),
+                max_health: ShadowOrigin::scale(200.0),
+                attack_damage: ShadowOrigin::scale(15.0),
+                movement_speed: ShadowOrigin::scale(0.23),
+                armor: ShadowOrigin::scale(8.0),
+                equipment: Vec::new(),
+                is_tank: true,
+                is_broodmother: Some(false),
+            },
+            BossSource::Dungeon {
+                rank: HunterRank::C,
+                archetype: "Вождь-берсерк".to_owned(),
+                red: false,
+            },
+        )
+    }
+
+    #[test]
+    fn elite_shadow_roster_persists_through_save_and_reload() {
+        let directory =
+            env::temp_dir().join(format!("sololeveling-state-test-{}-elite", Uuid::new_v4()));
+        let player_uuid = Uuid::new_v4();
+        let shadow = sample_elite_shadow();
+        let service = SoloLevelingState::new(directory.clone()).expect("state should initialize");
+        let mut elite_roster = EliteShadowRoster::default();
+        elite_roster.add(shadow.clone()).expect("slot free");
+        let data = SoloLevelingPlayerData {
+            uuid: player_uuid,
+            stats: HunterStats::new(),
+            won: Won::starting_balance(),
+            system_points: SystemPoints::zero(),
+            quest: SystemQuest::default(),
+            shadows: ShadowRoster::default(),
+            elite_shadows: elite_roster,
+            shop: ShopDay::unset(),
+            organization: OrganizationBook::new(),
+            cooldowns: AbilityCooldowns::default(),
+            class: ClassChoice::default(),
+            gear: SavedGear::default(),
+            deferred_inventory: Vec::new(),
+            starter: StarterKit::default(),
+            merchant: MerchantRecord::default(),
+            castle: CastleProgress::default(),
+            spells: SpellBook::default(),
+            quests: QuestBook::default(),
+        };
+        service.storage.save(&data).expect("save elite roster");
+
+        let loaded = SoloLevelingState::new(directory.clone())
+            .expect("state should reload")
+            .storage
+            .load_or_create(player_uuid)
+            .expect("load player data");
+        assert_eq!(loaded.elite_shadows.shadows.len(), 1);
+        assert_eq!(loaded.elite_shadows.shadows[0].id, shadow.id);
+        assert_eq!(loaded.elite_shadows.shadows[0].source, shadow.source);
 
         fs::remove_dir_all(directory).expect("cleanup should succeed");
     }

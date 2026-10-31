@@ -53,6 +53,18 @@ pub const RED_GATE_CHANCE_PERCENT: u8 = 10;
 pub const RED_GATE_SCALE: f64 = 1.5;
 /// Lifetime of a gate no player has entered.
 pub const UNUSED_GATE_LIFETIME_TICKS: u64 = TICKS_PER_SECOND * 60 * 60;
+/// Number of monster waves a gate break sends into the city.
+pub const GATE_BREAK_WAVES: u8 = 5;
+/// Delay between gate-break waves.
+pub const GATE_BREAK_WAVE_INTERVAL_TICKS: u64 = TICKS_PER_SECOND * 30;
+/// Horizontal radius around the gate frame where break mobs spawn.
+pub const GATE_BREAK_SPAWN_RADIUS: i32 = 8;
+/// Base Won paid to each nearby defender per cleared wave.
+pub const GATE_BREAK_WAVE_REWARD_BASE: u64 = 150;
+/// Horizontal distance from the gate that counts a hunter as a defender.
+pub const GATE_BREAK_PARTICIPATION_RADIUS: f64 = 48.0;
+/// How long a cleared dungeon stays open as a crystal mine.
+pub const MINE_DURATION_TICKS: u64 = TICKS_PER_SECOND * 60 * 5;
 /// Dungeon time limit after its first participant enters.
 pub const DUNGEON_TIME_LIMIT_TICKS: u64 = TICKS_PER_SECOND * 60 * 20;
 /// Survival time that clears a penalty-zone instance.
@@ -158,6 +170,7 @@ pub fn is_instance_world(world: &World) -> bool {
 pub struct GateRegistry {
     next_id: u64,
     gates: FxHashMap<u64, Gate>,
+    breaks: FxHashMap<u64, GateBreak>,
     revision: u64,
     persisted_revision: u64,
     pending_revision: Option<u64>,
@@ -176,6 +189,8 @@ pub struct GateRegistrySnapshot {
     gates: Vec<PersistedGate>,
     #[serde(default)]
     retired_gates: Vec<PersistedGateRetirement>,
+    #[serde(default)]
+    breaks: Vec<PersistedGateBreak>,
 }
 
 /// Stable serialized form that avoids requiring `BlockPos` or `HunterRank` serde support.
@@ -256,11 +271,60 @@ pub enum GateRetirementReason {
     Expired,
     /// A hunter entered the gate.
     Consumed,
+    /// The gate broke and was cleared by defenders.
+    Broken,
+}
+
+/// An active gate break in the city.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateBreak {
+    /// Gate that broke; its frame stays until the break is cleared.
+    pub gate: Gate,
+    /// Next wave to spawn, zero-based; reaches [`GATE_BREAK_WAVES`] when done.
+    pub wave: u8,
+    /// Tick at which the next wave may spawn.
+    pub next_wave_tick: u64,
+    /// Entity ids of mobs spawned for the current wave.
+    pub remaining_mobs: Vec<i32>,
+    /// Whether the initial city-wide warning has already been sent.
+    pub announced: bool,
+}
+
+/// Serialized form of [`GateBreak`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedGateBreak {
+    gate: PersistedGate,
+    wave: u8,
+    next_wave_tick: u64,
+}
+
+impl GateBreak {
+    fn persisted(&self) -> PersistedGateBreak {
+        PersistedGateBreak {
+            gate: PersistedGate::from_gate(&self.gate),
+            wave: self.wave,
+            next_wave_tick: self.next_wave_tick,
+        }
+    }
+
+    fn from_persisted(persisted: PersistedGateBreak, current_tick: u64) -> Result<Self, String> {
+        Ok(Self {
+            gate: persisted.gate.into_gate()?,
+            wave: persisted.wave,
+            next_wave_tick: persisted.next_wave_tick.max(current_tick),
+            remaining_mobs: Vec::new(),
+            announced: false,
+        })
+    }
 }
 
 impl GateRegistry {
     /// Replaces the live registry with the last committed snapshot.
-    pub fn restore(&mut self, snapshot: GateRegistrySnapshot) -> Result<(), String> {
+    pub fn restore(
+        &mut self,
+        snapshot: GateRegistrySnapshot,
+        current_tick: u64,
+    ) -> Result<(), String> {
         let gates = snapshot
             .gates
             .iter()
@@ -278,8 +342,18 @@ impl GateRegistry {
                     .map(|gate| (gate, retirement.reason))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let breaks = snapshot
+            .breaks
+            .iter()
+            .cloned()
+            .map(|persisted| GateBreak::from_persisted(persisted, current_tick))
+            .collect::<Result<Vec<_>, _>>()?;
         self.next_id = snapshot.next_id;
         self.gates = gates.iter().cloned().map(|gate| (gate.id, gate)).collect();
+        self.breaks = breaks
+            .into_iter()
+            .map(|break_state| (break_state.gate.id, break_state))
+            .collect();
         self.committed_gates = self.gates.clone();
         self.retired_gates = retired_gates
             .into_iter()
@@ -355,6 +429,14 @@ impl GateRegistry {
         let created = mem::take(&mut self.pending_created);
         self.next_id = self.persisted.next_id;
         self.gates = self.committed_gates.clone();
+        self.breaks = self
+            .persisted
+            .breaks
+            .iter()
+            .cloned()
+            .filter_map(|persisted| GateBreak::from_persisted(persisted, 0).ok())
+            .map(|break_state| (break_state.gate.id, break_state))
+            .collect();
         self.revision = self.persisted_revision;
         self.pending_revision = None;
         self.pending_removed.clear();
@@ -430,10 +512,17 @@ impl GateRegistry {
             })
             .collect::<Vec<_>>();
         retired_gates.sort_unstable_by_key(|retirement| retirement.gate.id);
+        let mut breaks = self
+            .breaks
+            .values()
+            .map(GateBreak::persisted)
+            .collect::<Vec<_>>();
+        breaks.sort_unstable_by_key(|break_state| break_state.gate.id);
         GateRegistrySnapshot {
             next_id: self.next_id,
             gates,
             retired_gates,
+            breaks,
         }
     }
 
@@ -521,27 +610,21 @@ impl GateRegistry {
         gate
     }
 
-    /// Removes unused gates that have reached their one-hour lifetime.
-    pub fn expire_unused(&mut self, tick: u64) -> Vec<Gate> {
-        let expired = self
-            .gates
+    /// Returns ids of unused gates that have reached their one-hour lifetime.
+    pub fn unused_ids(&self, tick: u64) -> Vec<u64> {
+        self.gates
             .values()
             .filter(|gate| {
                 !gate.entered
                     && tick.saturating_sub(gate.created_tick) >= UNUSED_GATE_LIFETIME_TICKS
             })
             .map(|gate| gate.id)
-            .collect::<Vec<_>>();
-        expired
-            .into_iter()
-            .filter_map(|id| self.remove_with_reason(id, GateRetirementReason::Expired))
             .collect()
     }
 
-    /// Removes gates whose wall-clock lifetime elapsed, including while the server was offline.
-    pub fn expire_unused_at(&mut self, now_unix_seconds: u64) -> Vec<Gate> {
-        let expired = self
-            .gates
+    /// Returns ids of gates whose wall-clock lifetime elapsed, including while the server was offline.
+    pub fn unused_ids_at(&self, now_unix_seconds: u64) -> Vec<u64> {
+        self.gates
             .values()
             .filter(|gate| {
                 !gate.entered
@@ -549,8 +632,20 @@ impl GateRegistry {
                         >= UNUSED_GATE_LIFETIME_TICKS / TICKS_PER_SECOND
             })
             .map(|gate| gate.id)
-            .collect::<Vec<_>>();
-        expired
+            .collect()
+    }
+
+    /// Removes unused gates that have reached their one-hour lifetime.
+    pub fn expire_unused(&mut self, tick: u64) -> Vec<Gate> {
+        self.unused_ids(tick)
+            .into_iter()
+            .filter_map(|id| self.remove_with_reason(id, GateRetirementReason::Expired))
+            .collect()
+    }
+
+    /// Removes gates whose wall-clock lifetime elapsed, including while the server was offline.
+    pub fn expire_unused_at(&mut self, now_unix_seconds: u64) -> Vec<Gate> {
+        self.unused_ids_at(now_unix_seconds)
             .into_iter()
             .filter_map(|id| self.remove_with_reason(id, GateRetirementReason::Expired))
             .collect()
@@ -614,6 +709,57 @@ impl GateRegistry {
         self.changed();
         Some(gate)
     }
+
+    /// Moves an unused gate into the active breaks list.
+    pub fn start_break(&mut self, id: u64) -> Option<GateBreak> {
+        let gate = self.gates.remove(&id)?;
+        self.committed_gates.remove(&id);
+        let break_state = GateBreak {
+            gate: gate.clone(),
+            wave: 0,
+            next_wave_tick: 0,
+            remaining_mobs: Vec::new(),
+            announced: false,
+        };
+        self.breaks.insert(id, break_state.clone());
+        self.changed();
+        Some(break_state)
+    }
+
+    /// Returns a snapshot of currently active breaks.
+    #[must_use]
+    pub fn breaks(&self) -> Vec<GateBreak> {
+        self.breaks.values().cloned().collect()
+    }
+
+    /// Iterates active breaks mutably.
+    pub fn breaks_mut(&mut self) -> impl Iterator<Item = &mut GateBreak> {
+        self.breaks.values_mut()
+    }
+
+    /// Mutable access to one active break.
+    pub fn break_mut(&mut self, id: u64) -> Option<&mut GateBreak> {
+        self.breaks.get_mut(&id)
+    }
+
+    /// Retires a cleared break and schedules its frame for cleanup.
+    pub fn clear_break(&mut self, id: u64) -> Option<Gate> {
+        let break_state = self.breaks.remove(&id)?;
+        self.retired_gates
+            .insert(id, (break_state.gate.clone(), GateRetirementReason::Broken));
+        self.pending_removed
+            .push((break_state.gate.clone(), GateRetirementReason::Broken));
+        self.changed();
+        Some(break_state.gate)
+    }
+
+    /// Returns whether a break is active at the given frame.
+    #[must_use]
+    pub fn has_break_at(&self, world: &Identifier, entrance: BlockPos) -> bool {
+        self.breaks.values().any(|break_state| {
+            break_state.gate.world == *world && break_state.gate.entrance == entrance
+        })
+    }
 }
 
 /// A reusable spatial slot in the shared instance world.
@@ -646,6 +792,17 @@ impl InstanceRegion {
             ),
         }
     }
+
+    /// Returns whether `pos` lies inside this region's horizontal footprint.
+    #[must_use]
+    pub fn contains(self, pos: BlockPos) -> bool {
+        let min_x = self.spawn.x.floor() as i32;
+        let min_z = self.spawn.z.floor() as i32;
+        pos.x() >= min_x
+            && pos.x() < min_x + INSTANCE_REGION_STRIDE
+            && pos.z() >= min_z
+            && pos.z() < min_z + INSTANCE_REGION_STRIDE
+    }
 }
 
 /// The procedurally generated dungeon of one run.
@@ -666,11 +823,26 @@ impl DungeonLayout {
     /// Generates the dungeon of `seed`, with two through five combat rooms.
     #[must_use]
     pub fn from_seed(seed: u64) -> Self {
+        Self::for_gate(seed, false)
+    }
+
+    /// Generates the dungeon of `seed`. Red gates always roll the ice theme.
+    #[must_use]
+    pub fn for_gate(seed: u64, red: bool) -> Self {
         let combat_room_count = 2 + u8::try_from((seed >> 56) % 4).unwrap_or(0);
+        let blueprint = if red {
+            Blueprint::generate_with_theme(
+                seed,
+                combat_room_count,
+                crate::dungeon::generator::Theme::Ice,
+            )
+        } else {
+            Blueprint::generate(seed, combat_room_count)
+        };
         Self {
             seed,
             combat_room_count,
-            blueprint: Arc::new(Blueprint::generate(seed, combat_room_count)),
+            blueprint: Arc::new(blueprint),
         }
     }
 
@@ -945,7 +1117,9 @@ mod tests {
         assert_eq!(gates.commit_persistence(write.revision).created[0], created);
 
         let mut restored = GateRegistry::default();
-        restored.restore(snapshot).expect("snapshot should restore");
+        restored
+            .restore(snapshot, 0)
+            .expect("snapshot should restore");
         let saved = restored.committed_gates();
         assert_eq!(saved.len(), 1);
         assert!(
@@ -992,7 +1166,7 @@ mod tests {
 
         let mut restored = GateRegistry::default();
         restored
-            .restore(snapshot)
+            .restore(snapshot, 0)
             .expect("retirement should restore");
         assert_eq!(restored.committed_gates(), Vec::<Gate>::new());
         assert_eq!(
@@ -1117,5 +1291,70 @@ mod tests {
         );
         assert_eq!(penalty_wave_size(PENALTY_ZONE_MAX_LIVE_ZOMBIES - 5), 5);
         assert_eq!(penalty_wave_size(PENALTY_ZONE_MAX_LIVE_ZOMBIES), 0);
+    }
+
+    #[test]
+    fn unused_gate_can_start_a_break() {
+        let mut gates = GateRegistry::default();
+        let gate = gates.create_ranked(
+            Identifier::from_steel("overworld"),
+            BlockPos::new(20, 70, 20),
+            0,
+            HunterRank::D,
+            false,
+        );
+        let break_state = gates.start_break(gate.id).expect("gate should break");
+        assert_eq!(break_state.gate.id, gate.id);
+        assert!(gates.breaks().iter().any(|b| b.gate.id == gate.id));
+        assert!(gates.committed_gate(gate.id).is_none());
+    }
+
+    #[test]
+    fn break_snapshot_round_trips_and_restores_next_wave_tick() {
+        let mut gates = GateRegistry::default();
+        let gate = gates.create_ranked(
+            Identifier::from_steel("overworld"),
+            BlockPos::new(20, 70, 20),
+            100,
+            HunterRank::C,
+            false,
+        );
+        let mut break_state = gates.start_break(gate.id).unwrap();
+        break_state.wave = 2;
+        break_state.next_wave_tick = 500;
+        // Mutate the registry directly so the snapshot sees the changed wave.
+        *gates.break_mut(gate.id).unwrap() = break_state.clone();
+
+        let write = gates.begin_persistence().expect("break is dirty");
+        let bytes = serde_json::to_vec(&write.snapshot).expect("snapshot should serialize");
+        let snapshot: GateRegistrySnapshot =
+            serde_json::from_slice(&bytes).expect("snapshot should deserialize");
+
+        let mut restored = GateRegistry::default();
+        restored.restore(snapshot, 1_000).expect("should restore");
+        let restored_break = restored.breaks().pop().expect("one break");
+        assert_eq!(restored_break.gate.id, gate.id);
+        assert_eq!(restored_break.wave, 2);
+        assert_eq!(restored_break.next_wave_tick, 1_000);
+    }
+
+    #[test]
+    fn cleared_break_retires_gate_as_broken() {
+        let mut gates = GateRegistry::default();
+        let gate = gates.create_ranked(
+            Identifier::from_steel("overworld"),
+            BlockPos::new(20, 70, 20),
+            0,
+            HunterRank::B,
+            false,
+        );
+        gates.start_break(gate.id);
+        let retired = gates.clear_break(gate.id).expect("break should clear");
+        assert_eq!(retired.id, gate.id);
+        assert!(gates.breaks().is_empty());
+        assert_eq!(
+            gates.retired_gates(),
+            vec![(gate, GateRetirementReason::Broken)]
+        );
     }
 }

@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::dungeon::generator::THEMES;
 use crate::dungeon::mobs::{MobClass, creature_name};
+use crate::rank::HunterRank;
 
 /// Highest level a retained shadow can reach.
 pub const MAX_SHADOW_LEVEL: u16 = 100;
@@ -304,11 +305,250 @@ fn same_name(stored: &str, typed: &str) -> bool {
     stored.trim().to_lowercase() == typed.trim().to_lowercase()
 }
 
+/// Maximum number of elite shadows a hunter may retain.
+pub const MAX_ELITE_SHADOW_SLOTS: usize = 3;
+/// Extraction attempts offered for one boss kill.
+pub const BOSS_EXTRACTION_ATTEMPTS: u32 = 3;
+/// Health multiplier applied to an elite shadow's summoned body.
+pub const ELITE_SHADOW_HEALTH_MULTIPLIER: f64 = 1.5;
+/// Damage multiplier applied to an elite shadow's summoned body.
+pub const ELITE_SHADOW_DAMAGE_MULTIPLIER: f64 = 1.3;
+/// Movement-speed multiplier applied to an elite shadow's summoned body.
+pub const ELITE_SHADOW_SPEED_MULTIPLIER: f64 = 1.1;
+
+/// Where an elite shadow came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BossSource {
+    /// A dungeon gate boss.
+    Dungeon {
+        /// Rank the gate was fought at.
+        rank: HunterRank,
+        /// Russian archetype name, e.g. "Вождь-берсерк".
+        archetype: String,
+        /// Whether the gate was a red gate.
+        red: bool,
+    },
+    /// An island nest guardian.
+    IslandNest {
+        /// Rank of the zone the nest stood in.
+        zone_rank: HunterRank,
+        /// Russian zone name, e.g. "Поля гнёзд".
+        zone_name: String,
+    },
+    /// The Ant King of the infested island.
+    IslandKing,
+    /// A Demon Castle floor boss.
+    CastleFloor {
+        /// Floor number the boss guarded.
+        floor: u32,
+    },
+}
+
+/// Result of one boss-shadow extraction ritual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractionResult {
+    /// The boss rises as an elite shadow.
+    Success,
+    /// All attempts failed; the soul dissipates.
+    Failure,
+}
+
+/// Returns the success percent for one extraction attempt against a boss of `rank`.
+///
+/// Stronger bosses resist the Shadow Monarch's call more often.
+#[must_use]
+pub const fn extraction_chance_percent(rank: HunterRank) -> u32 {
+    match rank {
+        HunterRank::E => 70,
+        HunterRank::D => 55,
+        HunterRank::C => 40,
+        HunterRank::B => 25,
+        HunterRank::A => 15,
+        HunterRank::S => 5,
+    }
+}
+
+/// Performs `attempts` extraction rolls, succeeding on the first passing roll.
+///
+/// `roll` returns a value in `0..100`; values below the rank chance succeed.
+#[must_use]
+pub fn attempt_extraction(
+    rank: HunterRank,
+    attempts: u32,
+    mut roll: impl FnMut() -> u32,
+) -> ExtractionResult {
+    let chance = extraction_chance_percent(rank);
+    for _ in 0..attempts {
+        if roll() < chance {
+            return ExtractionResult::Success;
+        }
+    }
+    ExtractionResult::Failure
+}
+
+/// A shadow extracted from a boss, stronger than ordinary shadows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EliteShadow {
+    /// Stable roster identity.
+    pub id: Uuid,
+    /// Player-visible name, unique within the elite roster.
+    pub name: String,
+    /// Vanilla mob type recreated when this shadow is summoned.
+    pub entity_type: Identifier,
+    /// Current elite shadow level.
+    pub level: u16,
+    /// Experience accumulated toward the next level.
+    pub experience: u64,
+    /// Points earned by levelling that have not been assigned to a stat.
+    pub unspent_points: u16,
+    /// Permanent health upgrades.
+    pub health: u16,
+    /// Permanent attack-damage upgrades.
+    pub attack: u16,
+    /// Permanent movement-speed upgrades.
+    pub speed: u16,
+    /// Present only while this shadow is rebuilding after its summoned body died.
+    #[serde(default)]
+    pub recovery: Option<ShadowRecovery>,
+    /// Stats, name and equipment inherited from the boss.
+    pub origin: ShadowOrigin,
+    /// Which boss this shadow was extracted from.
+    pub source: BossSource,
+}
+
+impl EliteShadow {
+    /// Creates a newly extracted elite shadow from a defeated boss.
+    #[must_use]
+    pub fn new(entity_type: Identifier, origin: ShadowOrigin, source: BossSource) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: origin.title.clone(),
+            entity_type,
+            level: 1,
+            experience: 0,
+            unspent_points: 0,
+            health: 0,
+            attack: 0,
+            speed: 0,
+            recovery: None,
+            origin,
+            source,
+        }
+    }
+
+    /// Experience needed to advance from this level.
+    #[must_use]
+    pub const fn experience_to_next_level(&self) -> u64 {
+        self.level as u64 * 100
+    }
+
+    /// Grants kill experience, returning the number of levels gained.
+    pub const fn grant_experience(&mut self, amount: u64) -> u16 {
+        if self.level >= MAX_SHADOW_LEVEL {
+            return 0;
+        }
+        self.experience = self.experience.saturating_add(amount);
+        let mut gained = 0;
+        while self.level < MAX_SHADOW_LEVEL && self.experience >= self.experience_to_next_level() {
+            self.experience -= self.experience_to_next_level();
+            self.level += 1;
+            self.unspent_points += 1;
+            gained += 1;
+        }
+        gained
+    }
+
+    /// Allocates one earned point to `stat`.
+    pub const fn allocate_point(&mut self, stat: ShadowStat) -> bool {
+        if self.unspent_points == 0 {
+            return false;
+        }
+        self.unspent_points -= 1;
+        match stat {
+            ShadowStat::Health => self.health += 1,
+            ShadowStat::Attack => self.attack += 1,
+            ShadowStat::Speed => self.speed += 1,
+        }
+        true
+    }
+
+    /// Starts rebuilding this shadow from zero health.
+    pub const fn begin_recovery(&mut self, maximum_health: u16) {
+        self.recovery = Some(ShadowRecovery {
+            health: 0,
+            maximum_health,
+        });
+    }
+
+    /// Restores health and reports whether persistent recovery state changed.
+    pub const fn recover(&mut self, health: u16) -> bool {
+        let Some(recovery) = &mut self.recovery else {
+            return false;
+        };
+        recovery.health = recovery.health.saturating_add(health);
+        if recovery.health >= recovery.maximum_health {
+            self.recovery = None;
+        }
+        true
+    }
+
+    /// Reports whether this shadow must finish rebuilding before it can be summoned.
+    #[must_use]
+    pub const fn is_recovering(&self) -> bool {
+        self.recovery.is_some()
+    }
+}
+
+/// The persisted elite-shadow roster owned by one hunter.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EliteShadowRoster {
+    /// Elite shadows in roster order.
+    pub shadows: Vec<EliteShadow>,
+}
+
+impl EliteShadowRoster {
+    /// Adds an elite shadow if a slot is free.
+    pub fn add(&mut self, shadow: EliteShadow) -> Result<(), &'static str> {
+        if self.shadows.len() >= MAX_ELITE_SHADOW_SLOTS {
+            return Err("Достигнут лимит элитных теней.");
+        }
+        self.shadows.push(shadow);
+        Ok(())
+    }
+
+    /// Looks up an elite shadow by its player-visible name.
+    #[must_use]
+    pub fn named(&self, name: &str) -> Option<&EliteShadow> {
+        self.shadows
+            .iter()
+            .find(|shadow| same_name(&shadow.name, name))
+    }
+
+    /// Returns a mutable elite shadow selected by its player-visible name.
+    pub fn named_mut(&mut self, name: &str) -> Option<&mut EliteShadow> {
+        self.shadows
+            .iter_mut()
+            .find(|shadow| same_name(&shadow.name, name))
+    }
+
+    /// Restores every destroyed elite shadow by `health`, returning whether anything changed.
+    pub fn recover(&mut self, health: u16) -> bool {
+        let mut changed = false;
+        for shadow in &mut self.shadows {
+            changed |= shadow.recover(health);
+        }
+        changed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use steel_utils::Identifier;
 
-    use super::{Shadow, ShadowOrigin, ShadowRoster};
+    use super::{
+        BOSS_EXTRACTION_ATTEMPTS, MAX_ELITE_SHADOW_SLOTS, Shadow, ShadowOrigin, ShadowRoster,
+    };
+    use crate::rank::HunterRank;
 
     #[test]
     fn arisen_shadows_have_stable_unique_ids_and_case_insensitive_names() {
@@ -399,6 +639,83 @@ mod tests {
                 .as_ref()
                 .is_some_and(|origin| origin.is_tank)
         );
+    }
+
+    #[test]
+    fn extraction_chance_falls_with_boss_rank() {
+        assert_eq!(super::extraction_chance_percent(HunterRank::E), 70);
+        assert_eq!(super::extraction_chance_percent(HunterRank::D), 55);
+        assert_eq!(super::extraction_chance_percent(HunterRank::C), 40);
+        assert_eq!(super::extraction_chance_percent(HunterRank::B), 25);
+        assert_eq!(super::extraction_chance_percent(HunterRank::A), 15);
+        assert_eq!(super::extraction_chance_percent(HunterRank::S), 5);
+    }
+
+    #[test]
+    fn extraction_succeeds_when_any_attempt_passes_and_fails_when_all_miss() {
+        assert_eq!(
+            super::attempt_extraction(HunterRank::E, BOSS_EXTRACTION_ATTEMPTS, || 0),
+            super::ExtractionResult::Success
+        );
+        assert_eq!(
+            super::attempt_extraction(HunterRank::E, BOSS_EXTRACTION_ATTEMPTS, || 99),
+            super::ExtractionResult::Failure
+        );
+    }
+
+    #[test]
+    fn elite_roster_holds_limited_slots_and_refuses_extras() {
+        let mut roster = super::EliteShadowRoster::default();
+        for _ in 0..MAX_ELITE_SHADOW_SLOTS {
+            roster
+                .add(sample_elite_shadow())
+                .expect("slot should be free");
+        }
+        assert!(roster.add(sample_elite_shadow()).is_err());
+        assert_eq!(roster.shadows.len(), MAX_ELITE_SHADOW_SLOTS);
+    }
+
+    #[test]
+    fn elite_shadow_levels_and_earns_points_like_an_army_shadow() {
+        let mut shadow = sample_elite_shadow();
+        assert_eq!(shadow.grant_experience(100), 1);
+        assert_eq!(shadow.level, 2);
+        assert_eq!(shadow.unspent_points, 1);
+        assert!(shadow.allocate_point(super::ShadowStat::Attack));
+        assert_eq!(shadow.attack, 1);
+    }
+
+    #[test]
+    fn elite_shadow_round_trips_through_json() {
+        let mut roster = super::EliteShadowRoster::default();
+        roster
+            .add(sample_elite_shadow())
+            .expect("sample elite shadow fits in an empty roster");
+        let encoded = serde_json::to_string(&roster).expect("serialize elite roster");
+        let restored: super::EliteShadowRoster =
+            serde_json::from_str(&encoded).expect("deserialize elite roster");
+        assert_eq!(restored, roster);
+    }
+
+    fn sample_elite_shadow() -> super::EliteShadow {
+        super::EliteShadow::new(
+            Identifier::vanilla_static("zombie"),
+            ShadowOrigin {
+                title: "Вождь-берсерк".to_owned(),
+                max_health: ShadowOrigin::scale(200.0),
+                attack_damage: ShadowOrigin::scale(15.0),
+                movement_speed: ShadowOrigin::scale(0.23),
+                armor: ShadowOrigin::scale(8.0),
+                equipment: Vec::new(),
+                is_tank: true,
+                is_broodmother: Some(false),
+            },
+            super::BossSource::Dungeon {
+                rank: HunterRank::C,
+                archetype: "Вождь-берсерк".to_owned(),
+                red: false,
+            },
+        )
     }
 
     #[test]

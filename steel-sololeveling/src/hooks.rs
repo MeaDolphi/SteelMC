@@ -46,13 +46,17 @@ use crate::organization::Event;
 use crate::organization_menu;
 use crate::quest::{PENALTY_DELAY_SECONDS, PENALTY_MIN_RANK, SystemQuest};
 use crate::quest_book::Goal;
+use crate::rank::HunterRank;
+use crate::scenario;
 use crate::session::HunterSession;
 use crate::session::QuestUpdate;
+use crate::shadow::{BossSource, EliteShadow};
 use crate::sidebar;
 use crate::sound::SystemSound;
 use crate::spell_menu;
 use crate::starter_menu;
 use crate::state::{EnchantAction, GateMenuAction, SoloLevelingState};
+use crate::temple;
 
 /// Solo Leveling's [`GameplayHooks`] implementation.
 ///
@@ -123,6 +127,7 @@ impl GameplayHooks for SoloLevelingHooks {
         self.state.tick_guild_payouts();
         self.state.tick_auction(server, tick_count);
         self.state.tick_dungeons(server, tick_count);
+        self.state.tick_scenarios(server, tick_count);
         self.state.tick_island(server, tick_count);
         self.state.tick_organization(server);
         self.state.tick_storms(server);
@@ -180,6 +185,7 @@ impl GameplayHooks for SoloLevelingHooks {
     fn on_player_disconnect(&self, server: &Server, player_uuid: Uuid) {
         self.state.on_party_disconnect(player_uuid);
         self.state.recall_shadows(player_uuid);
+        scenario::on_disconnect(player_uuid);
         self.state.end_player_run(server, player_uuid);
         self.state.retire_session(player_uuid);
     }
@@ -280,7 +286,9 @@ impl GameplayHooks for SoloLevelingHooks {
     }
 
     fn on_player_death(&self, _server: &Arc<Server>, player: &Player) {
-        self.state.recall_shadows(player.gameprofile.id());
+        let uuid = player.gameprofile.id();
+        self.state.recall_shadows(uuid);
+        scenario::on_player_death(uuid);
         self.state.observe_dungeon_player_death(player);
     }
 
@@ -345,11 +353,15 @@ impl GameplayHooks for SoloLevelingHooks {
         &self,
         world: &World,
         player: &Player,
-        _pos: BlockPos,
+        pos: BlockPos,
         state: BlockStateId,
         drops: &mut Vec<ItemStack>,
     ) {
         if state != instance::CRYSTAL_ORE.default_state() {
+            return;
+        }
+        if self.state.record_mine_crystal(world, pos, 1) {
+            drops.clear();
             return;
         }
         let Some(rank) = self.state.instance_rank(world) else {
@@ -399,6 +411,15 @@ impl GameplayHooks for SoloLevelingHooks {
                 self.state.queue_cast(player.gameprofile.id());
             }
             return Some(InteractionResult::Success);
+        }
+        if temple::is_temple_key(stack) {
+            return Some(match self.state.enter_temple(player, hand) {
+                Ok(()) => InteractionResult::Success,
+                Err(message) => {
+                    player.send_message(&TextComponent::plain(message).color(Color::Red));
+                    InteractionResult::Fail
+                }
+            });
         }
         item::consume::use_item(&self.state, player, stack, hand)
     }
@@ -618,9 +639,14 @@ impl GameplayHooks for SoloLevelingHooks {
         source: &DamageSource,
     ) {
         mobs::clear_health_line(world, entity);
+        scenario::on_boss_death(world, entity.id());
         self.state.observe_shadow_death(entity.uuid());
         let Some(killer) = source.causing_entity() else {
-            if !self.state.observe_island_death(world, entity.id(), None) {
+            if self
+                .state
+                .observe_island_death(world, entity.id(), None)
+                .is_none()
+            {
                 let _ = self
                     .state
                     .observe_dungeon_mob_death(world, entity.id(), None);
@@ -640,8 +666,28 @@ impl GameplayHooks for SoloLevelingHooks {
             self.state
                 .record_organization_event(vec![hunter], Event::Kill { zombie, rank });
         }
-        if self.state.observe_island_death(world, entity.id(), hunter) {
+        if let Some(kill) = self.state.observe_island_death(world, entity.id(), hunter) {
+            if let Some(player) = killer.as_player()
+                && let Some((source, rank)) = island_boss_source(&kill)
+                && let Some(shadow) = self
+                    .state
+                    .extract_island_boss_shadow(player, entity, source, rank)
+            {
+                announce_elite_extraction(player, &shadow);
+            }
             return;
+        }
+        if let Some(player) = killer.as_player()
+            && let Some(BossSource::Dungeon {
+                rank,
+                archetype,
+                red,
+            }) = self.state.dungeon_boss_source(world, entity.id())
+            && let Some(shadow) = self
+                .state
+                .extract_dungeon_boss_shadow(player, entity, rank, archetype, red)
+        {
+            announce_elite_extraction(player, &shadow);
         }
         // The run may end with this death, so the nameplate is read first.
         let label = self.state.dungeon_mob_label(world, entity.id());
@@ -735,6 +781,33 @@ fn is_shadow_tank(candidate: &dyn LivingEntity) -> bool {
     candidate
         .as_mob()
         .is_some_and(|mob| mob.allied_owner().is_some() && mob.is_allied_tank())
+}
+
+/// Returns the elite-shadow source and rank for an island boss kill.
+fn island_boss_source(kill: &island::IslandKill) -> Option<(BossSource, HunterRank)> {
+    match kill {
+        island::IslandKill::Nest { zone, .. } => Some((
+            BossSource::IslandNest {
+                zone_rank: zone.rank(),
+                zone_name: zone.display_name().to_owned(),
+            },
+            zone.rank(),
+        )),
+        island::IslandKill::King { .. } => Some((BossSource::IslandKing, HunterRank::S)),
+        island::IslandKill::Ant(_) => None,
+    }
+}
+
+/// Tells the hunter whether the boss became an elite shadow.
+fn announce_elite_extraction(player: &Player, shadow: &EliteShadow) {
+    SystemSound::Arise.play(player);
+    player.send_message(
+        &TextComponent::plain(format!(
+            "Ритуал «Восстань» удался: «{}» стала элитной тенью.",
+            shadow.name
+        ))
+        .color(Color::DarkRed),
+    );
 }
 
 /// Returns the hunter credited for a hit or a kill: the attacker itself, or the

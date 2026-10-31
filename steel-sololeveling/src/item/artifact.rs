@@ -205,6 +205,8 @@ pub enum ArtifactId {
     AntKingRing,
     /// Legendary amulet: cheats death with invulnerability.
     ShadowGuardAmulet,
+    /// Legendary amulet from the Cartenon Temple: a faint smiling aura.
+    SmilingGodsIdol,
 }
 
 impl ArtifactId {
@@ -254,6 +256,7 @@ impl ArtifactId {
             Self::ProspectorsNecklace => "prospectors_necklace",
             Self::AntKingRing => "ant_king_ring",
             Self::ShadowGuardAmulet => "shadow_guard_amulet",
+            Self::SmilingGodsIdol => "smiling_gods_idol",
         }
     }
 
@@ -296,7 +299,8 @@ impl ArtifactId {
             | Self::HuntersAmulet
             | Self::BloodAmulet
             | Self::ProspectorsNecklace
-            | Self::ShadowGuardAmulet => Some(GearKind::Amulet),
+            | Self::ShadowGuardAmulet
+            | Self::SmilingGodsIdol => Some(GearKind::Amulet),
             Self::KasakasVenomFang
             | Self::RaikansFang
             | Self::KargalgansStaff
@@ -357,6 +361,7 @@ impl ArtifactId {
             Self::ProspectorsNecklace => &PROSPECTORS_NECKLACE,
             Self::AntKingRing => &ANT_KING_RING,
             Self::ShadowGuardAmulet => &SHADOW_GUARD_AMULET,
+            Self::SmilingGodsIdol => &SMILING_GODS_IDOL,
         }
     }
 
@@ -516,7 +521,7 @@ impl ArmorLine {
 }
 
 /// Every named artifact.
-pub const ALL: [ArtifactId; 42] = [
+pub const ALL: [ArtifactId; 43] = [
     ArtifactId::KasakasVenomFang,
     ArtifactId::KnightsKiller,
     ArtifactId::BarukasDagger,
@@ -559,6 +564,7 @@ pub const ALL: [ArtifactId; 42] = [
     ArtifactId::ProspectorsNecklace,
     ArtifactId::AntKingRing,
     ArtifactId::ShadowGuardAmulet,
+    ArtifactId::SmilingGodsIdol,
 ];
 
 /// Which catalog list an artifact belongs to, for chest and shop rolls.
@@ -697,6 +703,11 @@ pub enum Ability {
         /// Cooldown in seconds.
         cooldown: u64,
     },
+    /// A faint divine aura increases all damage dealt.
+    SmilingAura {
+        /// Bonus as a fraction of the hit.
+        percent: f32,
+    },
 }
 
 impl Ability {
@@ -719,6 +730,7 @@ impl Ability {
             Self::Greed { .. } => "greed",
             Self::DoubleStrike { .. } => "double_strike",
             Self::ShadowGuard { .. } => "shadow_guard",
+            Self::SmilingAura { .. } => "smiling_aura",
         }
     }
 
@@ -740,7 +752,8 @@ impl Ability {
             | Self::BossSlayer { .. }
             | Self::Bloodthirst { .. }
             | Self::Greed { .. }
-            | Self::DoubleStrike { .. } => 0,
+            | Self::DoubleStrike { .. }
+            | Self::SmilingAura { .. } => 0,
         }
     }
 }
@@ -1479,6 +1492,15 @@ static SHADOW_GUARD_AMULET: Artifact = Artifact {
         cooldown: 90,
     }],
 };
+static SMILING_GODS_IDOL: Artifact = Artifact {
+    id: ArtifactId::SmilingGodsIdol,
+    name: "Идол улыбающегося бога",
+    rarity: Rarity::Legendary,
+    category: Category::Armor,
+    holder: &vanilla_items::HEART_OF_THE_SEA,
+    modifiers: &[],
+    abilities: &[Ability::SmilingAura { percent: 0.15 }],
+};
 
 /// Returns every weapon artifact of `rarity`.
 #[must_use]
@@ -1893,6 +1915,9 @@ pub fn describe_ability(ability: Ability) -> String {
         Ability::ShadowGuard { seconds, cooldown } => format!(
             "Смертельный удар оставляет 1 HP и даёт {seconds} с неуязвимости (перезарядка {cooldown} с)"
         ),
+        Ability::SmilingAura { percent } => {
+            format!("+{:.0}% урона от ауры улыбающегося бога", percent * 100.0)
+        }
     }
 }
 

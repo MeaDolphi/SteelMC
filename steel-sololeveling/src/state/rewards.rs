@@ -126,6 +126,7 @@ impl SoloLevelingState {
                     self.record_goal(*uuid, goal, 1);
                 }
             }
+            self.roll_temple_key(*uuid, clear);
         }
     }
 
@@ -321,7 +322,7 @@ impl SoloLevelingState {
     }
 
     /// Sends a System line to an online hunter.
-    pub(super) fn notify(&self, uuid: Uuid, text: &str) {
+    pub(crate) fn notify(&self, uuid: Uuid, text: &str) {
         if let Some(player) = self
             .online_players()
             .into_iter()

@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::class::HunterClass;
+use crate::job_change::JobChangeProgress;
 use crate::organization::rank_multiplier;
 use crate::rank::HunterRank;
 
@@ -78,6 +79,10 @@ pub enum Goal {
     GuildJoined,
     /// A lot sold on the auction.
     AuctionSale,
+    /// The Cartenon Temple was cleared.
+    TempleCleared,
+    /// The Knight Igris was defeated.
+    IgrisDefeated,
 }
 
 /// One daily errand or weekly trial.
@@ -129,7 +134,9 @@ pub fn errand_title(goal: Goal, target: u32) -> String {
         | Goal::ClassChosen
         | Goal::SpellUnlocked
         | Goal::GuildJoined
-        | Goal::AuctionSale => format!("Выполнить {target} раз"),
+        | Goal::AuctionSale
+        | Goal::TempleCleared
+        | Goal::IgrisDefeated => format!("Выполнить {target} раз"),
     }
 }
 
@@ -344,10 +351,14 @@ pub enum Achievement {
     Gates100,
     /// Sell a first lot on the auction.
     FirstAuctionSale,
+    /// Clear the Cartenon Temple.
+    CartenonTemple,
+    /// Complete the Second Awakening.
+    SecondAwakening,
 }
 
 /// Every step of the Hunter's Path, in path order.
-pub const PATH: [Achievement; 27] = [
+pub const PATH: [Achievement; 29] = [
     Achievement::StarterKit,
     Achievement::FirstGate,
     Achievement::FirstBoss,
@@ -374,6 +385,8 @@ pub const PATH: [Achievement; 27] = [
     Achievement::Level50,
     Achievement::RankA,
     Achievement::Castle60,
+    Achievement::CartenonTemple,
+    Achievement::SecondAwakening,
     Achievement::RankS,
 ];
 
@@ -409,6 +422,8 @@ impl Achievement {
             Self::Crystals1000 => "Тысяча кристаллов",
             Self::Gates100 => "Сотня врат",
             Self::FirstAuctionSale => "Первая сделка",
+            Self::CartenonTemple => "Картенонский храм",
+            Self::SecondAwakening => "Второе пробуждение",
         }
     }
 
@@ -443,6 +458,8 @@ impl Achievement {
             Self::Crystals1000 => "Добудьте 1000 кристаллов.",
             Self::Gates100 => "Закройте 100 врат.",
             Self::FirstAuctionSale => "Продайте лот на аукционе.",
+            Self::CartenonTemple => "Пройдите Картенонский храм.",
+            Self::SecondAwakening => "Завершите Второе пробуждение.",
         }
     }
 
@@ -461,6 +478,8 @@ impl Achievement {
             Self::FirstNest | Self::Crystals1000 | Self::Castle30 => (4_000, 500),
             Self::RankB | Self::Gates100 | Self::AntKing => (8_000, 1_000),
             Self::Level50 | Self::RankA | Self::Castle60 => (20_000, 2_500),
+            Self::CartenonTemple => (25_000, 3_000),
+            Self::SecondAwakening => (30_000, 4_000),
             Self::RankS => (50_000, 5_000),
         }
     }
@@ -507,6 +526,15 @@ pub struct QuestBook {
     /// Moscow day the Association salary was last paid.
     #[serde(default)]
     pub salary_day: u64,
+    /// Moscow day the temple key was last rolled for this hunter.
+    #[serde(default)]
+    pub temple_key_day: u64,
+    /// Whether the temple key has already been rolled today.
+    #[serde(default)]
+    pub temple_key_rolled: bool,
+    /// Progress of the Second Awakening quest chain.
+    #[serde(default)]
+    pub job_change: JobChangeProgress,
 }
 
 /// What recording a goal finished.
@@ -536,6 +564,9 @@ impl QuestBook {
             achievements: Vec::new(),
             lifetime: Vec::new(),
             salary_day: 0,
+            temple_key_day: 0,
+            temple_key_rolled: false,
+            job_change: JobChangeProgress::None,
         }
     }
 
@@ -653,6 +684,8 @@ impl QuestBook {
             Achievement::Crystals1000 => self.total(Goal::Crystal) >= 1_000,
             Achievement::Gates100 => self.total(Goal::GateCleared) >= 100,
             Achievement::FirstAuctionSale => has(Goal::AuctionSale),
+            Achievement::CartenonTemple => has(Goal::TempleCleared),
+            Achievement::SecondAwakening => has(Goal::IgrisDefeated),
         }
     }
 }

@@ -34,29 +34,31 @@ use text_components::format::Color;
 use uuid::Uuid;
 
 use super::boss::{BossAbilityAction, BossFight};
-use super::generator::{Room, RoomRole};
+use super::generator::{Room, RoomRole, Theme};
 use super::instance::{
     SpawnedMob, build_dungeon, dungeon_chunks, erase_footprint, footprint_chunks,
     gate_frame_chunks, gate_frame_is_clear, gate_frame_matches, gate_ground_is_dry,
     gate_space_is_clear, open_dungeon_exit, opening_contains, place_gate_frame, remove_gate_frame,
-    spawn_dungeon_boss, spawn_dungeon_wave, spawn_room_mobs,
+    spawn_city_break_mob, spawn_dungeon_boss, spawn_dungeon_wave, spawn_room_mobs,
 };
 use super::mobs::{MobClass, MobLabel};
 use super::skills::{MobSkills, SkillAction, refresh_plates};
 use super::tower;
 use super::{
-    DUNGEON_TIME_LIMIT_TICKS, DungeonLayout, DungeonWave, Footprint, GATE_SPAWN_INTERVAL_TICKS,
-    GATES_PER_SPAWN_CYCLE, Gate, GateRegistry, GateRegistryChanges, GateRegistrySnapshot,
-    GateRegistryWrite, GateRetirementReason, INSTANCE_WORLD_PATH, InstanceRegion,
-    InstanceRegionAllocator, LegacyGateCleanup, PENALTY_ZONE_DURATION_TICKS,
-    PENALTY_ZONE_WAVE_INTERVAL_TICKS, TICKS_PER_SECOND, penalty_wave_size, wave_for_gate,
-    wave_for_rank,
+    DUNGEON_TIME_LIMIT_TICKS, DungeonLayout, DungeonWave, Footprint,
+    GATE_BREAK_PARTICIPATION_RADIUS, GATE_BREAK_WAVE_INTERVAL_TICKS, GATE_BREAK_WAVE_REWARD_BASE,
+    GATE_BREAK_WAVES, GATE_SPAWN_INTERVAL_TICKS, GATES_PER_SPAWN_CYCLE, Gate, GateRegistry,
+    GateRegistryChanges, GateRegistrySnapshot, GateRegistryWrite, GateRetirementReason,
+    INSTANCE_WORLD_PATH, InstanceRegion, InstanceRegionAllocator, LegacyGateCleanup,
+    MINE_DURATION_TICKS, PENALTY_ZONE_DURATION_TICKS, PENALTY_ZONE_WAVE_INTERVAL_TICKS,
+    TICKS_PER_SECOND, penalty_wave_size, wave_for_gate, wave_for_rank,
 };
 use crate::castle;
 use crate::city;
 use crate::item::chest::{self, ChestKind};
+use crate::item::crystal;
 use crate::item::{key, material, pouch};
-use crate::organization::Event;
+use crate::organization::{Event, rank_multiplier};
 use crate::party::RaidContribution;
 use crate::rank::HunterRank;
 use crate::state::{GateClear, SoloLevelingState};
@@ -129,6 +131,24 @@ pub enum RunAction {
         uuid: Uuid,
         /// Rolls which nonzero stat is deducted.
         roll: usize,
+    },
+    /// Start the mine phase after a dungeon boss is defeated.
+    StartMine,
+    /// Pay defenders for a cleared gate-break wave.
+    CityDefenseWave {
+        /// Hunters present near the gate.
+        participants: Vec<Uuid>,
+        /// Rank the gate was fought at.
+        rank: HunterRank,
+    },
+    /// Pay miners when a mine shift ends.
+    CreditMine {
+        /// Hunters present inside the mine.
+        participants: Vec<Uuid>,
+        /// Rank the mine crystals sell at.
+        rank: HunterRank,
+        /// Crystals mined during the shift.
+        mined: u32,
     },
 }
 
@@ -310,6 +330,7 @@ struct GateCycle {
 struct GeneratingEntry {
     /// Players waiting for this instance; their UUIDs are enough to detect busyness.
     players: Vec<Uuid>,
+    #[expect(dead_code, reason = "kept for diagnostics and future expansion")]
     region: InstanceRegion,
     /// Gate consumed by this entry, restored if generation is cancelled.
     gate_id: Option<u64>,
@@ -330,9 +351,13 @@ struct GenerationResult {
     request: ChunkRequestHandle,
     footprint: Footprint,
     cancelled: bool,
+    #[expect(dead_code, reason = "kept for diagnostics and future expansion")]
     erase_micros: u64,
+    #[expect(dead_code, reason = "kept for diagnostics and future expansion")]
     build_micros: u64,
+    #[expect(dead_code, reason = "kept for diagnostics and future expansion")]
     block_count: usize,
+    #[expect(dead_code, reason = "kept for diagnostics and future expansion")]
     chunk_count: usize,
 }
 
@@ -539,11 +564,64 @@ struct InstanceRun {
     placed: bool,
     /// Set once an action was queued so the run stops ticking before it ends.
     finishing: bool,
+    /// Whether the entrance is locked: no voluntary exit until the boss falls.
+    locked: bool,
 }
 
 enum RunProgress {
     Dungeon(Box<DungeonProgress>),
     Penalty(PenaltyProgress),
+    Mine(MineProgress),
+}
+
+struct MineProgress {
+    rank: HunterRank,
+    #[expect(
+        dead_code,
+        reason = "preserved for run metadata and future payout rules"
+    )]
+    red: bool,
+    #[expect(
+        dead_code,
+        reason = "preserved for run metadata and future payout rules"
+    )]
+    floor: Option<u32>,
+    exit: BlockPos,
+    mined: u32,
+    quota: u32,
+    started_tick: u64,
+    duration_ticks: u64,
+    boss_materials: Vec<(Uuid, ItemStack)>,
+    boss_chest: Option<ChestKind>,
+    survivors: Vec<Uuid>,
+}
+
+impl MineProgress {
+    fn from_dungeon(progress: &mut DungeonProgress, tick: u64, exit: BlockPos) -> Self {
+        let quota = u32::from(wave_for_gate(progress.rank, progress.red).mob_count) * 3;
+        Self {
+            rank: progress.rank,
+            red: progress.red,
+            floor: progress.floor,
+            exit,
+            mined: 0,
+            quota,
+            started_tick: tick,
+            duration_ticks: MINE_DURATION_TICKS,
+            boss_materials: mem::take(&mut progress.boss_materials),
+            boss_chest: progress.boss_chest.take(),
+            survivors: mem::take(&mut progress.survivors),
+        }
+    }
+
+    fn remaining_ticks(&self, tick: u64) -> u64 {
+        self.duration_ticks
+            .saturating_sub(tick.saturating_sub(self.started_tick))
+    }
+
+    fn finished(&self, tick: u64) -> bool {
+        self.mined >= self.quota || tick.saturating_sub(self.started_tick) >= self.duration_ticks
+    }
 }
 
 struct DungeonProgress {
@@ -721,6 +799,7 @@ impl InstanceRun {
                 mobs
             }
             RunProgress::Penalty(progress) => mem::take(&mut progress.remaining_mobs),
+            RunProgress::Mine(_) => Vec::new(),
         }
     }
 
@@ -772,7 +851,7 @@ impl DungeonRuntime {
 
     /// Restores the durable gate registry after the main world has been loaded.
     pub fn restore_gate_registry(&mut self, snapshot: GateRegistrySnapshot) -> Result<(), String> {
-        self.gates.restore(snapshot)
+        self.gates.restore(snapshot, 0)
     }
 
     /// Starts an asynchronous write for changed gate metadata.
@@ -872,6 +951,7 @@ impl DungeonRuntime {
             match reason {
                 GateRetirementReason::Expired => announce_gate_expired(server, &gate),
                 GateRetirementReason::Consumed => announce_gate_consumed(server, &gate),
+                GateRetirementReason::Broken => announce_gate_broken(server, &gate),
             }
             if let Some(world) = server.worlds.get(&gate.world) {
                 self.queue_gate_cleanup(Arc::clone(world), gate);
@@ -910,8 +990,8 @@ impl DungeonRuntime {
         }
         self.find_penalty_entries(state, server);
         self.finish_entries(state, server, tick);
-
-        let mut actions = self.tick_runs(state, server, tick);
+        let mut actions = self.tick_gate_breaks(server, tick);
+        actions.extend(self.tick_runs(state, server, tick));
         actions.extend(self.return_strays(server));
         actions
     }
@@ -928,9 +1008,28 @@ impl DungeonRuntime {
             }
             match &run.progress {
                 RunProgress::Dungeon(progress) => Some(progress.rank),
+                RunProgress::Mine(progress) => Some(progress.rank),
                 RunProgress::Penalty(_) => None,
             }
         })
+    }
+
+    /// Records `amount` crystals mined in the mine run occupying `world` and `pos`.
+    ///
+    /// Returns `true` when the block was a mine crystal and its drops should be suppressed.
+    pub fn record_mine_crystal(&mut self, world: &World, pos: BlockPos, amount: u32) -> bool {
+        let Some(run) = self.runs.values_mut().find(|run| {
+            run.instance_world == world.key
+                && matches!(run.progress, RunProgress::Mine(_))
+                && run.region.contains(pos)
+        }) else {
+            return false;
+        };
+        let RunProgress::Mine(progress) = &mut run.progress else {
+            return false;
+        };
+        progress.mined += amount;
+        true
     }
 
     /// Marks an instance mob dead and opens the next combat room when needed.
@@ -948,6 +1047,7 @@ impl DungeonRuntime {
             let remaining = match &mut run.progress {
                 RunProgress::Dungeon(progress) => &mut progress.remaining_mobs,
                 RunProgress::Penalty(progress) => &mut progress.remaining_mobs,
+                RunProgress::Mine(_) => continue,
             };
             if let Some(index) = remaining.iter().position(|id| *id == entity_id) {
                 remaining.swap_remove(index);
@@ -972,6 +1072,7 @@ impl DungeonRuntime {
             match &run.progress {
                 RunProgress::Dungeon(progress) => progress.labels.get(&entity_id).cloned(),
                 RunProgress::Penalty(progress) => progress.labels.get(&entity_id).cloned(),
+                RunProgress::Mine(_) => None,
             }
         })
     }
@@ -990,6 +1091,7 @@ impl DungeonRuntime {
                 RunProgress::Penalty(progress) => {
                     progress.labels.contains_key(&first) && progress.labels.contains_key(&second)
                 }
+                RunProgress::Mine(_) => false,
             }
         })
     }
@@ -1100,7 +1202,7 @@ impl DungeonRuntime {
                     BossState::Alive(id) => Some(id),
                     _ => None,
                 },
-                RunProgress::Penalty(_) => None,
+                RunProgress::Penalty(_) | RunProgress::Mine(_) => None,
             }
         })
     }
@@ -1135,6 +1237,7 @@ impl DungeonRuntime {
             RunProgress::Penalty(_) => RunDeath::PenaltyFailed {
                 roll: rand::rng().random_range(0..5),
             },
+            RunProgress::Mine(_) => RunDeath::None,
         };
         if !run.members.is_empty() {
             log::debug!(
@@ -1242,7 +1345,85 @@ impl DungeonRuntime {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
-        let _ = self.gates.expire_unused_at(now);
+        for id in self.gates.unused_ids_at(now) {
+            self.gates.start_break(id);
+        }
+    }
+
+    fn gate_break_participants(server: &Server, gate: &Gate) -> Vec<Uuid> {
+        let center = DVec3::new(
+            f64::from(gate.entrance.x()),
+            f64::from(gate.entrance.y()),
+            f64::from(gate.entrance.z()),
+        );
+        server
+            .get_players()
+            .into_iter()
+            .filter(|player| {
+                player.get_world().key == gate.world
+                    && player.position().distance_squared(center)
+                        <= GATE_BREAK_PARTICIPATION_RADIUS.powi(2)
+                    && !player.is_dead_or_dying()
+            })
+            .map(|player| player.gameprofile.id())
+            .collect()
+    }
+
+    fn tick_gate_breaks(&mut self, server: &Arc<Server>, tick: u64) -> Vec<RunAction> {
+        let mut actions = Vec::new();
+        let mut cleared = Vec::new();
+        for break_state in self.gates.breaks_mut() {
+            if !break_state.announced {
+                break_state.announced = true;
+                announce_gate_break(server, &break_state.gate);
+            }
+            let Some(world) = server.worlds.get(&break_state.gate.world) else {
+                continue;
+            };
+            break_state
+                .remaining_mobs
+                .retain(|id| world.get_entity_by_id(*id).is_some());
+            if !break_state.remaining_mobs.is_empty() {
+                continue;
+            }
+            if break_state.wave > 0 {
+                let participants = Self::gate_break_participants(server, &break_state.gate);
+                actions.push(RunAction::CityDefenseWave {
+                    participants,
+                    rank: break_state.gate.rank,
+                });
+            }
+            if break_state.wave >= GATE_BREAK_WAVES {
+                cleared.push(break_state.gate.id);
+                continue;
+            }
+            break_state.wave += 1;
+            break_state.next_wave_tick = tick + GATE_BREAK_WAVE_INTERVAL_TICKS;
+            let wave = wave_for_gate(break_state.gate.rank, break_state.gate.red);
+            let theme = Theme::Crypt;
+            let count = wave.mob_count / 3;
+            for _ in 0..count {
+                if let Some(mob) = spawn_city_break_mob(
+                    world,
+                    break_state.gate.entrance,
+                    wave,
+                    break_state.gate.rank,
+                    theme,
+                ) {
+                    break_state.remaining_mobs.push(mob.id);
+                }
+            }
+        }
+        for id in cleared {
+            if let Some(gate) = self.gates.clear_break(id) {
+                log::info!(
+                    "sololeveling: gate break cleared in {} at {:?}",
+                    gate.world,
+                    gate.entrance
+                );
+            }
+        }
+        actions
     }
 
     fn queue_gate_cleanup(&mut self, world: Arc<World>, gate: Gate) {
@@ -1916,7 +2097,7 @@ impl DungeonRuntime {
             };
             let start = RunStart::Gate {
                 gate: gate.clone(),
-                layout: DungeonLayout::from_seed(rand::rng().random()),
+                layout: DungeonLayout::for_gate(rand::rng().random(), gate.red),
             };
             log::info!(
                 "sololeveling: hunter {} entered {}-rank gate {}",
@@ -2168,40 +2349,44 @@ impl DungeonRuntime {
             }
             return;
         }
-        let (progress, gate) = match start {
-            RunStart::Gate { gate, layout } => (
-                RunProgress::Dungeon(Box::new(DungeonProgress {
-                    rank: gate.rank,
-                    floor: gate.floor,
-                    red: gate.red,
-                    wave: gate
-                        .floor
-                        .map_or_else(|| wave_for_gate(gate.rank, gate.red), castle::wave),
-                    layout,
-                    combat_room: 0,
-                    remaining_mobs: Vec::new(),
-                    boss: BossState::Waiting,
-                    fight: None,
-                    exit: None,
-                    contributions: members
-                        .iter()
-                        .copied()
-                        .map(|member| (member, RaidContribution::default()))
-                        .collect(),
-                    boss_chest: None,
-                    survivors: Vec::new(),
-                    labels: FxHashMap::default(),
-                    wave_spawned: false,
-                    guarded_chambers: Vec::new(),
-                    extra_mobs: Vec::new(),
-                    skills: MobSkills::default(),
-                    pending_skills: Vec::new(),
-                    classes: FxHashMap::default(),
-                    boss_materials: Vec::new(),
-                    deaths: 0,
-                })),
-                Some(gate.id),
-            ),
+        let (progress, gate, locked) = match start {
+            RunStart::Gate { gate, layout } => {
+                let locked = gate.red;
+                (
+                    RunProgress::Dungeon(Box::new(DungeonProgress {
+                        rank: gate.rank,
+                        floor: gate.floor,
+                        red: gate.red,
+                        wave: gate
+                            .floor
+                            .map_or_else(|| wave_for_gate(gate.rank, gate.red), castle::wave),
+                        layout,
+                        combat_room: 0,
+                        remaining_mobs: Vec::new(),
+                        boss: BossState::Waiting,
+                        fight: None,
+                        exit: None,
+                        contributions: members
+                            .iter()
+                            .copied()
+                            .map(|member| (member, RaidContribution::default()))
+                            .collect(),
+                        boss_chest: None,
+                        survivors: Vec::new(),
+                        labels: FxHashMap::default(),
+                        wave_spawned: false,
+                        guarded_chambers: Vec::new(),
+                        extra_mobs: Vec::new(),
+                        skills: MobSkills::default(),
+                        pending_skills: Vec::new(),
+                        classes: FxHashMap::default(),
+                        boss_materials: Vec::new(),
+                        deaths: 0,
+                    })),
+                    Some(gate.id),
+                    locked,
+                )
+            }
             RunStart::Penalty => (
                 RunProgress::Penalty(PenaltyProgress {
                     next_wave_tick: tick + PENALTY_ZONE_WAVE_INTERVAL_TICKS,
@@ -2213,6 +2398,7 @@ impl DungeonRuntime {
                     pending_skills: Vec::new(),
                 }),
                 None,
+                false,
             ),
         };
         self.runs.insert(
@@ -2229,6 +2415,7 @@ impl DungeonRuntime {
                 gate,
                 placed: false,
                 finishing: false,
+                locked,
             },
         );
     }
@@ -2517,10 +2704,57 @@ impl DungeonRuntime {
             state.record_castle_clear(&climbers, floor);
         }
         progress.survivors = survivors;
-        Some(RunAction::ReturnPlayer {
+        Some(RunAction::StartMine)
+    }
+
+    fn tick_mine_run(
+        progress: &mut MineProgress,
+        context: &RunContext<'_>,
+        tick: u64,
+    ) -> Option<RunAction> {
+        let RunContext {
+            world: _,
+            player,
             uuid,
-            world: source_world.clone(),
-        })
+            source_world,
+            ..
+        } = context;
+        if progress.finished(tick) {
+            return Some(RunAction::ReturnPlayer {
+                uuid: *uuid,
+                world: (*source_world).clone(),
+            });
+        }
+        if opening_contains(progress.exit, player.position()) {
+            return Some(RunAction::ReturnPlayer {
+                uuid: *uuid,
+                world: (*source_world).clone(),
+            });
+        }
+        if tick.saturating_sub(progress.started_tick) % (20 * 60) == 0 {
+            player.send_message(
+                &TextComponent::plain(format!(
+                    "Шахта: добыто {}/{} кристаллов, осталось {} мин.",
+                    progress.mined,
+                    progress.quota,
+                    progress.remaining_ticks(tick) / 20 / 60
+                ))
+                .color(Color::Aqua),
+            );
+        }
+        None
+    }
+
+    fn mine_participants(world: &World, region: InstanceRegion, members: &[Uuid]) -> Vec<Uuid> {
+        members
+            .iter()
+            .filter(|member| {
+                world.players.get_by_uuid(*member).is_some_and(|player| {
+                    !player.is_dead_or_dying() && region.contains(BlockPos::from(player.position()))
+                })
+            })
+            .copied()
+            .collect()
     }
 
     #[expect(
@@ -2559,7 +2793,7 @@ impl DungeonRuntime {
                     RunProgress::Dungeon(progress) => {
                         Some(progress.layout.blueprint.theme.display_name())
                     }
-                    RunProgress::Penalty(_) => None,
+                    RunProgress::Penalty(_) | RunProgress::Mine(_) => None,
                 };
                 for member in &run.members {
                     if let Some(member) = players.get(member) {
@@ -2577,6 +2811,14 @@ impl DungeonRuntime {
                                 .color(Color::Red),
                             );
                         }
+                        if run.locked {
+                            member.send_message(
+                                &TextComponent::plain(
+                                    "Красные врата заперты. Выход откроется только после смерти босса.",
+                                )
+                                .color(Color::Red),
+                            );
+                        }
                     }
                 }
             }
@@ -2587,6 +2829,22 @@ impl DungeonRuntime {
                         actions.extend(members.iter().copied().map(RunAction::KillPlayer));
                     }
                     RunProgress::Penalty(_) => {
+                        actions.extend(members.iter().copied().map(|uuid| {
+                            RunAction::ReturnPlayer {
+                                uuid,
+                                world: source_world.clone(),
+                            }
+                        }));
+                    }
+                    RunProgress::Mine(ref progress) => {
+                        let Some(world) = server.worlds.get(&run.instance_world) else {
+                            continue;
+                        };
+                        actions.push(RunAction::CreditMine {
+                            participants: Self::mine_participants(world, run.region, &members),
+                            rank: progress.rank,
+                            mined: progress.mined,
+                        });
                         actions.extend(members.iter().copied().map(|uuid| {
                             RunAction::ReturnPlayer {
                                 uuid,
@@ -2613,15 +2871,36 @@ impl DungeonRuntime {
                     };
                     let action = Self::tick_dungeon_run(progress, &context, tick);
                     actions.extend(progress.pending_skills.drain(..).map(RunAction::MobSkill));
-                    self.pending_loot.append(&mut progress.boss_materials);
-                    if let Some(kind) = progress.boss_chest.take() {
-                        for survivor in progress.survivors.drain(..) {
-                            self.pending_loot.push((survivor, kind.stack()));
+                    let start_mine = matches!(action, Some(RunAction::StartMine));
+                    if !start_mine {
+                        self.pending_loot.append(&mut progress.boss_materials);
+                        if let Some(kind) = progress.boss_chest.take() {
+                            for survivor in progress.survivors.drain(..) {
+                                self.pending_loot.push((survivor, kind.stack()));
+                            }
                         }
                     }
                     if let Some(action) = action {
                         if matches!(action, RunAction::BossAbility(_)) {
                             actions.push(action);
+                            continue;
+                        }
+                        if matches!(action, RunAction::StartMine) {
+                            let exit = progress.exit.expect("exit opened before mine");
+                            run.progress =
+                                RunProgress::Mine(MineProgress::from_dungeon(progress, tick, exit));
+                            run.started_tick = tick;
+                            run.duration_ticks = MINE_DURATION_TICKS;
+                            for member in &run.members {
+                                if let Some(member) = players.get(member) {
+                                    member.send_message(
+                                        &TextComponent::plain(
+                                            "Босс повержен. Подземелье открыто как шахта — добудьте кристаллы.",
+                                        )
+                                        .color(Color::Gold),
+                                    );
+                                }
+                            }
                             continue;
                         }
                         run.finishing = true;
@@ -2631,6 +2910,51 @@ impl DungeonRuntime {
                                     RunAction::ReturnPlayer {
                                         uuid,
                                         world: world.clone(),
+                                    }
+                                }));
+                            }
+                            action => actions.push(action),
+                        }
+                    }
+                }
+                RunProgress::Mine(progress) => {
+                    let context = RunContext {
+                        state,
+                        started_tick: run.started_tick,
+                        world: &world,
+                        player,
+                        uuid,
+                        members: &run.members,
+                        region,
+                        source_world: &source_world,
+                    };
+                    let action = Self::tick_mine_run(progress, &context, tick);
+                    self.pending_loot.append(&mut progress.boss_materials);
+                    if let Some(kind) = progress.boss_chest.take() {
+                        for survivor in progress.survivors.drain(..) {
+                            self.pending_loot.push((survivor, kind.stack()));
+                        }
+                    }
+                    if let Some(action) = action {
+                        run.finishing = true;
+                        match action {
+                            RunAction::ReturnPlayer {
+                                world: target_world,
+                                ..
+                            } => {
+                                if let Some(world) = server.worlds.get(&target_world) {
+                                    actions.push(RunAction::CreditMine {
+                                        participants: Self::mine_participants(
+                                            world, run.region, &members,
+                                        ),
+                                        rank: progress.rank,
+                                        mined: progress.mined,
+                                    });
+                                }
+                                actions.extend(members.into_iter().map(|uuid| {
+                                    RunAction::ReturnPlayer {
+                                        uuid,
+                                        world: target_world.clone(),
                                     }
                                 }));
                             }
@@ -2742,6 +3066,30 @@ pub fn apply_action(state: &SoloLevelingState, server: &Arc<Server>, action: &Ru
         }
         RunAction::PenaltyLoss { uuid, roll } => {
             let _ = state.apply_penalty_failure(*uuid, *roll);
+        }
+        RunAction::StartMine => {}
+        RunAction::CityDefenseWave { participants, rank } => {
+            let reward = GATE_BREAK_WAVE_REWARD_BASE * rank_multiplier(*rank);
+            for uuid in participants {
+                state.credit_won(*uuid, reward);
+                state.record_organization_event(vec![*uuid], Event::CityDefense(*rank));
+                state.notify(*uuid, &format!("Волна прорыва отбита: +{reward} Won."));
+            }
+        }
+        RunAction::CreditMine {
+            participants,
+            rank,
+            mined,
+        } => {
+            if participants.is_empty() {
+                return;
+            }
+            let total = u64::from(*mined) * crystal::sale_price(*rank);
+            let share = total / participants.len() as u64;
+            for uuid in participants {
+                state.credit_won(*uuid, share);
+                state.notify(*uuid, &format!("Шахтная смена завершена: +{share} Won."));
+            }
         }
     }
 }
@@ -2860,6 +3208,30 @@ fn announce_gate_consumed(server: &Server, gate: &Gate) {
     );
 }
 
+fn announce_gate_broken(server: &Server, gate: &Gate) {
+    notify_near_gate(
+        server,
+        gate,
+        TextComponent::plain(format!(
+            "Врата ранга {} зачищены: рамка разобрана.",
+            gate.rank.name()
+        ))
+        .color(Color::Green),
+    );
+}
+
+fn announce_gate_break(server: &Server, gate: &Gate) {
+    notify_near_gate(
+        server,
+        gate,
+        TextComponent::plain(format!(
+            "Прорыв! Врата ранга {} открылись: монстры идут в город.",
+            gate.rank.name()
+        ))
+        .color(Color::Red),
+    );
+}
+
 fn notify_near_gate(server: &Server, gate: &Gate, message: TextComponent) {
     let center = DVec3::new(
         f64::from(gate.entrance.x()),
@@ -2882,8 +3254,14 @@ mod tests {
 
     use uuid::Uuid;
 
-    use super::{DungeonRuntime, GeneratingEntry};
+    use rustc_hash::FxHashMap;
+    use steel_utils::BlockPos;
+
+    use super::{BossState, DungeonProgress, DungeonRuntime, GeneratingEntry, MineProgress};
     use crate::dungeon::InstanceRegion;
+    use crate::dungeon::skills::MobSkills;
+    use crate::dungeon::{DungeonLayout, wave_for_gate};
+    use crate::rank::HunterRank;
 
     #[test]
     fn generating_entry_marks_players_busy() {
@@ -2923,5 +3301,40 @@ mod tests {
         assert!(runtime.cancel_generating_entry(leader));
         assert!(cancelled.load(Ordering::Relaxed));
         assert!(!runtime.cancel_generating_entry(Uuid::new_v4()));
+    }
+
+    #[test]
+    fn mine_progress_derives_quota_from_wave_size() {
+        let mut dungeon = DungeonProgress {
+            rank: HunterRank::D,
+            deaths: 0,
+            floor: None,
+            red: false,
+            wave: wave_for_gate(HunterRank::D, false),
+            layout: DungeonLayout::from_seed(1),
+            combat_room: 0,
+            remaining_mobs: Vec::new(),
+            boss: BossState::Waiting,
+            fight: None,
+            exit: Some(BlockPos::new(10, 64, 10)),
+            contributions: FxHashMap::default(),
+            boss_chest: None,
+            survivors: Vec::new(),
+            labels: FxHashMap::default(),
+            wave_spawned: false,
+            guarded_chambers: Vec::new(),
+            extra_mobs: Vec::new(),
+            skills: MobSkills::default(),
+            pending_skills: Vec::new(),
+            classes: FxHashMap::default(),
+            boss_materials: Vec::new(),
+        };
+        let exit = BlockPos::new(12, 64, 12);
+        let mine = MineProgress::from_dungeon(&mut dungeon, 100, exit);
+        assert_eq!(mine.rank, HunterRank::D);
+        assert_eq!(mine.mined, 0);
+        assert_eq!(mine.quota, u32::from(dungeon.wave.mob_count) * 3);
+        assert!(dungeon.boss_materials.is_empty());
+        assert_eq!(mine.exit, exit);
     }
 }
