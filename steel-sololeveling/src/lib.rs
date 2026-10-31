@@ -69,6 +69,7 @@ pub mod shop_menu;
 pub mod sidebar;
 pub mod sound;
 pub mod spell;
+pub mod spell_fx;
 pub mod spell_menu;
 pub mod starter;
 pub mod starter_menu;

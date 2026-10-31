@@ -23,6 +23,7 @@ use crate::behavior::item::{ItemBehavior, ItemUseAnimation};
 use crate::entity::Entity;
 use crate::entity::LivingEntity;
 use crate::entity::entities::ArrowEntity;
+use crate::player::Player;
 use crate::player::player_inventory::PlayerInventory;
 use crate::world::World;
 
@@ -93,9 +94,12 @@ impl ItemBehavior for CrossbowItem {
         if let Some(player) = user.as_player() {
             let mut inventory = player.inventory.lock();
             if let Some(ammo) = find_and_consume_arrow(
+                world,
+                player,
                 &mut inventory,
                 InteractionHand::MainHand,
                 player.has_infinite_materials(),
+                stack,
             ) {
                 let template = ItemStackTemplate::from_stack(&ammo)
                     .unwrap_or(ItemStackTemplate::new(ammo.item()));
@@ -171,15 +175,21 @@ fn charge_ticks(stack: &ItemStack) -> i32 {
 }
 
 /// Finds an arrow in the player's inventory, optionally consuming it.
+///
+/// Vanilla crossbows always consume ammunition outside creative mode;
+/// gameplay layers may keep it through [`crate::gameplay_hooks::GameplayHooks::keep_projectile_ammo`].
 fn find_and_consume_arrow(
+    world: &Arc<World>,
+    player: &Player,
     inventory: &mut PlayerInventory,
     hand: InteractionHand,
     has_infinite_materials: bool,
+    crossbow: &ItemStack,
 ) -> Option<ItemStack> {
     let hand_stack = inventory.get_item_in_hand(hand);
     if !hand_stack.is_empty() && is_arrow(hand_stack) {
         let arrow = hand_stack.copy_with_count(1);
-        if !has_infinite_materials {
+        if !should_keep_arrow(world, player, crossbow, &arrow, has_infinite_materials) {
             inventory.shrink_item_in_hand(hand, 1);
         }
         return Some(arrow);
@@ -190,10 +200,25 @@ fn find_and_consume_arrow(
         .iter()
         .position(|stack| !stack.is_empty() && is_arrow(stack))?;
     let arrow = inventory.get_items()[slot].copy_with_count(1);
-    if !has_infinite_materials {
+    if !should_keep_arrow(world, player, crossbow, &arrow, has_infinite_materials) {
         inventory.with_item_mut(slot, ItemStack::shrink_one);
     }
     Some(arrow)
+}
+
+fn should_keep_arrow(
+    world: &World,
+    player: &Player,
+    crossbow: &ItemStack,
+    arrow: &ItemStack,
+    has_infinite_materials: bool,
+) -> bool {
+    if has_infinite_materials {
+        return true;
+    }
+    world
+        .gameplay_hooks
+        .keep_projectile_ammo(player, crossbow, arrow)
 }
 
 fn is_arrow(stack: &ItemStack) -> bool {

@@ -20,6 +20,7 @@ use crate::entity::Entity;
 use crate::entity::LivingEntity;
 use crate::entity::entities::ArrowEntity;
 use crate::entity::projectile::AbstractArrow;
+use crate::player::Player;
 use crate::player::player_inventory::PlayerInventory;
 use crate::world::World;
 
@@ -73,6 +74,8 @@ impl ItemBehavior for BowItem {
             let has_infinite = player.has_infinite_materials();
             let mut inventory = player.inventory.lock();
             if let Some(arrow) = find_and_consume_arrow(
+                world,
+                player,
                 &mut inventory,
                 InteractionHand::MainHand,
                 has_infinite,
@@ -128,6 +131,8 @@ fn bow_power(ticks_used: i32) -> f64 {
 
 /// Finds an arrow in the player's inventory, optionally consuming it.
 fn find_and_consume_arrow(
+    world: &Arc<World>,
+    player: &Player,
     inventory: &mut PlayerInventory,
     hand: InteractionHand,
     has_infinite_materials: bool,
@@ -136,7 +141,7 @@ fn find_and_consume_arrow(
     let hand_stack = inventory.get_item_in_hand(hand);
     if !hand_stack.is_empty() && is_arrow(hand_stack) {
         let arrow = hand_stack.copy_with_count(1);
-        if !should_keep_arrow(bow, &arrow, has_infinite_materials) {
+        if !should_keep_arrow(world, player, bow, &arrow, has_infinite_materials) {
             inventory.shrink_item_in_hand(hand, 1);
         }
         return Some(arrow);
@@ -147,7 +152,7 @@ fn find_and_consume_arrow(
         .iter()
         .position(|stack| !stack.is_empty() && is_arrow(stack))?;
     let arrow = inventory.get_items()[slot].copy_with_count(1);
-    if !should_keep_arrow(bow, &arrow, has_infinite_materials) {
+    if !should_keep_arrow(world, player, bow, &arrow, has_infinite_materials) {
         inventory.with_item_mut(slot, ItemStack::shrink_one);
     }
     Some(arrow)
@@ -159,10 +164,26 @@ fn is_arrow(stack: &ItemStack) -> bool {
         || stack.is(&vanilla_items::TIPPED_ARROW)
 }
 
-fn should_keep_arrow(bow: &ItemStack, arrow: &ItemStack, has_infinite_materials: bool) -> bool {
+/// Vanilla ammo-keeping (`ProjectileWeaponItem`): creative mode or a bow with
+/// INFINITY firing a plain arrow. Gameplay layers may keep further ammunition
+/// through [`crate::gameplay_hooks::GameplayHooks::keep_projectile_ammo`], which only runs when
+/// vanilla would have consumed the arrow.
+fn should_keep_arrow(
+    world: &World,
+    player: &Player,
+    bow: &ItemStack,
+    arrow: &ItemStack,
+    has_infinite_materials: bool,
+) -> bool {
     if has_infinite_materials {
         return true;
     }
-    bow.get_enchantment_level(&vanilla_enchantments::INFINITY.key) > 0
+    if bow.get_enchantment_level(&vanilla_enchantments::INFINITY.key) > 0
         && arrow.is(&vanilla_items::ARROW)
+    {
+        return true;
+    }
+    world
+        .gameplay_hooks
+        .keep_projectile_ammo(player, bow, arrow)
 }

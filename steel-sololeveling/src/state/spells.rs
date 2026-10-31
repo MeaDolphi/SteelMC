@@ -24,7 +24,6 @@ use steel_protocol::packets::game::CSetExperience;
 use steel_registry::blocks::block_state_ext::BlockStateExt as _;
 use steel_registry::item_stack::ItemStack;
 use steel_registry::mob_effect::MobEffectRef;
-use steel_registry::particle_type::{ParticleData, ParticleType};
 use steel_registry::{vanilla_damage_types, vanilla_mob_effects, vanilla_particle_types};
 use steel_utils::geometry::WorldAabb;
 use steel_utils::types::InteractionHand;
@@ -45,7 +44,9 @@ use crate::item::grimoire;
 use crate::item::serial;
 use crate::quest_book::Goal;
 use crate::rank::HunterRank;
+use crate::sound::play_at;
 use crate::spell::{self, School, SpellError, SpellGear, SpellId};
+use crate::spell_fx as fx;
 
 /// Reach of aimed spells, in blocks.
 const AIM_RANGE: f64 = 24.0;
@@ -190,31 +191,6 @@ fn enemies_near(world: &World, center: DVec3, radius: f64) -> Vec<SharedEntity> 
     })
 }
 
-fn particles(world: &World, kind: &'static ParticleType, at: DVec3, count: i32, spread: f64) {
-    world.send_particles(
-        ParticleData::simple(kind),
-        at,
-        count,
-        DVec3::new(spread, spread, spread),
-        0.0,
-    );
-}
-
-/// Draws a line of particles from `from` to `to`.
-fn beam(world: &World, kind: &'static ParticleType, from: DVec3, to: DVec3) {
-    let length = from.distance(to);
-    let steps = (length / 0.75).ceil().max(1.0) as u32;
-    for step in 0..=steps {
-        particles(
-            world,
-            kind,
-            from.lerp(to, f64::from(step) / f64::from(steps)),
-            1,
-            0.0,
-        );
-    }
-}
-
 fn afflict(entity: &SharedEntity, effect: MobEffectRef, ticks: i32, amplifier: i32) {
     if let Some(living) = entity.as_living_entity() {
         living.add_mob_effect(MobEffectInstance::with_duration(effect, ticks, amplifier));
@@ -330,12 +306,13 @@ impl Caster<'_> {
     fn for_allies(&self, effect: impl Fn(&Arc<Player>)) {
         for ally in self.allies(PARTY_RADIUS) {
             effect(&ally);
-            particles(
+            fx::burst(
                 &self.world,
                 &vanilla_particle_types::HAPPY_VILLAGER,
                 ally.position() + DVec3::Y,
                 8,
                 0.4,
+                0.0,
             );
         }
     }
@@ -586,14 +563,15 @@ impl SoloLevelingState {
         let Some(world) = server.worlds.get(&meteor.world) else {
             return;
         };
-        particles(
+        fx::explosion(world, meteor.center);
+        fx::burst(
             world,
-            &vanilla_particle_types::EXPLOSION_EMITTER,
+            &vanilla_particle_types::LAVA,
             meteor.center,
-            1,
-            0.0,
+            24,
+            1.2,
+            0.1,
         );
-        particles(world, &vanilla_particle_types::LAVA, meteor.center, 30, 2.5);
         let cause: SharedEntity = Arc::<Player>::clone(&owner);
         let source =
             DamageSource::environment(&vanilla_damage_types::MAGIC).with_causing_entity(cause);
@@ -626,7 +604,14 @@ impl SoloLevelingState {
             let members = self
                 .party_of(owner)
                 .map_or_else(|| vec![owner], |party| party.members().to_vec());
-            particles(world, &vanilla_particle_types::END_ROD, center, 16, 3.0);
+            fx::burst(
+                world,
+                &vanilla_particle_types::END_ROD,
+                center,
+                16,
+                3.0,
+                0.0,
+            );
             let mut healed = 0.0;
             for member in members {
                 let Some(ally) = world.players.get_by_uuid(&member) else {
@@ -785,44 +770,51 @@ impl SoloLevelingState {
         let scale = caster.scale;
         match spell {
             SpellId::MagicArrow => {
+                fx::cast(world, spell, caster.player.position());
                 let shot = caster.aim(AIM_RANGE, false);
-                beam(
+                fx::beam(
                     world,
                     &vanilla_particle_types::END_ROD,
                     caster.eye,
                     shot.end,
                 );
                 if let Some(target) = shot.hits.first() {
+                    fx::impact(world, spell, target.position() + DVec3::Y);
                     caster.hurt(target, 6.0);
                 }
             }
             SpellId::Fireball => {
+                fx::cast(world, spell, caster.player.position());
                 let shot = caster.aim(AIM_RANGE, false);
                 let center = shot.hits.first().map_or(shot.end, |hit| hit.position());
-                beam(world, &vanilla_particle_types::FLAME, caster.eye, center);
-                particles(world, &vanilla_particle_types::EXPLOSION, center, 3, 1.0);
+                fx::trail(world, &fx::theme(spell), caster.eye, center);
+                fx::explosion(world, center);
+                fx::burst(world, &vanilla_particle_types::LAVA, center, 10, 0.5, 0.1);
                 for target in enemies_near(world, center, 3.0) {
                     caster.hurt(&target, 8.0);
                     target.set_remaining_fire_ticks(80 * caster.burn);
                 }
             }
             SpellId::IceSpear => {
+                fx::cast(world, spell, caster.player.position());
                 let shot = caster.aim(AIM_RANGE, false);
-                beam(
+                fx::beam(
                     world,
                     &vanilla_particle_types::SNOWFLAKE,
                     caster.eye,
                     shot.end,
                 );
                 if let Some(target) = shot.hits.first() {
+                    fx::impact(world, spell, target.position() + DVec3::Y);
                     caster.hurt(target, 10.0);
                     afflict(target, vanilla_mob_effects::SLOWNESS, 60, 2);
                 }
             }
             SpellId::ChainLightning => {
+                fx::cast(world, spell, caster.player.position());
                 let shot = caster.aim(AIM_RANGE, false);
                 let Some(first) = shot.hits.first().cloned() else {
-                    beam(
+                    fx::beam(
                         world,
                         &vanilla_particle_types::ELECTRIC_SPARK,
                         caster.eye,
@@ -834,13 +826,21 @@ impl SoloLevelingState {
                 let mut from = caster.eye;
                 let mut current = first;
                 let mut damage = 8.0;
+                play_at(
+                    world,
+                    fx::theme(spell).impact_sound,
+                    current.position(),
+                    0.6,
+                    1.0,
+                );
                 for _ in 0..4 {
-                    beam(
+                    fx::beam(
                         world,
                         &vanilla_particle_types::ELECTRIC_SPARK,
                         from,
                         current.position() + DVec3::Y,
                     );
+                    fx::flash(world, current.position() + DVec3::Y);
                     caster.hurt(&current, damage);
                     damage *= 0.75;
                     from = current.position() + DVec3::Y;
@@ -861,6 +861,7 @@ impl SoloLevelingState {
                 }
             }
             SpellId::ManaStorm => {
+                fx::cast(world, spell, caster.player.position());
                 self.storms.lock().push(Storm::new(
                     caster.player.gameprofile.id(),
                     world.key.clone(),
@@ -871,9 +872,20 @@ impl SoloLevelingState {
                 ));
             }
             SpellId::Meteor => {
+                fx::cast(world, spell, caster.player.position());
                 let shot = caster.aim(LONG_RANGE, false);
                 let center = shot.hits.first().map_or(shot.end, |hit| hit.position());
-                particles(world, &vanilla_particle_types::FLAME, center, 40, 2.5);
+                // A burning marker column shows where the sky will fall.
+                fx::spiral(
+                    world,
+                    &vanilla_particle_types::FLAME,
+                    center,
+                    0.6,
+                    6.0,
+                    1.0,
+                    20,
+                );
+                fx::ring(world, &vanilla_particle_types::LAVA, center, 2.0, 18);
                 self.spell_runtime.lock().meteors.push(Meteor {
                     owner: caster.player.gameprofile.id(),
                     world: world.key.clone(),
@@ -884,37 +896,39 @@ impl SoloLevelingState {
                 });
             }
             SpellId::VoidLance => {
+                fx::cast(world, spell, caster.player.position());
                 let shot = caster.aim(LONG_RANGE, true);
-                beam(world, &vanilla_particle_types::PORTAL, caster.eye, shot.end);
+                fx::beam(world, &vanilla_particle_types::PORTAL, caster.eye, shot.end);
                 for target in &shot.hits {
+                    fx::impact(world, spell, target.position() + DVec3::Y);
                     caster.hurt(target, 30.0);
                 }
             }
             SpellId::MonarchsWrath => {
+                fx::cast(world, spell, caster.player.position());
+                let feet = caster.player.position();
+                fx::spiral(
+                    world,
+                    &vanilla_particle_types::SOUL_FIRE_FLAME,
+                    feet,
+                    1.0,
+                    3.0,
+                    1.0,
+                    30,
+                );
                 self.with_session_mut(caster.player.gameprofile.id(), |session| {
                     session.magic.wrath_until = now + 10_000;
                 });
-                particles(
-                    world,
-                    &vanilla_particle_types::SOUL_FIRE_FLAME,
-                    caster.player.position() + DVec3::Y,
-                    40,
-                    0.8,
-                );
             }
             SpellId::LesserHeal => {
+                fx::cast(world, spell, caster.player.position());
                 let target = caster.ally_in_sight();
                 let healed = self.heal_hunter(&target, 6.0 * scale * caster.healing);
                 self.record_healing(caster.player.gameprofile.id(), healed);
-                particles(
-                    world,
-                    &vanilla_particle_types::HEART,
-                    target.position() + DVec3::Y * 2.0,
-                    5,
-                    0.4,
-                );
+                fx::impact(world, spell, target.position() + DVec3::Y * 2.0);
             }
             SpellId::Restoration => {
+                fx::cast(world, spell, caster.player.position());
                 // World queries run before the spell lock is taken.
                 let allies = caster.allies(PARTY_RADIUS);
                 let mut runtime = self.spell_runtime.lock();
@@ -930,20 +944,24 @@ impl SoloLevelingState {
                 drop(runtime);
                 caster.for_allies(|_| {});
             }
-            SpellId::Cleanse => caster.for_allies(|ally| {
-                for effect in [
-                    vanilla_mob_effects::POISON,
-                    vanilla_mob_effects::WITHER,
-                    vanilla_mob_effects::SLOWNESS,
-                    vanilla_mob_effects::WEAKNESS,
-                    vanilla_mob_effects::BLINDNESS,
-                    vanilla_mob_effects::DARKNESS,
-                ] {
-                    ally.remove_mob_effect(effect);
-                }
-                ally.set_remaining_fire_ticks(0);
-            }),
+            SpellId::Cleanse => {
+                fx::cast(world, spell, caster.player.position());
+                caster.for_allies(|ally| {
+                    for effect in [
+                        vanilla_mob_effects::POISON,
+                        vanilla_mob_effects::WITHER,
+                        vanilla_mob_effects::SLOWNESS,
+                        vanilla_mob_effects::WEAKNESS,
+                        vanilla_mob_effects::BLINDNESS,
+                        vanilla_mob_effects::DARKNESS,
+                    ] {
+                        ally.remove_mob_effect(effect);
+                    }
+                    ally.set_remaining_fire_ticks(0);
+                });
+            }
             SpellId::Barrier => {
+                fx::cast(world, spell, caster.player.position());
                 // Absorption gives 4 health per level.
                 let amplifier = (((8.0 * scale + caster.barrier) / 4.0).round() as i32 - 1).max(0);
                 caster.for_allies(|ally| {
@@ -955,43 +973,55 @@ impl SoloLevelingState {
                 });
             }
             SpellId::GreaterHeal => {
+                fx::cast(world, spell, caster.player.position());
                 let target = caster.ally_in_sight();
                 let healed = self.heal_hunter(
                     &target,
                     target.get_max_health() * (0.5 * scale * caster.healing).min(1.0),
                 );
                 self.record_healing(caster.player.gameprofile.id(), healed);
-                particles(
-                    world,
-                    &vanilla_particle_types::HEART,
-                    target.position() + DVec3::Y * 2.0,
-                    12,
-                    0.6,
-                );
+                fx::impact(world, spell, target.position() + DVec3::Y * 2.0);
             }
             SpellId::Sanctuary => {
+                fx::cast(world, spell, caster.player.position());
+                let center = caster.player.position();
+                fx::ring(
+                    world,
+                    &vanilla_particle_types::HAPPY_VILLAGER,
+                    DVec3::new(center.x, center.y + 0.1, center.z),
+                    6.0,
+                    40,
+                );
                 self.spell_runtime.lock().sanctuaries.push(Sanctuary {
                     owner: caster.player.gameprofile.id(),
                     world: world.key.clone(),
-                    center: caster.player.position(),
+                    center,
                     heal: scale * caster.healing,
                     until: now + 10_000,
                     next_pulse: now,
                 });
             }
-            SpellId::LastStand => caster.for_allies(|ally| {
-                self.with_session_mut(ally.gameprofile.id(), |session| {
-                    session.magic.last_stand_until = now + 6_000;
+            SpellId::LastStand => {
+                fx::cast(world, spell, caster.player.position());
+                caster.for_allies(|ally| {
+                    self.with_session_mut(ally.gameprofile.id(), |session| {
+                        session.magic.last_stand_until = now + 6_000;
+                    });
                 });
-            }),
+            }
             SpellId::Repulse => {
+                fx::cast(world, spell, caster.player.position());
                 let center = caster.player.position();
-                particles(
+                let mut look = caster.look;
+                look.y = 0.0;
+                fx::cone(
                     world,
                     &vanilla_particle_types::CLOUD,
                     center + DVec3::Y,
-                    30,
-                    2.5,
+                    look,
+                    5.0,
+                    30.0,
+                    28,
                 );
                 for target in enemies_near(world, center, 5.0) {
                     if let Some(living) = target.as_living_entity() {
@@ -1000,14 +1030,28 @@ impl SoloLevelingState {
                     }
                 }
             }
-            SpellId::Haste => caster.for_allies(|ally| {
-                ally.add_mob_effect(MobEffectInstance::with_duration(
-                    vanilla_mob_effects::SPEED,
-                    200,
-                    1,
-                ));
-            }),
+            SpellId::Haste => {
+                fx::cast(world, spell, caster.player.position());
+                let feet = caster.player.position();
+                fx::spiral(
+                    world,
+                    &vanilla_particle_types::SWEEP_ATTACK,
+                    feet,
+                    0.8,
+                    2.5,
+                    2.0,
+                    20,
+                );
+                caster.for_allies(|ally| {
+                    ally.add_mob_effect(MobEffectInstance::with_duration(
+                        vanilla_mob_effects::SPEED,
+                        200,
+                        1,
+                    ));
+                });
+            }
             SpellId::Shackles => {
+                fx::cast(world, spell, caster.player.position());
                 let shot = caster.aim(AIM_RANGE, false);
                 let target = shot.hits.first().ok_or("Оковы: нет цели в прицеле.")?;
                 let boss = self.is_boss(world, target.id());
@@ -1017,27 +1061,33 @@ impl SoloLevelingState {
                     if boss { 20 } else { 60 },
                     6,
                 );
-                beam(
+                fx::beam(
                     world,
                     &vanilla_particle_types::ENCHANT,
                     caster.eye,
                     target.position() + DVec3::Y,
                 );
+                fx::impact(world, spell, target.position() + DVec3::Y);
             }
-            SpellId::BlessingOfStrength => caster.for_allies(|ally| {
-                self.with_session_mut(ally.gameprofile.id(), |session| {
-                    session.magic.blessed_until = now + 30_000;
-                });
-            }),
-            SpellId::Weaken => {
-                let center = caster.player.position();
-                particles(
+            SpellId::BlessingOfStrength => {
+                fx::cast(world, spell, caster.player.position());
+                fx::burst(
                     world,
-                    &vanilla_particle_types::WITCH,
-                    center + DVec3::Y,
-                    30,
-                    3.0,
+                    &vanilla_particle_types::CRIT,
+                    caster.player.position() + DVec3::Y,
+                    16,
+                    0.6,
+                    0.1,
                 );
+                caster.for_allies(|ally| {
+                    self.with_session_mut(ally.gameprofile.id(), |session| {
+                        session.magic.blessed_until = now + 30_000;
+                    });
+                });
+            }
+            SpellId::Weaken => {
+                fx::cast(world, spell, caster.player.position());
+                let center = caster.player.position();
                 let targets = enemies_near(world, center, 6.0);
                 let mut runtime = self.spell_runtime.lock();
                 for target in targets {
@@ -1045,9 +1095,27 @@ impl SoloLevelingState {
                 }
             }
             SpellId::GravityWell => {
+                fx::cast(world, spell, caster.player.position());
                 let shot = caster.aim(AIM_RANGE, false);
                 let center = shot.hits.first().map_or(shot.end, |hit| hit.position());
-                particles(world, &vanilla_particle_types::PORTAL, center, 60, 3.0);
+                fx::spiral(
+                    world,
+                    &vanilla_particle_types::REVERSE_PORTAL,
+                    center,
+                    2.0,
+                    3.0,
+                    2.0,
+                    30,
+                );
+                fx::burst(
+                    world,
+                    &vanilla_particle_types::PORTAL,
+                    center,
+                    20,
+                    0.6,
+                    0.05,
+                );
+                play_at(world, fx::theme(spell).impact_sound, center, 0.8, 0.8);
                 for target in enemies_near(world, center, 8.0) {
                     if let Some(living) = target.as_living_entity() {
                         let outward = target.position() - center;
@@ -1056,14 +1124,26 @@ impl SoloLevelingState {
                     afflict(&target, vanilla_mob_effects::SLOWNESS, 80, 1);
                 }
             }
-            SpellId::NightVision => caster.for_allies(|ally| {
-                ally.add_mob_effect(MobEffectInstance::with_duration(
-                    vanilla_mob_effects::NIGHT_VISION,
-                    3_600,
-                    0,
-                ));
-            }),
+            SpellId::NightVision => {
+                fx::cast(world, spell, caster.player.position());
+                let feet = caster.player.position();
+                fx::ring(
+                    world,
+                    &vanilla_particle_types::NOTE,
+                    feet + DVec3::Y * 2.0,
+                    0.8,
+                    12,
+                );
+                caster.for_allies(|ally| {
+                    ally.add_mob_effect(MobEffectInstance::with_duration(
+                        vanilla_mob_effects::NIGHT_VISION,
+                        3_600,
+                        0,
+                    ));
+                });
+            }
             SpellId::Blink => {
+                fx::cast(world, spell, caster.player.position());
                 let player = caster.player;
                 let start = player.position();
                 let direction = caster.look.normalize_or_zero();
@@ -1083,23 +1163,42 @@ impl SoloLevelingState {
                 player
                     .teleport(destination, yaw, pitch)
                     .map_err(|_| "Скачок не удался.")?;
-                particles(
+                fx::burst(
                     world,
-                    &vanilla_particle_types::PORTAL,
+                    &vanilla_particle_types::REVERSE_PORTAL,
                     start + DVec3::Y,
-                    30,
-                    0.5,
+                    24,
+                    0.4,
+                    0.05,
                 );
-                particles(
+                fx::burst(
                     world,
                     &vanilla_particle_types::PORTAL,
                     destination + DVec3::Y,
-                    30,
-                    0.5,
+                    24,
+                    0.4,
+                    0.05,
                 );
+                play_at(world, fx::theme(spell).impact_sound, destination, 1.0, 1.1);
             }
             SpellId::Detection => {
+                fx::cast(world, spell, caster.player.position());
                 let center = caster.player.position();
+                // Two expanding sonar rings mark the sweep radius.
+                fx::ring(
+                    world,
+                    &vanilla_particle_types::END_ROD,
+                    center + DVec3::Y * 0.5,
+                    4.0,
+                    24,
+                );
+                fx::ring(
+                    world,
+                    &vanilla_particle_types::END_ROD,
+                    center + DVec3::Y * 0.5,
+                    8.0,
+                    32,
+                );
                 let found = enemies_near(world, center, 32.0);
                 for target in &found {
                     afflict(target, vanilla_mob_effects::GLOWING, 300, 0);
@@ -1116,6 +1215,7 @@ impl SoloLevelingState {
                 tell(caster.player, &report, Color::Aqua);
             }
             SpellId::Meditation => {
+                fx::cast(world, spell, caster.player.position());
                 self.with_session_mut(caster.player.gameprofile.id(), |session| {
                     session.magic.meditation = Some((now, caster.player.position()));
                 });
@@ -1126,16 +1226,12 @@ impl SoloLevelingState {
                 );
             }
             SpellId::ManaShield => {
+                fx::cast(world, spell, caster.player.position());
+                let feet = caster.player.position();
+                fx::ring_dust(world, fx::theme(spell).tint, feet + DVec3::Y, 1.4, 24);
                 self.with_session_mut(caster.player.gameprofile.id(), |session| {
                     session.magic.mana_shield_until = now + 10_000;
                 });
-                particles(
-                    world,
-                    &vanilla_particle_types::ENCHANT,
-                    caster.player.position() + DVec3::Y,
-                    40,
-                    0.8,
-                );
             }
         }
         let _ = rank;

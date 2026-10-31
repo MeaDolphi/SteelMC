@@ -47,7 +47,9 @@ use super::{
     BUBBLE_COLUMN_INSIDE_UP_ACCELERATION,
 };
 
-pub use abstract_arrow::{AbstractArrow, AbstractArrowBase};
+pub use abstract_arrow::{
+    AbstractArrow, AbstractArrowBase, PICKUP_ALLOWED, PICKUP_CREATIVE_ONLY, PICKUP_DISALLOWED,
+};
 pub use throwable::ThrowableProjectile;
 pub use throwable_item::ThrowableItemProjectile;
 pub use thrown_potion::{

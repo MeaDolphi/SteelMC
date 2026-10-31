@@ -18,7 +18,7 @@ use steel_core::server::Server;
 use steel_core::world::World;
 use steel_registry::blocks::block_state_ext::BlockStateExt;
 use steel_registry::item_stack::ItemStack;
-use steel_registry::{vanilla_blocks, vanilla_entities, vanilla_game_rules};
+use steel_registry::{vanilla_blocks, vanilla_entities, vanilla_game_rules, vanilla_items};
 use steel_utils::BlockPos;
 use steel_utils::types::{BlockStateId, InteractionHand};
 use text_components::format::Color;
@@ -463,6 +463,15 @@ impl GameplayHooks for SoloLevelingHooks {
         item::binding::may_retrieve(stack, player.gameprofile.id())
     }
 
+    fn keep_projectile_ammo(
+        &self,
+        _player: &Player,
+        _weapon: &ItemStack,
+        ammo: &ItemStack,
+    ) -> bool {
+        keeps_projectile_ammo(ammo)
+    }
+
     fn on_player_interact_entity(
         &self,
         player: &Arc<Player>,
@@ -785,6 +794,12 @@ fn is_shadow_tank(candidate: &dyn LivingEntity) -> bool {
         .is_some_and(|mob| mob.allied_owner().is_some() && mob.is_allied_tank())
 }
 
+/// Solo Leveling ammunition rule: ordinary arrows are free for their owner,
+/// while special ammunition (spectral, tipped) is still consumed.
+fn keeps_projectile_ammo(ammo: &ItemStack) -> bool {
+    ammo.is(&vanilla_items::ARROW)
+}
+
 /// Returns the elite-shadow source and rank for an island boss kill.
 fn island_boss_source(kill: &island::IslandKill) -> Option<(BossSource, HunterRank)> {
     match kill {
@@ -904,14 +919,31 @@ fn announce_quest(state: &SoloLevelingState, player: &Player, update: QuestUpdat
 mod tests {
     use super::{
         allows_city_mutation, allows_instance_mutation, allows_player_damage, is_shadow_tank,
+        keeps_projectile_ammo,
     };
     use glam::DVec3;
     use std::sync::Weak;
     use steel_core::entity::Entity as _;
     use steel_core::entity::entities::ZombieEntity;
     use steel_core::gameplay_hooks::BlockMutationCause;
-    use steel_registry::{init_vanilla_registry, vanilla_entities};
+    use steel_registry::item_stack::ItemStack;
+    use steel_registry::{init_vanilla_registry, vanilla_entities, vanilla_items};
     use uuid::Uuid;
+
+    #[test]
+    fn ordinary_arrows_are_kept_but_special_ammunition_is_consumed() {
+        init_vanilla_registry();
+
+        assert!(keeps_projectile_ammo(&ItemStack::new(
+            &vanilla_items::ARROW
+        )));
+        assert!(!keeps_projectile_ammo(&ItemStack::new(
+            &vanilla_items::SPECTRAL_ARROW
+        )));
+        assert!(!keeps_projectile_ammo(&ItemStack::new(
+            &vanilla_items::TIPPED_ARROW
+        )));
+    }
 
     #[test]
     fn dungeon_guard_is_not_a_taunt_target_but_a_tank_shadow_is() {

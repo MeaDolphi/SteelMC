@@ -6,6 +6,7 @@ mod eye_of_ender;
 mod firework_rocket;
 mod fishing_hook;
 mod snowball;
+mod spectral_arrow;
 mod splash_potion;
 mod thrown_egg;
 
@@ -15,5 +16,6 @@ pub use eye_of_ender::EyeOfEnderEntity;
 pub use firework_rocket::FireworkRocketEntity;
 pub use fishing_hook::{FishingHookEntity, FishingHookState};
 pub use snowball::SnowballEntity;
+pub use spectral_arrow::SpectralArrowEntity;
 pub use splash_potion::SplashPotionEntity;
 pub use thrown_egg::ThrownEggEntity;

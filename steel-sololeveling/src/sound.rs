@@ -4,9 +4,18 @@
 //! pack simply hears nothing. The ids here must match
 //! `resourcepack/tools/build.py`.
 
+use glam::DVec3;
 use steel_core::player::Player;
+use steel_core::world::World;
+use steel_protocol::packets::game::SoundSource;
+use steel_registry::sound_event::SoundEventRef;
 
 use crate::identifier::from_sololeveling;
+
+/// Plays a vanilla sound event at an exact position for everyone nearby.
+pub fn play_at(world: &World, sound: SoundEventRef, at: DVec3, volume: f32, pitch: f32) {
+    world.play_sound_at(sound, SoundSource::Players, at, volume, pitch, None);
+}
 
 /// One System sound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

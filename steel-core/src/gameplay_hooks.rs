@@ -288,6 +288,21 @@ pub trait GameplayHooks: Send + Sync {
         true
     }
 
+    /// Called when a player fires a bow or crossbow, after the vanilla ammo
+    /// consumption rules (creative `hasInfiniteMaterials`, bow INFINITY with
+    /// plain arrows) already allowed keeping the ammunition.
+    ///
+    /// Returning `true` keeps `ammo` in the player's inventory instead of
+    /// consuming it; the default preserves vanilla consumption.
+    fn keep_projectile_ammo(
+        &self,
+        _player: &Player,
+        _weapon: &ItemStack,
+        _ammo: &ItemStack,
+    ) -> bool {
+        false
+    }
+
     /// Called when a player dies, after vanilla death handling has run.
     ///
     /// Non-player deaths have no reachable [`Server`] handle at the vanilla

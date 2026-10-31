@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use glam::DVec3;
+use simdnbt::ToNbtTag as _;
 use simdnbt::borrow::NbtCompound as BorrowedNbtCompoundView;
 use simdnbt::owned::NbtCompound;
 use steel_registry::blocks::block_state_ext::BlockStateExt as _;
@@ -20,8 +21,11 @@ use steel_utils::locks::SyncMutex;
 
 use crate::behavior::BLOCK_BEHAVIORS;
 use crate::entity::damage::DamageSource;
-use crate::entity::{Projectile, ProjectileHit, RemovalReason, SharedEntity};
+use crate::entity::{LivingEntity, Projectile, ProjectileHit, RemovalReason, SharedEntity};
+use crate::inventory::container::Container as _;
+use crate::player::Player;
 use crate::world::ClipHitResult;
+use crate::world::World;
 
 /// Default gravity for arrows (`AbstractArrow.getDefaultGravity`).
 const DEFAULT_GRAVITY: f64 = 0.05;
@@ -33,6 +37,13 @@ const WATER_INERTIA: f64 = 0.6;
 const IN_GROUND_LIFETIME: i32 = 1200;
 /// Initial `shakeTime` value on block impact.
 const DEFAULT_SHAKE_TIME: i32 = 7;
+
+/// Vanilla `AbstractArrow.Pickup.DISALLOWED`: the arrow can never be picked up.
+pub const PICKUP_DISALLOWED: i8 = 0;
+/// Vanilla `AbstractArrow.Pickup.ALLOWED`: any player may pick the arrow up.
+pub const PICKUP_ALLOWED: i8 = 1;
+/// Vanilla `AbstractArrow.Pickup.CREATIVE_ONLY`: only creative players may pick the arrow up.
+pub const PICKUP_CREATIVE_ONLY: i8 = 2;
 
 /// Runtime fields shared by vanilla `AbstractArrow` subclasses.
 struct AbstractArrowState {
@@ -46,6 +57,7 @@ struct AbstractArrowState {
     pickup: i8,
     sound_event: &'static SoundEvent,
     weapon_item: Option<ItemStack>,
+    pickup_item: Option<ItemStack>,
 }
 
 impl AbstractArrowState {
@@ -61,6 +73,7 @@ impl AbstractArrowState {
             pickup: 0,
             sound_event: &sound_events::ENTITY_ARROW_HIT,
             weapon_item: None,
+            pickup_item: None,
         }
     }
 }
@@ -167,6 +180,15 @@ impl AbstractArrowBase {
 
     pub fn set_weapon_item(&self, value: Option<ItemStack>) {
         self.state.lock().weapon_item = value;
+    }
+
+    #[must_use]
+    pub fn pickup_item(&self) -> Option<ItemStack> {
+        self.state.lock().pickup_item.clone()
+    }
+
+    pub fn set_pickup_item(&self, value: Option<ItemStack>) {
+        self.state.lock().pickup_item = value;
     }
 }
 
@@ -276,6 +298,49 @@ pub trait AbstractArrow: Projectile {
         self.abstract_arrow_base().set_weapon_item(value);
     }
 
+    /// Vanilla `AbstractArrow.getDefaultPickupItem`: the stack returned when no
+    /// pickup stack was stored.
+    fn default_pickup_item(&self) -> ItemStack;
+
+    /// Vanilla `AbstractArrow.getPickupItem`.
+    fn pickup_item(&self) -> ItemStack {
+        self.abstract_arrow_base()
+            .pickup_item()
+            .unwrap_or_else(|| self.default_pickup_item())
+    }
+
+    /// Vanilla `AbstractArrow.setPickupItemStack`; an empty stack resets to the
+    /// default pickup item.
+    fn set_pickup_item(&self, item: ItemStack) {
+        let stored = if item.is_empty() { None } else { Some(item) };
+        self.abstract_arrow_base().set_pickup_item(stored);
+    }
+
+    /// Vanilla `AbstractArrow.tryPickup`.
+    fn try_pickup(&self, player: &Arc<Player>) -> bool {
+        match self.pickup() {
+            PICKUP_ALLOWED => {
+                let mut item = self.pickup_item();
+                player.inventory.lock().add(&mut item)
+            }
+            PICKUP_CREATIVE_ONLY => player.has_infinite_materials(),
+            _ => false,
+        }
+    }
+
+    /// Vanilla `AbstractArrow.playerTouch` for a stuck arrow.
+    fn abstract_arrow_player_touch(self: Arc<Self>, player: &Arc<Player>)
+    where
+        Self: Sized,
+    {
+        if !self.in_ground() || self.shake_time() > 0 {
+            return;
+        }
+        if self.try_pickup(player) {
+            self.set_removed(RemovalReason::Discarded);
+        }
+    }
+
     /// Vanilla `AbstractArrow.tick` movement and hit handling.
     fn abstract_arrow_tick(self: Arc<Self>) {
         if self.in_ground() {
@@ -355,6 +420,9 @@ pub trait AbstractArrow: Projectile {
         }
 
         if entity.hurt(&world, &source, damage as f32) {
+            if let Some(living) = entity.as_living_entity() {
+                self.do_post_hurt_effects(&world, living);
+            }
             // Vanilla applies knockback and enchantment effects here.
             if self.is_crit() {
                 // VANILLA CLIENT-LOCAL: critical hit particles.
@@ -363,6 +431,11 @@ pub trait AbstractArrow: Projectile {
 
         self.set_removed(RemovalReason::Discarded);
     }
+
+    /// Vanilla `AbstractArrow.doPostHurtEffects`, overridden by arrow
+    /// subclasses to apply on-hit effects (tipped-arrow potion contents,
+    /// spectral-arrow glowing).
+    fn do_post_hurt_effects(self: &Arc<Self>, _world: &World, _entity: &dyn LivingEntity) {}
 
     /// Vanilla `AbstractArrow.onHitBlock`.
     fn on_hit_block(self: Arc<Self>, hit: &ClipHitResult)
@@ -410,6 +483,7 @@ pub trait AbstractArrow: Projectile {
         nbt.insert("life", self.life());
         nbt.insert("PierceLevel", self.pierce_level());
         nbt.insert("pickup", self.pickup());
+        nbt.insert("item", self.pickup_item().to_nbt_tag());
     }
 
     /// Loads vanilla `AbstractArrow` fields from NBT.
@@ -421,5 +495,10 @@ pub trait AbstractArrow: Projectile {
         self.set_life(i32::from(nbt.short("life").unwrap_or(0)));
         self.set_pierce_level(nbt.byte("PierceLevel").unwrap_or(0));
         self.set_pickup(nbt.byte("pickup").unwrap_or(0));
+        if let Some(item_tag) = nbt.compound("item")
+            && let Some(item) = ItemStack::from_borrowed_compound(&item_tag)
+        {
+            self.set_pickup_item(item);
+        }
     }
 }
