@@ -267,7 +267,9 @@ impl ArtifactId {
     }
 
     /// Returns the System equipment slot this artifact goes into, or `None`
-    /// for weapons and tools, which are held instead.
+    /// for held weapons and tools. Mage staffs fit the gear's weapon slot:
+    /// their spellcasting bonuses apply from gear, leaving both hands free
+    /// for the grimoire.
     #[must_use]
     pub const fn gear_kind(self) -> Option<GearKind> {
         match self {
@@ -301,11 +303,11 @@ impl ArtifactId {
             | Self::ProspectorsNecklace
             | Self::ShadowGuardAmulet
             | Self::SmilingGodsIdol => Some(GearKind::Amulet),
+            Self::AshStaff | Self::KargalgansStaff | Self::DemonKingsStaff => {
+                Some(GearKind::Weapon)
+            }
             Self::KasakasVenomFang
             | Self::RaikansFang
-            | Self::KargalgansStaff
-            | Self::AshStaff
-            | Self::DemonKingsStaff
             | Self::KamishsWrath
             | Self::KnightsKiller
             | Self::BarukasDagger
@@ -400,6 +402,7 @@ impl ArtifactId {
             Some(GearKind::Feet) => ItemKind::Boots,
             Some(GearKind::Gloves) => ItemKind::Gloves,
             Some(GearKind::Ring | GearKind::Amulet) => ItemKind::Jewelry,
+            Some(GearKind::Weapon) => ItemKind::Staff,
             None => match self {
                 Self::CrystalPickaxe => ItemKind::Pickaxe,
                 _ if self.spell_gear().is_some() => ItemKind::Staff,
@@ -1596,6 +1599,7 @@ pub fn enchanted_stack(
             TextComponent::plain(format!("Требуется сила: {}", id.required_strength()))
                 .color(Color::Yellow)
         }))
+        .chain([slot_line(id)])
         .chain([
             TextComponent::plain(format!("Редкость: {}", artifact.rarity.display_name()))
                 .color(artifact.rarity.color()),
@@ -1836,6 +1840,22 @@ fn describe_amount(modifier: &Modifier) -> String {
     }
 }
 
+/// Returns the lore line telling where an artifact is worn.
+fn slot_line(id: ArtifactId) -> TextComponent {
+    match id.gear_kind() {
+        Some(GearKind::Weapon) => {
+            TextComponent::plain("Экипируется в Снаряжении Системы: Оружие или носится в руке")
+                .color(Color::DarkPurple)
+        }
+        Some(kind) => TextComponent::plain(format!(
+            "Экипируется в Снаряжении Системы: {}",
+            kind.display_name()
+        ))
+        .color(Color::DarkPurple),
+        None => TextComponent::plain("Носится в руке").color(Color::Gray),
+    }
+}
+
 /// Returns a one-line Russian summary of an ability for tooltips and messages.
 #[must_use]
 pub fn describe_ability(ability: Ability) -> String {
@@ -1925,6 +1945,7 @@ pub fn describe_ability(ability: Ability) -> String {
 mod tests {
     use super::*;
     use steel_registry::data_components::vanilla_components::LORE;
+    use steel_registry::init_vanilla_registry;
 
     #[test]
     fn only_epic_and_above_artifacts_have_abilities() {
@@ -1999,6 +2020,29 @@ mod tests {
             let stack = stack(id, None);
             assert_eq!(of(&stack), Some(id));
             assert_eq!(rarity_of(&stack), Some(id.artifact().rarity));
+        }
+    }
+
+    #[test]
+    fn stacks_describe_where_they_are_worn() {
+        init_vanilla_registry();
+        for id in ALL {
+            let stack = stack(id, None);
+            let lore = format!("{:?}", stack.get(LORE));
+            match id.gear_kind() {
+                Some(GearKind::Weapon) => assert!(
+                    lore.contains("Экипируется в Снаряжении Системы: Оружие"),
+                    "{id:?}: {lore}"
+                ),
+                Some(kind) => {
+                    assert!(
+                        lore.contains("Экипируется в Снаряжении Системы"),
+                        "{id:?}: {lore}"
+                    );
+                    assert!(lore.contains(kind.display_name()), "{id:?}: {lore}");
+                }
+                None => assert!(lore.contains("Носится в руке"), "{id:?}: {lore}"),
+            }
         }
     }
 }

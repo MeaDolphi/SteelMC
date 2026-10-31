@@ -449,6 +449,14 @@ fn play(caster: &SharedEntity, sound: SoundEventRef, pitch: f32) {
 }
 
 #[cfg(test)]
+impl MobSkills {
+    /// Returns whether `id` is tracked as a caster with an ability.
+    pub(crate) fn has_caster(&self, id: i32) -> bool {
+        self.casters.contains_key(&id)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use glam::DVec3;
 

@@ -47,11 +47,12 @@ use super::tower;
 use super::{
     DUNGEON_TIME_LIMIT_TICKS, DungeonLayout, DungeonWave, Footprint,
     GATE_BREAK_PARTICIPATION_RADIUS, GATE_BREAK_WAVE_INTERVAL_TICKS, GATE_BREAK_WAVE_REWARD_BASE,
-    GATE_BREAK_WAVES, GATE_SPAWN_INTERVAL_TICKS, GATES_PER_SPAWN_CYCLE, Gate, GateRegistry,
-    GateRegistryChanges, GateRegistrySnapshot, GateRegistryWrite, GateRetirementReason,
-    INSTANCE_WORLD_PATH, InstanceRegion, InstanceRegionAllocator, LegacyGateCleanup,
-    MINE_DURATION_TICKS, PENALTY_ZONE_DURATION_TICKS, PENALTY_ZONE_WAVE_INTERVAL_TICKS,
-    TICKS_PER_SECOND, penalty_wave_size, wave_for_gate, wave_for_rank,
+    GATE_BREAK_WAVES, GATE_SPAWN_INTERVAL_TICKS, GATES_PER_SPAWN_CYCLE, Gate, GateBreak,
+    GateRegistry, GateRegistryChanges, GateRegistrySnapshot, GateRegistryWrite,
+    GateRetirementReason, INSTANCE_WORLD_PATH, InstanceRegion, InstanceRegionAllocator,
+    LegacyGateCleanup, MINE_DURATION_TICKS, PENALTY_ZONE_DURATION_TICKS,
+    PENALTY_ZONE_WAVE_INTERVAL_TICKS, TICKS_PER_SECOND, penalty_wave_size, wave_for_gate,
+    wave_for_rank,
 };
 use crate::castle;
 use crate::city;
@@ -207,6 +208,9 @@ pub struct DungeonRuntime {
     gate_refusals: FxHashMap<Uuid, u64>,
     /// Test-gate ids and the hunter who requested them.
     pending_test_gate_players: FxHashMap<u64, Uuid>,
+    /// Abilities and nameplates of gate-break mobs, by gate id; break mobs
+    /// live in the city world, outside instance runs.
+    gate_break_tracks: FxHashMap<u64, GateBreakTrack>,
 }
 
 impl Debug for DungeonRuntime {
@@ -250,6 +254,7 @@ impl Debug for DungeonRuntime {
                 &self.pending_test_gate_players.len(),
             )
             .field("gate_refusals", &self.gate_refusals.len())
+            .field("gate_break_tracks", &self.gate_break_tracks.len())
             .finish()
     }
 }
@@ -756,6 +761,38 @@ impl DungeonProgress {
     }
 }
 
+/// Live mobs of one breaking gate: their abilities, nameplates and classes.
+///
+/// Break mobs spawn in the city world, not inside an instance run, so the run
+/// bookkeeping cannot adopt them; this mirrors the slice of
+/// [`DungeonProgress`] a gate break needs.
+#[derive(Debug, Default)]
+struct GateBreakTrack {
+    /// World the break's mobs live in, to match nameplates by world.
+    world: Identifier,
+    /// Blast damage of a bomber's explosion, from the gate rank's wave.
+    blast_power: f32,
+    /// Abilities of the break's shamans, bombers and broodmothers.
+    skills: MobSkills,
+    /// Nameplates by entity id, refreshed after damage.
+    labels: FxHashMap<i32, MobLabel>,
+    /// Classes by entity id.
+    classes: FxHashMap<i32, MobClass>,
+    /// Abilities to apply once the runtime lock is released.
+    pending_skills: Vec<SkillAction>,
+}
+
+impl GateBreakTrack {
+    /// Starts tracking `spawned` wave mobs: class abilities and nameplates.
+    fn adopt(&mut self, spawned: Vec<SpawnedMob>, tick: u64) {
+        for mob in spawned {
+            self.skills.track(mob.id, mob.class, tick);
+            self.labels.insert(mob.id, mob.label);
+            self.classes.insert(mob.id, mob.class);
+        }
+    }
+}
+
 /// Returns whether `position` stands inside the bounding rectangle of `room`.
 fn room_contains(region: InstanceRegion, room: &Room, position: DVec3) -> bool {
     let dx = position.x - region.spawn.x.floor();
@@ -1064,10 +1101,14 @@ impl DungeonRuntime {
         }
     }
 
-    /// Returns the nameplate of a dungeon mob or boss in `world`.
+    /// Returns the nameplate of a dungeon, penalty or gate-break mob in `world`.
+    ///
+    /// Gate-break mobs live in the city world outside instance runs, so their
+    /// plates are kept in `gate_break_tracks`; both kinds are returned here
+    /// so a hurt mob's plate is refreshed through the same hook path.
     #[must_use]
     pub fn mob_label(&self, world: &World, entity_id: i32) -> Option<MobLabel> {
-        self.runs.values().find_map(|run| {
+        let run_label = self.runs.values().find_map(|run| {
             if run.instance_world != world.key {
                 return None;
             }
@@ -1076,6 +1117,14 @@ impl DungeonRuntime {
                 RunProgress::Penalty(progress) => progress.labels.get(&entity_id).cloned(),
                 RunProgress::Mine(_) => None,
             }
+        });
+        run_label.or_else(|| {
+            self.gate_break_tracks.values().find_map(|track| {
+                (track.world == world.key)
+                    .then(|| track.labels.get(&entity_id))
+                    .flatten()
+                    .cloned()
+            })
         })
     }
 
@@ -1371,6 +1420,27 @@ impl DungeonRuntime {
             .collect()
     }
 
+    /// Positions of the hunters a breaking gate's mobs react to and whose
+    /// plates they show for: the same defenders the wave reward pays.
+    fn gate_break_hunter_positions(server: &Server, gate: &Gate) -> Vec<DVec3> {
+        let center = DVec3::new(
+            f64::from(gate.entrance.x()),
+            f64::from(gate.entrance.y()),
+            f64::from(gate.entrance.z()),
+        );
+        server
+            .get_players()
+            .into_iter()
+            .filter(|player| {
+                player.get_world().key == gate.world
+                    && player.position().distance_squared(center)
+                        <= GATE_BREAK_PARTICIPATION_RADIUS.powi(2)
+                    && !player.is_dead_or_dying()
+            })
+            .map(|player| player.position())
+            .collect()
+    }
+
     fn tick_gate_breaks(&mut self, server: &Arc<Server>, tick: u64) -> Vec<RunAction> {
         let mut actions = Vec::new();
         let mut cleared = Vec::new();
@@ -1385,6 +1455,14 @@ impl DungeonRuntime {
             break_state
                 .remaining_mobs
                 .retain(|id| world.get_entity_by_id(*id).is_some());
+            Self::tick_gate_break_mobs(
+                &mut self.gate_break_tracks,
+                server,
+                break_state,
+                world,
+                tick,
+                &mut actions,
+            );
             if !break_state.remaining_mobs.is_empty() {
                 continue;
             }
@@ -1404,6 +1482,7 @@ impl DungeonRuntime {
             let wave = wave_for_gate(break_state.gate.rank, break_state.gate.red);
             let theme = Theme::Crypt;
             let count = wave.mob_count / 3;
+            let mut spawned = Vec::new();
             for _ in 0..count {
                 if let Some(mob) = spawn_city_break_mob(
                     world,
@@ -1413,11 +1492,35 @@ impl DungeonRuntime {
                     theme,
                 ) {
                     break_state.remaining_mobs.push(mob.id);
+                    spawned.push(mob);
                 }
             }
+            // The same blast power a dungeon wave of this rank casts with.
+            let blast_power = (5.0 + 5.0 * wave.damage_multiplier) as f32;
+            let track = self
+                .gate_break_tracks
+                .entry(break_state.gate.id)
+                .or_insert_with(|| GateBreakTrack {
+                    world: break_state.gate.world.clone(),
+                    ..GateBreakTrack::default()
+                });
+            track.blast_power = blast_power;
+            track.adopt(spawned, tick);
         }
         for id in cleared {
             if let Some(gate) = self.gates.clear_break(id) {
+                // Larvae hatched by a broodmother outlive the wave they came
+                // with; discard them like a finished run discards its extras.
+                if let (Some(track), Some(world)) = (
+                    self.gate_break_tracks.remove(&id),
+                    server.worlds.get(&gate.world),
+                ) {
+                    for entity_id in track.labels.keys() {
+                        if let Some(entity) = world.get_entity_by_id(*entity_id) {
+                            entity.set_removed(RemovalReason::Discarded);
+                        }
+                    }
+                }
                 log::info!(
                     "sololeveling: gate break cleared in {} at {:?}",
                     gate.world,
@@ -1426,6 +1529,45 @@ impl DungeonRuntime {
             }
         }
         actions
+    }
+
+    /// Runs the abilities and nameplate visibility of one break's live mobs.
+    ///
+    /// Class abilities mirror a dungeon wave: the mobs were spawned by the
+    /// same [`spawn_city_break_mob`], only their skill state lives here
+    /// instead of in a run's [`DungeonProgress`].
+    fn tick_gate_break_mobs(
+        tracks: &mut FxHashMap<u64, GateBreakTrack>,
+        server: &Server,
+        break_state: &mut GateBreak,
+        world: &Arc<World>,
+        tick: u64,
+        actions: &mut Vec<RunAction>,
+    ) {
+        let Some(track) = tracks.get_mut(&break_state.gate.id) else {
+            return;
+        };
+        let hunters = Self::gate_break_hunter_positions(server, &break_state.gate);
+        let power = track.blast_power;
+        let out = track
+            .skills
+            .tick(world, &hunters, &break_state.remaining_mobs, power, tick);
+        track.pending_skills.extend(out.actions);
+        actions.extend(track.pending_skills.drain(..).map(RunAction::MobSkill));
+        for (id, label) in out.hatched {
+            // Like a dungeon run's larvae: fought for loot, but a wave is
+            // cleared by its spawned mobs, not by the brood it hatched.
+            track.labels.insert(id, label);
+        }
+        if tick.is_multiple_of(10) {
+            track
+                .labels
+                .retain(|id, _| world.get_entity_by_id(*id).is_some());
+            track
+                .classes
+                .retain(|id, _| world.get_entity_by_id(*id).is_some());
+            refresh_plates(world, &hunters, track.labels.keys());
+        }
     }
 
     fn queue_gate_cleanup(&mut self, world: Arc<World>, gate: Gate) {
@@ -3262,11 +3404,47 @@ mod tests {
     use rustc_hash::FxHashMap;
     use steel_utils::BlockPos;
 
-    use super::{BossState, DungeonProgress, DungeonRuntime, GeneratingEntry, MineProgress};
+    use super::{
+        BossState, DungeonProgress, DungeonRuntime, GateBreakTrack, GeneratingEntry, MineProgress,
+    };
     use crate::dungeon::InstanceRegion;
+    use crate::dungeon::generator::Theme;
+    use crate::dungeon::mobs::{MobClass, MobLabel};
     use crate::dungeon::skills::MobSkills;
     use crate::dungeon::{DungeonLayout, wave_for_gate};
     use crate::rank::HunterRank;
+
+    #[test]
+    fn gate_break_track_gives_mobs_their_class_skills_and_plates() {
+        let mut track = GateBreakTrack::default();
+        let shaman = break_mob(1, MobClass::Shaman);
+        let bomber = break_mob(2, MobClass::Bomber);
+        let warrior = break_mob(3, MobClass::Warrior);
+
+        track.adopt(vec![shaman, bomber, warrior], 0);
+
+        // Only classes with an ability are casters, like inside a dungeon.
+        assert!(track.skills.has_caster(1));
+        assert!(track.skills.has_caster(2));
+        assert!(!track.skills.has_caster(3));
+        assert_eq!(track.classes.get(&1), Some(&MobClass::Shaman));
+
+        // The plate carries name, class and a health line that is rewritten
+        // from the mob's current health after each hit.
+        let label = track.labels.get(&1).expect("shaman plate");
+        let plate = format!("{:?}", label.text());
+        assert!(plate.contains("Упырь [Шаман]"), "{plate}");
+        let health = format!("{:?}", label.health_text(21.2, 30.0));
+        assert!(health.contains("❤ 22/30"), "{health}");
+    }
+
+    fn break_mob(id: i32, class: MobClass) -> super::SpawnedMob {
+        super::SpawnedMob {
+            id,
+            class,
+            label: MobLabel::mob(Theme::Crypt, class),
+        }
+    }
 
     #[test]
     fn generating_entry_marks_players_busy() {

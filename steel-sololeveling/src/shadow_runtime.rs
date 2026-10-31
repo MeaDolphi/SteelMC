@@ -1,6 +1,7 @@
 //! Runtime-only summoning, ownership, and progression for retained shadows.
 
 use std::fmt;
+use std::sync::Arc;
 
 use glam::DVec3;
 use rustc_hash::FxHashMap;
@@ -8,6 +9,7 @@ use steel_core::entity::{
     AlliedMode, Entity, LivingEntity, RemovalReason, SharedEntity, spawn_mob,
 };
 use steel_core::player::Player;
+use steel_core::server::Server;
 use steel_core::world::World;
 use steel_registry::particle_type::ParticleData;
 use steel_registry::{REGISTRY, RegistryExt, vanilla_attributes, vanilla_particle_types};
@@ -15,8 +17,10 @@ use steel_utils::{BlockPos, Identifier};
 use text_components::Modifier as _;
 use text_components::TextComponent;
 use text_components::format::Color;
+use text_components::resolving::NoResolutor;
 use uuid::Uuid;
 
+use crate::dungeon::boss::{BossAbilityAction, BossFight, boss_for_gate};
 use crate::dungeon::mobs::{MobLabel, MobRarity, clear_health_line};
 use crate::dungeon::skills::{BROOD_COOLDOWN_TICKS, hatch_shadow};
 use crate::item::nbt;
@@ -54,6 +58,16 @@ struct ActiveEliteShadow {
     entity: SharedEntity,
 }
 
+/// Live archetype-ability fight of one summoned elite shadow body.
+struct EliteFight {
+    owner: Uuid,
+    entity: SharedEntity,
+    fight: BossFight,
+}
+
+/// How far from its body an elite shadow picks ability targets.
+const ELITE_TARGET_RANGE: f64 = 24.0;
+
 #[derive(Default)]
 struct ShadowBrood {
     ready_tick: Option<u64>,
@@ -82,6 +96,8 @@ impl ShadowBrood {
 pub struct ShadowRuntime {
     active: FxHashMap<Uuid, ActiveShadow>,
     elite_active: FxHashMap<Uuid, ActiveEliteShadow>,
+    /// Ability fights of summoned elite bodies, keyed by body entity uuid.
+    elite_fights: FxHashMap<Uuid, EliteFight>,
     /// Army-wide orders per owner; runtime-only, so a restart resets to follow.
     modes: FxHashMap<Uuid, AlliedMode>,
 }
@@ -92,6 +108,7 @@ impl fmt::Debug for ShadowRuntime {
             .debug_struct("ShadowRuntime")
             .field("active_count", &self.active.len())
             .field("elite_active_count", &self.elite_active.len())
+            .field("elite_fight_count", &self.elite_fights.len())
             .field("modes", &self.modes)
             .finish()
     }
@@ -124,6 +141,43 @@ impl ShadowRuntime {
                     .as_living_entity()
                     .is_some_and(|living| !living.is_dead_or_dying())
         });
+    }
+
+    /// Advances the archetype ability fights of summoned elite shadows.
+    ///
+    /// Returns the ability actions to resolve after the runtime lock is
+    /// released; each cast is announced to the shadow's owner. The dungeon
+    /// fight engine targets the uuid list it is given, so the unallied mobs
+    /// near the shadow stand in for the hunter party it was written for.
+    pub fn tick_elite_fights(&mut self, server: &Arc<Server>, tick: u64) -> Vec<BossAbilityAction> {
+        self.elite_fights.retain(|_, entry| {
+            !entry.entity.is_removed()
+                && entry
+                    .entity
+                    .as_living_entity()
+                    .is_some_and(|living| !living.is_dead_or_dying())
+        });
+        if self.elite_fights.is_empty() {
+            return Vec::new();
+        }
+        let players = server.get_players();
+        let mut actions = Vec::new();
+        for entry in self.elite_fights.values_mut() {
+            let Some(owner) = players
+                .iter()
+                .find(|player| player.gameprofile.id() == entry.owner)
+            else {
+                continue;
+            };
+            let Some(world) = entry.entity.level() else {
+                continue;
+            };
+            let targets = elite_targets(&world, entry.entity.as_ref());
+            if let Some(action) = entry.fight.tick(&world, owner, &targets, tick) {
+                actions.push(action);
+            }
+        }
+        actions
     }
 
     /// Retains a nearby mob the player just killed, with an immediate soul effect.
@@ -278,11 +332,13 @@ impl ShadowRuntime {
             return None;
         }
         let origin = capture_origin(entity, None);
-        let elite = EliteShadow::new(entity.entity_type().key.clone(), origin, source);
-        session
+        let mut elite = EliteShadow::new(entity.entity_type().key.clone(), origin, source);
+        elite.scale = capture_scale(entity);
+        let elite = session
             .elite_shadows
-            .add(elite.clone())
-            .expect("slot was checked above");
+            .add(elite)
+            .expect("slot was checked above")
+            .clone();
         Some(elite)
     }
 
@@ -355,6 +411,7 @@ impl ShadowRuntime {
             .collect();
         for id in &ids {
             if let Some(active) = self.elite_active.remove(id) {
+                self.elite_fights.remove(id);
                 active.entity.set_removed(RemovalReason::Discarded);
             }
         }
@@ -379,6 +436,7 @@ impl ShadowRuntime {
             return false;
         };
         if let Some(active) = self.elite_active.remove(&entity_id) {
+            self.elite_fights.remove(&entity_id);
             active.entity.set_removed(RemovalReason::Discarded);
         }
         true
@@ -503,6 +561,7 @@ impl ShadowRuntime {
             return Some((active.owner, active.shadow_id, maximum_health));
         }
         let active = self.elite_active.remove(&entity_uuid)?;
+        self.elite_fights.remove(&entity_uuid);
         let maximum_health = active
             .entity
             .as_living_entity()
@@ -660,6 +719,15 @@ impl ShadowRuntime {
         entity.set_custom_name_visible(true);
         apply_origin(entity.as_ref(), &shadow.origin);
         apply_elite_stats(entity.as_ref(), shadow);
+        if shadow.scale > 0 {
+            if let Some(living) = entity.as_living_entity() {
+                living.set_base_attribute_value(
+                    vanilla_attributes::SCALE,
+                    ShadowOrigin::unscale(shadow.scale),
+                );
+            }
+            entity.refresh_dimensions();
+        }
         world.send_particles(
             ParticleData::simple(&vanilla_particle_types::SOUL_FIRE_FLAME),
             entity.position(),
@@ -667,6 +735,16 @@ impl ShadowRuntime {
             DVec3::new(0.4, 0.7, 0.4),
             0.03,
         );
+        if let Some(fight) = elite_fight(shadow, entity.id()) {
+            self.elite_fights.insert(
+                entity.uuid(),
+                EliteFight {
+                    owner: hunter.gameprofile.id(),
+                    entity: Arc::clone(&entity),
+                    fight,
+                },
+            );
+        }
         self.elite_active.insert(
             entity.uuid(),
             ActiveEliteShadow {
@@ -731,10 +809,67 @@ impl ShadowBrood {
     }
 }
 
+/// Mobs an elite shadow may spend its abilities on: the unallied hostiles
+/// near its body. Players and every hunter's summons are excluded.
+fn elite_targets(world: &World, shadow: &dyn Entity) -> Vec<Uuid> {
+    let area = shadow.bounding_box().inflate(ELITE_TARGET_RANGE);
+    world
+        .get_entities_in_aabb_matching(&area, |entity| {
+            entity.uuid() != shadow.uuid()
+                && entity.as_player().is_none()
+                && entity
+                    .as_living_entity()
+                    .is_some_and(|living| !living.is_dead_or_dying())
+                && entity
+                    .as_mob()
+                    .is_some_and(|mob| mob.allied_owner().is_none())
+        })
+        .into_iter()
+        .map(|entity| entity.uuid())
+        .collect()
+}
+
+/// Starts the archetype ability fight of a freshly summoned elite body.
+///
+/// Ability damage scales from the elite body's inherited attack with the elite
+/// damage multiplier; the fight opens without a boss bar or an intro delay.
+fn elite_fight(shadow: &EliteShadow, boss_id: i32) -> Option<BossFight> {
+    let kind = shadow.source.boss_kind()?;
+    let rank = shadow.source.ability_rank();
+    let mut template = boss_for_gate(kind, rank, false);
+    if template.abilities.is_empty() {
+        return None;
+    }
+    template.power =
+        ShadowOrigin::unscale(shadow.origin.attack_damage) * ELITE_SHADOW_DAMAGE_MULTIPLIER;
+    Some(BossFight::new(&template, boss_id, 0))
+}
+
+/// Captures the body scale an elite shadow inherits, in thousandths; a
+/// vanilla-sized body stores zero so old and new saves behave the same.
+fn capture_scale(entity: &dyn LivingEntity) -> u32 {
+    let scale = entity
+        .attributes()
+        .lock()
+        .get_base_value(vanilla_attributes::SCALE)
+        .unwrap_or(1.0);
+    if (scale - 1.0).abs() < 0.001 {
+        0
+    } else {
+        ShadowOrigin::scale(scale)
+    }
+}
+
 /// Records what a dying mob was: its nameplate, base attributes and gear.
 fn capture_origin(entity: &dyn LivingEntity, label: Option<&MobLabel>) -> ShadowOrigin {
     let title = label.map_or_else(
-        || mob_name(&entity.entity_type().key.path).to_owned(),
+        || {
+            entity
+                .custom_name()
+                .map(|name| name.to_plain(&NoResolutor))
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| mob_name(&entity.entity_type().key.path).to_owned())
+        },
         |label| format!("{} {}", label.name, label.title),
     );
     let attributes = entity.attributes().lock();
@@ -913,14 +1048,17 @@ mod tests {
 
     use glam::DVec3;
     use steel_core::entity::entities::{EndermiteEntity, ZombieEntity};
-    use steel_core::entity::{AlliedMode, SharedEntity};
+    use steel_core::entity::{AlliedMode, Entity as _, LivingEntity, SharedEntity};
     use steel_registry::{init_vanilla_registry, vanilla_entities};
     use uuid::Uuid;
 
-    use super::{ActiveShadow, ShadowBrood, ShadowRuntime, capture_origin};
+    use super::{
+        ActiveShadow, ShadowBrood, ShadowRuntime, capture_origin, capture_scale, elite_fight,
+    };
     use crate::dungeon::generator::Theme;
     use crate::dungeon::mobs::{MobClass, MobLabel};
-    use crate::shadow::ShadowOrigin;
+    use crate::rank::HunterRank;
+    use crate::shadow::{BossSource, EliteShadow, ShadowOrigin, elite_ability_kit};
 
     fn active_brood() -> (ShadowRuntime, Uuid, Uuid, SharedEntity) {
         init_vanilla_registry();
@@ -1006,5 +1144,74 @@ mod tests {
         assert!(runtime.kill_source(Uuid::new_v4()).is_none());
         assert!(runtime.dismiss(owner, shadow_id));
         assert!(runtime.kill_source(larva.uuid()).is_none());
+    }
+
+    #[test]
+    fn boss_extraction_takes_the_nameplate_as_the_shadow_name() {
+        init_vanilla_registry();
+        let zombie = ZombieEntity::new(&vanilla_entities::ZOMBIE, 1, DVec3::ZERO, Weak::new());
+        zombie.set_custom_name(Some(text_components::TextComponent::plain(
+            "Король муравьёв".to_owned(),
+        )));
+        let origin = capture_origin(&zombie, None);
+        assert_eq!(origin.title, "Король муравьёв");
+        assert_eq!(capture_scale(&zombie), 0);
+
+        // A dungeon label still wins: plates like «Мумифицированный Босс»
+        // carry the class information the roster shows.
+        let label = MobLabel::mob(Theme::Crypt, MobClass::Warrior);
+        let labeled = capture_origin(&zombie, Some(&label));
+        assert_eq!(labeled.title, "Упырь Воин");
+    }
+
+    #[test]
+    fn boss_extraction_keeps_an_oversized_body() {
+        init_vanilla_registry();
+        let zombie = ZombieEntity::new(&vanilla_entities::ZOMBIE, 1, DVec3::ZERO, Weak::new());
+        assert_eq!(capture_scale(&zombie), 0, "vanilla size stores as zero");
+        zombie.set_base_attribute_value(steel_registry::vanilla_attributes::SCALE, 6.0);
+        assert_eq!(capture_scale(&zombie), ShadowOrigin::scale(6.0));
+    }
+
+    fn sample_elite(source: BossSource) -> EliteShadow {
+        EliteShadow::new(
+            steel_utils::Identifier::vanilla_static("zombie"),
+            ShadowOrigin {
+                title: "Вождь-берсерк".to_owned(),
+                max_health: ShadowOrigin::scale(200.0),
+                attack_damage: ShadowOrigin::scale(15.0),
+                movement_speed: ShadowOrigin::scale(0.23),
+                armor: ShadowOrigin::scale(8.0),
+                equipment: Vec::new(),
+                is_tank: true,
+                is_broodmother: Some(false),
+            },
+            source,
+        )
+    }
+
+    #[test]
+    fn elite_bodies_of_archetype_bosses_fight_with_abilities() {
+        init_vanilla_registry();
+        let dungeon = sample_elite(BossSource::Dungeon {
+            rank: HunterRank::C,
+            archetype: "Вождь-берсерк".to_owned(),
+            red: false,
+        });
+        assert!(elite_fight(&dungeon, 1).is_some());
+
+        let king = sample_elite(BossSource::IslandKing);
+        assert!(elite_fight(&king, 1).is_some());
+
+        let nest = sample_elite(BossSource::IslandNest {
+            zone_rank: HunterRank::A,
+            zone_name: "Поля гнёзд".to_owned(),
+        });
+        assert!(elite_fight(&nest, 1).is_none());
+
+        // Ability damage scales from the inherited attack with the elite
+        // multiplier; the kit comes from the archetype at the source rank.
+        let (_, rank) = elite_ability_kit(&king.source).expect("the King has a kit");
+        assert_eq!(rank, HunterRank::S);
     }
 }

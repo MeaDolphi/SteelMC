@@ -129,6 +129,7 @@ impl GameplayHooks for SoloLevelingHooks {
         self.state.tick_dungeons(server, tick_count);
         self.state.tick_scenarios(server, tick_count);
         self.state.tick_island(server, tick_count);
+        self.state.tick_elite_shadow_fights(server, tick_count);
         self.state.tick_organization(server);
         self.state.tick_storms(server);
         self.state.tick_spells(server);
@@ -372,7 +373,9 @@ impl GameplayHooks for SoloLevelingHooks {
         let mut crystals = item::crystal::stack(rank);
         let mined = 1 + self.state.crystal_bonus(player) + extra;
         crystals.set_count(mined);
-        drops.push(crystals);
+        // Mined crystals appear in the hunter's inventory right away; only
+        // what does not fit spills next to the broken block as a normal drop.
+        give_or_drop(crystals, |stack| player.add_item_with_sound(stack), drops);
         self.state.record_goal(
             player.gameprofile.id(),
             Goal::Crystal,
@@ -513,6 +516,14 @@ impl GameplayHooks for SoloLevelingHooks {
         pos: BlockPos,
         hand: InteractionHand,
     ) -> Option<InteractionResult> {
+        // A shadow-summon item is a soul lantern, so clicking a block would
+        // try to place it — and where building is forbidden the client keeps
+        // its placement prediction, so the stack visually vanishes. Activating
+        // the shadow instead keeps the item working and the inventory in sync.
+        let stack = player.inventory.lock().get_item_in_hand(hand).clone();
+        if item::shadow::entity(&stack).is_some() {
+            return item::consume::use_item(&self.state, player, &stack, hand);
+        }
         if !self.state.is_organization_board(&world.key, pos) {
             return None;
         }
@@ -534,6 +545,9 @@ impl GameplayHooks for SoloLevelingHooks {
         self.state.artifact_hit(entity, source, amount);
         self.order_shadows(world, entity, source);
         self.state.refresh_mob_label(world, entity);
+        if island::is_island_world(world) {
+            island::refresh_health_line(world, entity);
+        }
         let Some(killer) = source.causing_entity() else {
             return;
         };
@@ -676,13 +690,24 @@ impl GameplayHooks for SoloLevelingHooks {
                 .record_organization_event(vec![hunter], Event::Kill { zombie, rank });
         }
         if let Some(kill) = self.state.observe_island_death(world, entity.id(), hunter) {
-            if let Some(player) = killer.as_player()
-                && let Some((source, rank)) = island_boss_source(&kill)
-                && let Some(shadow) = self
-                    .state
-                    .extract_island_boss_shadow(player, entity, source, rank)
-            {
-                announce_elite_extraction(player, &shadow);
+            if let Some(player) = killer.as_player() {
+                if let Some((source, rank)) = island_boss_source(&kill)
+                    && let Some(shadow) = self
+                        .state
+                        .extract_island_boss_shadow(player, entity, source, rank)
+                {
+                    announce_elite_extraction(player, &shadow);
+                }
+                if matches!(kill, island::IslandKill::Nest { .. }) {
+                    // A nest is a part of the swarm, not a sentient champion;
+                    // the ritual only answers the Ant King.
+                    player.send_message(
+                        &TextComponent::plain(
+                            "Гнездо — часть роя, а не разумный враг: поднять его тень нельзя. Ритуал отвечает лишь Королю муравьёв.",
+                        )
+                        .color(Color::DarkGray),
+                    );
+                }
             }
             return;
         }
@@ -800,18 +825,26 @@ fn keeps_projectile_ammo(ammo: &ItemStack) -> bool {
     ammo.is(&vanilla_items::ARROW)
 }
 
-/// Returns the elite-shadow source and rank for an island boss kill.
-fn island_boss_source(kill: &island::IslandKill) -> Option<(BossSource, HunterRank)> {
+/// Gives a mined stack to the hunter first; only the remainder that does not
+/// fit becomes a normal drop next to the broken block.
+fn give_or_drop(
+    mut stack: ItemStack,
+    add: impl FnOnce(&mut ItemStack) -> bool,
+    drops: &mut Vec<ItemStack>,
+) {
+    if !add(&mut stack) {
+        drops.push(stack);
+    }
+}
+
+/// Returns the elite-shadow source of an island boss kill.
+///
+/// Nests are part of the swarm and raise nothing; only the Ant King answers
+/// the extraction ritual.
+const fn island_boss_source(kill: &island::IslandKill) -> Option<(BossSource, HunterRank)> {
     match kill {
-        island::IslandKill::Nest { zone, .. } => Some((
-            BossSource::IslandNest {
-                zone_rank: zone.rank(),
-                zone_name: zone.display_name().to_owned(),
-            },
-            zone.rank(),
-        )),
         island::IslandKill::King { .. } => Some((BossSource::IslandKing, HunterRank::S)),
-        island::IslandKill::Ant(_) => None,
+        island::IslandKill::Nest { .. } | island::IslandKill::Ant(_) => None,
     }
 }
 
@@ -918,14 +951,16 @@ fn announce_quest(state: &SoloLevelingState, player: &Player, update: QuestUpdat
 #[cfg(test)]
 mod tests {
     use super::{
-        allows_city_mutation, allows_instance_mutation, allows_player_damage, is_shadow_tank,
-        keeps_projectile_ammo,
+        allows_city_mutation, allows_instance_mutation, allows_player_damage, give_or_drop,
+        is_shadow_tank, keeps_projectile_ammo,
     };
     use glam::DVec3;
     use std::sync::Weak;
     use steel_core::entity::Entity as _;
     use steel_core::entity::entities::ZombieEntity;
     use steel_core::gameplay_hooks::BlockMutationCause;
+    use steel_core::inventory::container::Container as _;
+    use steel_core::player::player_inventory::PlayerInventory;
     use steel_registry::item_stack::ItemStack;
     use steel_registry::{init_vanilla_registry, vanilla_entities, vanilla_items};
     use uuid::Uuid;
@@ -1006,5 +1041,59 @@ mod tests {
         assert!(allows_player_damage(true, true, false));
         assert!(allows_player_damage(true, false, true));
         assert!(allows_player_damage(false, true, true));
+    }
+
+    #[test]
+    fn mined_crystals_land_in_inventory_and_only_the_overflow_drops() {
+        init_vanilla_registry();
+        let stack = |count: i32| {
+            let mut stack = ItemStack::new(&vanilla_items::DIAMOND);
+            stack.set_count(count);
+            stack
+        };
+        let count_of = |inventory: &PlayerInventory| -> i32 {
+            (0..inventory.get_container_size())
+                .filter(|slot| inventory.get_item(*slot).is(&vanilla_items::DIAMOND))
+                .map(|slot| inventory.get_item(slot).count())
+                .sum()
+        };
+
+        // A fitting stack goes entirely to the inventory and stays out of drops.
+        let mut inventory = PlayerInventory::new();
+        let mut drops = Vec::new();
+        give_or_drop(stack(5), |s| inventory.add(s), &mut drops);
+        assert!(drops.is_empty(), "a fitting stack must not become a drop");
+        assert_eq!(count_of(&inventory), 5);
+
+        // A full inventory cannot absorb anything: everything stays a drop.
+        let mut inventory = PlayerInventory::new();
+        for slot in 0..PlayerInventory::INVENTORY_SIZE {
+            inventory.set_item(slot, stack(64));
+        }
+        let mut drops = Vec::new();
+        give_or_drop(stack(3), |s| inventory.add(s), &mut drops);
+        assert_eq!(count_of(&inventory), 36 * 64);
+        assert_eq!(drops, vec![stack(3)]);
+    }
+
+    #[test]
+    fn island_extraction_is_offered_only_to_the_ant_king() {
+        use crate::island::{IslandKill, Zone};
+        use crate::rank::HunterRank;
+        use crate::shadow::BossSource;
+
+        let king = super::island_boss_source(&IslandKill::King {
+            hunters: Vec::new(),
+        });
+        assert_eq!(king, Some((BossSource::IslandKing, HunterRank::S)));
+        assert!(
+            super::island_boss_source(&IslandKill::Nest {
+                zone: Zone::Nests,
+                left: 3,
+                zone_cleared: false,
+            })
+            .is_none()
+        );
+        assert!(super::island_boss_source(&IslandKill::Ant(HunterRank::B)).is_none());
     }
 }

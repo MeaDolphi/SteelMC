@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use glam::{DVec3, IVec3};
 use rustc_hash::FxHashSet;
 use steel_core::chunk::Chunk;
-use steel_core::entity::{Entity as _, LivingEntity, RemovalReason, SharedEntity, spawn_mob};
+use steel_core::entity::{Entity, LivingEntity, RemovalReason, SharedEntity, spawn_mob};
 use steel_core::player::Player;
 use steel_core::server::Server;
 use steel_core::world::World;
@@ -35,6 +35,7 @@ use steel_core::worldgen::{
 use steel_registry::biome::BiomeRef;
 use steel_registry::blocks::block_state_ext::BlockStateExt as _;
 use steel_registry::blocks::properties::BlockStateProperties;
+use steel_registry::entity_type::EntityTypeRef;
 use steel_registry::item_stack::ItemStack;
 use steel_registry::vanilla_dimension_types::OVERWORLD;
 use steel_registry::{vanilla_attributes, vanilla_blocks, vanilla_entities};
@@ -45,6 +46,7 @@ use text_components::format::Color;
 use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
+use crate::dungeon::mobs::{self, MobLabel, MobRarity};
 use crate::dungeon::wave_for_rank;
 use crate::item::chest::ChestKind;
 use crate::item::key;
@@ -66,13 +68,19 @@ pub const EVACUATION_POS: DVec3 = DVec3::new(3.5, (GROUND_Y + 1) as f64, 134.5);
 /// Seconds the island stays calm after the Ant King dies.
 const CALM_SECONDS: u64 = 30 * 60;
 /// Ants one nest keeps alive around it.
-const ANTS_PER_NEST: usize = 5;
+// Balance: 8 per nest, hatching every 10 s, keeps all 18 nests (144 ants
+// plus the nest bodies) swarming a hunting party; lower counts read as
+// already-cleared ground.
+const ANTS_PER_NEST: usize = 8;
 /// Seconds between two hatchings of one nest.
-const HATCH_SECONDS: u64 = 15;
+const HATCH_SECONDS: u64 = 10;
 /// How close a hunter has to be for a nest to be awake.
 const AWAKE_RADIUS: f64 = 56.0;
 /// How far from its nest an ant hatches.
 const HATCH_RADIUS: i32 = 5;
+/// Body of an island ant. Steel has no ant mob, so an ant is a spider wearing
+/// the resource pack's red ant skin; its name and stats stay ant-themed.
+const ANT_BODY: EntityTypeRef = &vanilla_entities::SPIDER;
 
 /// One ring of the island.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -854,49 +862,92 @@ fn sweep_leftovers(world: &World, pos: BlockPos) {
         center.y + 12.0,
         center.z + reach,
     );
-    for entity in world.get_entities_in_aabb_matching(&area, |entity| {
-        entity.entity_type() == &vanilla_entities::ENDERMITE && !entity.is_removed()
-    }) {
+    for entity in world.get_entities_in_aabb_matching(&area, is_stray_ant) {
         entity.set_removed(RemovalReason::Discarded);
     }
 }
 
-/// Spawns one island mob: an endermite body scaled and strengthened.
-fn spawn_island_mob(
-    world: &Arc<World>,
-    pos: BlockPos,
+/// Whether `entity` is an island ant or nest body a previous run may have
+/// left behind. Allied mobs (a hunter's own shadows) are never swept.
+fn is_stray_ant(entity: &dyn Entity) -> bool {
+    (entity.entity_type() == &vanilla_entities::SPIDER
+        || entity.entity_type() == &vanilla_entities::ENDERMITE)
+        && entity
+            .as_mob()
+            .is_some_and(|mob| mob.allied_owner().is_none())
+        && !entity.is_removed()
+}
+
+/// Tuning of one island mob body: scale, stats, optional fixed speed and the
+/// themed nameplate.
+struct MobTuning {
     scale: f64,
     health: f64,
     damage: f64,
     speed: Option<f64>,
     name: TextComponent,
+}
+
+/// Spawns one island mob: a scaled and strengthened hostile body with a
+/// themed nameplate and a below-name health line, like the dungeon mobs.
+fn spawn_island_mob(
+    world: &Arc<World>,
+    body: EntityTypeRef,
+    pos: BlockPos,
+    tuning: MobTuning,
 ) -> Option<i32> {
-    let entity: SharedEntity = spawn_mob(world, &vanilla_entities::ENDERMITE, pos).ok()?;
+    let entity: SharedEntity = spawn_mob(world, body, pos).ok()?;
     let living = entity.as_living_entity()?;
-    living.set_base_attribute_value(vanilla_attributes::SCALE, scale);
-    living.set_base_attribute_value(vanilla_attributes::MAX_HEALTH, health);
-    living.set_base_attribute_value(vanilla_attributes::ATTACK_DAMAGE, damage);
-    if let Some(speed) = speed {
+    living.set_base_attribute_value(vanilla_attributes::SCALE, tuning.scale);
+    living.set_base_attribute_value(vanilla_attributes::MAX_HEALTH, tuning.health);
+    living.set_base_attribute_value(vanilla_attributes::ATTACK_DAMAGE, tuning.damage);
+    if let Some(speed) = tuning.speed {
         living.set_base_attribute_value(vanilla_attributes::MOVEMENT_SPEED, speed);
         living.set_base_attribute_value(vanilla_attributes::KNOCKBACK_RESISTANCE, 1.0);
     }
-    living.set_health(health as f32);
-    entity.set_custom_name(Some(name));
+    living.set_health(tuning.health as f32);
+    entity.set_custom_name(Some(tuning.name));
     entity.set_custom_name_visible(true);
     entity.refresh_dimensions();
+    mobs::show_health_line(world, living, &health_label());
     Some(entity.id())
+}
+
+/// The fixed label of an island health line: it only carries the colour, the
+/// mob's themed nameplate already shows above it.
+const fn health_label() -> MobLabel {
+    MobLabel {
+        name: String::new(),
+        title: String::new(),
+        color: Color::Red,
+        is_tank: false,
+        is_broodmother: false,
+        rarity: MobRarity::Common,
+    }
+}
+
+/// Rewrites the below-name health line of an island mob; called on every hit.
+pub fn refresh_health_line(world: &World, entity: &dyn LivingEntity) {
+    if entity.custom_name().is_none() {
+        return;
+    }
+    mobs::show_health_line(world, entity, &health_label());
 }
 
 fn spawn_ant(world: &Arc<World>, zone: Zone, pos: BlockPos) -> Option<i32> {
     let wave = wave_for_rank(zone.rank());
     spawn_island_mob(
         world,
+        ANT_BODY,
         pos,
-        1.8,
-        24.0 * wave.health_multiplier,
-        4.0 * wave.damage_multiplier,
-        None,
-        TextComponent::plain(format!("Муравей-солдат [{}]", zone.rank().name())).color(Color::Red),
+        MobTuning {
+            scale: 1.8,
+            health: 24.0 * wave.health_multiplier,
+            damage: 4.0 * wave.damage_multiplier,
+            speed: None,
+            name: TextComponent::plain(format!("Муравей-солдат [{}]", zone.rank().name()))
+                .color(Color::Red),
+        },
     )
 }
 
@@ -904,12 +955,16 @@ fn spawn_nest(world: &Arc<World>, zone: Zone, pos: BlockPos) -> Option<i32> {
     let wave = wave_for_rank(zone.rank());
     spawn_island_mob(
         world,
+        &vanilla_entities::ENDERMITE,
         pos,
-        4.0,
-        160.0 * wave.health_multiplier,
-        3.0 * wave.damage_multiplier,
-        Some(0.0),
-        TextComponent::plain(format!("Гнездо [{}]", zone.display_name())).color(Color::DarkPurple),
+        MobTuning {
+            scale: 4.0,
+            health: 160.0 * wave.health_multiplier,
+            damage: 3.0 * wave.damage_multiplier,
+            speed: Some(0.0),
+            name: TextComponent::plain(format!("Гнездо [{}]", zone.display_name()))
+                .color(Color::DarkPurple),
+        },
     )
 }
 
@@ -917,12 +972,15 @@ fn spawn_king(world: &Arc<World>) -> Option<i32> {
     let wave = wave_for_rank(HunterRank::S);
     spawn_island_mob(
         world,
+        &vanilla_entities::ENDERMITE,
         BlockPos::new(0, GROUND_Y + 1, 0),
-        6.0,
-        900.0 * wave.health_multiplier,
-        5.0 * wave.damage_multiplier,
-        None,
-        TextComponent::plain("Король муравьёв").color(Color::DarkRed),
+        MobTuning {
+            scale: 6.0,
+            health: 900.0 * wave.health_multiplier,
+            damage: 5.0 * wave.damage_multiplier,
+            speed: None,
+            name: TextComponent::plain("Король муравьёв").color(Color::DarkRed),
+        },
     )
 }
 
@@ -954,11 +1012,17 @@ pub fn travel_to(server: &Server, player: Arc<Player>, rank: HunterRank) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Weak};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use steel_core::entity::entities::{EndermiteEntity, SpiderEntity, ZombieEntity};
+    use steel_core::entity::{Entity as _, SharedEntity};
+    use steel_registry::{init_vanilla_registry, vanilla_entities};
     use uuid::Uuid;
 
-    use super::{ISLAND_RADIUS, IslandRuntime, IslandSnapshot, LANDING, NestSnapshot, Zone, nests};
+    use super::{
+        ANT_BODY, ISLAND_RADIUS, IslandRuntime, IslandSnapshot, LANDING, NestSnapshot, Zone, nests,
+    };
 
     #[test]
     fn zones_go_from_the_shore_to_the_centre() {
@@ -1034,5 +1098,51 @@ mod tests {
         let mut restored = IslandRuntime::new();
         restored.restore(with_orphan);
         assert!(!restored.nests.iter().any(|nest| nest.destroyed));
+    }
+
+    #[test]
+    fn ants_use_the_spider_body() {
+        init_vanilla_registry();
+        assert_eq!(ANT_BODY, &vanilla_entities::SPIDER);
+    }
+
+    #[test]
+    fn stray_sweep_takes_island_bodies_but_never_allied_mobs() {
+        init_vanilla_registry();
+        let spider: SharedEntity = Arc::new(SpiderEntity::new(
+            &vanilla_entities::SPIDER,
+            1,
+            glam::DVec3::ZERO,
+            Weak::new(),
+        ));
+        let endermite: SharedEntity = Arc::new(EndermiteEntity::new(
+            &vanilla_entities::ENDERMITE,
+            2,
+            glam::DVec3::ZERO,
+            Weak::new(),
+        ));
+        let zombie =
+            ZombieEntity::new(&vanilla_entities::ZOMBIE, 3, glam::DVec3::ZERO, Weak::new());
+        assert!(super::is_stray_ant(spider.as_ref()));
+        assert!(super::is_stray_ant(endermite.as_ref()));
+        assert!(!super::is_stray_ant(&zombie));
+
+        let allied =
+            ZombieEntity::new(&vanilla_entities::ZOMBIE, 4, glam::DVec3::ZERO, Weak::new());
+        allied
+            .as_mob()
+            .expect("zombie is a mob")
+            .set_allied_owner(Some(Uuid::new_v4()));
+        assert!(!super::is_stray_ant(&allied));
+
+        spider.set_removed(steel_core::entity::RemovalReason::Discarded);
+        assert!(!super::is_stray_ant(spider.as_ref()));
+    }
+
+    #[test]
+    fn island_health_line_rounds_up_like_dungeon_plates() {
+        let label = super::health_label();
+        let text = format!("{:?}", label.health_text(12.2, 28.0));
+        assert!(text.contains("❤ 13/28"), "{text}");
     }
 }

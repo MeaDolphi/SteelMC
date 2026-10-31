@@ -158,6 +158,7 @@ pub fn smiling_god_boss(rank: HunterRank) -> DungeonBoss {
         attack_knockback: 1.2,
         gear,
         abilities: BossKind::Warlord.abilities(rank),
+        skin: Some("boss_smiling_god"),
     }
 }
 

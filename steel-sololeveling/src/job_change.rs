@@ -89,5 +89,6 @@ pub fn igris_boss(rank: HunterRank) -> DungeonBoss {
         attack_knockback: 1.5,
         gear,
         abilities: BossKind::Warlord.abilities(rank),
+        skin: Some("boss_igris"),
     }
 }

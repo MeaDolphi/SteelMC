@@ -1,0 +1,14 @@
+{
+  "layers": {
+    "humanoid": [
+      {
+        "texture": "sololeveling:boss_smiling_god"
+      }
+    ],
+    "humanoid_leggings": [
+      {
+        "texture": "sololeveling:boss_smiling_god"
+      }
+    ]
+  }
+}

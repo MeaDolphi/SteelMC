@@ -230,25 +230,25 @@ impl SpellId {
             Self::MagicArrow => info(
                 "Магическая стрела",
                 Destruction,
-                "Луч до 24 блоков: 6 магического урона",
+                "Луч до 24 блоков: 5 магического урона",
                 10.0,
-                1,
+                2,
                 0,
                 D,
             ),
             Self::Fireball => info(
                 "Огненный шар",
                 Destruction,
-                "Взрыв радиусом 3 в точке взгляда: 8 урона и поджог",
+                "Взрыв радиусом 3 в точке взгляда: 7 урона и поджог",
                 25.0,
-                4,
+                5,
                 100,
                 D,
             ),
             Self::IceSpear => info(
                 "Ледяное копьё",
                 Destruction,
-                "10 урона и замедление 60% на 3 с",
+                "9 урона и замедление 60% на 3 с",
                 25.0,
                 5,
                 200,
@@ -259,14 +259,14 @@ impl SpellId {
                 Destruction,
                 "8 урона цели и до 3 соседям, каждому следующему −25%",
                 35.0,
-                6,
+                7,
                 300,
                 C,
             ),
             Self::ManaStorm => info(
                 "Буря маны",
                 Destruction,
-                "6 с вокруг мага: 4 урона в секунду в радиусе 5",
+                "6 с вокруг мага: 3,5 урона в секунду в радиусе 5",
                 60.0,
                 25,
                 800,
@@ -275,7 +275,7 @@ impl SpellId {
             Self::Meteor => info(
                 "Метеор",
                 Destruction,
-                "Через 1,5 с в точку взгляда: 25 урона в радиусе 5",
+                "Через 1,5 с в точку взгляда: 22 урона в радиусе 5",
                 70.0,
                 20,
                 1_500,
@@ -284,9 +284,9 @@ impl SpellId {
             Self::VoidLance => info(
                 "Копьё пустоты",
                 Destruction,
-                "Пробивает всех на линии: 30 урона, половина брони не защищает",
+                "Пробивает всех на линии: 26 урона, половина брони не защищает",
                 100.0,
-                30,
+                35,
                 3_000,
                 A,
             ),
@@ -655,6 +655,40 @@ const MIN_COST_FACTOR: f32 = 0.2;
 /// Largest cooldown reduction.
 const MAX_COOLDOWN_REDUCTION: f32 = 0.5;
 
+/// Damage taken inside a Sanctuary, as a fraction.
+pub const WARD_FACTOR: f32 = 0.70;
+/// Mana a Mana Shield spends per point of health it converts.
+///
+/// Balance (маг-нерф): the shield trades mana for safety, it must not make
+/// the caster untouchable; at 3 mana per health a full mana pool covers at
+/// most a third of the pool in health per activation.
+pub const SHIELD_MANA_PER_HEALTH: f32 = 3.0;
+/// Damage one hit may convert to mana on a Mana Shield; the rest lands on
+/// health. Without the cap, a deep mana pool absorbs every hit for the
+/// whole duration and the mage never feels boss bursts.
+pub const SHIELD_MAX_HIT: f32 = 12.0;
+
+/// Applies the Mage's protective layers to one incoming hit and returns
+/// the damage that still reaches health; spends `mana` on a Mana Shield.
+///
+/// A hit is mitigated by at most one layer: while a Mana Shield is active
+/// it converts damage to mana, and the Sanctuary ward yields to it, so the
+/// two never multiply into near-immunity.
+#[must_use]
+pub fn protected_damage(shielded: bool, warded: bool, mana: &mut f32, damage: f32) -> f32 {
+    if shielded {
+        let converted = damage
+            .min(SHIELD_MAX_HIT)
+            .min(*mana / SHIELD_MANA_PER_HEALTH);
+        *mana -= converted * SHIELD_MANA_PER_HEALTH;
+        damage - converted
+    } else if warded {
+        damage * WARD_FACTOR
+    } else {
+        damage
+    }
+}
+
 impl SpellGear {
     /// No bonuses.
     pub const NONE: Self = Self {
@@ -925,7 +959,7 @@ mod tests {
         assert_eq!(both.free_every, 5);
         assert!((both.cost_of(SpellId::Fireball) - 27.5).abs() < 1e-4);
         assert!((both.cost_of(SpellId::LesserHeal) - 24.0).abs() < 1e-4);
-        assert_eq!(both.cooldown_of(SpellId::Fireball), 2_000);
+        assert_eq!(both.cooldown_of(SpellId::Fireball), 2_500);
         let cheap = SpellGear {
             cost: -5.0,
             ..SpellGear::default()
@@ -946,5 +980,31 @@ mod tests {
         assert!(json.contains("magic_arrow"));
         let back: SpellBook = serde_json::from_str(&json).expect("decode");
         assert_eq!(back, book);
+    }
+
+    #[test]
+    fn a_mana_shield_converts_damage_until_mana_or_the_hit_cap_runs_out() {
+        let mut mana = 90.0;
+        assert!((protected_damage(true, false, &mut mana, 10.0) - 0.0).abs() < f32::EPSILON);
+        assert!((mana - 60.0).abs() < 1e-6);
+        // The per-hit cap lets burst damage through even with deep mana.
+        assert!((protected_damage(true, false, &mut mana, 20.0) - 8.0).abs() < 1e-6);
+        assert!((mana - 24.0).abs() < 1e-6);
+        // Without mana the shield holds nothing back.
+        mana = 0.0;
+        assert!((protected_damage(true, false, &mut mana, 5.0) - 5.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn ward_and_shield_never_mitigate_the_same_hit() {
+        let mut warded_mana = 90.0;
+        assert!((protected_damage(false, true, &mut warded_mana, 10.0) - 7.0).abs() < 1e-6);
+        // The shield answers instead of the ward: full conversion, no ×0.7.
+        let mut shielded_mana = 90.0;
+        assert!(
+            (protected_damage(true, true, &mut shielded_mana, 10.0) - 0.0).abs() < f32::EPSILON
+        );
+        assert!((shielded_mana - 60.0).abs() < 1e-6);
+        assert_eq!(warded_mana, 90.0);
     }
 }

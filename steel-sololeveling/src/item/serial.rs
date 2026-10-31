@@ -524,7 +524,8 @@ impl SerialId {
     }
 
     /// Returns the System equipment slot this item goes into, or `None` for
-    /// weapons and tools, which are held instead.
+    /// held weapons and tools. The Mage staff fits the gear's weapon slot,
+    /// like artifact staffs, so its bonuses apply with both hands free.
     #[must_use]
     pub fn gear_kind(self) -> Option<GearKind> {
         if let Some(index) = SPECIALIZATION.iter().position(|id| *id == self) {
@@ -548,6 +549,7 @@ impl SerialId {
             Self::HunterChestplate => Some(GearKind::Chest),
             Self::HunterLeggings => Some(GearKind::Legs),
             Self::HunterBoots => Some(GearKind::Feet),
+            Self::ApprenticeStaff => Some(GearKind::Weapon),
             _ => None,
         }
     }
@@ -601,6 +603,7 @@ impl SerialId {
             Some(GearKind::Feet) => ItemKind::Boots,
             Some(GearKind::Gloves) => ItemKind::Gloves,
             Some(GearKind::Ring | GearKind::Amulet) => ItemKind::Jewelry,
+            Some(GearKind::Weapon) => ItemKind::Staff,
             None => match self {
                 Self::HunterShield => return None,
                 Self::HunterPickaxe => ItemKind::Pickaxe,
@@ -1623,10 +1626,6 @@ pub fn stack(id: SerialId, owner: Option<Uuid>) -> ItemStack {
 /// Enchanting rebuilds the stack from the catalog, so the binding is passed
 /// back in and survives.
 #[must_use]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the lore is one chain of every kind of line a serial item can show"
-)]
 pub fn enchanted_stack(
     id: SerialId,
     owner: Option<Uuid>,
@@ -1678,6 +1677,7 @@ pub fn enchanted_stack(
             TextComponent::plain(format!("Требуется сила: {}", id.required_strength()))
                 .color(Color::Yellow)
         }))
+        .chain([slot_line(id)])
         .chain([
             TextComponent::plain(format!("Редкость: {}", Rarity::Common.display_name()))
                 .color(Rarity::Common.color()),
@@ -1719,6 +1719,18 @@ pub fn enchanted_stack(
         binding::bind(&mut stack, owner);
     }
     stack
+}
+
+/// Returns the lore line telling where a serial item is worn.
+fn slot_line(id: SerialId) -> TextComponent {
+    match id.gear_kind() {
+        Some(GearKind::Weapon) => {
+            TextComponent::plain("Экипируется в Снаряжении Системы: Оружие или носится в руке")
+                .color(Color::DarkPurple)
+        }
+        Some(_) => TextComponent::plain("Носится как броня").color(Color::DarkPurple),
+        None => TextComponent::plain("Носится в руке").color(Color::Gray),
+    }
 }
 
 /// Returns the serial item a stack holds, or `None` for an ordinary item.
@@ -2082,5 +2094,22 @@ mod tests {
             SerialId::EliteHeavyChestplate.required_strength()
                 < SerialId::SupremeHeavyChestplate.required_strength()
         );
+    }
+
+    #[test]
+    fn stacks_describe_where_they_are_worn() {
+        init_vanilla_registry();
+        for id in ALL {
+            let stack = stack(id, None);
+            let lore = format!("{:?}", stack.get(LORE));
+            match id.gear_kind() {
+                Some(GearKind::Weapon) => assert!(
+                    lore.contains("Экипируется в Снаряжении Системы: Оружие"),
+                    "{id:?}: {lore}"
+                ),
+                Some(_) => assert!(lore.contains("Носится как броня"), "{id:?}: {lore}"),
+                None => assert!(lore.contains("Носится в руке"), "{id:?}: {lore}"),
+            }
+        }
     }
 }

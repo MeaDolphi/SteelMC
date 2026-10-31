@@ -10,6 +10,9 @@ Running the script rewrites `resourcepack/pack/` and the zip next to it:
     python3 steel-sololeveling/resourcepack/tools/build.py
 
 The item ids written here must match `steel-sololeveling/src/item/model.rs`.
+Mob and boss skins are equipment assets (`mob_*`, `boss_*`) worn by dungeon
+bodies; the island ants override the vanilla spider texture because spiders
+wear no equipment.
 """
 
 import hashlib
@@ -779,6 +782,152 @@ def mob_skin(theme):
     return body, legs
 
 
+# Boss skins: dungeon bosses wear their own equipment asset instead of a
+# theme skin, so a Warlord reads as a commander of the System and not as a
+# dressed-up ghoul. All bosses share the System look — deep indigo bodies,
+# glowing eyes, cyan runes — and differ in pattern and eye colour, like the
+# anime bosses differ in presence, not in species.
+BOSS_THEMES = {
+    # name: (base, light, dark, eyes, rune, pattern)
+    "warlord": ("#2a1a5e", "#7a5fd0", "#120a2a", "#ff2d3d", "#3fd6ff", "plates"),
+    "berserker": ("#3a1030", "#8a3060", "#160612", "#ff5c1a", "#3fd6ff", "cracks"),
+    "shaman": ("#10284a", "#3f7ab0", "#081224", "#3fe8ff", "#9b6bff", "runes"),
+    "bomber": ("#241636", "#5a3f7a", "#0e0818", "#ffb02e", "#3fd6ff", "fuse"),
+    "broodmother": ("#2a0f38", "#7a3f9a", "#100418", "#ff4fd8", "#3fd6ff", "segments"),
+    # The red gate boss is the ice-forest elite (Baruka): a pale body that
+    # reads as frostbitten against the red gate glow.
+    "archer": ("#c8d4e8", "#eef4ff", "#5a6a8a", "#7a3fe0", "#3fd6ff", "frost"),
+    # The double-dungeon god: carved stone with a wide burning smile.
+    "smiling_god": ("#4a4a66", "#8a8ab0", "#22223a", "#b06bff", "#3fd6ff", "carved"),
+    # Igris, the blood-red commander of the castle.
+    "igris": ("#6e1020", "#c03040", "#2a0810", "#ff2d3d", "#ffcf3f", "plates"),
+}
+
+
+def boss_pattern(kind, base, light, dark, rune, seed):
+    def pick(face, x, y, width, height):
+        n = noise(x + width * 7, y + height * 3, seed + len(face))
+        if kind == "plates" and face in ("front", "back") and y % 4 == 3:
+            return rgb(rune if width == 8 and 2 <= x <= 5 else dark)
+        if kind == "cracks" and (n < 30 or (face == "front" and abs(x - (y * width // max(height, 1))) <= 0 and n < 90)):
+            return rgb(dark)
+        if kind == "runes" and face == "front" and width == 8 and 2 <= y <= 9:
+            cell = (x // 2, y // 2)
+            if noise(cell[0], cell[1], seed * 31) < 96:
+                return rgb(rune) if noise(x, y, seed * 17) < 200 else rgb(dark)
+            return rgb(base)
+        if kind == "fuse" and face in ("front", "back") and width == 8 and 5 <= y <= 6:
+            return rgb("#ffb02e" if y == 5 else "#ff5a1a")
+        if kind == "segments" and x % 3 == 2:
+            return rgb(dark)
+        if kind == "frost" and n < 26:
+            return rgb("#ffffff" if n < 8 else light)
+        if kind == "carved" and face == "front" and width == 8 and 4 <= y <= 5 and 1 <= x <= 6:
+            return rgb("#3a3a55")
+        if face == "top" or y == 0:
+            return rgb(light)
+        return rgb(base)
+
+    return pick
+
+
+def boss_face(kind, base, light, dark, eyes, rune):
+    pattern = boss_pattern(kind, base, light, dark, rune, 3)
+
+    def pick(face, x, y, width, height):
+        if face == "front":
+            if kind == "carved":
+                # The god's smile spans the whole face and burns from inside.
+                if y == 2 and x in (1, 2, 5, 6):
+                    return rgb(eyes)
+                if y in (4, 5) and 1 <= x <= 6:
+                    return rgb(eyes) if y == 4 else rgb(dark)
+            elif width == 8:
+                if y == 3 and 1 <= x <= 6:
+                    # Igris and the warlord wear a glowing visor slit.
+                    return rgb(eyes) if kind == "plates" or x in (2, 3, 4, 5) else pattern(face, x, y, width, height)
+                if y == 4 and x in (2, 3, 4, 5):
+                    return rgb(dark)
+            if y == 6 and 2 <= x <= 5:
+                return rgb(dark)
+        return pattern(face, x, y, width, height)
+
+    return pick
+
+
+def boss_skin(name):
+    base, light, dark, eyes, rune, kind = BOSS_THEMES[name]
+    body = Image.new("RGBA", (64, 32), (0, 0, 0, 0))
+    paint(body, HEAD, boss_face(kind, base, light, dark, eyes, rune))
+    paint(body, BODY, boss_pattern(kind, base, light, dark, rune, 5))
+    paint(body, ARM, boss_pattern(kind, base, light, dark, rune, 7))
+    paint(body, LEG, boss_pattern(kind, base, light, dark, rune, 11))
+    legs = Image.new("RGBA", (64, 32), (0, 0, 0, 0))
+    paint(legs, BODY, lower(3, boss_pattern(kind, base, light, dark, rune, 13)))
+    paint(legs, LEG, boss_pattern(kind, base, light, dark, rune, 17))
+    return body, legs
+
+
+# The island ants are spider bodies; spiders wear no equipment in vanilla, so
+# the only vanilla-legal look is overriding the spider texture itself. This
+# retextures every spider for pack users, which is acceptable because the
+# island is the only place spiders spawn. UVs mirror SpiderModel.
+SPIDER_HEAD = (32, 4, 8, 8, 8)
+SPIDER_CEPHALOTHORAX = (0, 0, 6, 6, 6)
+SPIDER_ABDOMEN = (0, 12, 10, 8, 12)
+SPIDER_LEG = (18, 0, 16, 2, 2)
+# Red ant chitin: bright carapace, dark joints, pale mandibles.
+ANT_MAIN = "#b02030"
+ANT_LIGHT = "#e84a55"
+ANT_DARK = "#4a0812"
+ANT_FANG = "#e8e0d0"
+ANT_EYES = "#ff2d3d"
+
+
+def ant_chitin(seed):
+    def pick(face, x, y, width, height):
+        n = noise(x + width * 5, y + height * 11, seed)
+        if face == "top" or y == 0:
+            return rgb(ANT_LIGHT)
+        if face == "bottom" or y == height - 1 or x in (0, width - 1):
+            return rgb(ANT_DARK)
+        if n < 34:
+            return rgb(ANT_DARK)
+        return rgb(ANT_MAIN)
+
+    return pick
+
+
+def spider_ant_texture():
+    body = Image.new("RGBA", (64, 32), (0, 0, 0, 0))
+
+    def head(face, x, y, width, height):
+        if face == "front" and y >= 5:
+            # Curved mandibles framing the mouth, pale like the anime ants.
+            return rgb(ANT_FANG) if x in (0, 1, width - 2, width - 1) else rgb(ANT_DARK)
+        return ant_chitin(7)(face, x, y, width, height)
+
+    def abdomen(face, x, y, width, height):
+        if face == "front" and y % 3 == 1:
+            return rgb(ANT_DARK)
+        return ant_chitin(13)(face, x, y, width, height)
+
+    paint(body, SPIDER_HEAD, head)
+    paint(body, SPIDER_CEPHALOTHORAX, ant_chitin(5))
+    paint(body, SPIDER_ABDOMEN, abdomen)
+    paint(body, SPIDER_LEG, ant_chitin(3))
+    eyes = Image.new("RGBA", (64, 32), (0, 0, 0, 0))
+
+    def glow(face, x, y, width, height):
+        # SpiderEyesLayer renders this texture fullbright.
+        if face == "front" and y in (2, 3) and x in (1, 2, width - 3, width - 2):
+            return rgb(ANT_EYES)
+        return None
+
+    paint(eyes, SPIDER_HEAD, glow)
+    return body, eyes
+
+
 # Facade signs above the doors of the city's key buildings. Each is a wide
 # board model an item frame shows about four blocks wide, with the title
 # rendered in a bold sans font and an icon of what the building offers.
@@ -1093,6 +1242,27 @@ def build():
                 }
             },
         )
+    for boss in BOSS_THEMES:
+        name = f"boss_{boss}"
+        body, legs = boss_skin(boss)
+        for kind, image in (("humanoid", body), ("humanoid_leggings", legs)):
+            layer = assets / "textures" / "entity" / "equipment" / kind / f"{name}.png"
+            layer.parent.mkdir(parents=True, exist_ok=True)
+            image.save(layer)
+        write_json(
+            assets / "equipment" / f"{name}.json",
+            {
+                "layers": {
+                    "humanoid": [{"texture": f"{NAMESPACE}:{name}"}],
+                    "humanoid_leggings": [{"texture": f"{NAMESPACE}:{name}"}],
+                }
+            },
+        )
+    spider, spider_eyes = spider_ant_texture()
+    vanilla = PACK / "assets" / "minecraft" / "textures" / "entity" / "spider"
+    vanilla.mkdir(parents=True, exist_ok=True)
+    spider.save(vanilla / "spider.png")
+    spider_eyes.save(vanilla / "spider_eyes.png")
     for name, (title, subtitle, accent, icon_template, icon_colours) in SIGNS.items():
         texture = assets / "textures" / "item" / "sign" / f"{name}.png"
         texture.parent.mkdir(parents=True, exist_ok=True)
@@ -1159,6 +1329,7 @@ def build():
     print(
         f"{len(ITEMS)} items, {len(UI_ICONS)} menu icons, "
         f"{len(EQUIPMENT) + len(LEGGINGS_LAYERS)} armor layers, {len(MOB_THEMES)} mob skins, "
+        f"{len(BOSS_THEMES)} boss skins, "
         f"{len(SIGNS)} signs, "
         f"{len(RANK_GLYPHS)} rank badges, {len(SOUNDS)} sounds -> {ZIP} (sha1 {digest})"
     )

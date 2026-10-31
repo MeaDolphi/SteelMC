@@ -1,11 +1,12 @@
 //! System equipment: artifacts a hunter equips through the System instead of
 //! wearing them.
 //!
-//! Gear sits in its own slots — head, body, legs, feet, gloves, two rings and
-//! an amulet — so gloves or rings never compete with vanilla armor slots. The
-//! hunter's body stays bare: gear only grants its attribute bonuses and
-//! abilities. The loadout is part of the persisted player data, and a chest
-//! menu moves artifacts between it and the inventory.
+//! Gear sits in its own slots — head, body, legs, feet, gloves, two rings,
+//! an amulet and a weapon slot for Mage staffs — so gloves, rings or staffs
+//! never compete with vanilla armor and hand slots. The hunter's body stays
+//! bare: gear only grants its attribute bonuses and abilities. The loadout
+//! is part of the persisted player data, and a chest menu moves artifacts
+//! between it and the inventory.
 
 use std::sync::Arc;
 
@@ -25,8 +26,10 @@ use text_components::{Modifier as _, TextComponent};
 use crate::class::HunterClass;
 use crate::identifier::from_sololeveling;
 use crate::item::artifact::{self, Ability, ArtifactId};
+use crate::item::serial;
 use crate::item::{named, nbt, with_lore};
 use crate::rank::HunterRank;
+use crate::spell::SpellGear;
 use crate::state::SoloLevelingState;
 use crate::ui::{After, open_guarded_buttons};
 
@@ -47,6 +50,9 @@ pub enum GearKind {
     Ring,
     /// Amulets and pendants.
     Amulet,
+    /// Held weapons; Mage staffs go here so both hands stay free for the
+    /// grimoire while the staff's spellcasting bonuses still apply.
+    Weapon,
 }
 
 impl GearKind {
@@ -61,6 +67,7 @@ impl GearKind {
             Self::Gloves => "Перчатки",
             Self::Ring => "Кольцо",
             Self::Amulet => "Амулет",
+            Self::Weapon => "Оружие",
         }
     }
 
@@ -73,12 +80,13 @@ impl GearKind {
             Self::Gloves => &vanilla_items::LEATHER_HORSE_ARMOR,
             Self::Ring => &vanilla_items::GOLD_NUGGET,
             Self::Amulet => &vanilla_items::HEART_OF_THE_SEA,
+            Self::Weapon => &vanilla_items::BLAZE_ROD,
         }
     }
 }
 
 /// Number of gear slots.
-pub const GEAR_SLOTS: usize = 8;
+pub const GEAR_SLOTS: usize = 9;
 /// The kind each gear slot takes, by gear index.
 pub const LAYOUT: [GearKind; GEAR_SLOTS] = [
     GearKind::Head,
@@ -89,11 +97,22 @@ pub const LAYOUT: [GearKind; GEAR_SLOTS] = [
     GearKind::Ring,
     GearKind::Ring,
     GearKind::Amulet,
+    GearKind::Weapon,
 ];
 /// Returns the gear kind an item can be equipped as, if any.
+///
+/// Serial items are regular equipment and stay out of the System gear, with
+/// one exception: a Mage staff fits the weapon slot, like artifact staffs,
+/// so its bonuses apply with both hands free for the grimoire.
 #[must_use]
 pub fn kind_of(stack: &ItemStack) -> Option<GearKind> {
-    artifact::of(stack)?.gear_kind()
+    if let Some(id) = artifact::of(stack) {
+        return id.gear_kind();
+    }
+    match serial::of(stack)?.gear_kind() {
+        weapon @ Some(GearKind::Weapon) => weapon,
+        _ => None,
+    }
 }
 
 pub(crate) fn free_slot(items: &[ItemStack], stack: &ItemStack) -> Option<usize> {
@@ -202,6 +221,23 @@ pub fn magic_bonus(items: &[ItemStack], class: Option<HunterClass>, strength: u3
         .sum()
 }
 
+/// Returns the spellcasting bonuses of the gear `items` a hunter of `rank`
+/// and `class` can use, from artifact and serial pieces alike. A Mage staff
+/// in the weapon slot counts, so its bonuses apply without occupying a
+/// hand; the same staff in a hand is read by the caller, not here.
+#[must_use]
+pub fn spell_gear(items: &[ItemStack], rank: HunterRank, class: Option<HunterClass>) -> SpellGear {
+    items
+        .iter()
+        .filter(|stack| wearable(stack, class) && artifact::usable_by(stack, rank))
+        .filter_map(|stack| {
+            artifact::of(stack)
+                .and_then(ArtifactId::spell_gear)
+                .or_else(|| serial::of(stack)?.spell_gear())
+        })
+        .fold(SpellGear::default(), SpellGear::combine)
+}
+
 /// Returns the attribute bonuses of the gear `items` a hunter of `rank`,
 /// `class` and `strength` can use, each with an id unique to its gear slot.
 #[must_use]
@@ -216,6 +252,7 @@ pub fn modifiers(
         .enumerate()
         .filter(|(_, stack)| {
             artifact::of(stack).is_some()
+                && kind_of(stack) != Some(GearKind::Weapon)
                 && artifact::usable_by(stack, rank)
                 && wearable(stack, class)
                 && strong_enough(stack, strength)
@@ -338,10 +375,13 @@ mod tests {
 
     use super::{
         GEAR_SLOTS, GearKind, LAYOUT, SavedGear, abilities, free_slot, kind_of, modifiers,
+        spell_gear,
     };
+    use crate::class::HunterClass;
     use crate::item::artifact::{self, ArtifactId};
     use crate::item::serial;
     use crate::rank::HunterRank;
+    use crate::spell::SpellGear;
     use steel_registry::item_stack::ItemStack;
 
     #[test]
@@ -359,9 +399,14 @@ mod tests {
         init_vanilla_registry();
         for id in serial::ALL {
             let stack = serial::stack(id, None);
-            assert_eq!(kind_of(&stack), None, "{id:?}");
-            let items: Vec<_> = (0..GEAR_SLOTS).map(|_| ItemStack::empty()).collect();
-            assert_eq!(free_slot(&items, &stack), None);
+            // The ApprenticeStaff is the one serial that fits the gear's
+            // weapon slot, like artifact staffs.
+            let expected = (id == serial::SerialId::ApprenticeStaff).then_some(GearKind::Weapon);
+            assert_eq!(kind_of(&stack), expected, "{id:?}");
+            if expected.is_none() {
+                let items: Vec<_> = (0..GEAR_SLOTS).map(|_| ItemStack::empty()).collect();
+                assert_eq!(free_slot(&items, &stack), None);
+            }
         }
     }
 
@@ -423,5 +468,60 @@ mod tests {
         let low = modifiers(&items, HunterRank::D, None, 0);
         assert!(!low.is_empty(), "the shoes still give their bonus");
         assert!(modifiers(&items, HunterRank::A, None, 0).len() > low.len());
+    }
+
+    #[test]
+    fn mage_staffs_take_the_weapon_slot_and_buff_from_gear() {
+        init_vanilla_registry();
+        for id in [
+            ArtifactId::AshStaff,
+            ArtifactId::KargalgansStaff,
+            ArtifactId::DemonKingsStaff,
+        ] {
+            let staff = artifact::stack(id, None);
+            assert_eq!(kind_of(&staff), Some(GearKind::Weapon), "{id:?}");
+            let items = vec![ItemStack::empty(); GEAR_SLOTS];
+            // Geared, the staff grants its spellcasting bonuses to a Mage
+            // and its Magic Focus ability, but no passive attack damage.
+            let mage = Some(HunterClass::Mage);
+            let slot = free_slot(&items, &staff).expect("free weapon slot");
+            assert_eq!(LAYOUT[slot], GearKind::Weapon);
+            let mut geared = items;
+            geared[slot] = staff;
+            let bonuses = spell_gear(&geared, HunterRank::S, mage);
+            assert_ne!(bonuses, SpellGear::default(), "{id:?}");
+            if id == ArtifactId::KargalgansStaff {
+                assert!(
+                    abilities(&geared, HunterRank::S, mage)
+                        .contains(&artifact::Ability::MagicFocus { percent: 0.3 }),
+                    "KargalgansStaff keeps its Magic Focus from the weapon slot"
+                );
+            }
+            assert!(
+                modifiers(&geared, HunterRank::S, mage, 0).is_empty(),
+                "{id:?} grants no held-weapon attributes from gear"
+            );
+        }
+    }
+
+    #[test]
+    fn the_apprentice_staff_buffs_from_the_weapon_slot() {
+        init_vanilla_registry();
+        let staff = serial::stack(serial::SerialId::ApprenticeStaff, None);
+        assert_eq!(kind_of(&staff), Some(GearKind::Weapon));
+        let mut geared = vec![ItemStack::empty(); GEAR_SLOTS];
+        let slot = free_slot(&geared, &staff).expect("free weapon slot");
+        geared[slot] = staff;
+        let bonuses = spell_gear(&geared, HunterRank::D, Some(HunterClass::Mage));
+        assert!(bonuses.magic > 0.0);
+    }
+
+    #[test]
+    fn melee_weapons_stay_hand_only() {
+        init_vanilla_registry();
+        for id in [ArtifactId::KnightsKiller, ArtifactId::DemonKingsLongsword] {
+            let weapon = artifact::stack(id, None);
+            assert_eq!(kind_of(&weapon), None, "{id:?}");
+        }
     }
 }

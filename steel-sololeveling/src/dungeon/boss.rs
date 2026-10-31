@@ -110,6 +110,17 @@ impl BossKind {
         Self::Archer
     }
 
+    /// Returns the default resource-pack equipment skin of the archetype.
+    #[must_use]
+    pub const fn skin(self) -> &'static str {
+        match self {
+            Self::Warlord => "boss_warlord",
+            Self::Archmage => "boss_shaman",
+            Self::Assassin => "boss_berserker",
+            Self::Archer => "boss_archer",
+        }
+    }
+
     /// Returns the abilities a boss of this kind uses at `rank`, by priority.
     ///
     /// Higher ranks unlock more of the kit, so an S gate fights differently
@@ -349,6 +360,8 @@ pub struct DungeonBoss {
     pub gear: BossGear,
     /// Abilities the boss may use during the fight, by priority.
     pub abilities: &'static [BossAbility],
+    /// Equipment asset id in the resource pack; `None` uses the archetype's skin.
+    pub skin: Option<&'static str>,
 }
 
 impl DungeonBoss {
@@ -415,6 +428,11 @@ impl DungeonBoss {
             ),
         };
         let mut equipment = vec![(EquipmentSlot::MainHand, weapon)];
+        let skin = self.skin.unwrap_or_else(|| self.kind.skin());
+        let armor = armor.map(|mut stack| {
+            crate::item::model::apply_equipment(&mut stack, skin);
+            stack
+        });
         equipment.extend(ARMOR_SLOTS.into_iter().zip(armor));
         equipment
     }
@@ -447,6 +465,7 @@ pub fn boss_for_gate(kind: BossKind, rank: HunterRank, red: bool) -> DungeonBoss
         attack_knockback: knockback,
         gear: BossGear::for_rank(rank),
         abilities: kind.abilities(rank),
+        skin: None,
     }
 }
 

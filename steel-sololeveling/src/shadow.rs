@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use steel_utils::Identifier;
 use uuid::Uuid;
 
+use crate::dungeon::boss::{BossAbility, BossKind};
 use crate::dungeon::generator::THEMES;
 use crate::dungeon::mobs::{MobClass, creature_name};
 use crate::rank::HunterRank;
@@ -344,6 +345,58 @@ pub enum BossSource {
     },
 }
 
+impl BossSource {
+    /// Returns the boss archetype whose ability kit this elite shadow inherits.
+    ///
+    /// Nests are part of the swarm and raise nothing. The Ant King fights like
+    /// a warlord: in the canon only the King (Beru) answers the Shadow Monarch.
+    #[must_use]
+    pub fn boss_kind(&self) -> Option<BossKind> {
+        match self {
+            Self::Dungeon { archetype, .. } => archetype_kind(archetype),
+            Self::IslandKing => Some(BossKind::Warlord),
+            Self::IslandNest { .. } | Self::CastleFloor { .. } => None,
+        }
+    }
+
+    /// Returns the rank that decides which tier of the ability kit is used.
+    #[must_use]
+    pub const fn ability_rank(&self) -> HunterRank {
+        match self {
+            Self::Dungeon { rank, .. } => *rank,
+            Self::IslandNest { zone_rank, .. } => *zone_rank,
+            // The Ant King is an S-rank threat; castle floor bosses are not
+            // extractable yet and only carry a rank for completeness.
+            Self::IslandKing | Self::CastleFloor { .. } => HunterRank::S,
+        }
+    }
+}
+
+/// Maps a stored boss archetype name back to its kind.
+///
+/// Red-gate plates carry the «Кровавый » prefix and are lowercased, so the
+/// comparison ignores both.
+fn archetype_kind(archetype: &str) -> Option<BossKind> {
+    let name = archetype.strip_prefix("Кровавый ").unwrap_or(archetype);
+    [
+        BossKind::Warlord,
+        BossKind::Archmage,
+        BossKind::Assassin,
+        BossKind::Archer,
+    ]
+    .into_iter()
+    .find(|kind| kind.display_name().to_lowercase() == name.to_lowercase())
+}
+
+/// Returns the boss-archetype ability kit an elite shadow of `source`
+/// summons with, and the rank the kit scales at.
+#[must_use]
+pub fn elite_ability_kit(source: &BossSource) -> Option<(&'static [BossAbility], HunterRank)> {
+    let kind = source.boss_kind()?;
+    let rank = source.ability_rank();
+    Some((kind.abilities(rank), rank))
+}
+
 /// Result of one boss-shadow extraction ritual.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtractionResult {
@@ -414,6 +467,10 @@ pub struct EliteShadow {
     pub origin: ShadowOrigin,
     /// Which boss this shadow was extracted from.
     pub source: BossSource,
+    /// Body scale inherited from the boss, in thousandths; zero keeps the
+    /// vanilla body size. Absent on elite shadows saved before scale existed.
+    #[serde(default)]
+    pub scale: u32,
 }
 
 impl EliteShadow {
@@ -433,6 +490,7 @@ impl EliteShadow {
             recovery: None,
             origin,
             source,
+            scale: 0,
         }
     }
 
@@ -508,12 +566,35 @@ pub struct EliteShadowRoster {
 
 impl EliteShadowRoster {
     /// Adds an elite shadow if a slot is free.
-    pub fn add(&mut self, shadow: EliteShadow) -> Result<(), &'static str> {
+    ///
+    /// Two bosses of one archetype are different shadows, so a name that is
+    /// already taken gets an ordinal suffix: summons are looked up by name,
+    /// and a duplicate name would make the second shadow unreachable.
+    ///
+    /// Returns the stored shadow, with its final unique name.
+    pub fn add(&mut self, mut shadow: EliteShadow) -> Result<&EliteShadow, &'static str> {
         if self.shadows.len() >= MAX_ELITE_SHADOW_SLOTS {
             return Err("Достигнут лимит элитных теней.");
         }
+        if self
+            .shadows
+            .iter()
+            .any(|kept| same_name(&kept.name, &shadow.name))
+        {
+            let base = shadow.name.clone();
+            let mut ordinal = 2;
+            while self
+                .shadows
+                .iter()
+                .any(|kept| same_name(&kept.name, &format!("{base} ({ordinal})")))
+            {
+                ordinal += 1;
+            }
+            shadow.name = format!("{base} ({ordinal})");
+        }
         self.shadows.push(shadow);
-        Ok(())
+        let index = self.shadows.len() - 1;
+        Ok(&self.shadows[index])
     }
 
     /// Looks up an elite shadow by its player-visible name.
@@ -676,6 +757,26 @@ mod tests {
     }
 
     #[test]
+    fn elite_roster_disambiguates_duplicate_boss_names() {
+        let mut roster = super::EliteShadowRoster::default();
+        roster
+            .add(sample_elite_shadow())
+            .expect("slot should be free");
+        let second = sample_elite_shadow();
+        roster.add(second).expect("slot should be free");
+        let third = sample_elite_shadow();
+        roster.add(third).expect("slot should be free");
+
+        assert_eq!(roster.shadows[0].name, "Вождь-берсерк");
+        assert_eq!(roster.shadows[1].name, "Вождь-берсерк (2)");
+        assert_eq!(roster.shadows[2].name, "Вождь-берсерк (3)");
+        // Each duplicate stays summonable by its own stored name.
+        for shadow in &roster.shadows {
+            assert!(roster.named(&shadow.name).is_some());
+        }
+    }
+
+    #[test]
     fn elite_shadow_levels_and_earns_points_like_an_army_shadow() {
         let mut shadow = sample_elite_shadow();
         assert_eq!(shadow.grant_experience(100), 1);
@@ -695,6 +796,56 @@ mod tests {
         let restored: super::EliteShadowRoster =
             serde_json::from_str(&encoded).expect("deserialize elite roster");
         assert_eq!(restored, roster);
+    }
+
+    #[test]
+    fn elite_shadow_from_older_save_has_vanilla_body_scale() {
+        let mut roster = super::EliteShadowRoster::default();
+        roster
+            .add(sample_elite_shadow())
+            .expect("sample elite shadow fits in an empty roster");
+        let mut data = serde_json::to_value(&roster).expect("serialize elite roster");
+        for shadow in data["shadows"].as_array_mut().expect("shadows") {
+            shadow.as_object_mut().expect("shadow").remove("scale");
+        }
+        let restored: super::EliteShadowRoster =
+            serde_json::from_value(data).expect("legacy elite roster");
+        assert_eq!(restored.shadows[0].scale, 0);
+    }
+
+    #[test]
+    fn elite_shadows_inherit_the_ability_kit_of_their_boss_archetype() {
+        use crate::dungeon::boss::BossKind;
+
+        let dungeon = super::BossSource::Dungeon {
+            rank: HunterRank::B,
+            archetype: "Вождь-берсерк".to_owned(),
+            red: false,
+        };
+        let (kit, rank) = super::elite_ability_kit(&dungeon).expect("dungeon boss has a kit");
+        assert_eq!(kit, BossKind::Warlord.abilities(HunterRank::B));
+        assert_eq!(rank, HunterRank::B);
+
+        let red_gate = super::BossSource::Dungeon {
+            rank: HunterRank::A,
+            archetype: "Кровавый архимаг".to_owned(),
+            red: true,
+        };
+        let (kit, _) = super::elite_ability_kit(&red_gate).expect("red-gate name maps back");
+        assert_eq!(kit, BossKind::Archmage.abilities(HunterRank::A));
+
+        let king = super::elite_ability_kit(&super::BossSource::IslandKing)
+            .expect("the Ant King carries a warlord kit");
+        assert_eq!(king.0, BossKind::Warlord.abilities(HunterRank::S));
+        assert_eq!(king.1, HunterRank::S);
+
+        assert!(
+            super::elite_ability_kit(&super::BossSource::IslandNest {
+                zone_rank: HunterRank::A,
+                zone_name: "Поля гнёзд".to_owned(),
+            })
+            .is_none()
+        );
     }
 
     fn sample_elite_shadow() -> super::EliteShadow {

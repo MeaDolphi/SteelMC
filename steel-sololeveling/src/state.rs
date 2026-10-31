@@ -1397,6 +1397,15 @@ impl SoloLevelingState {
         Some(elite)
     }
 
+    /// Drives the archetype abilities of summoned elite shadows and resolves
+    /// their casts after the shadow-runtime lock is released.
+    pub fn tick_elite_shadow_fights(&self, server: &Arc<Server>, tick: u64) {
+        let actions = self.shadow_runtime.lock().tick_elite_fights(server, tick);
+        for action in actions {
+            action.apply(server);
+        }
+    }
+
     /// Summons one named elite shadow for the player.
     pub fn summon_elite_shadow(&self, hunter: &Player, name: &str) -> Result<(), &'static str> {
         let mut runtime = self.shadow_runtime.lock();

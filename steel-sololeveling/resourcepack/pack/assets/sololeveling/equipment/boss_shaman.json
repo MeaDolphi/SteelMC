@@ -1,0 +1,14 @@
+{
+  "layers": {
+    "humanoid": [
+      {
+        "texture": "sololeveling:boss_shaman"
+      }
+    ],
+    "humanoid_leggings": [
+      {
+        "texture": "sololeveling:boss_shaman"
+      }
+    ]
+  }
+}

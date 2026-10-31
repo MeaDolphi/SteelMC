@@ -12,6 +12,8 @@
 //! walls, ceiling) is derived from the carved air, which keeps rooms and
 //! corridors airtight wherever they meet.
 
+use std::collections::VecDeque;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 use steel_registry::blocks::BlockRef;
 use steel_registry::vanilla_blocks;
@@ -330,7 +332,7 @@ impl Blueprint {
     #[must_use]
     pub fn generate_with_theme(seed: u64, combat_rooms: u8, theme: Theme) -> Self {
         let mut rng = SplitMix(seed);
-        let path = main_path(&mut rng, usize::from(combat_rooms) + 2);
+        let path = main_path(&mut rng, usize::try_from(combat_rooms).unwrap_or(0) + 2);
         let mut cells: Vec<((i32, i32), RoomRole)> = path
             .iter()
             .enumerate()
@@ -775,6 +777,43 @@ fn shell(
             }
         }
     }
+    // Walls are two blocks thick. Every wall block that borders carved air
+    // must have solid ground on all its other horizontal faces: mining a
+    // crystal ore out of the inner layer would otherwise expose the void
+    // behind or beside the wall. Carved columns on the far side seal
+    // themselves, so only truly solid ground receives a backing block.
+    let inner_walls: Vec<(i32, i32, i32)> = solid
+        .iter()
+        .filter(|(_, part)| matches!(part, Part::Wall | Part::WallAlt))
+        .map(|((x, y, z), _)| (*x, *y, *z))
+        .collect();
+    for (x, y, z) in inner_walls {
+        // Ore also sits in reentrant corners that only touch room air
+        // diagonally, so the air check spans all eight surrounding columns.
+        let faces_air = (-1..=1)
+            .flat_map(|dx| (-1..=1).map(move |dz| (dx, dz)))
+            .filter(|(dx, dz)| *dx != 0 || *dz != 0)
+            .any(|(dx, dz)| is_air(x + dx, y, z + dz));
+        if !faces_air {
+            continue;
+        }
+        for (dx, dz) in DIRECTIONS {
+            let (bx, bz) = (x - dx, z - dz);
+            // A carved column only rules out its own air; above its ceiling
+            // or below its floor the position is outside shell and must be
+            // backed like any other void (floors and ceilings of carved
+            // columns are already solid by now, so `or_insert` keeps them).
+            if is_air(bx, y, bz) {
+                continue;
+            }
+            let backing = if hash(seed ^ 0x5A5A, bx, y, bz).is_multiple_of(4) {
+                Part::WallAlt
+            } else {
+                Part::Wall
+            };
+            solid.entry((bx, y, bz)).or_insert(backing);
+        }
+    }
     // A wall column with air on all four sides stands inside a room: a pillar.
     for ((x, y, z), part) in &mut solid {
         if matches!(part, Part::Wall | Part::WallAlt)
@@ -785,6 +824,41 @@ fn shell(
                 .all(|(dx, dz)| air.contains_key(&(x + dx, z + dz)))
         {
             *part = Part::Pillar;
+        }
+    }
+    // Cavern outlines can carve cells that touch the rest of the dungeon only
+    // diagonally; sealed behind walls they would read as void holes next to
+    // mined ore. Any carved position the entrance air cannot reach is filled
+    // back in.
+    const AROUND: [(i32, i32, i32); 6] = [
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    ];
+    let mut interior: FxHashSet<(i32, i32, i32)> = FxHashSet::default();
+    let mut queue: VecDeque<(i32, i32, i32)> = VecDeque::from([(0, 0, 0)]);
+    interior.insert((0, 0, 0));
+    while let Some((x, y, z)) = queue.pop_front() {
+        for (dx, dy, dz) in AROUND {
+            let next = (x + dx, y + dy, z + dz);
+            if is_air(next.0, next.1, next.2) && interior.insert(next) {
+                queue.push_back(next);
+            }
+        }
+    }
+    for ((x, z), column) in air {
+        for y in 0..i32::from(column.height) {
+            if !interior.contains(&(*x, y, *z)) {
+                let part = if hash(seed ^ 0x5A5A, *x, y, *z).is_multiple_of(4) {
+                    Part::WallAlt
+                } else {
+                    Part::Wall
+                };
+                solid.insert((*x, y, *z), part);
+            }
         }
     }
     let mut ore_candidates = ore_candidates
@@ -1021,6 +1095,69 @@ mod tests {
         for seed in 0..50 {
             let layout = crate::dungeon::DungeonLayout::for_gate(seed, true);
             assert_eq!(layout.blueprint.theme, Theme::Ice);
+        }
+    }
+
+    #[test]
+    fn walls_are_two_blocks_thick_and_mining_ore_opens_no_hole_outside() {
+        const AROUND: [(i32, i32, i32); 6] = [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ];
+        for seed in 0..50 {
+            let blueprint = Blueprint::generate(seed, 5);
+            let solid: FxHashSet<(i32, i32, i32)> =
+                blueprint.blocks.iter().map(|block| block.offset).collect();
+            let ((min_x, min_y, min_z), (max_x, max_y, max_z)) = blueprint.bounds;
+
+            // The carved interior is sealed: a flood fill from the entrance
+            // air stays strictly inside the shell and never reaches the void.
+            let mut interior: FxHashSet<(i32, i32, i32)> = FxHashSet::default();
+            let mut queue = VecDeque::from([(0, 0, 0)]);
+            interior.insert((0, 0, 0));
+            while let Some((x, y, z)) = queue.pop_front() {
+                for (dx, dy, dz) in AROUND {
+                    let next = (x + dx, y + dy, z + dz);
+                    if solid.contains(&next) {
+                        continue;
+                    }
+                    assert!(
+                        next.0 > min_x
+                            && next.0 < max_x
+                            && next.1 > min_y
+                            && next.1 < max_y
+                            && next.2 > min_z
+                            && next.2 < max_z,
+                        "seed {seed}: dungeon leaks towards {next:?}"
+                    );
+                    if interior.insert(next) {
+                        queue.push_back(next);
+                    }
+                }
+            }
+
+            // Mining a crystal ore out of the inner wall layer leaves every
+            // exposed neighbour solid or interior: the backing wall keeps the
+            // void outside.
+            for block in blueprint
+                .blocks
+                .iter()
+                .filter(|block| block.part == Part::Ore)
+            {
+                let (x, y, z) = block.offset;
+                for (dx, dy, dz) in AROUND {
+                    let neighbour = (x + dx, y + dy, z + dz);
+                    assert!(
+                        solid.contains(&neighbour) || interior.contains(&neighbour),
+                        "seed {seed}: mining ore at {:?} opens a hole to {neighbour:?}",
+                        block.offset
+                    );
+                }
+            }
         }
     }
 }

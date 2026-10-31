@@ -60,20 +60,40 @@ const PARTY_RADIUS: f64 = 10.0;
 const PULSE_MILLIS: u64 = 1_000;
 /// Damage taken by a Weakened mob's victim, as a fraction.
 const WEAKEN_FACTOR: f32 = 0.75;
-/// Damage taken inside a Sanctuary, as a fraction.
-const WARD_FACTOR: f32 = 0.70;
 /// Extra damage of a blessed hunter, as a fraction.
 const BLESSING_BONUS: f32 = 0.15;
 /// Extra destruction damage under Monarch's Wrath.
 const WRATH_DAMAGE: f32 = 1.3;
 /// Destruction mana cost under Monarch's Wrath, as a fraction.
 const WRATH_MANA: f32 = 0.5;
-/// Mana a Mana Shield spends per point of health it absorbs.
-const SHIELD_MANA_PER_HEALTH: f32 = 2.0;
 /// Milliseconds of a full Meditation.
 const MEDITATION_MILLIS: u64 = 4_000;
 /// Share of maximum mana a full Meditation restores.
 const MEDITATION_SHARE: f32 = 0.5;
+
+// Destruction damage, one constant per spell.
+//
+// Balance (маг-нерф): the upper-bound sustained damage of the spammable
+// rotation (damage per cast divided by the base cooldown, mana and bonuses
+// aside) is cut from ~11.3 to ~6.8 per second, about −40%, so a Mage wins
+// by kiting and burst windows instead of out-damaging melee classes while
+// never being reached. Long-cooldown spells keep most of their per-cast
+// punch. The band is pinned by
+// `destruction_rotation_sustained_damage_fits_the_nerf_band`.
+/// Damage of one Magic Arrow.
+const MAGIC_ARROW_DAMAGE: f32 = 5.0;
+/// Damage of one Fireball on every mob in the blast.
+const FIREBALL_DAMAGE: f32 = 7.0;
+/// Damage of one Ice Spear.
+const ICE_SPEAR_DAMAGE: f32 = 9.0;
+/// Damage of Chain Lightning's first strike; each jump keeps 75%.
+const CHAIN_LIGHTNING_DAMAGE: f32 = 8.0;
+/// Damage per second of a Mana Storm to every mob inside.
+const MANA_STORM_DAMAGE_PER_SECOND: f32 = 3.5;
+/// Damage of one Meteor on every mob in the blast.
+const METEOR_DAMAGE: f32 = 22.0;
+/// Damage of a Void Lance to every mob on the line.
+const VOID_LANCE_DAMAGE: f32 = 26.0;
 
 /// A Meteor on its way down.
 #[derive(Debug)]
@@ -780,7 +800,7 @@ impl SoloLevelingState {
                 );
                 if let Some(target) = shot.hits.first() {
                     fx::impact(world, spell, target.position() + DVec3::Y);
-                    caster.hurt(target, 6.0);
+                    caster.hurt(target, MAGIC_ARROW_DAMAGE);
                 }
             }
             SpellId::Fireball => {
@@ -791,7 +811,7 @@ impl SoloLevelingState {
                 fx::explosion(world, center);
                 fx::burst(world, &vanilla_particle_types::LAVA, center, 10, 0.5, 0.1);
                 for target in enemies_near(world, center, 3.0) {
-                    caster.hurt(&target, 8.0);
+                    caster.hurt(&target, FIREBALL_DAMAGE);
                     target.set_remaining_fire_ticks(80 * caster.burn);
                 }
             }
@@ -806,7 +826,7 @@ impl SoloLevelingState {
                 );
                 if let Some(target) = shot.hits.first() {
                     fx::impact(world, spell, target.position() + DVec3::Y);
-                    caster.hurt(target, 10.0);
+                    caster.hurt(target, ICE_SPEAR_DAMAGE);
                     afflict(target, vanilla_mob_effects::SLOWNESS, 60, 2);
                 }
             }
@@ -825,7 +845,7 @@ impl SoloLevelingState {
                 let mut struck = vec![first.id()];
                 let mut from = caster.eye;
                 let mut current = first;
-                let mut damage = 8.0;
+                let mut damage = CHAIN_LIGHTNING_DAMAGE;
                 play_at(
                     world,
                     fx::theme(spell).impact_sound,
@@ -867,7 +887,7 @@ impl SoloLevelingState {
                     world.key.clone(),
                     caster.player.position(),
                     5.0,
-                    4.0 * caster.power,
+                    MANA_STORM_DAMAGE_PER_SECOND * caster.power,
                     now + 6_000,
                 ));
             }
@@ -890,7 +910,7 @@ impl SoloLevelingState {
                     owner: caster.player.gameprofile.id(),
                     world: world.key.clone(),
                     center,
-                    damage: 25.0 * caster.power,
+                    damage: METEOR_DAMAGE * caster.power,
                     burn_ticks: 100 * caster.burn,
                     due: now + 1_500,
                 });
@@ -901,7 +921,7 @@ impl SoloLevelingState {
                 fx::beam(world, &vanilla_particle_types::PORTAL, caster.eye, shot.end);
                 for target in &shot.hits {
                     fx::impact(world, spell, target.position() + DVec3::Y);
-                    caster.hurt(target, 30.0);
+                    caster.hurt(target, VOID_LANCE_DAMAGE);
                 }
             }
             SpellId::MonarchsWrath => {
@@ -1283,11 +1303,6 @@ impl SoloLevelingState {
             serial::of(&stack)
         })
         .filter(|id| id.line() == Some(crate::item::artifact::ArmorLine::Robe));
-        let artifact_gear = worn
-            .iter()
-            .filter(|stack| gear::wearable(stack, class))
-            .filter(|stack| artifact::usable_by(stack, rank))
-            .filter_map(|stack| artifact::of(stack)?.spell_gear());
         let artifact_staff_spell_gear = artifact_staffs
             .filter(|stack| artifact::usable_by(stack, rank))
             .filter_map(|stack| artifact::of(stack)?.spell_gear());
@@ -1296,7 +1311,7 @@ impl SoloLevelingState {
             .filter_map(|stack| serial::of(stack)?.spell_gear());
         artifact_staff_spell_gear
             .chain(serial_staff_spell_gear)
-            .chain(artifact_gear)
+            .chain([gear::spell_gear(&worn, rank, class)])
             .chain(physical_robes.filter_map(|id| id.spell_gear()))
             .fold(
                 self.enchant_spell_gear(player.gameprofile.id()),
@@ -1357,18 +1372,18 @@ impl SoloLevelingState {
                     let magic = &mut session.magic;
                     magic.last_hurt = now;
                     magic.meditation = None;
-                    let mut damage = damage;
-                    if magic.ward_until > now {
-                        damage *= WARD_FACTOR;
+                    // A single layer answers a hit: the Mana Shield, while
+                    // it holds, converts damage and the Sanctuary ward
+                    // yields; see `spell::protected_damage`.
+                    if magic.mana_shield_until > now {
+                        if let Some(mana) = magic.mana.as_mut() {
+                            spell::protected_damage(true, magic.ward_until > now, mana, damage)
+                        } else {
+                            spell::protected_damage(false, magic.ward_until > now, &mut 0.0, damage)
+                        }
+                    } else {
+                        spell::protected_damage(false, magic.ward_until > now, &mut 0.0, damage)
                     }
-                    if magic.mana_shield_until > now
-                        && let Some(mana) = magic.mana.as_mut()
-                    {
-                        let absorbed = damage.min(*mana / SHIELD_MANA_PER_HEALTH);
-                        *mana -= absorbed * SHIELD_MANA_PER_HEALTH;
-                        damage -= absorbed;
-                    }
-                    damage
                 })
                 .unwrap_or(damage);
         }
@@ -1427,7 +1442,10 @@ fn holds_grimoire(player: &Player) -> bool {
 mod tests {
     use glam::DVec3;
 
-    use super::{cast_cost, compass};
+    use super::{
+        CHAIN_LIGHTNING_DAMAGE, FIREBALL_DAMAGE, ICE_SPEAR_DAMAGE, MAGIC_ARROW_DAMAGE,
+        MANA_STORM_DAMAGE_PER_SECOND, METEOR_DAMAGE, VOID_LANCE_DAMAGE, cast_cost, compass,
+    };
     use crate::spell::{SpellGear, SpellId};
 
     #[test]
@@ -1438,5 +1456,44 @@ mod tests {
         assert_eq!(compass(DVec3::ZERO, DVec3::new(0.0, 0.0, -10.0)), "север");
         assert_eq!(compass(DVec3::ZERO, DVec3::new(10.0, 0.0, 0.0)), "восток");
         assert_eq!(compass(DVec3::ZERO, DVec3::new(0.0, 0.0, 10.0)), "юг");
+    }
+
+    #[test]
+    fn destruction_rotation_sustained_damage_fits_the_nerf_band() {
+        // Upper-bound sustained damage of the four spammable destruction
+        // spells: damage per cast divided by the base cooldown, mana and
+        // bonuses aside. The balance target is ~6.8 per second, about −40%
+        // of the pre-nerf ~11.3; see the constants above the cast code.
+        let rotation = [
+            (MAGIC_ARROW_DAMAGE, SpellId::MagicArrow),
+            (FIREBALL_DAMAGE, SpellId::Fireball),
+            (ICE_SPEAR_DAMAGE, SpellId::IceSpear),
+            (CHAIN_LIGHTNING_DAMAGE, SpellId::ChainLightning),
+        ];
+        let per_second: f32 = rotation
+            .iter()
+            .map(|(damage, spell)| damage / (spell.info().cooldown_millis as f32 / 1_000.0))
+            .sum();
+        assert!(
+            (5.8..=7.8).contains(&per_second),
+            "sustained rotation damage {per_second} outside the nerf band"
+        );
+    }
+
+    #[test]
+    fn destruction_damage_grows_with_the_spell_tier() {
+        let storm_total = MANA_STORM_DAMAGE_PER_SECOND * 6.0;
+        let per_cast = [
+            MAGIC_ARROW_DAMAGE,
+            FIREBALL_DAMAGE,
+            CHAIN_LIGHTNING_DAMAGE,
+            ICE_SPEAR_DAMAGE,
+            storm_total,
+            METEOR_DAMAGE,
+            VOID_LANCE_DAMAGE,
+        ];
+        for pair in per_cast.windows(2) {
+            assert!(pair[0] <= pair[1], "{pair:?} breaks the tier order");
+        }
     }
 }
