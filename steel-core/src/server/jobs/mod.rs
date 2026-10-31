@@ -165,13 +165,25 @@ impl ServerJobQueue {
 
     /// Completes durable jobs, then cancels ordinary jobs before final saves.
     pub async fn finish_all(&self) {
+        // A stuck job must not freeze the whole shutdown: log its type and
+        // abandon it instead of awaiting forever.
+        const JOB_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         loop {
             let jobs = mem::take(&mut *self.jobs.lock());
             if jobs.is_empty() {
                 return;
             }
             for job in jobs {
-                job.finish_shutdown().await;
+                let name = std::any::type_name_of_val(&*job);
+                let shutdown = job.finish_shutdown();
+                if tokio::time::timeout(JOB_SHUTDOWN_TIMEOUT, shutdown)
+                    .await
+                    .is_err()
+                {
+                    log::error!(
+                        "server job {name} did not finish within {JOB_SHUTDOWN_TIMEOUT:?} during shutdown; abandoning it"
+                    );
+                }
             }
         }
     }

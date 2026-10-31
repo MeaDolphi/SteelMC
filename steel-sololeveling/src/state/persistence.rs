@@ -1500,7 +1500,14 @@ impl SoloLevelingState {
                     move |result| {
                         let loaded = match result {
                             Ok(result) => result,
-                            Err(error) => panic!("gameplay account load task failed: {error}"),
+                            Err(error) => {
+                                log::error!(
+                                    "sololeveling: gameplay account load task failed: {error}"
+                                );
+                                state.persistence.lock().busy = false;
+                                let _ = reply.send(Err(io::Error::other(error.to_string())));
+                                return;
+                            }
                         };
                         let mut persistence = state.persistence.lock();
                         persistence.busy = false;
@@ -2377,7 +2384,21 @@ impl SoloLevelingState {
             move |result| {
                 let (prepared, result) = match result {
                     Ok(result) => result,
-                    Err(error) => panic!("gameplay account commit task failed: {error}"),
+                    Err(error) => {
+                        // A panicked IO task leaves the commit status unknown;
+                        // report it as uncommitted like any other failed write
+                        // instead of freezing the queue and the shutdown.
+                        log::error!("sololeveling: gameplay account commit task failed: {error}");
+                        state.persistence.lock().busy = false;
+                        completion(
+                            &state,
+                            CommitReport {
+                                committed: false,
+                                confirmed: false,
+                            },
+                        );
+                        return;
+                    }
                 };
                 let report = prepared.complete(&state, &result);
                 completion(&state, report);
@@ -2396,6 +2417,13 @@ impl SoloLevelingState {
             .map_err(|error| error.to_string())?;
         self.queue_party_save().map_err(|error| error.to_string())?;
         self.persistence.lock().quiescing = true;
+        // A graceful shutdown must not hang on a stuck write: log progress
+        // and give up with an error after the deadline, letting the world
+        // save proceed (the storage layer is atomic, so nothing corrupts).
+        const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+        const FLUSH_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + FLUSH_TIMEOUT;
+        let mut last_log = std::time::Instant::now();
         loop {
             server.jobs.finish_all().await;
             let empty = {
@@ -2424,6 +2452,23 @@ impl SoloLevelingState {
                 return Ok(());
             }
             self.tick_persistence(&server);
+            if last_log.elapsed() >= FLUSH_LOG_INTERVAL {
+                let persistence = self.persistence.lock();
+                log::info!(
+                    "sololeveling: flushing persistence: {} write(s) left, busy={}",
+                    persistence.requests.len(),
+                    persistence.busy
+                );
+                last_log = std::time::Instant::now();
+            }
+            if std::time::Instant::now() >= deadline {
+                let persistence = self.persistence.lock();
+                return Err(format!(
+                    "persistence flush timed out with {} write(s) left, busy={}",
+                    persistence.requests.len(),
+                    persistence.busy
+                ));
+            }
         }
     }
 }
