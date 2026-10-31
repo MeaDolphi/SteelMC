@@ -13,6 +13,7 @@
 #![recursion_limit = "256"]
 
 pub mod abilities;
+pub mod admin_menu;
 pub mod auction;
 pub mod auction_menu;
 pub mod castle;

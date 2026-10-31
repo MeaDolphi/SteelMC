@@ -1,4 +1,4 @@
-//! Serial hunter gear: starter, specialization, improved and merchant items.
+//! Serial hunter gear: starter, specialization, improved, elite, supreme and merchant items.
 //!
 //! Unlike named artifacts, serial items are regular Minecraft equipment. They
 //! keep their vanilla holder look, work in vanilla armor slots, and carry a
@@ -28,10 +28,12 @@ use uuid::Uuid;
 use super::artifact::{ArmorLine, Category, Modifier, Rarity};
 use super::binding;
 use super::enchantment::{self, Effect, Enchantment, ItemKind};
+use super::material::Quality;
 use super::{named, read_kind, record, tag_string, with_lore, write_tag};
 use crate::class::HunterClass;
 use crate::gear::GearKind;
 use crate::identifier::from_sololeveling;
+use crate::rank::HunterRank;
 use crate::spell::SpellGear;
 
 /// Kind stored in the record of a serial item.
@@ -138,9 +140,169 @@ pub enum SerialId {
     ImprovedHunterDagger,
     /// Improved starter-line weapon.
     ImprovedHunterAxe,
+    /// Elite light specialization helmet.
+    EliteLightHelmet,
+    /// Elite light specialization chestplate.
+    EliteLightChestplate,
+    /// Elite light specialization leggings.
+    EliteLightLeggings,
+    /// Elite light specialization boots.
+    EliteLightBoots,
+    /// Elite reinforced specialization helmet.
+    EliteReinforcedHelmet,
+    /// Elite reinforced specialization chestplate.
+    EliteReinforcedChestplate,
+    /// Elite reinforced specialization leggings.
+    EliteReinforcedLeggings,
+    /// Elite reinforced specialization boots.
+    EliteReinforcedBoots,
+    /// Elite heavy specialization helmet.
+    EliteHeavyHelmet,
+    /// Elite heavy specialization chestplate.
+    EliteHeavyChestplate,
+    /// Elite heavy specialization leggings.
+    EliteHeavyLeggings,
+    /// Elite heavy specialization boots.
+    EliteHeavyBoots,
+    /// Elite robe specialization helmet.
+    EliteRobeHelmet,
+    /// Elite robe specialization chestplate.
+    EliteRobeChestplate,
+    /// Elite robe specialization leggings.
+    EliteRobeLeggings,
+    /// Elite robe specialization boots.
+    EliteRobeBoots,
+    /// Elite starter-line weapon.
+    EliteHunterSword,
+    /// Elite starter-line weapon.
+    EliteHunterDagger,
+    /// Elite starter-line weapon.
+    EliteHunterAxe,
+    /// Supreme light specialization helmet.
+    SupremeLightHelmet,
+    /// Supreme light specialization chestplate.
+    SupremeLightChestplate,
+    /// Supreme light specialization leggings.
+    SupremeLightLeggings,
+    /// Supreme light specialization boots.
+    SupremeLightBoots,
+    /// Supreme reinforced specialization helmet.
+    SupremeReinforcedHelmet,
+    /// Supreme reinforced specialization chestplate.
+    SupremeReinforcedChestplate,
+    /// Supreme reinforced specialization leggings.
+    SupremeReinforcedLeggings,
+    /// Supreme reinforced specialization boots.
+    SupremeReinforcedBoots,
+    /// Supreme heavy specialization helmet.
+    SupremeHeavyHelmet,
+    /// Supreme heavy specialization chestplate.
+    SupremeHeavyChestplate,
+    /// Supreme heavy specialization leggings.
+    SupremeHeavyLeggings,
+    /// Supreme heavy specialization boots.
+    SupremeHeavyBoots,
+    /// Supreme robe specialization helmet.
+    SupremeRobeHelmet,
+    /// Supreme robe specialization chestplate.
+    SupremeRobeChestplate,
+    /// Supreme robe specialization leggings.
+    SupremeRobeLeggings,
+    /// Supreme robe specialization boots.
+    SupremeRobeBoots,
+    /// Supreme starter-line weapon.
+    SupremeHunterSword,
+    /// Supreme starter-line weapon.
+    SupremeHunterDagger,
+    /// Supreme starter-line weapon.
+    SupremeHunterAxe,
     /// Common Mage staff sold by the city merchant.
     ApprenticeStaff,
 }
+
+pub(crate) mod tiered;
+
+/// One of the three crafted serial tiers made to order at the city merchant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CraftedTier {
+    /// Tier II: common materials, rank D.
+    Improved,
+    /// Tier III: reinforced materials, rank C.
+    Elite,
+    /// Tier IV: superior materials, rank A.
+    Supreme,
+}
+
+impl CraftedTier {
+    /// Returns the lowest hunter rank that may order this tier.
+    #[must_use]
+    pub const fn rank(self) -> HunterRank {
+        match self {
+            Self::Improved => HunterRank::D,
+            Self::Elite => HunterRank::C,
+            Self::Supreme => HunterRank::A,
+        }
+    }
+
+    /// Returns the material quality consumed by this tier.
+    #[must_use]
+    pub const fn quality(self) -> Quality {
+        match self {
+            Self::Improved => Quality::Common,
+            Self::Elite => Quality::Reinforced,
+            Self::Supreme => Quality::Superior,
+        }
+    }
+
+    /// Returns the Russian tier name shown in the order menu.
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Improved => "Улучшенная",
+            Self::Elite => "Элитная",
+            Self::Supreme => "Высшая",
+        }
+    }
+
+    /// Multiplier applied to the improved tier's work fee.
+    #[must_use]
+    pub const fn work_multiplier(self) -> u64 {
+        match self {
+            Self::Improved => 1,
+            Self::Elite => 2,
+            Self::Supreme => 4,
+        }
+    }
+
+    /// Multiplier applied to the improved tier's base material counts.
+    #[must_use]
+    pub const fn material_multiplier(self) -> f64 {
+        match self {
+            Self::Improved => 1.0,
+            Self::Elite => 1.5,
+            Self::Supreme => 2.0,
+        }
+    }
+
+    /// Number of stable essences each recipe of this tier needs.
+    #[must_use]
+    pub const fn essence(self) -> u32 {
+        match self {
+            Self::Improved => 1,
+            Self::Elite => 2,
+            Self::Supreme => 3,
+        }
+    }
+}
+
+/// Bonus to outgoing magic damage of one elite mage-clothing piece.
+pub const ELITE_ROBE_MAGIC_BONUS_PER_PIECE: f32 = 0.06;
+/// Bonus to outgoing magic damage of one supreme mage-clothing piece.
+pub const SUPREME_ROBE_MAGIC_BONUS_PER_PIECE: f32 = 0.08;
+/// Strength elite heavy armor needs before its bonuses apply.
+pub const ELITE_HEAVY_STRENGTH: u32 = 30;
+/// Strength supreme heavy armor needs before its bonuses apply.
+pub const SUPREME_HEAVY_STRENGTH: u32 = 40;
 
 impl SerialId {
     /// Returns the stable tag value of the serial item.
@@ -191,6 +353,44 @@ impl SerialId {
             Self::ImprovedHunterSword => "improved_hunter_sword",
             Self::ImprovedHunterDagger => "improved_hunter_dagger",
             Self::ImprovedHunterAxe => "improved_hunter_axe",
+            Self::EliteLightHelmet => "elite_light_helmet",
+            Self::EliteLightChestplate => "elite_light_chestplate",
+            Self::EliteLightLeggings => "elite_light_leggings",
+            Self::EliteLightBoots => "elite_light_boots",
+            Self::EliteReinforcedHelmet => "elite_reinforced_helmet",
+            Self::EliteReinforcedChestplate => "elite_reinforced_chestplate",
+            Self::EliteReinforcedLeggings => "elite_reinforced_leggings",
+            Self::EliteReinforcedBoots => "elite_reinforced_boots",
+            Self::EliteHeavyHelmet => "elite_heavy_helmet",
+            Self::EliteHeavyChestplate => "elite_heavy_chestplate",
+            Self::EliteHeavyLeggings => "elite_heavy_leggings",
+            Self::EliteHeavyBoots => "elite_heavy_boots",
+            Self::EliteRobeHelmet => "elite_robe_helmet",
+            Self::EliteRobeChestplate => "elite_robe_chestplate",
+            Self::EliteRobeLeggings => "elite_robe_leggings",
+            Self::EliteRobeBoots => "elite_robe_boots",
+            Self::EliteHunterSword => "elite_hunter_sword",
+            Self::EliteHunterDagger => "elite_hunter_dagger",
+            Self::EliteHunterAxe => "elite_hunter_axe",
+            Self::SupremeLightHelmet => "supreme_light_helmet",
+            Self::SupremeLightChestplate => "supreme_light_chestplate",
+            Self::SupremeLightLeggings => "supreme_light_leggings",
+            Self::SupremeLightBoots => "supreme_light_boots",
+            Self::SupremeReinforcedHelmet => "supreme_reinforced_helmet",
+            Self::SupremeReinforcedChestplate => "supreme_reinforced_chestplate",
+            Self::SupremeReinforcedLeggings => "supreme_reinforced_leggings",
+            Self::SupremeReinforcedBoots => "supreme_reinforced_boots",
+            Self::SupremeHeavyHelmet => "supreme_heavy_helmet",
+            Self::SupremeHeavyChestplate => "supreme_heavy_chestplate",
+            Self::SupremeHeavyLeggings => "supreme_heavy_leggings",
+            Self::SupremeHeavyBoots => "supreme_heavy_boots",
+            Self::SupremeRobeHelmet => "supreme_robe_helmet",
+            Self::SupremeRobeChestplate => "supreme_robe_chestplate",
+            Self::SupremeRobeLeggings => "supreme_robe_leggings",
+            Self::SupremeRobeBoots => "supreme_robe_boots",
+            Self::SupremeHunterSword => "supreme_hunter_sword",
+            Self::SupremeHunterDagger => "supreme_hunter_dagger",
+            Self::SupremeHunterAxe => "supreme_hunter_axe",
             Self::ApprenticeStaff => "apprentice_staff",
         }
     }
@@ -249,6 +449,44 @@ impl SerialId {
             Self::ImprovedHunterSword => &IMPROVED_HUNTER_SWORD,
             Self::ImprovedHunterDagger => &IMPROVED_HUNTER_DAGGER,
             Self::ImprovedHunterAxe => &IMPROVED_HUNTER_AXE,
+            Self::EliteLightHelmet => &tiered::ELITE_LIGHT_HELMET,
+            Self::EliteLightChestplate => &tiered::ELITE_LIGHT_CHESTPLATE,
+            Self::EliteLightLeggings => &tiered::ELITE_LIGHT_LEGGINGS,
+            Self::EliteLightBoots => &tiered::ELITE_LIGHT_BOOTS,
+            Self::EliteReinforcedHelmet => &tiered::ELITE_REINFORCED_HELMET,
+            Self::EliteReinforcedChestplate => &tiered::ELITE_REINFORCED_CHESTPLATE,
+            Self::EliteReinforcedLeggings => &tiered::ELITE_REINFORCED_LEGGINGS,
+            Self::EliteReinforcedBoots => &tiered::ELITE_REINFORCED_BOOTS,
+            Self::EliteHeavyHelmet => &tiered::ELITE_HEAVY_HELMET,
+            Self::EliteHeavyChestplate => &tiered::ELITE_HEAVY_CHESTPLATE,
+            Self::EliteHeavyLeggings => &tiered::ELITE_HEAVY_LEGGINGS,
+            Self::EliteHeavyBoots => &tiered::ELITE_HEAVY_BOOTS,
+            Self::EliteRobeHelmet => &tiered::ELITE_ROBE_HELMET,
+            Self::EliteRobeChestplate => &tiered::ELITE_ROBE_CHESTPLATE,
+            Self::EliteRobeLeggings => &tiered::ELITE_ROBE_LEGGINGS,
+            Self::EliteRobeBoots => &tiered::ELITE_ROBE_BOOTS,
+            Self::EliteHunterSword => &tiered::ELITE_HUNTER_SWORD,
+            Self::EliteHunterDagger => &tiered::ELITE_HUNTER_DAGGER,
+            Self::EliteHunterAxe => &tiered::ELITE_HUNTER_AXE,
+            Self::SupremeLightHelmet => &tiered::SUPREME_LIGHT_HELMET,
+            Self::SupremeLightChestplate => &tiered::SUPREME_LIGHT_CHESTPLATE,
+            Self::SupremeLightLeggings => &tiered::SUPREME_LIGHT_LEGGINGS,
+            Self::SupremeLightBoots => &tiered::SUPREME_LIGHT_BOOTS,
+            Self::SupremeReinforcedHelmet => &tiered::SUPREME_REINFORCED_HELMET,
+            Self::SupremeReinforcedChestplate => &tiered::SUPREME_REINFORCED_CHESTPLATE,
+            Self::SupremeReinforcedLeggings => &tiered::SUPREME_REINFORCED_LEGGINGS,
+            Self::SupremeReinforcedBoots => &tiered::SUPREME_REINFORCED_BOOTS,
+            Self::SupremeHeavyHelmet => &tiered::SUPREME_HEAVY_HELMET,
+            Self::SupremeHeavyChestplate => &tiered::SUPREME_HEAVY_CHESTPLATE,
+            Self::SupremeHeavyLeggings => &tiered::SUPREME_HEAVY_LEGGINGS,
+            Self::SupremeHeavyBoots => &tiered::SUPREME_HEAVY_BOOTS,
+            Self::SupremeRobeHelmet => &tiered::SUPREME_ROBE_HELMET,
+            Self::SupremeRobeChestplate => &tiered::SUPREME_ROBE_CHESTPLATE,
+            Self::SupremeRobeLeggings => &tiered::SUPREME_ROBE_LEGGINGS,
+            Self::SupremeRobeBoots => &tiered::SUPREME_ROBE_BOOTS,
+            Self::SupremeHunterSword => &tiered::SUPREME_HUNTER_SWORD,
+            Self::SupremeHunterDagger => &tiered::SUPREME_HUNTER_DAGGER,
+            Self::SupremeHunterAxe => &tiered::SUPREME_HUNTER_AXE,
             Self::ApprenticeStaff => &APPRENTICE_STAFF,
         }
     }
@@ -256,66 +494,58 @@ impl SerialId {
     /// Returns the System equipment slot this item goes into, or `None` for
     /// weapons and tools, which are held instead.
     #[must_use]
-    pub const fn gear_kind(self) -> Option<GearKind> {
-        match self {
-            Self::HunterHelmet
-            | Self::LightHelmet
-            | Self::ReinforcedHelmet
-            | Self::HeavyHelmet
-            | Self::RobeHelmet
-            | Self::ImprovedLightHelmet
-            | Self::ImprovedReinforcedHelmet
-            | Self::ImprovedHeavyHelmet
-            | Self::ImprovedRobeHelmet => Some(GearKind::Head),
-            Self::HunterChestplate
-            | Self::LightChestplate
-            | Self::ReinforcedChestplate
-            | Self::HeavyChestplate
-            | Self::RobeChestplate
-            | Self::ImprovedLightChestplate
-            | Self::ImprovedReinforcedChestplate
-            | Self::ImprovedHeavyChestplate
-            | Self::ImprovedRobeChestplate => Some(GearKind::Chest),
-            Self::HunterLeggings
-            | Self::LightLeggings
-            | Self::ReinforcedLeggings
-            | Self::HeavyLeggings
-            | Self::RobeLeggings
-            | Self::ImprovedLightLeggings
-            | Self::ImprovedReinforcedLeggings
-            | Self::ImprovedHeavyLeggings
-            | Self::ImprovedRobeLeggings => Some(GearKind::Legs),
-            Self::HunterBoots
-            | Self::LightBoots
-            | Self::ReinforcedBoots
-            | Self::HeavyBoots
-            | Self::RobeBoots
-            | Self::ImprovedLightBoots
-            | Self::ImprovedReinforcedBoots
-            | Self::ImprovedHeavyBoots
-            | Self::ImprovedRobeBoots => Some(GearKind::Feet),
-            Self::HunterSword
-            | Self::HunterDagger
-            | Self::HunterAxe
-            | Self::HunterShield
-            | Self::HunterPickaxe
-            | Self::ImprovedHunterSword
-            | Self::ImprovedHunterDagger
-            | Self::ImprovedHunterAxe
-            | Self::ApprenticeStaff => None,
+    pub fn gear_kind(self) -> Option<GearKind> {
+        if let Some(index) = SPECIALIZATION.iter().position(|id| *id == self) {
+            return Some(match index % 4 {
+                0 => GearKind::Head,
+                1 => GearKind::Chest,
+                2 => GearKind::Legs,
+                _ => GearKind::Feet,
+            });
         }
+        if let Some((_, index)) = self.tier_index() {
+            return (index < 16).then_some(match index % 4 {
+                0 => GearKind::Head,
+                1 => GearKind::Chest,
+                2 => GearKind::Legs,
+                _ => GearKind::Feet,
+            });
+        }
+        match self {
+            Self::HunterHelmet => Some(GearKind::Head),
+            Self::HunterChestplate => Some(GearKind::Chest),
+            Self::HunterLeggings => Some(GearKind::Legs),
+            Self::HunterBoots => Some(GearKind::Feet),
+            _ => None,
+        }
+    }
+
+    /// Returns the position of this piece inside its crafted tier array, if it
+    /// belongs to one.
+    pub(crate) fn tier_index(self) -> Option<(CraftedTier, usize)> {
+        if let Some(index) = IMPROVED.iter().position(|id| *id == self) {
+            return Some((CraftedTier::Improved, index));
+        }
+        if let Some(index) = tiered::ELITE.iter().position(|id| *id == self) {
+            return Some((CraftedTier::Elite, index));
+        }
+        if let Some(index) = tiered::SUPREME.iter().position(|id| *id == self) {
+            return Some((CraftedTier::Supreme, index));
+        }
+        None
     }
 
     /// Returns the specialization armor line of this piece, if any.
     ///
-    /// [`SPECIALIZATION`] and [`IMPROVED`] list each line's four pieces in
-    /// [`ArmorLine::ALL`] order, so the position decides the line.
+    /// [`SPECIALIZATION`], [`IMPROVED`], [`tiered::ELITE`] and
+    /// [`tiered::SUPREME`] list each line's four pieces in [`ArmorLine::ALL`]
+    /// order, so the position decides the line.
     #[must_use]
     pub fn line(self) -> Option<ArmorLine> {
         let index = SPECIALIZATION
             .iter()
             .position(|id| *id == self)
-            .or_else(|| IMPROVED.iter().position(|id| *id == self))?;
+            .or_else(|| self.tier_index().map(|(_, index)| index))?;
         ArmorLine::ALL.get(index / 4).copied()
     }
 
@@ -369,8 +599,12 @@ impl SerialId {
     #[must_use]
     pub fn magic_bonus(self) -> f32 {
         match self.line() {
-            Some(ArmorLine::Robe) if self.is_improved() => IMPROVED_ROBE_MAGIC_BONUS_PER_PIECE,
-            Some(ArmorLine::Robe) => ROBE_MAGIC_BONUS_PER_PIECE,
+            Some(ArmorLine::Robe) => match self.crafted_tier() {
+                Some(CraftedTier::Improved) => IMPROVED_ROBE_MAGIC_BONUS_PER_PIECE,
+                Some(CraftedTier::Elite) => ELITE_ROBE_MAGIC_BONUS_PER_PIECE,
+                Some(CraftedTier::Supreme) => SUPREME_ROBE_MAGIC_BONUS_PER_PIECE,
+                None => ROBE_MAGIC_BONUS_PER_PIECE,
+            },
             _ => 0.0,
         }
     }
@@ -379,6 +613,12 @@ impl SerialId {
     #[must_use]
     pub fn is_improved(self) -> bool {
         IMPROVED.contains(&self)
+    }
+
+    /// Returns the crafted tier this serial belongs to, if any.
+    #[must_use]
+    pub fn crafted_tier(self) -> Option<CraftedTier> {
+        self.tier_index().map(|(tier, _)| tier)
     }
 
     /// Returns whether this is a piece of the Association starter kit.
@@ -390,8 +630,13 @@ impl SerialId {
     /// Returns the Strength this piece needs before its bonuses apply.
     #[must_use]
     pub fn required_strength(self) -> u32 {
-        if self.is_improved() && self.line() == Some(ArmorLine::Heavy) {
-            IMPROVED_HEAVY_STRENGTH
+        if self.line() == Some(ArmorLine::Heavy) {
+            match self.crafted_tier() {
+                Some(CraftedTier::Improved) => IMPROVED_HEAVY_STRENGTH,
+                Some(CraftedTier::Elite) => ELITE_HEAVY_STRENGTH,
+                Some(CraftedTier::Supreme) => SUPREME_HEAVY_STRENGTH,
+                None => 0,
+            }
         } else {
             0
         }
@@ -488,7 +733,7 @@ pub const STARTER_OUTFIT: [SerialId; 6] = [
 pub const MAGE_SHOP: [SerialId; 1] = [SerialId::ApprenticeStaff];
 
 /// Every serial item.
-pub const ALL: [SerialId; 45] = {
+pub const ALL: [SerialId; 83] = {
     let all = [
         SerialId::HunterSword,
         SerialId::HunterDagger,
@@ -534,6 +779,44 @@ pub const ALL: [SerialId; 45] = {
         SerialId::ImprovedHunterSword,
         SerialId::ImprovedHunterDagger,
         SerialId::ImprovedHunterAxe,
+        SerialId::EliteLightHelmet,
+        SerialId::EliteLightChestplate,
+        SerialId::EliteLightLeggings,
+        SerialId::EliteLightBoots,
+        SerialId::EliteReinforcedHelmet,
+        SerialId::EliteReinforcedChestplate,
+        SerialId::EliteReinforcedLeggings,
+        SerialId::EliteReinforcedBoots,
+        SerialId::EliteHeavyHelmet,
+        SerialId::EliteHeavyChestplate,
+        SerialId::EliteHeavyLeggings,
+        SerialId::EliteHeavyBoots,
+        SerialId::EliteRobeHelmet,
+        SerialId::EliteRobeChestplate,
+        SerialId::EliteRobeLeggings,
+        SerialId::EliteRobeBoots,
+        SerialId::EliteHunterSword,
+        SerialId::EliteHunterDagger,
+        SerialId::EliteHunterAxe,
+        SerialId::SupremeLightHelmet,
+        SerialId::SupremeLightChestplate,
+        SerialId::SupremeLightLeggings,
+        SerialId::SupremeLightBoots,
+        SerialId::SupremeReinforcedHelmet,
+        SerialId::SupremeReinforcedChestplate,
+        SerialId::SupremeReinforcedLeggings,
+        SerialId::SupremeReinforcedBoots,
+        SerialId::SupremeHeavyHelmet,
+        SerialId::SupremeHeavyChestplate,
+        SerialId::SupremeHeavyLeggings,
+        SerialId::SupremeHeavyBoots,
+        SerialId::SupremeRobeHelmet,
+        SerialId::SupremeRobeChestplate,
+        SerialId::SupremeRobeLeggings,
+        SerialId::SupremeRobeBoots,
+        SerialId::SupremeHunterSword,
+        SerialId::SupremeHunterDagger,
+        SerialId::SupremeHunterAxe,
         SerialId::ApprenticeStaff,
     ];
     // Const assertions are not stable for enum array lengths, so keep the
@@ -1561,5 +1844,86 @@ mod tests {
             let stack = stack(id, None);
             assert!(crate::item::artifact::of(&stack).is_none(), "{id:?}");
         }
+    }
+
+    #[test]
+    fn elite_and_supreme_names_round_trip() {
+        init_vanilla_registry();
+        for id in tiered::ELITE.into_iter().chain(tiered::SUPREME) {
+            assert_eq!(SerialId::from_name(id.name()), Some(id), "{id:?}");
+            let stack = stack(id, None);
+            assert_eq!(of(&stack), Some(id));
+        }
+    }
+
+    #[test]
+    fn elite_and_supreme_are_crafted_tiers() {
+        for id in tiered::ELITE {
+            assert_eq!(id.crafted_tier(), Some(CraftedTier::Elite));
+        }
+        for id in tiered::SUPREME {
+            assert_eq!(id.crafted_tier(), Some(CraftedTier::Supreme));
+        }
+    }
+
+    #[test]
+    fn elite_and_supreme_armor_beats_improved() {
+        init_vanilla_registry();
+        fn armor(id: SerialId) -> f64 {
+            id.serial()
+                .modifiers
+                .iter()
+                .find(|modifier| modifier.attribute.key == vanilla_attributes::ARMOR.key)
+                .map(|modifier| modifier.amount)
+                .unwrap_or(0.0)
+        }
+        for index in 0..16 {
+            let improved = armor(IMPROVED[index]);
+            let elite = armor(tiered::ELITE[index]);
+            let supreme = armor(tiered::SUPREME[index]);
+            assert!(improved < elite, "index {index}");
+            assert!(elite < supreme, "index {index}");
+        }
+    }
+
+    #[test]
+    fn elite_and_supreme_weapons_deal_more_damage() {
+        init_vanilla_registry();
+        fn damage(id: SerialId) -> f64 {
+            id.serial()
+                .modifiers
+                .iter()
+                .find(|modifier| modifier.attribute.key == vanilla_attributes::ATTACK_DAMAGE.key)
+                .map(|modifier| modifier.amount)
+                .unwrap_or(0.0)
+        }
+        for index in 16..19 {
+            let improved = damage(IMPROVED[index]);
+            let elite = damage(tiered::ELITE[index]);
+            let supreme = damage(tiered::SUPREME[index]);
+            assert!(improved < elite, "index {index}");
+            assert!(elite < supreme, "index {index}");
+        }
+    }
+
+    #[test]
+    fn robe_magic_bonus_and_heavy_strength_grow_by_tier() {
+        init_vanilla_registry();
+        assert!(
+            SerialId::ImprovedRobeChestplate.magic_bonus()
+                < SerialId::EliteRobeChestplate.magic_bonus()
+        );
+        assert!(
+            SerialId::EliteRobeChestplate.magic_bonus()
+                < SerialId::SupremeRobeChestplate.magic_bonus()
+        );
+        assert!(
+            SerialId::ImprovedHeavyChestplate.required_strength()
+                < SerialId::EliteHeavyChestplate.required_strength()
+        );
+        assert!(
+            SerialId::EliteHeavyChestplate.required_strength()
+                < SerialId::SupremeHeavyChestplate.required_strength()
+        );
     }
 }

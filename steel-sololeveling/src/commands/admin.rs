@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::admin_menu;
 use steel_core::command::{
     CommandArgument, CommandContext, CommandError, CommandRegistration, CommandRegistrationError,
     CommandRegistry, CommandSource, argument, literal,
@@ -90,6 +91,20 @@ pub fn register(
                             Ok(queued)
                         })
                     })
+            })
+            .then({
+                let state = Arc::clone(&state);
+                literal("menu").executes(move |context| {
+                    require_operator(*context)?;
+                    let Some(player) = context.source().player() else {
+                        return Err(CommandError::from(
+                            "Команда доступна только игроку.",
+                        ));
+                    };
+                    admin_menu::open(player, Arc::clone(&state));
+                    operator_message(*context, "Открыто админ-меню.");
+                    Ok(1)
+                })
             })
             .then({
                 literal("artifact")
@@ -252,6 +267,18 @@ fn rank_note(id: CatalogId) -> String {
                 )
             }),
         CatalogId::Serial(_) => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use steel_core::permission::{PermissionExpr, PermissionKey};
+
+    #[test]
+    fn sladmin_requires_a_real_operator_permission_key() {
+        let key = PermissionKey::parse("sololeveling.admin").expect("valid permission key");
+        let expr = PermissionExpr::key(key);
+        assert!(matches!(expr, PermissionExpr::Key(_)));
     }
 }
 

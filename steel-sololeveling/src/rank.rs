@@ -43,6 +43,19 @@ impl HunterRank {
         }
     }
 
+    /// Returns the minimum level that grants this rank.
+    #[must_use]
+    pub const fn min_level(self) -> u32 {
+        match self {
+            Self::E => 1,
+            Self::D => 10,
+            Self::C => 25,
+            Self::B => 50,
+            Self::A => 75,
+            Self::S => 100,
+        }
+    }
+
     /// Returns the one-letter rank displayed to players.
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -137,5 +150,25 @@ mod tests {
         assert_eq!(HunterRank::from_level(75), HunterRank::A);
         assert_eq!(HunterRank::from_level(99), HunterRank::A);
         assert_eq!(HunterRank::from_level(100), HunterRank::S);
+    }
+
+    #[test]
+    fn min_level_is_the_first_level_of_each_rank() {
+        assert_eq!(HunterRank::E.min_level(), 1);
+        assert_eq!(HunterRank::D.min_level(), 10);
+        assert_eq!(HunterRank::C.min_level(), 25);
+        assert_eq!(HunterRank::B.min_level(), 50);
+        assert_eq!(HunterRank::A.min_level(), 75);
+        assert_eq!(HunterRank::S.min_level(), 100);
+        for rank in [
+            HunterRank::E,
+            HunterRank::D,
+            HunterRank::C,
+            HunterRank::B,
+            HunterRank::A,
+            HunterRank::S,
+        ] {
+            assert_eq!(HunterRank::from_level(rank.min_level()), rank);
+        }
     }
 }
