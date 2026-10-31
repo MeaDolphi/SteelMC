@@ -598,7 +598,9 @@ struct MineProgress {
 
 impl MineProgress {
     fn from_dungeon(progress: &mut DungeonProgress, tick: u64, exit: BlockPos) -> Self {
-        let quota = u32::from(wave_for_gate(progress.rank, progress.red).mob_count) * 3;
+        // A shift is done when every vein placed in the dungeon was mined, not
+        // by wave size: waves far outnumber the ore that physically exists.
+        let quota = progress.rank.crystal_vein_count() as u32;
         Self {
             rank: progress.rank,
             red: progress.red,
@@ -3221,15 +3223,18 @@ fn announce_gate_broken(server: &Server, gate: &Gate) {
 }
 
 fn announce_gate_break(server: &Server, gate: &Gate) {
-    notify_near_gate(
-        server,
-        gate,
-        TextComponent::plain(format!(
-            "Прорыв! Врата ранга {} открылись: монстры идут в город.",
-            gate.rank.name()
-        ))
-        .color(Color::Red),
-    );
+    // A gate break is a city-wide emergency, so every hunter in the city hears
+    // of it, not only the ones near the frame.
+    let message = TextComponent::plain(format!(
+        "Прорыв! Врата ранга {} открылись: монстры идут в город.",
+        gate.rank.name()
+    ))
+    .color(Color::Red);
+    for player in server.get_players() {
+        if player.get_world().key == gate.world {
+            player.send_message(&message);
+        }
+    }
 }
 
 fn notify_near_gate(server: &Server, gate: &Gate, message: TextComponent) {
@@ -3304,7 +3309,7 @@ mod tests {
     }
 
     #[test]
-    fn mine_progress_derives_quota_from_wave_size() {
+    fn mine_quota_matches_the_placed_veins() {
         let mut dungeon = DungeonProgress {
             rank: HunterRank::D,
             deaths: 0,
@@ -3333,7 +3338,7 @@ mod tests {
         let mine = MineProgress::from_dungeon(&mut dungeon, 100, exit);
         assert_eq!(mine.rank, HunterRank::D);
         assert_eq!(mine.mined, 0);
-        assert_eq!(mine.quota, u32::from(dungeon.wave.mob_count) * 3);
+        assert_eq!(mine.quota, HunterRank::D.crystal_vein_count() as u32);
         assert!(dungeon.boss_materials.is_empty());
         assert_eq!(mine.exit, exit);
     }

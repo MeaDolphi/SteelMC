@@ -301,7 +301,7 @@ fn complete_run(
                 uuid,
                 "Картенонский храм пройден: Идол улыбающегося бога ваш.",
             );
-            grant_scenario_experience(state, uuid);
+            grant_scenario_experience(state, uuid, run.rank);
         }
         ScenarioKind::JobChange => {
             state.record_goal(uuid, Goal::IgrisDefeated, 1);
@@ -312,14 +312,19 @@ fn complete_run(
                 uuid,
                 "Второе пробуждение завершено: ваш класс эволюционировал.",
             );
-            grant_scenario_experience(state, uuid);
+            grant_scenario_experience(state, uuid, run.rank);
         }
     }
     return_player(server, player, &run.source_world);
 }
 
-fn grant_scenario_experience(state: &SoloLevelingState, uuid: Uuid) {
-    let experience = 5_000;
+fn grant_scenario_experience(state: &SoloLevelingState, uuid: Uuid, rank: HunterRank) {
+    #[expect(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "the multiplier is a small positive constant of the rank"
+    )]
+    let experience = (1_000.0 * rank.rank_multiplier()) as u64;
     if let Some((stats, level_up)) = state.grant_experience(uuid, experience) {
         state.notify_progress(
             uuid,

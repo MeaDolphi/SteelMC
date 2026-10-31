@@ -945,6 +945,14 @@ impl SoloLevelingState {
         if level_up.levels_gained > 0 {
             notice.levels = notice.levels.saturating_add(level_up.levels_gained);
             notice.level = level;
+            if HunterRank::from_level(level - level_up.levels_gained) != level_up.new_rank {
+                notice.rank_up = Some(level_up.new_rank);
+            }
+            if level >= crate::job_change::JOB_CHANGE_LEVEL
+                && level - level_up.levels_gained < crate::job_change::JOB_CHANGE_LEVEL
+            {
+                notice.awakening_hint = true;
+            }
         }
     }
 

@@ -102,8 +102,8 @@ impl HunterRank {
     #[must_use]
     pub const fn crystal_vein_count(self) -> usize {
         match self {
-            Self::E => 0,
-            Self::D => 1,
+            Self::E => 2,
+            Self::D => 2,
             Self::C => 3,
             Self::B => 5,
             Self::A => 7,
@@ -135,7 +135,7 @@ mod tests {
                 HunterRank::S,
             ]
             .map(HunterRank::crystal_vein_count),
-            [0, 1, 3, 5, 7, 9]
+            [2, 2, 3, 5, 7, 9]
         );
     }
 

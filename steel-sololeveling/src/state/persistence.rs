@@ -2252,13 +2252,15 @@ impl SoloLevelingState {
 
     /// Drains queued writes off-tick, rejecting new admissions during shutdown.
     pub async fn flush_persistence(self: Arc<Self>, server: Arc<Server>) -> Result<(), String> {
-        self.persistence.lock().quiescing = true;
         for uuid in self.sessions.player_ids() {
             self.save_session(uuid).map_err(|error| error.to_string())?;
         }
+        // Queued before quiescing: those queues refuse new work once shutdown
+        // starts, but a graceful shutdown must still write them.
         self.queue_island_save()
             .map_err(|error| error.to_string())?;
         self.queue_party_save().map_err(|error| error.to_string())?;
+        self.persistence.lock().quiescing = true;
         loop {
             server.jobs.finish_all().await;
             let empty = {

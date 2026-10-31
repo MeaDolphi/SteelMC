@@ -91,7 +91,7 @@ fn lines(view: &SidebarView) -> Vec<Line> {
         ),
         line(
             "points",
-            format!("Очки статов: {}", stats.unspent_points),
+            format!("Очки характеристик: {}", stats.unspent_points),
             Color::Yellow,
         ),
         line(

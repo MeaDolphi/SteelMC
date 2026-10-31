@@ -112,7 +112,9 @@ fn info_item(view: StarterKit) -> ItemStack {
                 .color(Color::Gray),
             TextComponent::plain("и кирка для магических кристаллов в подземельях.")
                 .color(Color::Gray),
-            TextComponent::plain("Броня надевается в снаряжении Системы.").color(Color::Gray),
+            TextComponent::plain("Броня надевается в обычные слоты тела. Меню Системы")
+                .color(Color::Gray),
+            TextComponent::plain("принимает только артефакты.").color(Color::Gray),
             TextComponent::plain("Вещи привязаны к вам, не ломаются и не выпадают при смерти.")
                 .color(Color::Gray),
             TextComponent::plain("Набор выдаётся один раз и не восстанавливается.")

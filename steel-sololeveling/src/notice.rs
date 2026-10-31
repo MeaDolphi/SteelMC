@@ -14,6 +14,7 @@ use text_components::format::Color;
 use text_components::translation::TranslatedMessage;
 use text_components::{Modifier as _, TextComponent};
 
+use crate::rank::HunterRank;
 use crate::sound::SystemSound;
 use crate::stats::STAT_POINTS_PER_LEVEL;
 
@@ -28,6 +29,10 @@ pub struct Notice {
     pub levels: u32,
     /// Level reached, when `levels` is not zero.
     pub level: u32,
+    /// Rank just promoted to, if these levels crossed a rank boundary.
+    pub rank_up: Option<HunterRank>,
+    /// These levels first crossed the Second Awakening threshold.
+    pub awakening_hint: bool,
     /// Items received: identity used to merge repeats, shown name, count.
     pub loot: Vec<(String, TextComponent, i32)>,
 }
@@ -96,6 +101,25 @@ impl Notice {
                     self.levels.saturating_mul(STAT_POINTS_PER_LEVEL)
                 ))
                 .color(Color::Aqua),
+            );
+        }
+        if let Some(rank) = self.rank_up {
+            player.send_message(
+                &TextComponent::plain(format!(
+                    "Переоценка пройдена: ваш ранг охотника повышен до {}!",
+                    rank.name()
+                ))
+                .color(Color::Gold)
+                .bold(true),
+            );
+        }
+        if self.awakening_hint {
+            player.send_message(
+                &TextComponent::plain(
+                    "Система предлагает испытание: Второе пробуждение доступно (Система → Класс)."
+                        .to_owned(),
+                )
+                .color(Color::LightPurple),
             );
         }
         if let Some(line) = self.loot_line() {

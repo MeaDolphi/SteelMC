@@ -98,15 +98,7 @@ impl SoloLevelingState {
         if !is_temple_key(held) {
             return Err("В руке нет ключа Картенонского храма.".to_owned());
         }
-        let mut consumed = held.clone();
-        if consumed.count > 1 {
-            consumed.count -= 1;
-        } else {
-            consumed = ItemStack::empty();
-        }
         drop(inventory);
-        player.inventory.lock().set_item_in_hand(hand, consumed);
-
         let boss = smiling_god_boss(rank);
         let name = TextComponent::plain("Улыбающийся бог")
             .color(Color::DarkRed)
@@ -118,7 +110,21 @@ impl SoloLevelingState {
             rank,
             boss,
             name,
-        )
+        )?;
+        // Consume the key only after the scenario accepted the run, so a
+        // refused entry never burns it.
+        let mut inventory = player.inventory.lock();
+        let held = inventory.get_item_in_hand(hand).clone();
+        if is_temple_key(&held) {
+            if held.count > 1 {
+                let mut remaining = held;
+                remaining.count -= 1;
+                inventory.set_item_in_hand(hand, remaining);
+            } else {
+                inventory.set_item_in_hand(hand, ItemStack::empty());
+            }
+        }
+        Ok(())
     }
 }
 

@@ -701,6 +701,8 @@ impl GameplayHooks for SoloLevelingHooks {
                     .arise_from_player_kill(player, world, entity, label.as_ref())
         {
             SystemSound::Arise.play(player);
+            player.send_title(TextComponent::plain("Восстань").color(Color::DarkPurple));
+            player.send_title_times(5, 30, 10);
             player.send_message(
                 &TextComponent::plain(format!("«{}» восстаёт из тени.", shadow.name))
                     .color(Color::DarkPurple),

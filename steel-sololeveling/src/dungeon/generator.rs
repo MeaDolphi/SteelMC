@@ -895,8 +895,8 @@ mod tests {
 
                 assert_eq!(all.len(), 9, "seed {seed}, combat rooms {combat_rooms}");
                 assert_eq!(s_rank, all, "S rank must expose the whole vein set");
-                assert_eq!(d_rank.len(), 1, "seed {seed}, combat rooms {combat_rooms}");
-                assert_eq!(d_rank, all[..1], "lower ranks use a stable prefix");
+                assert_eq!(d_rank.len(), 2, "seed {seed}, combat rooms {combat_rooms}");
+                assert_eq!(d_rank, all[..2], "lower ranks use a stable prefix");
                 for rank in [
                     HunterRank::E,
                     HunterRank::D,
