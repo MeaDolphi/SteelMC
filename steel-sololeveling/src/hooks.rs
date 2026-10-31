@@ -83,6 +83,8 @@ impl GameplayHooks for SoloLevelingHooks {
             state.load_guilds(&server).await?;
             state.load_auction(&server).await?;
             state.load_gate_registry(&server).await?;
+            state.load_island(&server).await?;
+            state.load_parties(&server).await?;
             let Some(city_world) = server.worlds.server_default_world() else {
                 return Err("Solo Leveling city world is not loaded".to_owned());
             };
@@ -404,8 +406,9 @@ impl GameplayHooks for SoloLevelingHooks {
     fn allow_item_drop(&self, player: &Player, stack: &ItemStack) -> bool {
         // The drop key on the grimoire, or on a Mage staff held with the
         // grimoire in the off hand, cycles the prepared spells instead.
-        let staff_with_grimoire = item::artifact::of(stack)
+        let staff_with_grimoire = (item::artifact::of(stack)
             .is_some_and(|id| id.spell_gear().is_some())
+            || item::serial::of(stack).is_some_and(|id| id.spell_gear().is_some()))
             && item::grimoire::is_grimoire(
                 player
                     .inventory

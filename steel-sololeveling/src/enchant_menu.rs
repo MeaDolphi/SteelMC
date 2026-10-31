@@ -18,11 +18,50 @@ use steel_utils::{DowncastType, DowncastTypeKey};
 use text_components::format::Color;
 use text_components::{Modifier as _, TextComponent};
 
-use crate::item::artifact::{self, Artifact};
+use crate::item::artifact::{self, Artifact, Rarity};
 use crate::item::enchantment::{self, Enchantment};
+use crate::item::serial::{self, Serial, SerialId};
 use crate::item::{append_lore, named, with_lore};
 use crate::state::{EnchantTarget, SoloLevelingState};
 use crate::ui::{After, open_buttons};
+
+/// Either a named artifact or a serial item that can be enchanted.
+#[derive(Debug, Clone, Copy)]
+enum Enchantable {
+    Artifact(&'static Artifact),
+    Serial(&'static Serial),
+}
+
+impl Enchantable {
+    fn id(self) -> EitherId {
+        match self {
+            Self::Artifact(artifact) => EitherId::Artifact(artifact.id),
+            Self::Serial(serial) => EitherId::Serial(serial.id),
+        }
+    }
+
+    fn rarity(self) -> Rarity {
+        match self {
+            Self::Artifact(artifact) => artifact.rarity,
+            Self::Serial(_) => Rarity::Common,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EitherId {
+    Artifact(crate::item::artifact::ArtifactId),
+    Serial(SerialId),
+}
+
+impl EitherId {
+    fn enchant_kind(self) -> Option<crate::item::enchantment::ItemKind> {
+        match self {
+            Self::Artifact(id) => id.enchant_kind(),
+            Self::Serial(id) => id.enchant_kind(),
+        }
+    }
+}
 
 const MENU_SLOTS: usize = 54;
 /// Artifacts the picker can list in its largest chest.
@@ -33,6 +72,21 @@ const INFO_SLOT: usize = 5;
 const POWER_ROW: usize = 9;
 /// First slot of the bottom row of side effects.
 const SIDE_EFFECT_ROW: usize = 45;
+
+fn held_enchantable(stack: &ItemStack) -> Option<Enchantable> {
+    if let Some(artifact) = artifact::held(stack) {
+        return Some(Enchantable::Artifact(artifact));
+    }
+    serial::held(stack).map(Enchantable::Serial)
+}
+
+fn enchantments_of(stack: &ItemStack) -> Vec<Enchantment> {
+    if artifact::of(stack).is_some() {
+        artifact::enchantments_of(stack)
+    } else {
+        serial::enchantments_of(stack)
+    }
+}
 
 /// Opens the picker of artifacts to enchant.
 ///
@@ -47,7 +101,7 @@ pub fn open_picker(player: &Player, state: Arc<SoloLevelingState>) {
                     EnchantTarget::Inventory(slot),
                 )
             })
-            .filter(|(stack, _)| artifact::of(stack).is_some())
+            .filter(|(stack, _)| held_enchantable(stack).is_some())
             .collect()
     };
     let gear = state
@@ -56,7 +110,7 @@ pub fn open_picker(player: &Player, state: Arc<SoloLevelingState>) {
     choices.extend(
         gear.into_iter()
             .enumerate()
-            .filter(|(_, stack)| artifact::of(stack).is_some())
+            .filter(|(_, stack)| held_enchantable(stack).is_some())
             .map(|(index, stack)| (stack, EnchantTarget::Gear(index))),
     );
     choices.truncate(PICKER_LIMIT);
@@ -105,11 +159,13 @@ pub fn open(
     held: ItemStack,
     target: EnchantTarget,
 ) {
-    let Some(artifact) = artifact::held(&held) else {
-        player.send_message(&TextComponent::plain("Этот предмет не артефакт.").color(Color::Red));
+    let Some(item) = held_enchantable(&held) else {
+        player.send_message(
+            &TextComponent::plain("Этот предмет нельзя зачаровать.").color(Color::Red),
+        );
         return;
     };
-    let applied = artifact::enchantments_of(&held);
+    let applied = enchantments_of(&held);
     player.open_menu(
         TextComponent::plain("Зачарование").color(Color::DarkAqua),
         move |context| {
@@ -119,7 +175,7 @@ pub fn open(
                 state,
                 held,
                 target,
-                artifact,
+                item,
                 applied,
             )
         },
@@ -132,7 +188,7 @@ fn build(
     state: Arc<SoloLevelingState>,
     held: ItemStack,
     target: EnchantTarget,
-    artifact: &'static Artifact,
+    item: Enchantable,
     applied: Vec<Enchantment>,
 ) -> Menu {
     let mut kind = EnchantMenuKind {
@@ -141,7 +197,7 @@ fn build(
         container: None,
         held,
         target,
-        artifact,
+        item,
         applied,
         queued: None,
         completion: None,
@@ -159,8 +215,8 @@ fn build(
 ///
 /// Powers fill three rows, simple ones first; side effects take the bottom
 /// row. An item without a kind is offered nothing.
-fn offers(artifact: &Artifact) -> Vec<(usize, Enchantment)> {
-    let Some(kind) = artifact.id.enchant_kind() else {
+fn offers(item: Enchantable) -> Vec<(usize, Enchantment)> {
+    let Some(kind) = item.id().enchant_kind() else {
         return Vec::new();
     };
     let mut fitting: Vec<Enchantment> = enchantment::ALL
@@ -191,7 +247,7 @@ pub(crate) struct EnchantMenuKind {
     container: Option<Shared<SimpleContainer>>,
     held: ItemStack,
     target: EnchantTarget,
-    artifact: &'static Artifact,
+    item: Enchantable,
     applied: Vec<Enchantment>,
     queued: Option<Enchantment>,
     completion: Option<Arc<SyncMutex<Option<EnchantTarget>>>>,
@@ -199,12 +255,12 @@ pub(crate) struct EnchantMenuKind {
 
 impl EnchantMenuKind {
     fn finish(&mut self, target: EnchantTarget, held: ItemStack) -> bool {
-        let Some(artifact) = artifact::held(&held) else {
+        let Some(item) = held_enchantable(&held) else {
             return false;
         };
         self.target = target;
-        self.artifact = artifact;
-        self.applied = artifact::enchantments_of(&held);
+        self.item = item;
+        self.applied = enchantments_of(&held);
         self.held = held;
         self.queued = None;
         self.completion = None;
@@ -214,7 +270,7 @@ impl EnchantMenuKind {
     fn items(&self, player: &Player) -> Vec<ItemStack> {
         let mut items = vec![ItemStack::empty(); MENU_SLOTS];
         let used = enchantment::points_used(&self.applied);
-        let budget = enchantment::budget(self.artifact.rarity);
+        let budget = enchantment::budget(self.item.rarity());
         items[ITEM_SLOT] = self.held.clone();
         items[INFO_SLOT] = with_lore(
             named(
@@ -238,7 +294,7 @@ impl EnchantMenuKind {
             .state
             .with_session_mut(player.gameprofile.id(), |session| session.won.amount())
             .unwrap_or(0);
-        for (slot, enchantment) in offers(self.artifact) {
+        for (slot, enchantment) in offers(self.item) {
             items[slot] = self.offer_item(enchantment, balance);
         }
         items
@@ -257,8 +313,8 @@ impl EnchantMenuKind {
             ("Обрабатывается…".to_owned(), Color::Gold)
         } else {
             match enchantment::check(
-                self.artifact.rarity,
-                self.artifact.id.enchant_kind(),
+                self.item.rarity(),
+                self.item.id().enchant_kind(),
                 &self.applied,
                 enchantment,
                 balance,
@@ -365,7 +421,7 @@ impl MenuKind for EnchantMenuKind {
             return ClickOutcome::Fallthrough;
         }
         let local = slot - buttons.start();
-        let Some(enchantment) = offers(self.artifact)
+        let Some(enchantment) = offers(self.item)
             .into_iter()
             .find_map(|(at, enchantment)| (at == local).then_some(enchantment))
         else {
@@ -409,10 +465,9 @@ mod tests {
     use steel_utils::locks::SyncMutex;
 
     use super::{EnchantMenuKind, MENU_SLOTS, POWER_ROW, SIDE_EFFECT_ROW, offers};
-    use crate::item::artifact::{
-        self, ALL, ArtifactId, IMPROVED, MAGE_SHOP, SPECIALIZATION, STARTER,
-    };
+    use crate::item::artifact::{self, ALL, ArtifactId};
     use crate::item::enchantment::Enchantment;
+    use crate::item::serial::ALL as SERIAL_ALL;
     use crate::state::{EnchantTarget, SoloLevelingState};
 
     #[test]
@@ -427,7 +482,7 @@ mod tests {
             container: None,
             held: artifact::stack(id, None),
             target: EnchantTarget::Inventory(0),
-            artifact: id.artifact(),
+            item: super::Enchantable::Artifact(id.artifact()),
             applied: Vec::new(),
             queued: Some(enchantment),
             completion: Some(Arc::new(SyncMutex::new(None))),
@@ -456,14 +511,23 @@ mod tests {
 
     #[test]
     fn every_offer_has_its_own_slot() {
-        for id in ALL
-            .into_iter()
-            .chain(STARTER)
-            .chain(SPECIALIZATION)
-            .chain(IMPROVED)
-            .chain(MAGE_SHOP)
-        {
-            let offered = offers(id.artifact());
+        for id in ALL.into_iter() {
+            let offered = offers(super::Enchantable::Artifact(id.artifact()));
+            for (slot, enchantment) in &offered {
+                let row = if enchantment.is_side_effect() {
+                    SIDE_EFFECT_ROW..MENU_SLOTS
+                } else {
+                    POWER_ROW..SIDE_EFFECT_ROW - 9
+                };
+                assert!(row.contains(slot), "{id:?} {enchantment:?} at {slot}");
+            }
+            let mut slots: Vec<usize> = offered.iter().map(|(slot, _)| *slot).collect();
+            slots.sort_unstable();
+            slots.dedup();
+            assert_eq!(slots.len(), offered.len());
+        }
+        for id in SERIAL_ALL.into_iter() {
+            let offered = offers(super::Enchantable::Serial(id.serial()));
             for (slot, enchantment) in &offered {
                 let row = if enchantment.is_side_effect() {
                     SIDE_EFFECT_ROW..MENU_SLOTS

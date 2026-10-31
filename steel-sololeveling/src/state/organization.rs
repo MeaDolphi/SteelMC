@@ -419,6 +419,11 @@ impl SoloLevelingState {
         for member in members {
             self.queue_organization_save(member);
         }
+        if let Err(error) = self.queue_party_save() {
+            log::warn!(
+                "sololeveling: could not queue party save after group contract accept: {error}"
+            );
+        }
         Ok(())
     }
 
@@ -446,6 +451,11 @@ impl SoloLevelingState {
                     .release_cancelled(group.contract, today);
             });
             self.queue_organization_save(participant);
+        }
+        if let Err(error) = self.queue_party_save() {
+            log::warn!(
+                "sololeveling: could not queue party save after group contract cancel: {error}"
+            );
         }
         Ok(group.contract)
     }

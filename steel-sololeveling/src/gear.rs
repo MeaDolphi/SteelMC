@@ -340,6 +340,7 @@ mod tests {
         GEAR_SLOTS, GearKind, LAYOUT, SavedGear, abilities, free_slot, kind_of, modifiers,
     };
     use crate::item::artifact::{self, ArtifactId};
+    use crate::item::serial;
     use crate::rank::HunterRank;
     use steel_registry::item_stack::ItemStack;
 
@@ -351,6 +352,17 @@ mod tests {
         let sword = artifact::stack(ArtifactId::KnightsKiller, None);
         assert_eq!(kind_of(&sword), None);
         assert_eq!(LAYOUT.len(), GEAR_SLOTS);
+    }
+
+    #[test]
+    fn serial_items_are_not_system_gear() {
+        init_vanilla_registry();
+        for id in serial::ALL {
+            let stack = serial::stack(id, None);
+            assert_eq!(kind_of(&stack), None, "{id:?}");
+            let items: Vec<_> = (0..GEAR_SLOTS).map(|_| ItemStack::empty()).collect();
+            assert_eq!(free_slot(&items, &stack), None);
+        }
     }
 
     #[test]

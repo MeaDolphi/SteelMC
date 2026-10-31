@@ -17,7 +17,7 @@ use text_components::format::Color;
 use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
-use crate::item::artifact::{self, ArtifactId, STARTER_WEAPONS};
+use crate::item::serial::{self, STARTER_WEAPONS, SerialId};
 use crate::item::{append_lore, named, with_lore};
 use crate::merchant_menu;
 use crate::starter::{self, StarterKit};
@@ -55,7 +55,7 @@ fn build(container_id: u8, player: &Player, state: Arc<SoloLevelingState>) -> Me
     })
 }
 
-fn weapon_at(slot: usize) -> Option<ArtifactId> {
+fn weapon_at(slot: usize) -> Option<SerialId> {
     WEAPON_SLOTS
         .iter()
         .position(|weapon_slot| *weapon_slot == slot)
@@ -73,7 +73,7 @@ fn menu_items(view: Option<StarterKit>, uuid: Uuid) -> Vec<ItemStack> {
     }
     if view.pickaxe_owed() {
         items[PICKAXE_SLOT] = append_lore(
-            artifact::stack(ArtifactId::HunterPickaxe, Some(uuid)),
+            serial::stack(SerialId::HunterPickaxe, Some(uuid)),
             vec![
                 TextComponent::plain("Кирка теперь входит в стартовый набор.").color(Color::White),
                 TextComponent::plain("Клик — получить.").color(Color::Green),
@@ -122,7 +122,7 @@ fn info_item(view: StarterKit) -> ItemStack {
     )
 }
 
-fn weapon_item(view: StarterKit, weapon: ArtifactId, uuid: Uuid) -> ItemStack {
+fn weapon_item(view: StarterKit, weapon: SerialId, uuid: Uuid) -> ItemStack {
     let action = match view.weapon {
         None => ("Клик — получить набор с этим оружием.", Color::Green),
         Some(chosen) if chosen == weapon => ("Ваше текущее оружие.", Color::Aqua),
@@ -133,7 +133,7 @@ fn weapon_item(view: StarterKit, weapon: ArtifactId, uuid: Uuid) -> ItemStack {
         Some(_) => ("Обмен закрыт после входа во врата.", Color::DarkGray),
     };
     append_lore(
-        artifact::stack(weapon, Some(uuid)),
+        serial::stack(weapon, Some(uuid)),
         vec![
             TextComponent::plain(starter::weapon_role(weapon)).color(Color::White),
             TextComponent::plain(action.0).color(action.1),
@@ -239,7 +239,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::{INFO_SLOT, WEAPON_SLOTS, menu_items, weapon_at};
-    use crate::item::artifact::{self, STARTER_WEAPONS};
+    use crate::item::serial::{self, STARTER_WEAPONS};
     use crate::starter::StarterKit;
 
     #[test]
@@ -256,7 +256,7 @@ mod tests {
         let items = menu_items(Some(StarterKit::default()), Uuid::new_v4());
         assert!(items[INFO_SLOT].is(&vanilla_items::WRITABLE_BOOK));
         for (slot, weapon) in WEAPON_SLOTS.into_iter().zip(STARTER_WEAPONS) {
-            assert_eq!(artifact::of(&items[slot]), Some(weapon));
+            assert_eq!(serial::of(&items[slot]), Some(weapon));
         }
     }
 }

@@ -13,7 +13,7 @@ use text_components::TextComponent;
 use uuid::Uuid;
 
 use super::{Request, account, stage_inventory_item};
-use crate::item::{artifact, nbt};
+use crate::item::{nbt, serial};
 use crate::merchant::{self, MerchantOffer, Showcase};
 use crate::merchant_menu::MerchantMenuKind;
 use crate::rank::HunterRank;
@@ -165,7 +165,7 @@ impl SoloLevelingState {
         if offer.showcase == Showcase::Personal {
             snapshot.merchant.mark(offer.period, offer.index);
         }
-        let item = artifact::stack(offer.item, None);
+        let item = serial::stack(offer.item, None);
         let mut stored = false;
         if stage_inventory_item(&mut reservation, item.clone()).is_err() {
             match nbt::encode(&item) {
@@ -220,7 +220,7 @@ impl SoloLevelingState {
                             session.economic_busy = false;
                         });
                         SystemSound::Reward.play(&completion_player);
-                        let name = offer.item.artifact().name;
+                        let name = offer.item.serial().name;
                         completion_player.send_message(&TextComponent::plain(if stored {
                             format!("Куплено: {name}. Инвентарь полон — товар в Хранилище.")
                         } else {

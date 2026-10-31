@@ -16,7 +16,7 @@ use uuid::Uuid;
 use super::{Request, account, stage_inventory_item};
 use crate::crafting::{self, available};
 use crate::crafting_menu::CraftingMenuKind;
-use crate::item::artifact::{self, ArtifactId};
+use crate::item::serial::{self, SerialId};
 use crate::item::{binding, material, nbt};
 use crate::quest_book::Goal;
 use crate::sound::SystemSound;
@@ -56,11 +56,7 @@ impl CraftingError {
 
 impl SoloLevelingState {
     /// Queues a crafting order for `output`.
-    pub fn request_crafting(
-        &self,
-        player: &Player,
-        output: ArtifactId,
-    ) -> Result<(), CraftingError> {
+    pub fn request_crafting(&self, player: &Player, output: SerialId) -> Result<(), CraftingError> {
         let uuid = player.gameprofile.id();
         let recipe = crafting::recipe(output).ok_or(CraftingError::UnknownRecipe)?;
         let accepted = self
@@ -102,7 +98,7 @@ impl SoloLevelingState {
         server: &Arc<Server>,
         player: Arc<Player>,
         uuid: Uuid,
-        output: ArtifactId,
+        output: SerialId,
     ) -> bool {
         let fail = |message: &'static str| {
             self.release_shop_purchase(uuid);
@@ -175,7 +171,7 @@ impl SoloLevelingState {
                 *stack = replacement;
             }
         }
-        let item = artifact::stack(output, None);
+        let item = serial::stack(output, None);
         let mut stored = false;
         if stage_inventory_item(&mut reservation, item.clone()).is_err() {
             match nbt::encode(&item) {
@@ -229,7 +225,7 @@ impl SoloLevelingState {
                             session.economic_busy = false;
                         });
                         SystemSound::Reward.play(&completion_player);
-                        let name = output.artifact().name;
+                        let name = output.serial().name;
                         completion_player.send_message(&TextComponent::plain(if stored {
                             format!("Изготовлено: {name}. Инвентарь полон — предмет в Хранилище.")
                         } else {

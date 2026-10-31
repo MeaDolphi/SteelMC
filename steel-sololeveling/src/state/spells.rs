@@ -15,6 +15,7 @@ use rustc_hash::FxHashMap;
 use steel_core::entity::damage::DamageSource;
 use steel_core::entity::{Entity, LivingEntity, MobEffectInstance, SharedEntity};
 use steel_core::inventory::container::Container as _;
+use steel_core::inventory::equipment::EquipmentSlot;
 use steel_core::player::Player;
 use steel_core::player::player_inventory::Prediction;
 use steel_core::server::Server;
@@ -41,6 +42,7 @@ use crate::dungeon::runtime::find_player;
 use crate::gear;
 use crate::item::artifact::{self, Category};
 use crate::item::grimoire;
+use crate::item::serial;
 use crate::quest_book::Goal;
 use crate::rank::HunterRank;
 use crate::spell::{self, School, SpellError, SpellGear, SpellId};
@@ -1140,8 +1142,9 @@ impl SoloLevelingState {
         Ok(())
     }
 
-    /// Returns the spellcasting bonuses of a Mage's staffs in either hand and
-    /// System gear; other classes get none.
+    /// Returns the spellcasting bonuses of a Mage's staffs in either hand,
+    /// System gear, and serial robe pieces worn in vanilla armor slots; other
+    /// classes get none.
     pub(super) fn spell_gear(&self, player: &Player) -> SpellGear {
         let Some((class, rank, worn)) = self.with_session_mut(player.gameprofile.id(), |session| {
             (
@@ -1155,23 +1158,50 @@ impl SoloLevelingState {
         if class != Some(HunterClass::Mage) {
             return SpellGear::default();
         }
-        let hands: Vec<ItemStack> = {
+        let (main, off): (ItemStack, ItemStack) = {
             let inventory = player.inventory.lock();
-            [InteractionHand::MainHand, InteractionHand::OffHand]
-                .into_iter()
-                .map(|hand| inventory.get_item_in_hand(hand).clone())
-                .collect()
+            (
+                inventory
+                    .get_item_in_hand(InteractionHand::MainHand)
+                    .clone(),
+                inventory.get_item_in_hand(InteractionHand::OffHand).clone(),
+            )
         };
-        let staffs = hands.into_iter().filter(|stack| {
+        let hands = [main, off];
+        let artifact_staffs = hands.iter().filter(|stack| {
             artifact::held(stack).is_some_and(|held| held.category == Category::Weapon)
         });
-        staffs
-            .chain(
-                worn.into_iter()
-                    .filter(|stack| gear::wearable(stack, class)),
-            )
+        let serial_staffs = hands
+            .iter()
+            .filter(|stack| serial::held(stack).is_some_and(|serial| serial.spell_gear.is_some()));
+        let physical_robes = [
+            EquipmentSlot::Head,
+            EquipmentSlot::Chest,
+            EquipmentSlot::Legs,
+            EquipmentSlot::Feet,
+        ]
+        .into_iter()
+        .filter_map(|slot| {
+            let mut stack = ItemStack::empty();
+            player.with_equipment_slot(slot, &mut |item| stack = item.clone());
+            serial::of(&stack)
+        })
+        .filter(|id| id.line() == Some(crate::item::artifact::ArmorLine::Robe));
+        let artifact_gear = worn
+            .iter()
+            .filter(|stack| gear::wearable(stack, class))
             .filter(|stack| artifact::usable_by(stack, rank))
-            .filter_map(|stack| artifact::of(&stack)?.spell_gear())
+            .filter_map(|stack| artifact::of(stack)?.spell_gear());
+        let artifact_staff_spell_gear = artifact_staffs
+            .filter(|stack| artifact::usable_by(stack, rank))
+            .filter_map(|stack| artifact::of(stack)?.spell_gear());
+        let serial_staff_spell_gear = serial_staffs
+            .filter(|stack| artifact::usable_by(stack, rank))
+            .filter_map(|stack| serial::of(stack)?.spell_gear());
+        artifact_staff_spell_gear
+            .chain(serial_staff_spell_gear)
+            .chain(artifact_gear)
+            .chain(physical_robes.filter_map(|id| id.spell_gear()))
             .fold(
                 self.enchant_spell_gear(player.gameprofile.id()),
                 SpellGear::combine,

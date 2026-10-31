@@ -16,6 +16,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use glam::{DVec3, IVec3};
 use rustc_hash::FxHashSet;
 use steel_core::chunk::Chunk;
@@ -65,15 +67,15 @@ pub const EVACUATION_POS: DVec3 = DVec3::new(3.5, (GROUND_Y + 1) as f64, 134.5);
 const CALM_SECONDS: u64 = 30 * 60;
 /// Ants one nest keeps alive around it.
 const ANTS_PER_NEST: usize = 5;
-/// Ticks between two hatchings of one nest.
-const HATCH_TICKS: u64 = 20 * 15;
+/// Seconds between two hatchings of one nest.
+const HATCH_SECONDS: u64 = 15;
 /// How close a hunter has to be for a nest to be awake.
 const AWAKE_RADIUS: f64 = 56.0;
 /// How far from its nest an ant hatches.
 const HATCH_RADIUS: i32 = 5;
 
 /// One ring of the island.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Zone {
     /// The outer beach.
     Shore,
@@ -413,9 +415,12 @@ struct Nest {
     /// Ants it hatched that are still alive.
     ants: Vec<i32>,
     destroyed: bool,
+    /// Unix second at which the next ant may hatch; zero means as soon as possible.
     next_hatch: u64,
     /// Whether leftovers of an earlier run were swept from around the nest.
     swept: bool,
+    /// Ants that should be respawned after a restore before normal hatching resumes.
+    restore_ants: usize,
 }
 
 /// What died on the island, and who is paid for it.
@@ -471,6 +476,7 @@ impl IslandRuntime {
                     destroyed: false,
                     next_hatch: 0,
                     swept: false,
+                    restore_ants: 0,
                 })
                 .collect(),
             king: None,
@@ -483,6 +489,12 @@ impl IslandRuntime {
     #[must_use]
     pub fn nests_left(&self) -> usize {
         self.nests.iter().filter(|nest| !nest.destroyed).count()
+    }
+
+    /// Returns whether the island is in the calm period after the King died.
+    #[must_use]
+    pub const fn is_calm(&self) -> bool {
+        self.calm_until > 0
     }
 
     /// Remembers that `hunter` fought on the island.
@@ -542,8 +554,21 @@ impl IslandRuntime {
             if nest.core.is_none_or(|id| !alive(world, id)) {
                 nest.core = spawn_nest(world, nest.zone, nest.pos);
             }
-            if nest.ants.len() < ANTS_PER_NEST && tick >= nest.next_hatch {
-                nest.next_hatch = tick + HATCH_TICKS;
+            let restore_target = nest.ants.len().max(nest.restore_ants).min(ANTS_PER_NEST);
+            while nest.ants.len() < restore_target {
+                let offset =
+                    (nest.ants.len() as i32).rem_euclid(2 * HATCH_RADIUS + 1) - HATCH_RADIUS;
+                let spot =
+                    BlockPos::new(nest.pos.x() + offset, nest.pos.y(), nest.pos.z() - offset);
+                if let Some(id) = spawn_ant(world, nest.zone, spot) {
+                    nest.ants.push(id);
+                } else {
+                    break;
+                }
+            }
+            nest.restore_ants = 0;
+            if nest.ants.len() < ANTS_PER_NEST && now >= nest.next_hatch {
+                nest.next_hatch = now + HATCH_SECONDS;
                 let offset = (tick as i32).rem_euclid(2 * HATCH_RADIUS + 1) - HATCH_RADIUS;
                 let spot =
                     BlockPos::new(nest.pos.x() + offset, nest.pos.y(), nest.pos.z() - offset);
@@ -644,6 +669,90 @@ impl IslandRuntime {
             .find(|nest| nest.ants.contains(&entity_id))?;
         nest.ants.retain(|id| *id != entity_id);
         Some(IslandKill::Ant(nest.zone.rank()))
+    }
+}
+
+/// Serialized state of one nest, independent of transient entity ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NestSnapshot {
+    /// Nest column, matched against the deterministic island layout on restore.
+    pub pos: [i32; 3],
+    /// Whether the nest body has been destroyed.
+    pub destroyed: bool,
+    /// Whether leftovers from an earlier run were already swept.
+    pub swept: bool,
+    /// How many ants were alive around the nest when the snapshot was taken.
+    pub ant_count: usize,
+    /// Unix second at which the next ant may hatch.
+    pub next_hatch_at: u64,
+}
+
+/// Serialized shared island infestation, safe to publish as a gameplay document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct IslandSnapshot {
+    /// Unix second the calm after the King ends; zero while infested.
+    #[serde(default)]
+    pub calm_until: u64,
+    /// Per-nest progress, in no guaranteed order.
+    #[serde(default)]
+    pub nests: Vec<NestSnapshot>,
+    /// Hunters who hit something on the island since the last King.
+    #[serde(default)]
+    pub fighters: Vec<Uuid>,
+}
+
+impl NestSnapshot {
+    fn from_nest(nest: &Nest) -> Self {
+        Self {
+            pos: [nest.pos.x(), nest.pos.y(), nest.pos.z()],
+            destroyed: nest.destroyed,
+            swept: nest.swept,
+            ant_count: nest.ants.len(),
+            next_hatch_at: nest.next_hatch,
+        }
+    }
+}
+
+impl IslandRuntime {
+    /// Captures the persistent parts of the current infestation.
+    #[must_use]
+    pub fn snapshot(&self) -> IslandSnapshot {
+        IslandSnapshot {
+            calm_until: self.calm_until,
+            nests: self.nests.iter().map(NestSnapshot::from_nest).collect(),
+            fighters: self.fighters.iter().copied().collect(),
+        }
+    }
+
+    /// Replaces live state with a previously published snapshot.
+    ///
+    /// Live entity ids are intentionally discarded; ants and the King are
+    /// respawned by the normal tick rules after the world is loaded.
+    pub fn restore(&mut self, snapshot: IslandSnapshot) {
+        let expected = nests();
+        let mut restored = Vec::with_capacity(expected.len());
+        for (zone, pos) in expected {
+            let saved = snapshot
+                .nests
+                .iter()
+                .find(|nest| nest.pos == [pos.x(), pos.y(), pos.z()]);
+            restored.push(Nest {
+                zone,
+                pos,
+                core: None,
+                ants: Vec::new(),
+                destroyed: saved.map_or(false, |nest| nest.destroyed),
+                next_hatch: saved.map_or(0, |nest| nest.next_hatch_at),
+                swept: saved.map_or(false, |nest| nest.swept),
+                restore_ants: saved.map_or(0, |nest| nest.ant_count),
+            });
+        }
+        *self = Self {
+            nests: restored,
+            king: None,
+            calm_until: snapshot.calm_until,
+            fighters: snapshot.fighters.iter().copied().collect(),
+        };
     }
 }
 
@@ -845,7 +954,11 @@ pub fn travel_to(server: &Server, player: Arc<Player>, rank: HunterRank) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ISLAND_RADIUS, LANDING, Zone, nests};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use uuid::Uuid;
+
+    use super::{ISLAND_RADIUS, IslandRuntime, IslandSnapshot, LANDING, NestSnapshot, Zone, nests};
 
     #[test]
     fn zones_go_from_the_shore_to_the_centre() {
@@ -866,5 +979,60 @@ mod tests {
             let landing = f64::from(pos.x() - LANDING.x()).hypot(f64::from(pos.z() - LANDING.z()));
             assert!(landing > 16.0, "nest {pos:?} sits on the landing");
         }
+    }
+
+    #[test]
+    fn island_snapshot_round_trips_nest_progress_and_calm() {
+        let mut island = IslandRuntime::new();
+        let first_pos = [
+            island.nests[0].pos.x(),
+            island.nests[0].pos.y(),
+            island.nests[0].pos.z(),
+        ];
+        island.nests[0].destroyed = true;
+        island.nests[0].swept = true;
+        island.nests[0].next_hatch = 123;
+        island.nests[1].ants.push(1);
+        island.nests[1].ants.push(2);
+        island.nests[1].next_hatch = 456;
+        let fighter = Uuid::new_v4();
+        island.fighters.insert(fighter);
+        let calm_until = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs())
+            + 1_000;
+        island.calm_until = calm_until;
+
+        let bytes = serde_json::to_vec(&island.snapshot()).expect("snapshot should serialize");
+        let snapshot: IslandSnapshot =
+            serde_json::from_slice(&bytes).expect("snapshot should load");
+
+        let mut restored = IslandRuntime::new();
+        restored.restore(snapshot);
+
+        assert!(restored.is_calm());
+        assert_eq!(restored.calm_until, calm_until);
+        assert!(restored.fighters.contains(&fighter));
+        assert_eq!(restored.nests.len(), island.nests.len());
+        assert!(restored.nests[0].destroyed);
+        assert!(restored.nests[0].swept);
+        assert_eq!(restored.nests[0].next_hatch, 123);
+        assert_eq!(restored.nests[0].restore_ants, 0);
+        assert_eq!(restored.nests[1].restore_ants, 2);
+        assert_eq!(restored.nests[1].next_hatch, 456);
+
+        let missing_pos = [first_pos[0] + 1, first_pos[1], first_pos[2]];
+        let orphan = NestSnapshot {
+            pos: missing_pos,
+            destroyed: true,
+            swept: true,
+            ant_count: 7,
+            next_hatch_at: 999,
+        };
+        let mut with_orphan = IslandSnapshot::default();
+        with_orphan.nests.push(orphan);
+        let mut restored = IslandRuntime::new();
+        restored.restore(with_orphan);
+        assert!(!restored.nests.iter().any(|nest| nest.destroyed));
     }
 }

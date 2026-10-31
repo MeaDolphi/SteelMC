@@ -7,7 +7,8 @@ use std::io::{self, ErrorKind};
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use glam::DVec3;
 use rand::RngExt as _;
@@ -21,9 +22,11 @@ use steel_core::entity::{Entity as _, LivingEntity as _, RemovalReason};
 use steel_core::player::Player;
 use steel_core::player::connection::NetworkConnection as _;
 use steel_core::server::Server;
+use steel_core::server::jobs::{JobPoll, ServerJob, ServerJobContext};
 use steel_core::world::World;
 use steel_registry::item_stack::ItemStack;
 use steel_registry::vanilla_damage_types;
+use steel_utils::locks::SyncMutex;
 use steel_utils::{BlockPos, Identifier};
 use text_components::Modifier as _;
 use text_components::TextComponent;
@@ -151,7 +154,10 @@ pub struct DungeonRuntime {
     regions: InstanceRegionAllocator,
     gate_cycle: Option<GateCycle>,
     pending_gates: Vec<PendingGate>,
-    pending_entries: FxHashMap<Uuid, PendingEntry>,
+    /// Hunters whose instance region is being prepared by a [`DungeonGenerationJob`].
+    generating_entries: FxHashMap<Uuid, GeneratingEntry>,
+    /// Results produced by generation jobs, drained by [`finish_entries`].
+    completed_generations: Arc<SyncMutex<Vec<GenerationResult>>>,
     runs: FxHashMap<Uuid, InstanceRun>,
     /// Gate frames to tear down once a [`Server`] handle is available again.
     spent_gates: Vec<u64>,
@@ -191,7 +197,11 @@ impl Debug for DungeonRuntime {
             .field("regions", &self.regions)
             .field("gate_cycle", &self.gate_cycle.is_some())
             .field("pending_gates", &self.pending_gates.len())
-            .field("pending_entries", &self.pending_entries.len())
+            .field("generating_entries", &self.generating_entries.len())
+            .field(
+                "completed_generations",
+                &self.completed_generations.lock().len(),
+            )
             .field("runs", &self.runs.len())
             .field("spent_gates", &self.spent_gates.len())
             .field("pending_gate_cleanup", &self.pending_gate_cleanup.len())
@@ -293,13 +303,209 @@ struct GateCycle {
     gates_created: u8,
 }
 
-struct PendingEntry {
+/// Lightweight bookkeeping for one dungeon/penalty generation job.
+///
+/// The heavy region preparation lives in [`DungeonGenerationJob`] so the
+/// runtime lock is not held while blocks are written.
+struct GeneratingEntry {
+    /// Players waiting for this instance; their UUIDs are enough to detect busyness.
+    players: Vec<Uuid>,
+    region: InstanceRegion,
+    /// Gate consumed by this entry, restored if generation is cancelled.
+    gate_id: Option<u64>,
+    /// Shared with the generation job so disconnects and persistence failures
+    /// can cancel work without reaching into the job queue.
+    cancelled: Arc<AtomicBool>,
+}
+
+/// Outcome of a [`DungeonGenerationJob`], drained by [`finish_entries`].
+struct GenerationResult {
+    leader: Uuid,
     players: Vec<Arc<Player>>,
     source_world: Identifier,
     instance_world: Arc<World>,
     region: InstanceRegion,
     start: RunStart,
+    /// Keeps the generated chunks loaded until the run is admitted or discarded.
     request: ChunkRequestHandle,
+    footprint: Footprint,
+    cancelled: bool,
+    erase_micros: u64,
+    build_micros: u64,
+    block_count: usize,
+    chunk_count: usize,
+}
+
+/// Server job that waits for instance chunks, clears the previous footprint,
+/// builds the new dungeon/tower and records the footprint.
+///
+/// The job runs on the serialized game-tick task, so world block mutation is
+/// safe; it only avoids doing that work inside the world-tick and gameplay-hook
+/// phases.  Cancellation is cooperative via [`AtomicBool`].
+struct DungeonGenerationJob {
+    leader: Uuid,
+    players: Option<Vec<Arc<Player>>>,
+    source_world: Option<Identifier>,
+    instance_world: Option<Arc<World>>,
+    region: InstanceRegion,
+    start: Option<RunStart>,
+    previous: Option<Footprint>,
+    request: Option<ChunkRequestHandle>,
+    cancelled: Arc<AtomicBool>,
+    completed: Arc<SyncMutex<Vec<GenerationResult>>>,
+}
+
+impl DungeonGenerationJob {
+    fn push_result(
+        &mut self,
+        footprint: Footprint,
+        erase_micros: u64,
+        build_micros: u64,
+        block_count: usize,
+        chunk_count: usize,
+        cancelled: bool,
+    ) {
+        let Some(request) = self.request.take() else {
+            return;
+        };
+        self.completed.lock().push(GenerationResult {
+            leader: self.leader,
+            players: self.players.take().unwrap_or_default(),
+            source_world: self.source_world.take().unwrap_or_default(),
+            instance_world: self.instance_world.take().unwrap_or_else(|| {
+                // The instance world is never used after this point without a
+                // real handle; a default is unreachable because it was always set.
+                unreachable!("DungeonGenerationJob ran without an instance world")
+            }),
+            region: self.region,
+            start: self.start.take().expect("generation result missing start"),
+            request,
+            footprint,
+            cancelled,
+            erase_micros,
+            build_micros,
+            block_count,
+            chunk_count,
+        });
+    }
+
+    fn finish_cancelled(&mut self) {
+        if let Some(mut request) = self.request.take() {
+            request.cancel();
+        }
+        self.push_result(Footprint::Tower, 0, 0, 0, 0, true);
+    }
+}
+
+impl ServerJob for DungeonGenerationJob {
+    fn poll(&mut self, _context: &mut ServerJobContext) -> JobPoll {
+        if self.cancelled.load(Ordering::Relaxed) {
+            self.finish_cancelled();
+            return JobPoll::Finished;
+        }
+        let Some(request) = self.request.as_ref() else {
+            self.finish_cancelled();
+            return JobPoll::Finished;
+        };
+        match request.poll() {
+            ChunkRequestState::Pending { .. } => JobPoll::Pending,
+            ChunkRequestState::Cancelled => {
+                self.finish_cancelled();
+                JobPoll::Finished
+            }
+            ChunkRequestState::Ready => {
+                if request.ready_chunks().is_none() {
+                    return JobPoll::Pending;
+                }
+                if self.cancelled.load(Ordering::Relaxed) {
+                    self.finish_cancelled();
+                    return JobPoll::Finished;
+                }
+                let chunk_count = request.positions().len();
+                let instance_world = self
+                    .instance_world
+                    .as_ref()
+                    .expect("generation job missing instance world");
+                let erase_start = Instant::now();
+                erase_footprint(instance_world, self.region, self.previous);
+                let erase_micros = erase_start.elapsed().as_micros() as u64;
+
+                let (footprint, block_count, build_micros) = match self
+                    .start
+                    .as_ref()
+                    .expect("generation job missing start")
+                {
+                    RunStart::Gate { gate, layout } => {
+                        let build_start = Instant::now();
+                        build_dungeon(instance_world, self.region, layout, gate.rank);
+                        let build_micros = build_start.elapsed().as_micros() as u64;
+                        log::info!(
+                            "sololeveling: cleared previous instance footprint in {:.2} ms (region {}, {} chunks)",
+                            erase_micros as f64 / 1000.0,
+                            self.region.slot,
+                            chunk_count
+                        );
+                        log::info!(
+                            "sololeveling: built a {} dungeon in {:.2} ms (region {}, seed {}, {} blocks, {} chunks)",
+                            layout.blueprint.theme.display_name(),
+                            build_micros as f64 / 1000.0,
+                            self.region.slot,
+                            layout.seed,
+                            layout.blueprint.blocks.len(),
+                            chunk_count
+                        );
+                        (
+                            Footprint::Dungeon { seed: layout.seed },
+                            layout.blueprint.blocks.len(),
+                            build_micros,
+                        )
+                    }
+                    RunStart::Penalty => {
+                        let build_start = Instant::now();
+                        tower::build_tower(instance_world, self.region);
+                        let build_micros = build_start.elapsed().as_micros() as u64;
+                        log::info!(
+                            "sololeveling: cleared previous instance footprint in {:.2} ms (region {}, {} chunks)",
+                            erase_micros as f64 / 1000.0,
+                            self.region.slot,
+                            chunk_count
+                        );
+                        log::info!(
+                            "sololeveling: built a penalty tower in {:.2} ms (region {}, {} chunks)",
+                            build_micros as f64 / 1000.0,
+                            self.region.slot,
+                            chunk_count
+                        );
+                        (Footprint::Tower, 0, build_micros)
+                    }
+                };
+                self.push_result(
+                    footprint,
+                    erase_micros,
+                    build_micros,
+                    block_count,
+                    chunk_count,
+                    false,
+                );
+                JobPoll::Finished
+            }
+        }
+    }
+
+    fn cancel(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.finish_cancelled();
+    }
+
+    fn finish_shutdown(
+        mut self: Box<Self>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        self.cancelled.store(true, Ordering::Relaxed);
+        if let Some(mut request) = self.request.take() {
+            request.cancel();
+        }
+        Box::pin(async {})
+    }
 }
 
 /// Which kind of instance has to be prepared for a pending entry.
@@ -604,16 +810,19 @@ impl DungeonRuntime {
         for gate in created {
             self.pending_test_gate_players.remove(&gate.id);
         }
-        let pending_gate_entries = self
-            .pending_entries
-            .iter()
-            .filter_map(|(uuid, entry)| {
-                matches!(entry.start, RunStart::Gate { .. }).then_some(*uuid)
-            })
-            .collect::<Vec<_>>();
-        for uuid in pending_gate_entries {
-            if let Some(entry) = self.pending_entries.remove(&uuid) {
-                self.regions.release(entry.region);
+        // Cancel gate entries that are still being generated.  The regions are
+        // released once the jobs observe the cancellation and report back.
+        for entry in self.generating_entries.values() {
+            if entry.gate_id.is_some() {
+                entry.cancelled.store(true, Ordering::Relaxed);
+            }
+        }
+        // Any completed gate results that have not been finalized yet are
+        // treated as cancelled; finish_entries will release their regions and
+        // reopen their gates from the restored registry.
+        for result in self.completed_generations.lock().iter_mut() {
+            if matches!(result.start, RunStart::Gate { .. }) {
+                result.cancelled = true;
             }
         }
         self.gate_cycle = None;
@@ -905,7 +1114,7 @@ impl DungeonRuntime {
     /// after the last participant has died.
     pub fn on_player_death(&mut self, player: &Player) -> RunDeath {
         let uuid = player.gameprofile.id();
-        self.discard_pending_entry(uuid);
+        self.cancel_generating_entry(uuid);
         let Some(run_key) = self
             .runs
             .iter()
@@ -946,7 +1155,7 @@ impl DungeonRuntime {
     ///
     /// The connection is already gone, so the run's boss bar needs no removal.
     pub fn on_player_disconnect(&mut self, server: &Server, player_uuid: Uuid) {
-        self.discard_pending_entry(player_uuid);
+        self.cancel_generating_entry(player_uuid);
         self.complete_offline_run(player_uuid);
         self.flush_spent(server);
     }
@@ -991,14 +1200,11 @@ impl DungeonRuntime {
         self.spend_mobs(&mut run);
     }
 
-    fn discard_pending_entry(&mut self, player_uuid: Uuid) -> bool {
-        let Some(entry) = self.pending_entries.remove(&player_uuid) else {
+    fn cancel_generating_entry(&mut self, player_uuid: Uuid) -> bool {
+        let Some(entry) = self.generating_entries.get(&player_uuid) else {
             return false;
         };
-        if let RunStart::Gate { gate, .. } = &entry.start {
-            self.gates.reopen(gate.id);
-        }
-        self.regions.release(entry.region);
+        entry.cancelled.store(true, Ordering::Relaxed);
         true
     }
 
@@ -1743,7 +1949,13 @@ impl DungeonRuntime {
                     .color(Color::Aqua),
                 );
             }
-            self.begin_entry(participants, world.key.clone(), instance_world, start);
+            self.begin_entry(
+                server,
+                participants,
+                world.key.clone(),
+                instance_world,
+                start,
+            );
         }
     }
 
@@ -1766,6 +1978,7 @@ impl DungeonRuntime {
             };
             log::info!("sololeveling: hunter {uuid} was sent to the penalty zone");
             self.begin_entry(
+                server,
                 vec![player],
                 world.key.clone(),
                 instance_world,
@@ -1775,19 +1988,18 @@ impl DungeonRuntime {
     }
 
     fn is_busy(&self, player_uuid: Uuid) -> bool {
-        self.pending_entries.values().any(|entry| {
-            entry
-                .players
-                .iter()
-                .any(|player| player.gameprofile.id() == player_uuid)
-        }) || self
-            .runs
+        self.generating_entries
             .values()
-            .any(|run| run.members.contains(&player_uuid))
+            .any(|entry| entry.players.contains(&player_uuid))
+            || self
+                .runs
+                .values()
+                .any(|run| run.members.contains(&player_uuid))
     }
 
     fn begin_entry(
         &mut self,
+        server: &Arc<Server>,
         players: Vec<Arc<Player>>,
         source_world: Identifier,
         instance_world: Arc<World>,
@@ -1815,19 +2027,39 @@ impl DungeonRuntime {
             ticket_kind: ChunkTicketKind::Portal,
         });
         let Some(leader) = players.first().map(|player| player.gameprofile.id()) else {
+            self.regions.release(region);
             return;
         };
-        self.pending_entries.insert(
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let player_uuids = players
+            .iter()
+            .map(|player| player.gameprofile.id())
+            .collect();
+        let gate_id = match &start {
+            RunStart::Gate { gate, .. } => Some(gate.id),
+            RunStart::Penalty => None,
+        };
+        self.generating_entries.insert(
             leader,
-            PendingEntry {
-                players,
-                source_world,
-                instance_world,
+            GeneratingEntry {
+                players: player_uuids,
                 region,
-                start,
-                request,
+                gate_id,
+                cancelled: Arc::clone(&cancelled),
             },
         );
+        server.jobs.spawn(DungeonGenerationJob {
+            leader,
+            players: Some(players),
+            source_world: Some(source_world),
+            instance_world: Some(Arc::clone(&instance_world)),
+            region,
+            start: Some(start),
+            previous,
+            request: Some(request),
+            cancelled,
+            completed: Arc::clone(&self.completed_generations),
+        });
     }
 
     #[expect(
@@ -1835,171 +2067,170 @@ impl DungeonRuntime {
         reason = "entering a run stays one reviewable sequence: cancel, wait, then admit"
     )]
     fn finish_entries(&mut self, state: &SoloLevelingState, server: &Arc<Server>, tick: u64) {
-        let mut cancelled = Vec::new();
-        let ready = self
-            .pending_entries
-            .iter()
-            .filter_map(|(uuid, entry)| match entry.request.poll() {
-                ChunkRequestState::Ready
-                    if !self.gates.persistence_blocks_gate_actions()
-                        || matches!(entry.start, RunStart::Penalty) =>
-                {
-                    Some(*uuid)
-                }
-                ChunkRequestState::Ready | ChunkRequestState::Pending { .. } => None,
-                ChunkRequestState::Cancelled => {
-                    cancelled.push(*uuid);
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        for uuid in cancelled {
-            self.discard_pending_entry(uuid);
-        }
-
-        for uuid in ready {
-            if self.gates.persistence_blocks_gate_actions()
-                && self
-                    .pending_entries
-                    .get(&uuid)
-                    .is_some_and(|entry| matches!(entry.start, RunStart::Gate { .. }))
-            {
+        let results = mem::take(&mut *self.completed_generations.lock());
+        let mut skipped = Vec::new();
+        for result in results {
+            if result.cancelled {
+                self.discard_generation_result(&result);
                 continue;
             }
-            if let Some(PendingEntry {
-                start: RunStart::Gate { gate, .. },
-                ..
-            }) = self.pending_entries.get(&uuid)
-                && self.gates.remove(gate.id).is_some()
-            {
-                // The entrance is consumed only after its removal commits.
+            let Some(entry) = self.generating_entries.get(&result.leader) else {
+                // The entry was already cleaned up; release the region defensively.
+                self.regions.release(result.region);
+                if let RunStart::Gate { gate, .. } = &result.start {
+                    self.gates.reopen(gate.id);
+                }
+                continue;
+            };
+            if entry.cancelled.load(Ordering::Relaxed) {
+                self.discard_generation_result(&result);
                 continue;
             }
-            let Some(entry) = self.pending_entries.remove(&uuid) else {
+            if matches!(result.start, RunStart::Gate { .. })
+                && self.gates.persistence_blocks_gate_actions()
+            {
+                skipped.push(result);
                 continue;
-            };
-            let PendingEntry {
-                players,
-                source_world,
-                instance_world,
-                region,
-                start,
-                request,
-            } = entry;
-            let mut penalty_rank = HunterRank::E;
-            let duration_ticks = match &start {
-                RunStart::Gate { .. } => DUNGEON_TIME_LIMIT_TICKS,
-                RunStart::Penalty => {
-                    let Some(rank) = state.claim_penalty(uuid) else {
-                        self.regions.release(region);
-                        continue;
-                    };
-                    penalty_rank = rank;
-                    PENALTY_ZONE_DURATION_TICKS
-                }
-            };
-            erase_footprint(&instance_world, region, self.regions.footprint(region));
-            let footprint = match &start {
-                RunStart::Gate { gate, layout } => {
-                    build_dungeon(&instance_world, region, layout, gate.rank);
-                    log::info!(
-                        "sololeveling: built a {} dungeon (seed {}) in instance region {}",
-                        layout.blueprint.theme.display_name(),
-                        layout.seed,
-                        region.slot
-                    );
-                    Footprint::Dungeon { seed: layout.seed }
-                }
-                RunStart::Penalty => {
-                    tower::build_tower(&instance_world, region);
-                    Footprint::Tower
-                }
-            };
-            self.regions.record(region, footprint);
-            let mut members = Vec::with_capacity(players.len());
-            for player in players {
-                let player_uuid = player.gameprofile.id();
-                if let Err(error) =
-                    server.queue_player_world_selection(Arc::clone(&player), &instance_world)
-                {
-                    log::warn!(
-                        "sololeveling: unable to move hunter {player_uuid} into an instance: {error}"
-                    );
+            }
+            if let RunStart::Gate { gate, .. } = &result.start {
+                if self.gates.remove(gate.id).is_some() {
+                    // Consume the gate retirement now; finalize the run once the
+                    // removal is visible (i.e. on the next tick after persistence commits).
+                    skipped.push(result);
                     continue;
                 }
-                members.push(player_uuid);
             }
-            if members.is_empty() {
-                self.regions.release(region);
-                if let RunStart::Gate { gate, .. } = &start {
-                    self.gates.restore_gate(gate.clone());
-                }
+            self.generating_entries.remove(&result.leader);
+            self.finalize_entry(state, server, tick, result);
+        }
+        self.completed_generations.lock().extend(skipped);
+    }
+
+    fn discard_generation_result(&mut self, result: &GenerationResult) {
+        self.generating_entries.remove(&result.leader);
+        self.regions.release(result.region);
+        if let RunStart::Gate { gate, .. } = &result.start {
+            self.gates.reopen(gate.id);
+        }
+    }
+
+    fn finalize_entry(
+        &mut self,
+        state: &SoloLevelingState,
+        server: &Arc<Server>,
+        tick: u64,
+        result: GenerationResult,
+    ) {
+        let GenerationResult {
+            leader,
+            players,
+            source_world,
+            instance_world,
+            region,
+            start,
+            request,
+            footprint,
+            ..
+        } = result;
+        let mut penalty_rank = HunterRank::E;
+        let duration_ticks = match &start {
+            RunStart::Gate { .. } => DUNGEON_TIME_LIMIT_TICKS,
+            RunStart::Penalty => {
+                let Some(rank) = state.claim_penalty(leader) else {
+                    self.regions.release(region);
+                    return;
+                };
+                penalty_rank = rank;
+                PENALTY_ZONE_DURATION_TICKS
+            }
+        };
+        self.regions.record(region, footprint);
+        let mut members = Vec::with_capacity(players.len());
+        for player in players {
+            let player_uuid = player.gameprofile.id();
+            if player.connection.closed() {
                 continue;
             }
-            let (progress, gate) = match start {
-                RunStart::Gate { gate, layout } => (
-                    RunProgress::Dungeon(Box::new(DungeonProgress {
-                        rank: gate.rank,
-                        floor: gate.floor,
-                        red: gate.red,
-                        wave: gate
-                            .floor
-                            .map_or_else(|| wave_for_gate(gate.rank, gate.red), castle::wave),
-                        layout,
-                        combat_room: 0,
-                        remaining_mobs: Vec::new(),
-                        boss: BossState::Waiting,
-                        fight: None,
-                        exit: None,
-                        contributions: members
-                            .iter()
-                            .copied()
-                            .map(|member| (member, RaidContribution::default()))
-                            .collect(),
-                        boss_chest: None,
-                        survivors: Vec::new(),
-                        labels: FxHashMap::default(),
-                        wave_spawned: false,
-                        guarded_chambers: Vec::new(),
-                        extra_mobs: Vec::new(),
-                        skills: MobSkills::default(),
-                        pending_skills: Vec::new(),
-                        classes: FxHashMap::default(),
-                        boss_materials: Vec::new(),
-                        deaths: 0,
-                    })),
-                    Some(gate.id),
-                ),
-                RunStart::Penalty => (
-                    RunProgress::Penalty(PenaltyProgress {
-                        next_wave_tick: tick + PENALTY_ZONE_WAVE_INTERVAL_TICKS,
-                        remaining_mobs: Vec::new(),
-                        rank: penalty_rank,
-                        groups: 0,
-                        labels: FxHashMap::default(),
-                        skills: MobSkills::default(),
-                        pending_skills: Vec::new(),
-                    }),
-                    None,
-                ),
-            };
-            self.runs.insert(
-                uuid,
-                InstanceRun {
-                    members,
-                    source_world,
-                    instance_world: instance_world.key.clone(),
-                    region,
-                    chunks: request,
-                    started_tick: tick,
-                    duration_ticks,
-                    progress,
-                    gate,
-                    placed: false,
-                    finishing: false,
-                },
-            );
+            if let Err(error) =
+                server.queue_player_world_selection(Arc::clone(&player), &instance_world)
+            {
+                log::warn!(
+                    "sololeveling: unable to move hunter {player_uuid} into an instance: {error}"
+                );
+                continue;
+            }
+            members.push(player_uuid);
         }
+        if members.is_empty() {
+            self.regions.release(region);
+            if let RunStart::Gate { gate, .. } = &start {
+                self.gates.restore_gate(gate.clone());
+            }
+            return;
+        }
+        let (progress, gate) = match start {
+            RunStart::Gate { gate, layout } => (
+                RunProgress::Dungeon(Box::new(DungeonProgress {
+                    rank: gate.rank,
+                    floor: gate.floor,
+                    red: gate.red,
+                    wave: gate
+                        .floor
+                        .map_or_else(|| wave_for_gate(gate.rank, gate.red), castle::wave),
+                    layout,
+                    combat_room: 0,
+                    remaining_mobs: Vec::new(),
+                    boss: BossState::Waiting,
+                    fight: None,
+                    exit: None,
+                    contributions: members
+                        .iter()
+                        .copied()
+                        .map(|member| (member, RaidContribution::default()))
+                        .collect(),
+                    boss_chest: None,
+                    survivors: Vec::new(),
+                    labels: FxHashMap::default(),
+                    wave_spawned: false,
+                    guarded_chambers: Vec::new(),
+                    extra_mobs: Vec::new(),
+                    skills: MobSkills::default(),
+                    pending_skills: Vec::new(),
+                    classes: FxHashMap::default(),
+                    boss_materials: Vec::new(),
+                    deaths: 0,
+                })),
+                Some(gate.id),
+            ),
+            RunStart::Penalty => (
+                RunProgress::Penalty(PenaltyProgress {
+                    next_wave_tick: tick + PENALTY_ZONE_WAVE_INTERVAL_TICKS,
+                    remaining_mobs: Vec::new(),
+                    rank: penalty_rank,
+                    groups: 0,
+                    labels: FxHashMap::default(),
+                    skills: MobSkills::default(),
+                    pending_skills: Vec::new(),
+                }),
+                None,
+            ),
+        };
+        self.runs.insert(
+            leader,
+            InstanceRun {
+                members,
+                source_world,
+                instance_world: instance_world.key.clone(),
+                region,
+                chunks: request,
+                started_tick: tick,
+                duration_ticks,
+                progress,
+                gate,
+                placed: false,
+                finishing: false,
+            },
+        );
     }
 
     /// Advances one dungeon run: waves, then the boss, then the exit.
@@ -2641,5 +2872,56 @@ fn notify_near_gate(server: &Server, gate: &Gate, message: TextComponent) {
         {
             player.send_message(&message);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use uuid::Uuid;
+
+    use super::{DungeonRuntime, GeneratingEntry};
+    use crate::dungeon::InstanceRegion;
+
+    #[test]
+    fn generating_entry_marks_players_busy() {
+        let mut runtime = DungeonRuntime::default();
+        let leader = Uuid::new_v4();
+        let member = Uuid::new_v4();
+        runtime.generating_entries.insert(
+            leader,
+            GeneratingEntry {
+                players: vec![leader, member],
+                region: InstanceRegion::from_slot(0),
+                gate_id: None,
+                cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+
+        assert!(runtime.is_busy(leader));
+        assert!(runtime.is_busy(member));
+        assert!(!runtime.is_busy(Uuid::new_v4()));
+    }
+
+    #[test]
+    fn cancel_generating_entry_sets_shared_flag() {
+        let mut runtime = DungeonRuntime::default();
+        let leader = Uuid::new_v4();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        runtime.generating_entries.insert(
+            leader,
+            GeneratingEntry {
+                players: vec![leader],
+                region: InstanceRegion::from_slot(1),
+                gate_id: Some(7),
+                cancelled: Arc::clone(&cancelled),
+            },
+        );
+
+        assert!(runtime.cancel_generating_entry(leader));
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert!(!runtime.cancel_generating_entry(Uuid::new_v4()));
     }
 }

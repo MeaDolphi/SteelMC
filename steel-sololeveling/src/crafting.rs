@@ -8,9 +8,10 @@
 
 use steel_registry::item_stack::ItemStack;
 
-use crate::item::artifact::{ArmorLine, ArtifactId, IMPROVED};
+use crate::item::artifact::ArmorLine;
 use crate::item::binding;
 use crate::item::material::{self, Material, Quality};
+use crate::item::serial::{IMPROVED, SerialId};
 use crate::rank::HunterRank;
 
 /// Lowest rank that may order the improved tier.
@@ -22,7 +23,7 @@ pub const IMPROVED_QUALITY: Quality = Quality::Common;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recipe {
     /// The item made.
-    pub output: ArtifactId,
+    pub output: SerialId,
     /// Materials consumed, all of [`Recipe::quality`].
     pub materials: Vec<(Material, u32)>,
     /// Quality every material must have.
@@ -45,7 +46,7 @@ const fn line_materials(line: ArmorLine) -> (Material, Material) {
 
 /// Returns the recipe that makes `output`, if it is made to order.
 #[must_use]
-pub fn recipe(output: ArtifactId) -> Option<Recipe> {
+pub fn recipe(output: SerialId) -> Option<Recipe> {
     if !output.is_improved() {
         return None;
     }
@@ -105,8 +106,8 @@ pub fn available(recipe: &Recipe, slots: &[ItemStack]) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::{IMPROVED_RANK, all, recipe};
-    use crate::item::artifact::{ArtifactId, IMPROVED};
     use crate::item::material::Material;
+    use crate::item::serial::{IMPROVED, SerialId};
 
     #[test]
     fn every_improved_item_has_one_recipe_with_essence() {
@@ -121,13 +122,13 @@ mod tests {
             assert!(recipe.work > 0);
             assert_eq!(recipe.rank, IMPROVED_RANK);
         }
-        assert_eq!(recipe(ArtifactId::HunterSword), None);
+        assert_eq!(recipe(SerialId::HunterSword), None);
     }
 
     #[test]
     fn a_chestplate_costs_more_than_boots() {
-        let chest = recipe(ArtifactId::ImprovedHeavyChestplate).expect("recipe");
-        let boots = recipe(ArtifactId::ImprovedHeavyBoots).expect("recipe");
+        let chest = recipe(SerialId::ImprovedHeavyChestplate).expect("recipe");
+        let boots = recipe(SerialId::ImprovedHeavyBoots).expect("recipe");
         assert!(chest.work > boots.work);
         assert_eq!(chest.materials[0], (Material::MagicMetal, 8));
         assert_eq!(chest.materials[1], (Material::ChitinPlate, 4));

@@ -74,9 +74,6 @@ mod tests {
         paths.push("system_book".to_owned());
         paths.push("grimoire".to_owned());
         paths.push("won_pouch".to_owned());
-        for id in artifact::MAGE_SHOP {
-            paths.push(format!("artifact/{}", id.name()));
-        }
         paths.push("key/castle".to_owned());
         for (kind, _) in city::SIGNS {
             paths.push(kind.model().to_owned());

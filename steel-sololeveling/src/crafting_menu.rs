@@ -17,7 +17,7 @@ use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
 use crate::crafting::{self, Recipe};
-use crate::item::artifact::{self, IMPROVED};
+use crate::item::serial::{self, IMPROVED};
 use crate::item::{append_lore, named, with_lore};
 use crate::merchant_menu;
 use crate::rank::HunterRank;
@@ -165,7 +165,7 @@ fn recipe_item(view: &View, recipe: &Recipe, carried: &[u32]) -> ItemStack {
         ("Клик — заказать.", Color::Yellow)
     };
     lines.push(TextComponent::plain(status).color(color));
-    append_lore(artifact::stack(recipe.output, None), lines)
+    append_lore(serial::stack(recipe.output, None), lines)
 }
 
 pub(crate) struct CraftingMenuKind {
@@ -236,7 +236,7 @@ impl MenuKind for CraftingMenuKind {
             Ok(()) => player.send_message(
                 &TextComponent::plain(format!(
                     "Заказ «{}» обрабатывается.",
-                    recipe.output.artifact().name
+                    recipe.output.serial().name
                 ))
                 .color(Color::Gold),
             ),
@@ -259,8 +259,8 @@ mod tests {
     use super::{BACK_SLOT, INFO_SLOT, MENU_SLOTS, recipe_at, slot_of};
     use super::{INVENTORY_SLOTS, carried_materials};
     use crate::crafting;
-    use crate::item::artifact::IMPROVED;
     use crate::item::material;
+    use crate::item::serial::IMPROVED;
 
     #[test]
     fn material_counts_use_the_already_locked_container() {

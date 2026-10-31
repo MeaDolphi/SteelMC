@@ -17,7 +17,7 @@ use deferred::DeferredTransfer;
 pub use starter::StarterError;
 use starter::StarterTransfer;
 
-use crate::item::artifact::ArtifactId;
+use crate::item::serial::SerialId;
 use crate::merchant::MerchantOffer;
 
 use std::{
@@ -66,6 +66,14 @@ const fn guild_document_key() -> Identifier {
 
 const fn gate_registry_document_key() -> Identifier {
     Identifier::new_static("sololeveling", "gates/registry")
+}
+
+const fn island_document_key() -> Identifier {
+    Identifier::new_static("sololeveling", "island")
+}
+
+const fn party_document_key() -> Identifier {
+    Identifier::new_static("sololeveling", "parties")
 }
 
 #[derive(Debug)]
@@ -140,7 +148,7 @@ enum Request {
     },
     Crafting {
         uuid: Uuid,
-        output: ArtifactId,
+        output: SerialId,
     },
     GateRegistry(GateRegistryWrite),
     Auction(AuctionRequest),
@@ -162,6 +170,12 @@ enum Request {
     GuildCollect {
         player: Uuid,
     },
+    IslandSnapshot {
+        bytes: Vec<u8>,
+    },
+    PartySnapshot {
+        bytes: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -175,6 +189,8 @@ pub(super) struct Persistence {
     guild_document_failed: bool,
     guild_transaction_pending: bool,
     gate_document_failed: bool,
+    island_document_failed: bool,
+    party_document_failed: bool,
     busy: bool,
     quiescing: bool,
 }
@@ -264,6 +280,40 @@ impl SoloLevelingState {
             .lock()
             .restore_gate_registry(snapshot)
             .map_err(|error| format!("failed to restore gate registry: {error}"))?;
+        self.persistence.lock().document_expected.insert(key, bytes);
+        Ok(())
+    }
+
+    /// Loads the shared island infestation before the first gameplay tick.
+    pub async fn load_island(&self, server: &Server) -> Result<(), String> {
+        let key = island_document_key();
+        let bytes = server
+            .player_data_storage
+            .load_extension(&key)
+            .await
+            .map_err(|error| format!("failed to load island state: {error}"))?;
+        if let Some(bytes) = bytes.as_deref() {
+            let snapshot = serde_json::from_slice::<crate::island::IslandSnapshot>(bytes)
+                .map_err(|error| format!("failed to decode island state: {error}"))?;
+            self.island.lock().restore(snapshot);
+        }
+        self.persistence.lock().document_expected.insert(key, bytes);
+        Ok(())
+    }
+
+    /// Loads active parties and their group contracts before the first gameplay tick.
+    pub async fn load_parties(&self, server: &Server) -> Result<(), String> {
+        let key = party_document_key();
+        let bytes = server
+            .player_data_storage
+            .load_extension(&key)
+            .await
+            .map_err(|error| format!("failed to load party state: {error}"))?;
+        if let Some(bytes) = bytes.as_deref() {
+            let snapshot = serde_json::from_slice::<crate::party::PartyRegistrySnapshot>(bytes)
+                .map_err(|error| format!("failed to decode party state: {error}"))?;
+            self.party_runtime.lock().restore(snapshot);
+        }
         self.persistence.lock().document_expected.insert(key, bytes);
         Ok(())
     }
@@ -380,6 +430,50 @@ impl SoloLevelingState {
         persistence
             .requests
             .push_back(Request::GuildCollect { player });
+        Ok(())
+    }
+
+    /// Queues the current island infestation snapshot for durable publication.
+    pub(crate) fn queue_island_save(&self) -> io::Result<()> {
+        let bytes = serde_json::to_vec(&self.island.lock().snapshot())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mut persistence = self.persistence.lock();
+        if persistence.island_document_failed || persistence.quiescing {
+            return Err(io::Error::other("island document storage is unavailable"));
+        }
+        if let Some(Request::IslandSnapshot { bytes: pending }) = persistence
+            .requests
+            .iter_mut()
+            .find(|request| matches!(request, Request::IslandSnapshot { .. }))
+        {
+            *pending = bytes;
+        } else {
+            persistence
+                .requests
+                .push_back(Request::IslandSnapshot { bytes });
+        }
+        Ok(())
+    }
+
+    /// Queues the current party registry snapshot for durable publication.
+    pub(crate) fn queue_party_save(&self) -> io::Result<()> {
+        let bytes = serde_json::to_vec(&self.party_runtime.lock().snapshot())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mut persistence = self.persistence.lock();
+        if persistence.party_document_failed || persistence.quiescing {
+            return Err(io::Error::other("party document storage is unavailable"));
+        }
+        if let Some(Request::PartySnapshot { bytes: pending }) = persistence
+            .requests
+            .iter_mut()
+            .find(|request| matches!(request, Request::PartySnapshot { .. }))
+        {
+            *pending = bytes;
+        } else {
+            persistence
+                .requests
+                .push_back(Request::PartySnapshot { bytes });
+        }
         Ok(())
     }
 
@@ -817,6 +911,7 @@ impl SoloLevelingState {
             PreparedCommit::prepare(self, snapshots, updates),
             move |state, report| {
                 if report.committed {
+                    let mut removed = false;
                     for party in state.party_runtime.lock().parties_mut() {
                         if let Some(index) = party.contracts.iter().position(|active| {
                             active.pending_turn_in
@@ -827,7 +922,15 @@ impl SoloLevelingState {
                                     .any(|uuid| completion_group.participants.contains(uuid))
                         }) {
                             party.contracts.remove(index);
+                            removed = true;
                             break;
+                        }
+                    }
+                    if removed {
+                        if let Err(error) = state.queue_party_save() {
+                            log::warn!(
+                                "sololeveling: could not queue party save after group turn-in: {error}"
+                            );
                         }
                     }
                 } else {
@@ -1687,6 +1790,60 @@ impl SoloLevelingState {
                     self.begin_guild_collection(server, player);
                 }
             }
+            Request::IslandSnapshot { bytes } => {
+                let key = island_document_key();
+                let expected = self
+                    .persistence
+                    .lock()
+                    .document_expected
+                    .get(&key)
+                    .cloned()
+                    .flatten();
+                let prepared = PreparedCommit::document(key, expected, bytes.clone());
+                self.submit_commit(server, Ok(prepared), move |state, report| {
+                    let mut persistence = state.persistence.lock();
+                    if report.committed {
+                        persistence
+                            .document_expected
+                            .insert(island_document_key(), Some(bytes));
+                    } else {
+                        persistence.island_document_failed = true;
+                        persistence.requests.retain(|request| {
+                            !matches!(request, Request::IslandSnapshot { .. })
+                        });
+                        log::error!(
+                            "sololeveling: island state write failed; further island writes are disabled"
+                        );
+                    }
+                });
+            }
+            Request::PartySnapshot { bytes } => {
+                let key = party_document_key();
+                let expected = self
+                    .persistence
+                    .lock()
+                    .document_expected
+                    .get(&key)
+                    .cloned()
+                    .flatten();
+                let prepared = PreparedCommit::document(key, expected, bytes.clone());
+                self.submit_commit(server, Ok(prepared), move |state, report| {
+                    let mut persistence = state.persistence.lock();
+                    if report.committed {
+                        persistence
+                            .document_expected
+                            .insert(party_document_key(), Some(bytes));
+                    } else {
+                        persistence.party_document_failed = true;
+                        persistence.requests.retain(|request| {
+                            !matches!(request, Request::PartySnapshot { .. })
+                        });
+                        log::error!(
+                            "sololeveling: party state write failed; further party writes are disabled"
+                        );
+                    }
+                });
+            }
         }
     }
 
@@ -2099,6 +2256,9 @@ impl SoloLevelingState {
         for uuid in self.sessions.player_ids() {
             self.save_session(uuid).map_err(|error| error.to_string())?;
         }
+        self.queue_island_save()
+            .map_err(|error| error.to_string())?;
+        self.queue_party_save().map_err(|error| error.to_string())?;
         loop {
             server.jobs.finish_all().await;
             let empty = {
@@ -2114,6 +2274,12 @@ impl SoloLevelingState {
                 }
                 if persistence.gate_document_failed {
                     return Err("Gate registry storage failed".to_owned());
+                }
+                if persistence.island_document_failed {
+                    return Err("Island state storage failed".to_owned());
+                }
+                if persistence.party_document_failed {
+                    return Err("Party state storage failed".to_owned());
                 }
                 persistence.requests.is_empty() && !persistence.busy
             };

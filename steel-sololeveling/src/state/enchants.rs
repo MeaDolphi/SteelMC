@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use steel_core::entity::damage::DamageSource;
 use steel_core::entity::{Entity, LivingEntity, MobEffectInstance, SharedEntity};
+use steel_core::inventory::equipment::EquipmentSlot;
 use steel_core::player::Player;
 use steel_core::server::Server;
 use steel_registry::item_stack::ItemStack;
@@ -29,6 +30,7 @@ use crate::dungeon::runtime::find_player;
 use crate::gear;
 use crate::item::artifact::{self, Category};
 use crate::item::enchantment::{EnchantSummary, Enchantment};
+use crate::item::serial;
 use crate::spell::{self, SpellGear};
 
 /// Ticks between two recounts of a hunter's worn enchantments.
@@ -153,23 +155,59 @@ impl SoloLevelingState {
                 inventory.get_item_in_hand(InteractionHand::OffHand).clone(),
             )
         };
-        let weapon = |stack: &ItemStack| {
+        let artifact_weapon = |stack: &ItemStack| {
             artifact::held(stack).is_some_and(|held| held.category == Category::Weapon)
         };
-        let staff = |stack: &ItemStack| {
-            weapon(stack) && artifact::of(stack).is_some_and(|id| id.spell_gear().is_some())
+        let artifact_staff = |stack: &ItemStack| {
+            artifact_weapon(stack)
+                && artifact::of(stack).is_some_and(|id| id.spell_gear().is_some())
         };
-        [main]
+        let serial_weapon = |stack: &ItemStack| {
+            serial::held(stack)
+                .is_some_and(|serial| serial.category != crate::item::artifact::Category::Armor)
+        };
+        let serial_staff =
+            |stack: &ItemStack| serial::of(stack).is_some_and(|id| id.spell_gear().is_some());
+        let artifact_enchants = [main.clone()]
             .into_iter()
-            .filter(weapon)
-            .chain([off].into_iter().filter(staff))
+            .filter(artifact_weapon)
+            .chain([off.clone()].into_iter().filter(artifact_staff))
             .filter(|stack| artifact::usable_by(stack, rank) && gear::wearable(stack, class))
             .chain(worn.into_iter().filter(|stack| {
                 artifact::usable_by(stack, rank)
                     && gear::wearable(stack, class)
                     && gear::strong_enough(stack, strength)
             }))
-            .flat_map(|stack| artifact::enchantments_of(&stack))
+            .flat_map(|stack| artifact::enchantments_of(&stack));
+        let serial_hand_enchants = [main]
+            .into_iter()
+            .filter(serial_weapon)
+            .chain([off].into_iter().filter(serial_staff))
+            .flat_map(|stack| serial::enchantments_of(&stack));
+        let serial_armor_enchants = {
+            [
+                EquipmentSlot::Head,
+                EquipmentSlot::Chest,
+                EquipmentSlot::Legs,
+                EquipmentSlot::Feet,
+            ]
+            .into_iter()
+            .filter_map(|slot| {
+                let mut stack = ItemStack::empty();
+                player.with_equipment_slot(slot, &mut |item| stack = item.clone());
+                serial::of(&stack).map(|id| (stack, id))
+            })
+            .filter(|(_, id)| {
+                id.allowed_classes()
+                    .is_none_or(|classes| class.is_some_and(|c| classes.contains(&c)))
+                    && id.required_strength() <= strength
+            })
+            .flat_map(|(stack, _)| serial::enchantments_of(&stack))
+            .collect::<Vec<_>>()
+        };
+        artifact_enchants
+            .chain(serial_hand_enchants)
+            .chain(serial_armor_enchants)
             .collect()
     }
 

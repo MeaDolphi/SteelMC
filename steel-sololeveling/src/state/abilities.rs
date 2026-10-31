@@ -474,19 +474,27 @@ impl SoloLevelingState {
         for slot in ARMOR_SLOTS {
             let mut removed = None;
             player.with_equipment_slot_mut(slot, &mut |stack| {
-                if artifact::of(stack).is_some() && !artifact::usable_by(stack, rank) {
+                let Some(id) = artifact::of(stack) else {
+                    return;
+                };
+                if id.gear_kind().is_some() {
+                    removed = Some(mem::replace(stack, ItemStack::empty()));
+                } else if !artifact::usable_by(stack, rank) {
                     removed = Some(mem::replace(stack, ItemStack::empty()));
                 }
             });
             if let Some(stack) = removed {
-                player.send_message(
-                    &TextComponent::plain(format!(
+                let message = if artifact::of(&stack).is_some_and(|id| id.gear_kind().is_some()) {
+                    "Этот артефакт надевается в снаряжении Системы, а не в обычные слоты брони."
+                        .to_owned()
+                } else {
+                    format!(
                         "Ваш ранг {} слишком низок для этого артефакта (нужен {}): он снят.",
                         rank.name(),
                         artifact::required_rank(&stack).map_or("?", |required| required.name())
-                    ))
-                    .color(Color::Red),
-                );
+                    )
+                };
+                player.send_message(&TextComponent::plain(message).color(Color::Red));
                 player.add_item_or_drop(stack, Prediction::ServerOnly);
             }
         }
@@ -563,6 +571,39 @@ impl SoloLevelingState {
     fn queue_ability_save(&self, uuid: Uuid) {
         if let Err(error) = self.save_session(uuid) {
             log::warn!("sololeveling: failed to persist ability cooldowns of {uuid}: {error}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use steel_registry::init_vanilla_registry;
+
+    use crate::item::{artifact, serial};
+
+    #[test]
+    fn named_artifact_armor_is_removed_from_physical_slots() {
+        init_vanilla_registry();
+        for id in artifact::ALL {
+            if id.gear_kind().is_some() {
+                let stack = artifact::stack(id, None);
+                assert!(
+                    artifact::of(&stack).is_some_and(|id| id.gear_kind().is_some()),
+                    "physical-slot removal must catch {id:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn serial_armor_stays_in_physical_slots() {
+        init_vanilla_registry();
+        for id in serial::ALL {
+            let stack = serial::stack(id, None);
+            assert!(
+                artifact::of(&stack).is_none(),
+                "serial {id:?} must not be seen as an artifact"
+            );
         }
     }
 }

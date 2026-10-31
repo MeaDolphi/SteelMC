@@ -317,6 +317,7 @@ impl SoloLevelingState {
 
     /// Advances the shared island infestation and serves travel requests.
     pub fn tick_island(&self, server: &Arc<Server>, tick: u64) {
+        let before = self.island.lock().snapshot();
         let travels = mem::take(&mut *self.island_travel.lock());
         for (uuid, to_island) in travels {
             let Some(player) = server
@@ -339,6 +340,12 @@ impl SoloLevelingState {
             }
         }
         self.island.lock().tick(server, tick);
+        let after = self.island.lock().snapshot();
+        if before != after {
+            if let Err(error) = self.queue_island_save() {
+                log::warn!("sololeveling: could not queue island save after tick: {error}");
+            }
+        }
     }
 
     /// Asks to move a hunter to the island, or back to the city.
@@ -413,6 +420,9 @@ impl SoloLevelingState {
                 self.queue_system_loot(hunter, stack);
             }
         }
+        if let Err(error) = self.queue_island_save() {
+            log::warn!("sololeveling: could not queue island save after island death: {error}");
+        }
         true
     }
 
@@ -466,7 +476,13 @@ impl SoloLevelingState {
         target: Uuid,
         tick: u64,
     ) -> Result<(), PartyError> {
-        self.party_runtime.lock().invite(inviter, target, tick)
+        let result = self.party_runtime.lock().invite(inviter, target, tick);
+        if result.is_ok() {
+            if let Err(error) = self.queue_party_save() {
+                log::warn!("sololeveling: could not queue party save after invite: {error}");
+            }
+        }
+        result
     }
 
     /// Returns the leader whose party currently invites `player`.
@@ -478,17 +494,35 @@ impl SoloLevelingState {
 
     /// Accepts the caller's current party invitation.
     pub fn accept_party_invitation(&self, player: Uuid, tick: u64) -> Result<Uuid, PartyError> {
-        self.party_runtime.lock().accept(player, tick)
+        let result = self.party_runtime.lock().accept(player, tick);
+        if result.is_ok() {
+            if let Err(error) = self.queue_party_save() {
+                log::warn!("sololeveling: could not queue party save after accept: {error}");
+            }
+        }
+        result
     }
 
     /// Leaves the caller's current party.
     pub fn leave_party(&self, player: Uuid) -> Option<PartyExit> {
-        self.party_runtime.lock().leave(player)
+        let result = self.party_runtime.lock().leave(player);
+        if result.is_some() {
+            if let Err(error) = self.queue_party_save() {
+                log::warn!("sololeveling: could not queue party save after leave: {error}");
+            }
+        }
+        result
     }
 
     /// Removes a party member at its leader's request.
     pub fn kick_from_party(&self, leader: Uuid, target: Uuid) -> Result<(), PartyError> {
-        self.party_runtime.lock().kick(leader, target)
+        let result = self.party_runtime.lock().kick(leader, target);
+        if result.is_ok() {
+            if let Err(error) = self.queue_party_save() {
+                log::warn!("sololeveling: could not queue party save after kick: {error}");
+            }
+        }
+        result
     }
 
     /// Returns the caller's current party.

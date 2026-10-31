@@ -18,7 +18,7 @@ use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
 use crate::crafting_menu;
-use crate::item::artifact;
+use crate::item::serial;
 use crate::item::{append_lore, named, with_lore};
 use crate::merchant::{
     self, MerchantOffer, MerchantRecord, PERSONAL_DISCOUNT_PERCENT, PERSONAL_PERIOD_SECONDS,
@@ -177,7 +177,7 @@ fn offer_item(view: &View, offer: MerchantOffer) -> ItemStack {
     if offer.showcase == Showcase::Personal && view.record.bought(offer.period, offer.index) {
         return named(
             ItemStack::new(&vanilla_items::GRAY_STAINED_GLASS_PANE),
-            TextComponent::plain(format!("Куплено: {}", offer.item.artifact().name))
+            TextComponent::plain(format!("Куплено: {}", offer.item.serial().name))
                 .color(Color::DarkGray),
         );
     }
@@ -189,7 +189,7 @@ fn offer_item(view: &View, offer: MerchantOffer) -> ItemStack {
         ("Клик — купить.", Color::Yellow)
     };
     append_lore(
-        artifact::stack(offer.item, None),
+        serial::stack(offer.item, None),
         vec![
             TextComponent::plain(format!("Цена: {} Won", offer.price)).color(Color::Gold),
             TextComponent::plain(status).color(color),
@@ -269,7 +269,7 @@ impl MenuKind for MerchantMenuKind {
             Ok(()) => player.send_message(
                 &TextComponent::plain(format!(
                     "Покупка «{}» обрабатывается.",
-                    offer.item.artifact().name
+                    offer.item.serial().name
                 ))
                 .color(Color::Gold),
             ),
@@ -350,7 +350,7 @@ mod tests {
 
     use super::{PERSONAL_SLOTS, SHARED_SLOTS, View, menu_items, offer_at};
     use crate::class::HunterClass;
-    use crate::item::artifact;
+    use crate::item::serial;
     use crate::merchant::{self, MerchantRecord};
     use crate::rank::HunterRank;
 
@@ -385,12 +385,12 @@ mod tests {
         let mut view = sample();
         let first = view.personal[0];
         assert_eq!(
-            artifact::of(&menu_items(Some(&view))[PERSONAL_SLOTS[0]]),
+            serial::of(&menu_items(Some(&view))[PERSONAL_SLOTS[0]]),
             Some(first.item)
         );
         view.record.mark(first.period, first.index);
         assert_eq!(
-            artifact::of(&menu_items(Some(&view))[PERSONAL_SLOTS[0]]),
+            serial::of(&menu_items(Some(&view))[PERSONAL_SLOTS[0]]),
             None
         );
     }

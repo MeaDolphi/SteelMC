@@ -23,11 +23,10 @@ use steel_registry::item_stack::ItemStack;
 use uuid::Uuid;
 
 use crate::class::HunterClass;
-use crate::item::artifact::{
-    self, ArmorLine, ArtifactId, MAGE_SHOP, Rarity, SPECIALIZATION, STARTER,
-};
+use crate::item::artifact::{self, ArmorLine, Rarity};
 use crate::item::binding;
 use crate::item::material::{self, Material, Quality};
+use crate::item::serial::{self, MAGE_SHOP, SPECIALIZATION, STARTER, SerialId};
 use crate::rank::HunterRank;
 
 /// Seconds one shared showcase stays up.
@@ -62,7 +61,7 @@ pub struct MerchantOffer {
     /// Position in its showcase.
     pub index: usize,
     /// The item sold.
-    pub item: ArtifactId,
+    pub item: SerialId,
     /// Price in Won.
     pub price: u64,
 }
@@ -101,34 +100,34 @@ impl MerchantRecord {
 
 /// Returns the base price of `item` in Won, or `None` if it is not sold.
 #[must_use]
-pub const fn base_price(item: ArtifactId) -> Option<u64> {
+pub const fn base_price(item: SerialId) -> Option<u64> {
     let price = match item {
-        ArtifactId::HunterSword
-        | ArtifactId::HunterDagger
-        | ArtifactId::HunterAxe
-        | ArtifactId::HunterLeggings
-        | ArtifactId::ApprenticeStaff => 300,
-        ArtifactId::HunterShield
-        | ArtifactId::HunterHelmet
-        | ArtifactId::HunterBoots
-        | ArtifactId::HunterPickaxe => 150,
-        ArtifactId::HunterChestplate => 350,
-        ArtifactId::LightHelmet
-        | ArtifactId::LightBoots
-        | ArtifactId::ReinforcedHelmet
-        | ArtifactId::ReinforcedBoots
-        | ArtifactId::HeavyHelmet
-        | ArtifactId::HeavyBoots
-        | ArtifactId::RobeHelmet
-        | ArtifactId::RobeBoots => 250,
-        ArtifactId::LightLeggings
-        | ArtifactId::ReinforcedLeggings
-        | ArtifactId::HeavyLeggings
-        | ArtifactId::RobeLeggings => 450,
-        ArtifactId::LightChestplate
-        | ArtifactId::ReinforcedChestplate
-        | ArtifactId::HeavyChestplate
-        | ArtifactId::RobeChestplate => 550,
+        SerialId::HunterSword
+        | SerialId::HunterDagger
+        | SerialId::HunterAxe
+        | SerialId::HunterLeggings
+        | SerialId::ApprenticeStaff => 300,
+        SerialId::HunterShield
+        | SerialId::HunterHelmet
+        | SerialId::HunterBoots
+        | SerialId::HunterPickaxe => 150,
+        SerialId::HunterChestplate => 350,
+        SerialId::LightHelmet
+        | SerialId::LightBoots
+        | SerialId::ReinforcedHelmet
+        | SerialId::ReinforcedBoots
+        | SerialId::HeavyHelmet
+        | SerialId::HeavyBoots
+        | SerialId::RobeHelmet
+        | SerialId::RobeBoots => 250,
+        SerialId::LightLeggings
+        | SerialId::ReinforcedLeggings
+        | SerialId::HeavyLeggings
+        | SerialId::RobeLeggings => 450,
+        SerialId::LightChestplate
+        | SerialId::ReinforcedChestplate
+        | SerialId::HeavyChestplate
+        | SerialId::RobeChestplate => 550,
         _ => return None,
     };
     Some(price)
@@ -156,9 +155,13 @@ pub fn buyback_price(stack: &ItemStack) -> Option<u64> {
         };
         return Some(unit * count);
     }
-    let id = artifact::of(stack)?;
+    if let Some(id) = serial::of(stack) {
+        let each = base_price(id).map_or(30, |price| price * 30 / 100);
+        return Some(each * count);
+    }
+    let _id = artifact::of(stack)?;
     let each = match artifact::rarity_of(stack)? {
-        Rarity::Common => base_price(id).map_or(30, |price| price * 30 / 100),
+        Rarity::Common => 30,
         Rarity::Rare => 150,
         Rarity::Epic => 600,
         Rarity::Legendary => 2_500,
@@ -224,7 +227,7 @@ pub fn personal_showcase(
     class: Option<HunterClass>,
     period: u64,
 ) -> Vec<MerchantOffer> {
-    let pool: Vec<ArtifactId> = SPECIALIZATION
+    let pool: Vec<SerialId> = SPECIALIZATION
         .into_iter()
         .filter(|item| class.is_none_or(|class| item.line().is_some_and(|line| fits(line, class))))
         .collect();
@@ -252,12 +255,12 @@ fn fits(line: ArmorLine, class: HunterClass) -> bool {
 
 /// Returns whether a hunter of `rank` may buy `item`.
 #[must_use]
-pub fn may_buy(item: ArtifactId, rank: HunterRank) -> bool {
+pub fn may_buy(item: SerialId, rank: HunterRank) -> bool {
     item.line().is_none() || rank >= SPECIALIZATION_RANK
 }
 
 /// Picks `count` distinct entries of `pool` from `seed`.
-fn pick_distinct(pool: &[ArtifactId], count: usize, seed: u64) -> Vec<ArtifactId> {
+fn pick_distinct(pool: &[SerialId], count: usize, seed: u64) -> Vec<SerialId> {
     let mut remaining = pool.to_vec();
     let mut state = seed;
     let mut picked = Vec::with_capacity(count);
@@ -285,7 +288,7 @@ mod tests {
         personal_showcase, shared_showcase,
     };
     use crate::class::HunterClass;
-    use crate::item::artifact::{ArtifactId, MAGE_SHOP, SPECIALIZATION, STARTER};
+    use crate::item::serial::{MAGE_SHOP, SPECIALIZATION, STARTER, SerialId};
     use crate::rank::HunterRank;
 
     #[test]
@@ -293,7 +296,7 @@ mod tests {
         for item in STARTER.into_iter().chain(SPECIALIZATION) {
             assert!(base_price(item).is_some(), "{item:?}");
         }
-        assert_eq!(base_price(ArtifactId::RedKnightsHelmet), None);
+        assert_eq!(base_price(SerialId::ImprovedHunterSword), None);
     }
 
     #[test]
@@ -336,9 +339,9 @@ mod tests {
 
     #[test]
     fn specialization_needs_rank_d() {
-        assert!(may_buy(ArtifactId::HunterSword, HunterRank::E));
-        assert!(!may_buy(ArtifactId::LightChestplate, HunterRank::E));
-        assert!(may_buy(ArtifactId::LightChestplate, HunterRank::D));
+        assert!(may_buy(SerialId::HunterSword, HunterRank::E));
+        assert!(!may_buy(SerialId::LightChestplate, HunterRank::E));
+        assert!(may_buy(SerialId::LightChestplate, HunterRank::D));
     }
 
     #[test]

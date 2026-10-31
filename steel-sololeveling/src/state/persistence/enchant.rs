@@ -18,6 +18,7 @@ use crate::item::artifact;
 use crate::item::binding;
 use crate::item::enchantment::{self, EnchantError, Enchantment};
 use crate::item::nbt;
+use crate::item::serial;
 use crate::quest_book::Goal;
 use crate::sound::SystemSound;
 use crate::state::auction::park_main_hand_stack;
@@ -28,6 +29,33 @@ use steel_utils::locks::SyncMutex;
 
 fn refuse(player: &Player, message: &str) {
     player.send_message(&TextComponent::plain(message.to_owned()).color(Color::Red));
+}
+
+fn enchant_target_info(
+    stack: &ItemStack,
+) -> Result<
+    (
+        crate::item::artifact::Rarity,
+        Option<crate::item::enchantment::ItemKind>,
+        Vec<Enchantment>,
+    ),
+    EnchantError,
+> {
+    if let Some(artifact) = artifact::held(stack) {
+        return Ok((
+            artifact.rarity,
+            artifact.id.enchant_kind(),
+            artifact::enchantments_of(stack),
+        ));
+    }
+    if let Some(serial) = serial::held(stack) {
+        return Ok((
+            crate::item::artifact::Rarity::Common,
+            serial.id.enchant_kind(),
+            serial::enchantments_of(stack),
+        ));
+    }
+    Err(EnchantError::NotArtifact)
 }
 
 impl SoloLevelingState {
@@ -46,17 +74,11 @@ impl SoloLevelingState {
         let held = self
             .enchant_target_stack(player, target)
             .ok_or(EnchantError::NotArtifact)?;
-        let artifact = artifact::held(&held).ok_or(EnchantError::NotArtifact)?;
+        let (rarity, kind, applied) = enchant_target_info(&held)?;
         let balance = self
             .with_session_mut(uuid, |session| session.won.amount())
             .unwrap_or(0);
-        enchantment::check(
-            artifact.rarity,
-            artifact.id.enchant_kind(),
-            &artifact::enchantments_of(&held),
-            enchantment,
-            balance,
-        )?;
+        enchantment::check(rarity, kind, &applied, enchantment, balance)?;
         if !self.persistence.lock().accepts_writes(uuid) {
             return Err(EnchantError::Storage);
         }
@@ -125,31 +147,34 @@ impl SoloLevelingState {
         let Some(held) = self.enchant_target_stack(&player, target) else {
             return fail(EnchantError::NotArtifact.message());
         };
-        let Some(id) = artifact::of(&held) else {
-            return fail(EnchantError::NotArtifact.message());
-        };
-        let catalog = id.artifact();
-        let mut applied = artifact::enchantments_of(&held);
         let Some(mut snapshot) = self
             .sessions
             .with_mut(uuid, |session| session.saved_data(uuid))
         else {
             return fail("Данные охотника не загружены.");
         };
-        if let Err(error) = enchantment::check(
-            catalog.rarity,
-            id.enchant_kind(),
-            &applied,
-            enchantment,
-            snapshot.won.amount(),
-        ) {
-            return fail(error.message());
-        }
+        let mut applied = match enchant_target_info(&held) {
+            Ok((rarity, kind, applied)) => {
+                if let Err(error) =
+                    enchantment::check(rarity, kind, &applied, enchantment, snapshot.won.amount())
+                {
+                    return fail(error.message());
+                }
+                applied
+            }
+            Err(_) => return fail(EnchantError::NotArtifact.message()),
+        };
         if !snapshot.won.debit(enchantment.price()) {
             return fail(EnchantError::InsufficientFunds.message());
         }
         applied.push(enchantment);
-        let mut enchanted = artifact::enchanted_stack(id, binding::bound_owner(&held), &applied);
+        let mut enchanted = if let Some(id) = artifact::of(&held) {
+            artifact::enchanted_stack(id, binding::bound_owner(&held), &applied)
+        } else if let Some(id) = serial::of(&held) {
+            serial::enchanted_stack(id, binding::bound_owner(&held), &applied)
+        } else {
+            return fail(EnchantError::NotArtifact.message());
+        };
         enchanted.count = held.count;
         let balance = snapshot.won;
         if let EnchantTarget::Gear(index) = target {

@@ -476,13 +476,14 @@ impl OrganizationBook {
 }
 
 /// A contract a party took, with its members fixed at acceptance.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupContract {
     /// The shared contract.
     pub contract: Contract,
     /// Members entitled to the payment; leaving forfeits the share.
     pub participants: Vec<Uuid>,
     /// An accepted payout transaction is in flight.
+    #[serde(skip, default)]
     pub(crate) pending_turn_in: bool,
 }
 

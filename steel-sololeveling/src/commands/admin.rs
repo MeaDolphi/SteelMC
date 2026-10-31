@@ -16,7 +16,25 @@ use uuid::Uuid;
 
 use crate::identifier::from_sololeveling;
 use crate::item::artifact::{self, ArtifactId};
+use crate::item::serial::{self, SerialId};
 use crate::state::SoloLevelingState;
+
+/// Either a named artifact or a serial item, accepted by the admin give command.
+#[derive(Debug, Clone, Copy)]
+enum CatalogId {
+    Artifact(ArtifactId),
+    Serial(SerialId),
+}
+
+impl CatalogId {
+    #[must_use]
+    fn name(self) -> &'static str {
+        match self {
+            Self::Artifact(id) => id.name(),
+            Self::Serial(id) => id.name(),
+        }
+    }
+}
 
 /// Registers `/sladmin shop refresh` and `/sladmin artifact give`.
 #[expect(
@@ -82,7 +100,7 @@ pub fn register(
                                     .executes(move |context| {
                                         require_operator(*context)?;
                                         let target = context.player("player")?;
-                                        let id = artifact_id(*context)?;
+                                        let id = catalog_id(*context)?;
                                         give_artifact(
                                             context.source().server(),
                                             &target,
@@ -91,14 +109,14 @@ pub fn register(
                                         )?;
                                         operator_message(
                                             *context,
-                                            &format!("Выдача артефакта {} поставлена в очередь.{}", id.name(), rank_note(id)),
+                                            &format!("Выдача предмета {} поставлена в очередь.{}", id.name(), rank_note(id)),
                                         );
                                         Ok(1)
                                     })
                                     .then(literal("personal").executes(move |context| {
                                         require_operator(*context)?;
                                         let target = context.player("player")?;
-                                        let id = artifact_id(*context)?;
+                                        let id = catalog_id(*context)?;
                                         give_artifact(
                                             context.source().server(),
                                             &target,
@@ -107,7 +125,7 @@ pub fn register(
                                         )?;
                                         operator_message(
                                             *context,
-                                            &format!("Выдача личного артефакта {} поставлена в очередь.", id.name()),
+                                            &format!("Выдача личного предмета {} поставлена в очередь.", id.name()),
                                         );
                                         Ok(1)
                                     })),
@@ -128,7 +146,7 @@ pub fn register(
                                                 "Из консоли используйте /sladmin artifact give <игрок> <артефакт>.",
                                             )
                                         })?;
-                                    let id = artifact_id(*context)?;
+                                    let id = catalog_id(*context)?;
                                     give_artifact(
                                         context.source().server(),
                                         &target,
@@ -137,7 +155,7 @@ pub fn register(
                                     )?;
                                     operator_message(
                                         *context,
-                                        &format!("Выдача артефакта {} поставлена в очередь.{}", id.name(), rank_note(id)),
+                                        &format!("Выдача предмета {} поставлена в очередь.{}", id.name(), rank_note(id)),
                                     );
                                     Ok(1)
                                 })
@@ -152,7 +170,7 @@ pub fn register(
                                                 "Из консоли используйте /sladmin artifact give <игрок> <артефакт> personal.",
                                             )
                                         })?;
-                                    let id = artifact_id(*context)?;
+                                    let id = catalog_id(*context)?;
                                     give_artifact(
                                         context.source().server(),
                                         &target,
@@ -161,7 +179,7 @@ pub fn register(
                                     )?;
                                     operator_message(
                                         *context,
-                                        &format!("Выдача личного артефакта {} поставлена в очередь.", id.name()),
+                                        &format!("Выдача личного предмета {} поставлена в очередь.", id.name()),
                                     );
                                     Ok(1)
                                 })),
@@ -172,6 +190,7 @@ pub fn register(
                         let catalog = artifact::ALL
                             .into_iter()
                             .map(|id| format!("{} — {}", id.name(), id.artifact().name))
+                            .chain(serial::ALL.into_iter().map(|id| format!("{} — {}", id.name(), id.serial().name)))
                             .collect::<Vec<_>>()
                             .join("\n");
                         operator_message(*context, &catalog);
@@ -206,32 +225,40 @@ fn operator_message(context: CommandContext<'_>, message: &str) {
     log::info!("sololeveling operator: {message}");
 }
 
-fn artifact_id(context: CommandContext<'_>) -> Result<ArtifactId, CommandError> {
+fn catalog_id(context: CommandContext<'_>) -> Result<CatalogId, CommandError> {
     let name = context.string("artifact")?;
-    ArtifactId::from_name(name).ok_or_else(|| {
-        CommandError::from(format!(
-            "Неизвестный артефакт «{name}». Используйте id из каталога артефактов."
-        ))
-    })
+    if let Some(id) = ArtifactId::from_name(name) {
+        return Ok(CatalogId::Artifact(id));
+    }
+    if let Some(id) = SerialId::from_name(name) {
+        return Ok(CatalogId::Serial(id));
+    }
+    Err(CommandError::from(format!(
+        "Неизвестный предмет «{name}». Используйте id из каталога артефактов или серийных вещей."
+    )))
 }
 
 /// Reminds the operator that an unbound artifact obeys the rank gate.
-fn rank_note(id: ArtifactId) -> String {
-    id.artifact()
-        .rarity
-        .transferable_minimum_rank()
-        .map_or_else(String::new, |rank| {
-            format!(
-                " Без привязки он работает только с ранга {}; для проверки на любом ранге добавьте personal.",
-                rank.name()
-            )
-        })
+fn rank_note(id: CatalogId) -> String {
+    match id {
+        CatalogId::Artifact(id) => id
+            .artifact()
+            .rarity
+            .transferable_minimum_rank()
+            .map_or_else(String::new, |rank| {
+                format!(
+                    " Без привязки он работает только с ранга {}; для проверки на любом ранге добавьте personal.",
+                    rank.name()
+                )
+            }),
+        CatalogId::Serial(_) => String::new(),
+    }
 }
 
 fn give_artifact(
     server: &Arc<Server>,
     target: &Arc<Player>,
-    id: ArtifactId,
+    id: CatalogId,
     owner: Option<Uuid>,
 ) -> Result<(), CommandError> {
     let mut reservation = target
@@ -244,7 +271,10 @@ fn give_artifact(
             "У игрока нет свободного места в инвентаре.",
         ));
     };
-    let stack = artifact::stack(id, owner);
+    let stack = match id {
+        CatalogId::Artifact(id) => artifact::stack(id, owner),
+        CatalogId::Serial(id) => serial::stack(id, owner),
+    };
     reservation
         .set_item(slot, stack)
         .map_err(|_| CommandError::from("Не удалось подготовить инвентарь игрока."))?;
@@ -254,7 +284,7 @@ fn give_artifact(
         .submit_stored_inventory_transaction(vec![reservation], Vec::new(), move |result| {
             match result {
                 Ok(TransactionCommit::Committed) => recipient.send_message(
-                    &TextComponent::plain("Оператор выдал вам артефакт.")
+                    &TextComponent::plain("Оператор выдал вам предмет.")
                         .color(Color::LightPurple),
                 ),
                 Ok(TransactionCommit::DurabilityUncertain) => recipient.send_message(

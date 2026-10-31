@@ -16,8 +16,9 @@ use text_components::TextComponent;
 use uuid::Uuid;
 
 use super::{Request, account, stage_inventory_item};
-use crate::item::artifact::ArtifactId;
-use crate::item::{artifact, binding, nbt};
+use crate::item::binding;
+use crate::item::nbt;
+use crate::item::serial::{self, SerialId};
 use crate::quest_book::Goal;
 use crate::sound::SystemSound;
 use crate::starter::{self, StarterKit};
@@ -30,9 +31,9 @@ const INVENTORY_SLOTS: usize = 36;
 #[derive(Debug, Clone, Copy)]
 pub(super) enum StarterTransfer {
     /// Claim the kit with this weapon.
-    Claim(ArtifactId),
+    Claim(SerialId),
     /// Hand the claimed weapon back for this one.
-    Swap(ArtifactId),
+    Swap(SerialId),
     /// Hand out the pickaxe a kit claimed before it existed still owes.
     Pickaxe,
 }
@@ -82,7 +83,7 @@ impl SoloLevelingState {
     pub fn request_starter_kit(
         &self,
         player: &Player,
-        weapon: ArtifactId,
+        weapon: SerialId,
     ) -> Result<(), StarterError> {
         self.queue_starter(player, StarterTransfer::Claim(weapon))
     }
@@ -91,7 +92,7 @@ impl SoloLevelingState {
     pub fn request_starter_swap(
         &self,
         player: &Player,
-        weapon: ArtifactId,
+        weapon: SerialId,
     ) -> Result<(), StarterError> {
         self.queue_starter(player, StarterTransfer::Swap(weapon))
     }
@@ -210,7 +211,7 @@ impl SoloLevelingState {
                     return fail(StarterError::PickaxeNotOwed.message());
                 }
                 snapshot.starter.pickaxe = true;
-                vec![artifact::stack(ArtifactId::HunterPickaxe, Some(uuid))]
+                vec![serial::stack(SerialId::HunterPickaxe, Some(uuid))]
             }
             StarterTransfer::Swap(weapon) => {
                 let Some(old) = snapshot
@@ -227,7 +228,7 @@ impl SoloLevelingState {
                 // can never leave the hunter with two starter weapons.
                 let returned = (0..INVENTORY_SLOTS).find(|slot| {
                     reservation.item(*slot).is_ok_and(|stack| {
-                        artifact::of(&stack) == Some(old)
+                        serial::of(&stack) == Some(old)
                             && binding::bound_owner(&stack) == Some(uuid)
                     })
                 });
@@ -237,7 +238,7 @@ impl SoloLevelingState {
                     );
                 };
                 if reservation
-                    .set_item(slot, artifact::stack(weapon, Some(uuid)))
+                    .set_item(slot, serial::stack(weapon, Some(uuid)))
                     .is_err()
                 {
                     return fail("Не удалось подготовить инвентарь к обмену.");
@@ -310,7 +311,7 @@ impl SoloLevelingState {
                             ),
                             StarterTransfer::Claim(_) => "Стартовый набор получен.".to_owned(),
                             StarterTransfer::Swap(weapon) => {
-                                format!("Оружие обменено: {}.", weapon.artifact().name)
+                                format!("Оружие обменено: {}.", weapon.serial().name)
                             }
                             StarterTransfer::Pickaxe if stored > 0 => {
                                 "Кирка охотника получена — она в Хранилище.".to_owned()

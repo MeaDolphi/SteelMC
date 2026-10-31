@@ -12,6 +12,7 @@ use super::SoloLevelingState;
 use crate::abilities;
 use crate::class::{self, ClassError, HunterClass};
 use crate::gear;
+use crate::item::serial;
 use crate::quest_book::Goal;
 use crate::rank::HunterRank;
 
@@ -113,6 +114,7 @@ impl SoloLevelingState {
                 gear_magic
                     + self.magic_focus(attacker)
                     + self.spell_gear(attacker).magic
+                    + self.serial_armor_magic_bonus(attacker)
                     + if class == Some(HunterClass::Mage) {
                         class::MAGE_MAGIC_BONUS * scale
                     } else {
@@ -160,6 +162,25 @@ impl SoloLevelingState {
             }
         }
         damage
+    }
+
+    /// Returns the magic damage bonus from serial robe pieces worn in vanilla
+    /// armor slots.
+    fn serial_armor_magic_bonus(&self, player: &Player) -> f32 {
+        use steel_core::inventory::equipment::EquipmentSlot;
+        [
+            EquipmentSlot::Head,
+            EquipmentSlot::Chest,
+            EquipmentSlot::Legs,
+            EquipmentSlot::Feet,
+        ]
+        .into_iter()
+        .map(|slot| {
+            let mut stack = steel_registry::item_stack::ItemStack::empty();
+            player.with_equipment_slot(slot, &mut |item| stack = item.clone());
+            serial::of(&stack).map_or(0.0, |id| id.magic_bonus())
+        })
+        .sum()
     }
 
     /// Pays owed lifesteal and keeps the class bonuses in step with the rank.

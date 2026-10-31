@@ -1,6 +1,7 @@
 //! Ephemeral party membership, invitations, and raid contribution accounting.
 
 use rustc_hash::FxHashMap;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::organization::GroupContract;
@@ -257,6 +258,64 @@ impl PartyRuntime {
         self.invitations
             .retain(|_, invitation| tick <= invitation.expires_at);
     }
+
+    /// Captures party rosters and their active group contracts.
+    #[must_use]
+    pub fn snapshot(&self) -> PartyRegistrySnapshot {
+        PartyRegistrySnapshot {
+            parties: self
+                .parties
+                .values()
+                .map(|party| PartySnapshot {
+                    members: party.members.clone(),
+                    contracts: party.contracts.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Replaces live parties from a previously published snapshot.
+    ///
+    /// Pending invitations are intentionally not restored; they are tied to the
+    /// previous process's tick counter and would be meaningless after restart.
+    pub fn restore(&mut self, snapshot: PartyRegistrySnapshot) {
+        self.parties.clear();
+        self.membership.clear();
+        self.invitations.clear();
+        for saved in snapshot.parties {
+            if saved.members.is_empty() {
+                continue;
+            }
+            let leader = saved.members[0];
+            let mut party = Party::new(leader);
+            for member in saved.members.iter().skip(1) {
+                if party.add(*member).is_err() {
+                    break;
+                }
+            }
+            party.contracts = saved.contracts;
+            for member in &party.members {
+                self.membership.insert(*member, leader);
+            }
+            self.parties.insert(leader, party);
+        }
+    }
+}
+
+/// Serialized party registry, published as one gameplay document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PartyRegistrySnapshot {
+    /// Active parties; the leader is the first member of each party.
+    pub parties: Vec<PartySnapshot>,
+}
+
+/// Serialized party: roster and active group contracts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartySnapshot {
+    /// Members in leader and join order.
+    pub members: Vec<Uuid>,
+    /// Active group contracts sharing the party's lifetime.
+    pub contracts: Vec<GroupContract>,
 }
 
 /// Records one raid member's contribution.
@@ -326,5 +385,58 @@ mod tests {
             Some(PartyExit::Continued { new_leader: first })
         );
         assert_eq!(parties.party_of(second).map(Party::leader), Some(first));
+    }
+
+    #[test]
+    fn party_registry_round_trips_rosters_and_group_contracts() {
+        use crate::organization::{Contract, GroupContract, Objective, Template};
+        use crate::rank::HunterRank;
+
+        let leader = Uuid::new_v4();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut parties = PartyRuntime::default();
+        parties.invite(leader, first, 0).expect("invite first");
+        parties.accept(first, 0).expect("accept first");
+        parties.invite(leader, second, 1).expect("invite second");
+        parties.accept(second, 1).expect("accept second");
+
+        let template = Template {
+            objective: Objective::Boss,
+            rank: HunterRank::C,
+        };
+        let contract = Contract::accepted(template, 1, 7);
+        parties
+            .parties_mut()
+            .next()
+            .expect("one party")
+            .contracts
+            .push(GroupContract {
+                contract,
+                participants: vec![leader, first, second],
+                pending_turn_in: true,
+            });
+
+        let bytes = serde_json::to_vec(&parties.snapshot()).expect("snapshot should serialize");
+        let snapshot: PartyRegistrySnapshot =
+            serde_json::from_slice(&bytes).expect("snapshot should load");
+
+        let mut restored = PartyRuntime::default();
+        restored.restore(snapshot);
+
+        assert!(
+            restored.invitations.is_empty(),
+            "invitations are not restored"
+        );
+        let party = restored.party_of(leader).expect("leader has a party");
+        assert_eq!(party.leader(), leader);
+        assert_eq!(party.members(), &[leader, first, second]);
+        assert_eq!(party.contracts.len(), 1);
+        assert_eq!(party.contracts[0].contract, contract);
+        assert_eq!(party.contracts[0].participants, [leader, first, second]);
+        assert!(
+            !party.contracts[0].pending_turn_in,
+            "in-flight turn-in flag is not restored"
+        );
     }
 }

@@ -27,6 +27,7 @@ pub mod model;
 pub mod nbt;
 pub mod potion;
 pub mod pouch;
+pub mod serial;
 pub mod shadow;
 
 use simdnbt::owned::{NbtCompound, NbtTag};
