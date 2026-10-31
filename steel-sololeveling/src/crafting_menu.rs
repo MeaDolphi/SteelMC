@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::crafting::{self, Recipe};
 use crate::item::serial::{self, CraftedTier, IMPROVED, SerialId};
-use crate::item::{append_lore, named, with_lore};
+use crate::item::{append_lore, binding, named, with_lore};
 use crate::merchant_menu;
 use crate::rank::HunterRank;
 use crate::state::SoloLevelingState;
@@ -82,6 +82,8 @@ struct View {
     tier: CraftedTier,
     /// Carried units of each recipe's materials, in the current tier's order.
     carried: Vec<Vec<u32>>,
+    /// Whether each recipe's previous-tier base is carried, in the same order.
+    bases: Vec<bool>,
 }
 
 fn view(
@@ -97,6 +99,7 @@ fn view(
         rank,
         tier,
         carried: carried_materials(inventory, tier),
+        bases: carried_bases(inventory, uuid, tier),
     })
 }
 
@@ -107,6 +110,23 @@ fn carried_materials(inventory: &dyn Container, tier: CraftedTier) -> Vec<Vec<u3
     crafting::tier_recipes(tier)
         .iter()
         .map(|recipe| crafting::available(recipe, &slots))
+        .collect()
+}
+
+/// Returns whether each recipe's base is carried: a personal copy of the
+/// hunter or a transferable one, never another hunter's personal item.
+fn carried_bases(inventory: &dyn Container, uuid: Uuid, tier: CraftedTier) -> Vec<bool> {
+    let slots: Vec<ItemStack> = (0..INVENTORY_SLOTS)
+        .map(|slot| inventory.get_item(slot).clone())
+        .collect();
+    crafting::tier_recipes(tier)
+        .iter()
+        .map(|recipe| match crafting::base_of(recipe.output) {
+            Some(base) => slots.iter().any(|stack| {
+                serial::of(stack) == Some(base) && !binding::bound_to_other(stack, uuid)
+            }),
+            None => true,
+        })
         .collect()
 }
 
@@ -156,6 +176,8 @@ fn menu_items(view: Option<&View>) -> Vec<ItemStack> {
             TextComponent::plain("Материалы — из инвентаря, работа оплачивается в Won.")
                 .color(Color::Gray),
             TextComponent::plain("Без таймера и без риска провала.").color(Color::Gray),
+            TextComponent::plain("Заказ забирает предыдущий тир и сохраняет его привязку.")
+                .color(Color::Gray),
             TextComponent::plain("Изделия можно передавать и продавать.").color(Color::Gray),
         ],
     );
@@ -176,13 +198,13 @@ fn menu_items(view: Option<&View>) -> Vec<ItemStack> {
     {
         items[TAB_SLOTS[index]] = tab_item(view, tier);
     }
-    for ((index, recipe), carried) in crafting::tier_recipes(view.tier)
+    for ((index, recipe), (carried, has_base)) in crafting::tier_recipes(view.tier)
         .into_iter()
         .enumerate()
-        .zip(&view.carried)
+        .zip(view.carried.iter().zip(&view.bases))
     {
         if let Some(slot) = slot_of(index) {
-            items[slot] = recipe_item(view, &recipe, carried);
+            items[slot] = recipe_item(view, &recipe, carried, *has_base);
         }
     }
     items
@@ -213,7 +235,7 @@ fn tab_item(view: &View, tier: CraftedTier) -> ItemStack {
     )
 }
 
-fn recipe_item(view: &View, recipe: &Recipe, carried: &[u32]) -> ItemStack {
+fn recipe_item(view: &View, recipe: &Recipe, carried: &[u32], has_base: bool) -> ItemStack {
     let mut lines: Vec<TextComponent> = recipe
         .materials
         .iter()
@@ -231,6 +253,17 @@ fn recipe_item(view: &View, recipe: &Recipe, carried: &[u32]) -> ItemStack {
             })
         })
         .collect();
+    let base = crafting::base_of(recipe.output);
+    if let Some(base) = base {
+        lines.push(
+            TextComponent::plain(format!(
+                "Основа: {} — {}",
+                base.serial().name,
+                if has_base { "есть" } else { "нет" }
+            ))
+            .color(if has_base { Color::Green } else { Color::Red }),
+        );
+    }
     lines.push(
         TextComponent::plain(format!("Работа мастера: {} Won", recipe.work)).color(Color::Gold),
     );
@@ -248,6 +281,8 @@ fn recipe_item(view: &View, recipe: &Recipe, carried: &[u32]) -> ItemStack {
         ("Не хватает Won.".to_owned(), Color::Red)
     } else if !enough {
         ("Не хватает материалов.".to_owned(), Color::Red)
+    } else if base.is_some() && !has_base {
+        ("Нет основы заказа в инвентаре.".to_owned(), Color::Red)
     } else {
         ("Клик — заказать.".to_owned(), Color::Yellow)
     };
@@ -353,12 +388,15 @@ mod tests {
     use steel_utils::locks::IntoShared;
 
     use super::{
-        BACK_SLOT, INFO_SLOT, INVENTORY_SLOTS, MENU_SLOTS, TAB_SLOTS, carried_materials, recipe_at,
-        slot_of, tier_from_tab,
+        BACK_SLOT, INFO_SLOT, INVENTORY_SLOTS, MENU_SLOTS, TAB_SLOTS, carried_bases,
+        carried_materials, recipe_at, slot_of, tier_from_tab,
     };
     use crate::crafting;
-    use crate::item::material;
-    use crate::item::serial::{CraftedTier, IMPROVED, tiered};
+    use crate::item::serial::{CraftedTier, IMPROVED, SerialId, tiered};
+    use crate::item::{material, serial};
+    use crate::rank::HunterRank;
+    use steel_registry::data_components::vanilla_components::LORE;
+    use uuid::Uuid;
 
     #[test]
     fn material_counts_use_the_already_locked_container() {
@@ -415,5 +453,66 @@ mod tests {
         assert_eq!(tier_from_tab(TAB_SLOTS[0]), Some(CraftedTier::Improved));
         assert_eq!(tier_from_tab(TAB_SLOTS[1]), Some(CraftedTier::Elite));
         assert_eq!(tier_from_tab(TAB_SLOTS[2]), Some(CraftedTier::Supreme));
+    }
+
+    #[test]
+    fn bases_are_carried_only_when_usable() {
+        init_vanilla_registry();
+        let uuid = Uuid::new_v4();
+        let stranger = Uuid::new_v4();
+        let mut slots = vec![ItemStack::empty(); INVENTORY_SLOTS];
+        // The elite chestplate's base is the improved chestplate of the same
+        // line; find its recipe position inside the elite tier.
+        let recipes = crafting::tier_recipes(CraftedTier::Elite);
+        let index = recipes
+            .iter()
+            .position(|recipe| recipe.output == SerialId::EliteHeavyChestplate)
+            .expect("elite heavy chestplate recipe");
+        let base_carried = |slots: &[ItemStack]| {
+            let shared = SimpleContainer::from_items(slots.to_vec()).into_shared();
+            let guard = ContainerLockGuard::lock_all(&[ContainerRef::from(Arc::clone(&shared))]);
+            let locked = guard
+                .get_typed::<SimpleContainer>(ContainerId::from_arc(&shared))
+                .expect("inventory participates in the menu lock");
+            carried_bases(locked, uuid, CraftedTier::Elite)[index]
+        };
+        assert!(!base_carried(&slots), "no base is carried");
+
+        slots[0] = serial::stack(SerialId::ImprovedHeavyChestplate, Some(uuid));
+        assert!(base_carried(&slots), "the hunter's personal copy counts");
+
+        slots[0] = serial::stack(SerialId::ImprovedHeavyChestplate, None);
+        assert!(base_carried(&slots), "a transferable copy counts");
+
+        slots[0] = serial::stack(SerialId::ImprovedHeavyChestplate, Some(stranger));
+        assert!(
+            !base_carried(&slots),
+            "another hunter's personal copy does not"
+        );
+
+        // A wrong serial id never counts as the base.
+        slots[0] = serial::stack(SerialId::ImprovedLightChestplate, Some(uuid));
+        assert!(!base_carried(&slots));
+    }
+
+    #[test]
+    fn recipe_lore_shows_the_base_and_blocks_ordering_without_it() {
+        init_vanilla_registry();
+        let recipe = crafting::recipe(SerialId::EliteHeavyChestplate).expect("recipe");
+        let view = super::View {
+            won: u64::MAX,
+            rank: HunterRank::S,
+            tier: CraftedTier::Elite,
+            carried: vec![recipe.materials.iter().map(|(_, needed)| *needed).collect()],
+            bases: vec![false],
+        };
+        let item = super::recipe_item(&view, &recipe, &view.carried[0], false);
+        let lore = format!("{:?}", item.get(LORE));
+        assert!(lore.contains("Основа:"), "{lore}");
+        assert!(lore.contains("Нет основы заказа"), "{lore}");
+
+        let ready = super::recipe_item(&view, &recipe, &view.carried[0], true);
+        let lore = format!("{:?}", ready.get(LORE));
+        assert!(lore.contains("Клик — заказать."), "{lore}");
     }
 }

@@ -18,7 +18,7 @@ use steel_core::chunk::chunk_request::{
 };
 use steel_core::chunk::status::ChunkStatus;
 use steel_core::entity::damage::DamageSource;
-use steel_core::entity::{Entity as _, LivingEntity as _, RemovalReason};
+use steel_core::entity::{Entity, LivingEntity as _, RemovalReason};
 use steel_core::player::Player;
 use steel_core::player::connection::NetworkConnection as _;
 use steel_core::server::Server;
@@ -27,9 +27,10 @@ use steel_core::world::World;
 use steel_registry::item_stack::ItemStack;
 use steel_registry::vanilla_damage_types;
 use steel_utils::locks::SyncMutex;
-use steel_utils::{BlockPos, Identifier};
+use steel_utils::{BlockPos, Identifier, WorldAabb};
 use text_components::Modifier as _;
 use text_components::TextComponent;
+use text_components::content::Content;
 use text_components::format::Color;
 use uuid::Uuid;
 
@@ -1064,7 +1065,17 @@ impl DungeonRuntime {
 
     /// Restores the durable gate registry after the main world has been loaded.
     pub fn restore_gate_registry(&mut self, snapshot: GateRegistrySnapshot) -> Result<(), String> {
-        self.gates.restore(snapshot, 0)
+        self.gates.restore(snapshot, 0)?;
+        // The server tick restarts at zero every session while a persisted
+        // next_wave_tick is an absolute tick of the previous one, so a
+        // restored break would wait out the old uptime before its next wave.
+        // The wave mobs themselves are re-adopted from the world (see
+        // [`Self::adopt_gate_break_orphans`]), so the next wave may spawn as
+        // soon as the adopted wave is cleared.
+        for break_state in self.gates.breaks_mut() {
+            break_state.next_wave_tick = 0;
+        }
+        Ok(())
     }
 
     /// Starts an asynchronous write for changed gate metadata.
@@ -1645,6 +1656,14 @@ impl DungeonRuntime {
             break_state
                 .remaining_mobs
                 .retain(|id| world.get_entity_by_id(*id).is_some());
+            if break_state.wave > 0 && tick.is_multiple_of(20) {
+                Self::adopt_gate_break_orphans(
+                    &mut self.gate_break_tracks,
+                    break_state,
+                    world,
+                    tick,
+                );
+            }
             Self::tick_gate_break_mobs(
                 &mut self.gate_break_tracks,
                 server,
@@ -1665,6 +1684,11 @@ impl DungeonRuntime {
             }
             if break_state.wave >= GATE_BREAK_WAVES {
                 cleared.push(break_state.gate.id);
+                continue;
+            }
+            // Waves keep their interval even when the previous one fell fast;
+            // without the gate they spawn back to back and swamp the defenders.
+            if !break_state.wave_due(tick) {
                 continue;
             }
             break_state.wave += 1;
@@ -1758,6 +1782,72 @@ impl DungeonRuntime {
                 .retain(|id, _| world.get_entity_by_id(*id).is_some());
             refresh_plates(world, &hunters, track.labels.keys());
         }
+    }
+
+    /// Adopts break wave mobs that lost their track back into the break.
+    ///
+    /// The break state persists across restarts, but its mobs live in chunks,
+    /// so after a restore they are back in the world untracked: no plates, no
+    /// class abilities, and they never count toward the wave. Adoption is
+    /// preferred over sweeping them because they keep the stats and plates
+    /// they spawned with, and respawning a fresh wave on top would double the
+    /// fight. Runs once a second per break that already spawned a wave.
+    fn adopt_gate_break_orphans(
+        tracks: &mut FxHashMap<u64, GateBreakTrack>,
+        break_state: &mut GateBreak,
+        world: &Arc<World>,
+        tick: u64,
+    ) {
+        let center = DVec3::new(
+            f64::from(break_state.gate.entrance.x()),
+            f64::from(break_state.gate.entrance.y()),
+            f64::from(break_state.gate.entrance.z()),
+        );
+        // The same radius the break's mobs hunt hunters in: wave mobs spawn
+        // closer, but chase defenders across the whole participation zone.
+        let reach = GATE_BREAK_PARTICIPATION_RADIUS;
+        let area = WorldAabb::new(
+            center.x - reach,
+            center.y - 8.0,
+            center.z - reach,
+            center.x + reach,
+            center.y + 16.0,
+            center.z + reach,
+        );
+        let mut adopted = Vec::new();
+        for entity in world.get_entities_in_aabb_matching(&area, is_adoptable_break_mob) {
+            let id = entity.id();
+            let known = tracks
+                .get(&break_state.gate.id)
+                .is_some_and(|track| track.labels.contains_key(&id));
+            if known || break_state.remaining_mobs.contains(&id) {
+                continue;
+            }
+            let Some(class) = entity.custom_name().as_ref().and_then(break_mob_class) else {
+                continue;
+            };
+            adopted.push(SpawnedMob {
+                id,
+                class,
+                label: MobLabel::mob(Theme::Crypt, class),
+            });
+        }
+        if adopted.is_empty() {
+            return;
+        }
+        let wave = wave_for_gate(break_state.gate.rank, break_state.gate.red);
+        let track = tracks
+            .entry(break_state.gate.id)
+            .or_insert_with(|| GateBreakTrack {
+                world: break_state.gate.world.clone(),
+                ..GateBreakTrack::default()
+            });
+        // Adopted bombers explode with the same blast a fresh wave casts.
+        track.blast_power = (5.0 + 5.0 * wave.damage_multiplier) as f32;
+        for mob in &adopted {
+            break_state.remaining_mobs.push(mob.id);
+        }
+        track.adopt(adopted, tick);
     }
 
     fn queue_gate_cleanup(&mut self, world: Arc<World>, gate: Gate) {
@@ -3782,6 +3872,30 @@ fn players_too_close(world: &World, position: BlockPos, server: &Server) -> bool
     })
 }
 
+/// Whether `entity` can be a break wave mob that lost its track: a living,
+/// unallied mob. Allied mobs (a hunter's own shadows) are never touched.
+fn is_adoptable_break_mob(entity: &dyn Entity) -> bool {
+    entity
+        .as_mob()
+        .is_some_and(|mob| mob.allied_owner().is_none())
+        && entity
+            .as_living_entity()
+            .is_none_or(|living| !living.is_dead_or_dying())
+        && !entity.is_removed()
+}
+
+/// Reads the class out of a break mob's plate: the plate text is the
+/// creature name with the class in brackets, e.g. `Упырь [Страж]`.
+fn break_mob_class(name: &TextComponent) -> Option<MobClass> {
+    let Content::Text { text } = &name.content else {
+        return None;
+    };
+    MobClass::ALL
+        .iter()
+        .copied()
+        .find(|class| text.contains(&format!("[{}]", class.display_name())))
+}
+
 /// Explains that an owed penalty zone keeps a hunter out of gates.
 fn penalty_refusal(wait_seconds: Option<u64>) -> String {
     match wait_seconds {
@@ -3968,6 +4082,51 @@ mod tests {
         assert!(runtime.cancel_generating_entry(leader));
         assert!(cancelled.load(Ordering::Relaxed));
         assert!(!runtime.cancel_generating_entry(Uuid::new_v4()));
+    }
+
+    #[test]
+    fn restored_break_does_not_wait_out_the_previous_session_uptime() {
+        use steel_utils::Identifier;
+
+        use crate::dungeon::{GateBreak, GateRegistry};
+
+        let mut gates = GateRegistry::default();
+        let gate = gates.create_ranked(
+            Identifier::from_steel("overworld"),
+            BlockPos::new(20, 70, 20),
+            500_000,
+            HunterRank::C,
+            false,
+        );
+        let break_state = gates.start_break(gate.id).expect("gate should break");
+        // The previous session died mid-break: an absolute tick far ahead of
+        // the tick counter, which restarts at zero on every boot.
+        *gates.break_mut(gate.id).expect("break state should exist") = GateBreak {
+            next_wave_tick: 500_600,
+            ..break_state
+        };
+        let write = gates.begin_persistence().expect("break is dirty");
+        let snapshot = write.snapshot;
+
+        let mut runtime = DungeonRuntime::default();
+        runtime
+            .restore_gate_registry(snapshot)
+            .expect("snapshot should restore");
+        let restored = runtime.gates.breaks().pop().expect("one break").wave_due(0);
+        assert!(
+            restored,
+            "a restored break may spawn its next wave as soon as the adopted wave is cleared"
+        );
+    }
+
+    #[test]
+    fn break_mob_class_reads_the_plate_text() {
+        use text_components::TextComponent;
+
+        let plate = TextComponent::plain("Упырь [Страж]");
+        assert_eq!(super::break_mob_class(&plate), Some(MobClass::Guard));
+        let king = TextComponent::plain("Король муравьёв");
+        assert_eq!(super::break_mob_class(&king), None);
     }
 
     #[test]

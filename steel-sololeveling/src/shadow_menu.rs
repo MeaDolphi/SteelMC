@@ -34,6 +34,7 @@ const MODE_SLOT: usize = 46;
 const SUMMON_ALL_SLOT: usize = 47;
 const ELITE_SLOT: usize = 48;
 const INFO_SLOT: usize = 49;
+const FILTER_SLOT: usize = 50;
 const RECALL_ALL_SLOT: usize = 51;
 const NEXT_SLOT: usize = 53;
 
@@ -41,6 +42,7 @@ const DETAIL_SLOTS: usize = 27;
 const DETAIL_SHADOW_SLOT: usize = 4;
 const BACK_SLOT: usize = 18;
 const TOGGLE_SLOT: usize = 22;
+const DISBAND_SLOT: usize = 24;
 /// Upgrade buttons and the stat each one raises.
 const UPGRADES: [(usize, ShadowStat); 3] = [
     (11, ShadowStat::Health),
@@ -50,14 +52,93 @@ const UPGRADES: [(usize, ShadowStat); 3] = [
 
 /// Opens the army menu on its first page.
 pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
-    open_army(player, state, 0);
+    open_army(player, state, 0, ArmyFilter::default());
 }
 
-fn open_army(player: &Player, state: Arc<SoloLevelingState>, page: usize) {
+/// How the hopper button filters or orders the army roster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ArmyFilter {
+    /// Roster order, everything.
+    #[default]
+    All,
+    /// Only shadows whose role draws hostile aggro.
+    Tanks,
+    /// Only broodmothers.
+    Broodmothers,
+    /// Only shadows rebuilding after their summoned body died.
+    Recovering,
+    /// Everything, strongest by level first.
+    ByLevel,
+}
+
+impl ArmyFilter {
+    /// Returns the filter after `self` in the button's cycle.
+    const fn next(self) -> Self {
+        match self {
+            Self::All => Self::Tanks,
+            Self::Tanks => Self::Broodmothers,
+            Self::Broodmothers => Self::Recovering,
+            Self::Recovering => Self::ByLevel,
+            Self::ByLevel => Self::All,
+        }
+    }
+
+    /// Returns the player-visible filter name.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::All => "Все",
+            Self::Tanks => "Танки",
+            Self::Broodmothers => "Матки",
+            Self::Recovering => "Восстанавливаются",
+            Self::ByLevel => "По уровню ↓",
+        }
+    }
+}
+
+/// Applies the hopper filter to one page-less read of the roster.
+fn apply_filter(roster: Vec<Shadow>, filter: ArmyFilter) -> Vec<Shadow> {
+    match filter {
+        ArmyFilter::All => roster,
+        ArmyFilter::Tanks => roster
+            .into_iter()
+            .filter(|shadow| shadow.origin.as_ref().is_some_and(|origin| origin.is_tank))
+            .collect(),
+        ArmyFilter::Broodmothers => roster
+            .into_iter()
+            .filter(|shadow| {
+                shadow
+                    .origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.is_broodmother == Some(true))
+            })
+            .collect(),
+        ArmyFilter::Recovering => roster.into_iter().filter(Shadow::is_recovering).collect(),
+        ArmyFilter::ByLevel => {
+            let mut roster = roster;
+            roster.sort_by(|first, second| second.level.cmp(&first.level));
+            roster
+        }
+    }
+}
+
+fn filter_item(filter: ArmyFilter) -> ItemStack {
+    with_lore(
+        named(
+            ItemStack::new(&vanilla_items::HOPPER),
+            TextComponent::plain(format!("Фильтр: {}", filter.name())).color(Color::Aqua),
+        ),
+        vec![
+            TextComponent::plain("Отбирает тени в списке армии.").color(Color::Gray),
+            TextComponent::plain(format!("Клик — {}.", filter.next().name())).color(Color::Yellow),
+        ],
+    )
+}
+
+fn open_army(player: &Player, state: Arc<SoloLevelingState>, page: usize, filter: ArmyFilter) {
     player.open_menu(
         TextComponent::plain("Армия теней").color(Color::DarkPurple),
         move |context| {
-            let view = ArmyView::read(&state, context.player.gameprofile.id(), page);
+            let view = ArmyView::read(&state, context.player.gameprofile.id(), page, filter);
             let container = SimpleContainer::from_items(view.items()).into_shared();
             let mut builder =
                 MenuBuilder::new(&vanilla_menu_types::GENERIC_9X6, context.container_id);
@@ -68,16 +149,23 @@ fn open_army(player: &Player, state: Arc<SoloLevelingState>, page: usize) {
                 buttons,
                 container,
                 page: view.page,
+                filter,
             })
         },
     );
 }
 
-fn open_detail(player: &Player, state: Arc<SoloLevelingState>, shadow_id: Uuid, page: usize) {
+fn open_detail(
+    player: &Player,
+    state: Arc<SoloLevelingState>,
+    shadow_id: Uuid,
+    page: usize,
+    filter: ArmyFilter,
+) {
     player.open_menu(
         TextComponent::plain("Тень").color(Color::DarkPurple),
         move |context| {
-            let items = detail_items(&state, context.player.gameprofile.id(), shadow_id);
+            let items = detail_items(&state, context.player.gameprofile.id(), shadow_id, false);
             let container = SimpleContainer::from_items(items).into_shared();
             let mut builder =
                 MenuBuilder::new(&vanilla_menu_types::GENERIC_9X3, context.container_id);
@@ -89,6 +177,8 @@ fn open_detail(player: &Player, state: Arc<SoloLevelingState>, shadow_id: Uuid, 
                 container,
                 shadow_id,
                 page,
+                filter,
+                confirm_disband: false,
             })
         },
     );
@@ -100,18 +190,21 @@ struct ArmyView {
     active: Vec<Uuid>,
     limit: usize,
     mode: AlliedMode,
+    filter: ArmyFilter,
     page: usize,
     pages: usize,
 }
 
 impl ArmyView {
-    fn read(state: &SoloLevelingState, owner: Uuid, page: usize) -> Self {
-        let roster = state.shadows(owner).unwrap_or_default();
+    fn read(state: &SoloLevelingState, owner: Uuid, page: usize, filter: ArmyFilter) -> Self {
+        let total = state.shadows(owner).unwrap_or_default();
+        let roster = apply_filter(total, filter);
         let pages = roster.len().div_ceil(PER_PAGE).max(1);
         Self {
             active: state.active_shadows(owner),
             limit: state.shadow_army_limit(owner),
             mode: state.shadow_mode(owner),
+            filter,
             page: page.min(pages - 1),
             pages,
             roster,
@@ -132,15 +225,23 @@ impl ArmyView {
             }
         }
         if self.roster.is_empty() {
+            let (title, hint): (&str, &str) = if self.filter == ArmyFilter::All {
+                (
+                    "Армия пуста",
+                    "Убейте моба в данже рядом с собой, и его душа восстанет как тень.",
+                )
+            } else {
+                (
+                    "Никто не подходит",
+                    "Под этот фильтр не попадает ни одна тень.",
+                )
+            };
             items[22] = with_lore(
                 named(
                     ItemStack::new(&vanilla_items::SOUL_LANTERN),
-                    TextComponent::plain("Армия пуста").color(Color::Gray),
+                    TextComponent::plain(title).color(Color::Gray),
                 ),
-                vec![
-                    TextComponent::plain("Убейте моба в данже рядом с собой,").color(Color::Gray),
-                    TextComponent::plain("и его душа восстанет как тень.").color(Color::Gray),
-                ],
+                vec![TextComponent::plain(hint).color(Color::Gray)],
             );
         }
         items[PREVIOUS_SLOT] = ui::previous_page();
@@ -152,6 +253,7 @@ impl ArmyView {
         );
         items[ELITE_SLOT] = button(&vanilla_items::DRAGON_HEAD, "Элитные тени", Color::DarkRed);
         items[MODE_SLOT] = mode_item(self.mode);
+        items[FILTER_SLOT] = filter_item(self.filter);
         items[RECALL_ALL_SLOT] = button(&vanilla_items::BARRIER, "Отозвать всех", Color::Red);
         items[INFO_SLOT] = with_lore(
             named(
@@ -162,7 +264,7 @@ impl ArmyView {
             vec![
                 TextComponent::plain(format!("Призвано: {} / {}", self.active.len(), self.limit))
                     .color(Color::Gray),
-                TextComponent::plain(format!("Теней в армии: {}", self.roster.len()))
+                TextComponent::plain(format!("Показано теней: {}", self.roster.len()))
                     .color(Color::Gray),
                 TextComponent::plain("ЛКМ по тени — призвать или отозвать.").color(Color::Yellow),
                 TextComponent::plain("ПКМ по тени — прокачка.").color(Color::Yellow),
@@ -368,6 +470,7 @@ struct ArmyMenuKind {
     buttons: Section,
     container: Shared<SimpleContainer>,
     page: usize,
+    filter: ArmyFilter,
 }
 
 // SAFETY: This Solo Leveling-owned key uniquely identifies the concrete menu kind.
@@ -395,7 +498,7 @@ impl MenuKind for ArmyMenuKind {
         }
         let owner = player.gameprofile.id();
         let local = slot - self.buttons.start();
-        let view = ArmyView::read(&self.state, owner, self.page);
+        let view = ArmyView::read(&self.state, owner, self.page, self.filter);
         match local {
             PREVIOUS_SLOT => self.page = view.page.saturating_sub(1),
             NEXT_SLOT => self.page = (view.page + 1).min(view.pages - 1),
@@ -416,6 +519,14 @@ impl MenuKind for ArmyMenuKind {
                     Color::DarkPurple,
                 );
             }
+            FILTER_SLOT => {
+                self.filter = self.filter.next();
+                tell(
+                    player,
+                    &format!("Фильтр армии: {}.", self.filter.name()),
+                    Color::Aqua,
+                );
+            }
             ELITE_SLOT => {
                 open_elite_army(player, Arc::clone(&self.state), 0);
                 return ClickOutcome::Consume;
@@ -429,19 +540,30 @@ impl MenuKind for ArmyMenuKind {
                     return ClickOutcome::Consume;
                 };
                 if button == MouseButton::Right {
-                    open_detail(player, Arc::clone(&self.state), shadow.id, view.page);
+                    open_detail(
+                        player,
+                        Arc::clone(&self.state),
+                        shadow.id,
+                        view.page,
+                        self.filter,
+                    );
                     return ClickOutcome::Consume;
                 }
                 toggle(&self.state, player, shadow);
             }
         }
-        let items = ArmyView::read(&self.state, owner, self.page).items();
+        let items = ArmyView::read(&self.state, owner, self.page, self.filter).items();
         refresh(guard, &self.container, items);
         ClickOutcome::Consume
     }
 }
 
-fn detail_items(state: &SoloLevelingState, owner: Uuid, shadow_id: Uuid) -> Vec<ItemStack> {
+fn detail_items(
+    state: &SoloLevelingState,
+    owner: Uuid,
+    shadow_id: Uuid,
+    confirm_disband: bool,
+) -> Vec<ItemStack> {
     let mut items = vec![ItemStack::empty(); DETAIL_SLOTS];
     let Some(shadow) = state
         .shadows(owner)
@@ -503,6 +625,29 @@ fn detail_items(state: &SoloLevelingState, owner: Uuid, shadow_id: Uuid) -> Vec<
             Color::DarkPurple,
         )
     };
+    items[DISBAND_SLOT] = if confirm_disband {
+        with_lore(
+            named(
+                ItemStack::new(&vanilla_items::LAVA_BUCKET),
+                TextComponent::plain("Точно распустить?").color(Color::Red),
+            ),
+            vec![
+                TextComponent::plain("Тень исчезнет навсегда, без возврата.").color(Color::Gray),
+                TextComponent::plain("Клик — распустить.").color(Color::Yellow),
+            ],
+        )
+    } else {
+        with_lore(
+            named(
+                ItemStack::new(&vanilla_items::LAVA_BUCKET),
+                TextComponent::plain("Распустить").color(Color::DarkRed),
+            ),
+            vec![
+                TextComponent::plain("Тень исчезнет навсегда, без возврата.").color(Color::Gray),
+                TextComponent::plain("Первый клик — подтверждение.").color(Color::Yellow),
+            ],
+        )
+    };
     items
 }
 
@@ -512,6 +657,8 @@ struct DetailMenuKind {
     container: Shared<SimpleContainer>,
     shadow_id: Uuid,
     page: usize,
+    filter: ArmyFilter,
+    confirm_disband: bool,
 }
 
 // SAFETY: This Solo Leveling-owned key uniquely identifies the concrete menu kind.
@@ -547,8 +694,32 @@ impl MenuKind for DetailMenuKind {
         };
         let local = slot - self.buttons.start();
         if local == BACK_SLOT {
-            open_army(player, Arc::clone(&self.state), self.page);
+            open_army(player, Arc::clone(&self.state), self.page, self.filter);
             return ClickOutcome::Consume;
+        }
+        if local == DISBAND_SLOT {
+            if self.confirm_disband {
+                if let Err(error) = self.state.disband_shadow(owner, self.shadow_id) {
+                    tell(player, error, Color::Red);
+                } else {
+                    tell(
+                        player,
+                        "Тень распущена: её душа рассеялась.",
+                        Color::DarkGray,
+                    );
+                }
+                open_army(player, Arc::clone(&self.state), self.page, self.filter);
+                return ClickOutcome::Consume;
+            }
+            self.confirm_disband = true;
+            tell(
+                player,
+                "Нажмите «Распустить» ещё раз, чтобы подтвердить.",
+                Color::Yellow,
+            );
+        } else {
+            // Any other action cancels a pending disband confirmation.
+            self.confirm_disband = false;
         }
         if local == TOGGLE_SLOT {
             toggle(&self.state, player, &shadow);
@@ -571,7 +742,7 @@ impl MenuKind for DetailMenuKind {
                 Err(error) => tell(player, error, Color::Red),
             }
         }
-        let items = detail_items(&self.state, owner, self.shadow_id);
+        let items = detail_items(&self.state, owner, self.shadow_id, self.confirm_disband);
         refresh(guard, &self.container, items);
         ClickOutcome::Consume
     }
@@ -607,7 +778,8 @@ fn open_elite_detail(player: &Player, state: Arc<SoloLevelingState>, shadow_id: 
     player.open_menu(
         TextComponent::plain("Элитная тень").color(Color::DarkRed),
         move |context| {
-            let items = elite_detail_items(&state, context.player.gameprofile.id(), shadow_id);
+            let items =
+                elite_detail_items(&state, context.player.gameprofile.id(), shadow_id, false);
             let container = SimpleContainer::from_items(items).into_shared();
             let mut builder =
                 MenuBuilder::new(&vanilla_menu_types::GENERIC_9X3, context.container_id);
@@ -619,6 +791,7 @@ fn open_elite_detail(player: &Player, state: Arc<SoloLevelingState>, shadow_id: 
                 container,
                 shadow_id,
                 page,
+                confirm_disband: false,
             })
         },
     );
@@ -886,7 +1059,7 @@ impl MenuKind for EliteArmyMenuKind {
                 None => tell(player, "Призвать элитных теней сейчас нельзя.", Color::Red),
             },
             ELITE_ARMY_SLOT => {
-                open_army(player, Arc::clone(&self.state), 0);
+                open_army(player, Arc::clone(&self.state), 0, ArmyFilter::All);
                 return ClickOutcome::Consume;
             }
             MODE_SLOT => {
@@ -923,7 +1096,12 @@ impl MenuKind for EliteArmyMenuKind {
     }
 }
 
-fn elite_detail_items(state: &SoloLevelingState, owner: Uuid, shadow_id: Uuid) -> Vec<ItemStack> {
+fn elite_detail_items(
+    state: &SoloLevelingState,
+    owner: Uuid,
+    shadow_id: Uuid,
+    confirm_disband: bool,
+) -> Vec<ItemStack> {
     let mut items = vec![ItemStack::empty(); DETAIL_SLOTS];
     let Some(shadow) = state
         .elite_shadows(owner)
@@ -985,6 +1163,31 @@ fn elite_detail_items(state: &SoloLevelingState, owner: Uuid, shadow_id: Uuid) -
             Color::DarkRed,
         )
     };
+    items[DISBAND_SLOT] = if confirm_disband {
+        with_lore(
+            named(
+                ItemStack::new(&vanilla_items::LAVA_BUCKET),
+                TextComponent::plain("Точно распустить?").color(Color::Red),
+            ),
+            vec![
+                TextComponent::plain("Элитная тень исчезнет навсегда, без возврата.")
+                    .color(Color::Gray),
+                TextComponent::plain("Клик — распустить.").color(Color::Yellow),
+            ],
+        )
+    } else {
+        with_lore(
+            named(
+                ItemStack::new(&vanilla_items::LAVA_BUCKET),
+                TextComponent::plain("Распустить").color(Color::DarkRed),
+            ),
+            vec![
+                TextComponent::plain("Элитная тень исчезнет навсегда, без возврата.")
+                    .color(Color::Gray),
+                TextComponent::plain("Первый клик — подтверждение.").color(Color::Yellow),
+            ],
+        )
+    };
     items
 }
 
@@ -994,6 +1197,7 @@ struct EliteDetailMenuKind {
     container: Shared<SimpleContainer>,
     shadow_id: Uuid,
     page: usize,
+    confirm_disband: bool,
 }
 
 // SAFETY: This Solo Leveling-owned key uniquely identifies the concrete menu kind.
@@ -1032,6 +1236,30 @@ impl MenuKind for EliteDetailMenuKind {
             open_elite_army(player, Arc::clone(&self.state), self.page);
             return ClickOutcome::Consume;
         }
+        if local == DISBAND_SLOT {
+            if self.confirm_disband {
+                if let Err(error) = self.state.disband_elite_shadow(owner, self.shadow_id) {
+                    tell(player, error, Color::Red);
+                } else {
+                    tell(
+                        player,
+                        "Элитная тень распущена: её душа рассеялась.",
+                        Color::DarkGray,
+                    );
+                }
+                open_elite_army(player, Arc::clone(&self.state), self.page);
+                return ClickOutcome::Consume;
+            }
+            self.confirm_disband = true;
+            tell(
+                player,
+                "Нажмите «Распустить» ещё раз, чтобы подтвердить.",
+                Color::Yellow,
+            );
+        } else {
+            // Any other action cancels a pending disband confirmation.
+            self.confirm_disband = false;
+        }
         if local == TOGGLE_SLOT {
             elite_toggle(&self.state, player, &shadow);
         } else if let Some((_, stat)) = UPGRADES.iter().find(|(at, _)| *at == local) {
@@ -1053,7 +1281,7 @@ impl MenuKind for EliteDetailMenuKind {
                 Err(error) => tell(player, error, Color::Red),
             }
         }
-        let items = elite_detail_items(&self.state, owner, self.shadow_id);
+        let items = elite_detail_items(&self.state, owner, self.shadow_id, self.confirm_disband);
         refresh(guard, &self.container, items);
         ClickOutcome::Consume
     }
@@ -1062,8 +1290,9 @@ impl MenuKind for EliteDetailMenuKind {
 #[cfg(test)]
 mod tests {
     use super::{
-        ARMY_SLOTS, BACK_SLOT, DETAIL_SHADOW_SLOT, DETAIL_SLOTS, INFO_SLOT, MODE_SLOT, NEXT_SLOT,
-        PER_PAGE, PREVIOUS_SLOT, RECALL_ALL_SLOT, SUMMON_ALL_SLOT, TOGGLE_SLOT, UPGRADES,
+        ARMY_SLOTS, ArmyFilter, BACK_SLOT, DETAIL_SHADOW_SLOT, DETAIL_SLOTS, DISBAND_SLOT,
+        FILTER_SLOT, INFO_SLOT, MODE_SLOT, NEXT_SLOT, PER_PAGE, PREVIOUS_SLOT, RECALL_ALL_SLOT,
+        SUMMON_ALL_SLOT, TOGGLE_SLOT, UPGRADES, apply_filter,
     };
 
     #[test]
@@ -1073,12 +1302,13 @@ mod tests {
             MODE_SLOT,
             SUMMON_ALL_SLOT,
             INFO_SLOT,
+            FILTER_SLOT,
             RECALL_ALL_SLOT,
             NEXT_SLOT,
         ] {
             assert!((PER_PAGE..ARMY_SLOTS).contains(&slot));
         }
-        let mut detail = vec![DETAIL_SHADOW_SLOT, BACK_SLOT, TOGGLE_SLOT];
+        let mut detail = vec![DETAIL_SHADOW_SLOT, BACK_SLOT, TOGGLE_SLOT, DISBAND_SLOT];
         detail.extend(UPGRADES.iter().map(|(slot, _)| *slot));
         assert!(detail.iter().all(|slot| *slot < DETAIL_SLOTS));
         let mut unique = detail.clone();
@@ -1102,5 +1332,91 @@ mod tests {
             seen,
             [AlliedMode::Follow, AlliedMode::Hold, AlliedMode::Passive]
         );
+    }
+
+    #[test]
+    fn the_filter_button_cycles_through_every_category_and_back() {
+        let mut filter = ArmyFilter::All;
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            seen.push(filter);
+            filter = filter.next();
+        }
+        assert_eq!(filter, ArmyFilter::All);
+        assert_eq!(
+            seen,
+            [
+                ArmyFilter::All,
+                ArmyFilter::Tanks,
+                ArmyFilter::Broodmothers,
+                ArmyFilter::Recovering,
+                ArmyFilter::ByLevel,
+            ]
+        );
+    }
+
+    fn sample_shadow(name: &str, is_tank: bool, is_broodmother: bool) -> super::Shadow {
+        use crate::shadow::ShadowOrigin;
+        let mut shadow = super::Shadow::new(
+            steel_utils::Identifier::vanilla_static("zombie"),
+            1,
+            Some(ShadowOrigin {
+                title: name.to_owned(),
+                max_health: ShadowOrigin::scale(20.0),
+                attack_damage: ShadowOrigin::scale(2.0),
+                movement_speed: ShadowOrigin::scale(0.2),
+                armor: 0,
+                equipment: Vec::new(),
+                is_tank,
+                is_broodmother: Some(is_broodmother),
+            }),
+        );
+        shadow.name = name.to_owned();
+        shadow
+    }
+
+    #[test]
+    fn the_filter_keeps_only_the_matching_category() {
+        let tank = sample_shadow("Танк", true, false);
+        let broodmother = sample_shadow("Матка", false, true);
+        let regular = sample_shadow("Обычная", false, false);
+        let mut recovering = sample_shadow("Умирающая", false, false);
+        recovering.begin_recovery(20);
+        let roster = || {
+            vec![
+                tank.clone(),
+                broodmother.clone(),
+                regular.clone(),
+                recovering.clone(),
+            ]
+        };
+
+        let tanks = apply_filter(roster(), ArmyFilter::Tanks);
+        assert_eq!(tanks.len(), 1);
+        assert_eq!(tanks[0].name, "Танк");
+
+        let broodmothers = apply_filter(roster(), ArmyFilter::Broodmothers);
+        assert_eq!(broodmothers.len(), 1);
+        assert_eq!(broodmothers[0].name, "Матка");
+
+        let recovering_only = apply_filter(roster(), ArmyFilter::Recovering);
+        assert_eq!(recovering_only.len(), 1);
+        assert_eq!(recovering_only[0].name, "Умирающая");
+
+        assert_eq!(apply_filter(roster(), ArmyFilter::All).len(), 4);
+    }
+
+    #[test]
+    fn the_level_filter_sorts_strongest_first() {
+        let mut weak = sample_shadow("Слабая", false, false);
+        weak.level = 1;
+        let mut strong = sample_shadow("Сильная", false, false);
+        strong.level = 9;
+        let mut mid = sample_shadow("Средняя", false, false);
+        mid.level = 5;
+
+        let sorted = apply_filter(vec![weak, strong.clone(), mid], ArmyFilter::ByLevel);
+        let names: Vec<_> = sorted.iter().map(|shadow| shadow.name.as_str()).collect();
+        assert_eq!(names, ["Сильная", "Средняя", "Слабая"]);
     }
 }

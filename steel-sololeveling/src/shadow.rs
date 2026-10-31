@@ -284,6 +284,12 @@ impl ShadowRoster {
             .find(|shadow| same_name(&shadow.name, name))
     }
 
+    /// Removes and returns the shadow with `id`, e.g. when it is disbanded.
+    pub fn remove(&mut self, id: Uuid) -> Option<Shadow> {
+        let index = self.shadows.iter().position(|shadow| shadow.id == id)?;
+        Some(self.shadows.remove(index))
+    }
+
     /// Returns a mutable shadow selected by its player-visible name.
     pub fn named_mut(&mut self, name: &str) -> Option<&mut Shadow> {
         self.shadows
@@ -605,6 +611,12 @@ impl EliteShadowRoster {
             .find(|shadow| same_name(&shadow.name, name))
     }
 
+    /// Removes and returns the elite shadow with `id`, e.g. when it is disbanded.
+    pub fn remove(&mut self, id: Uuid) -> Option<EliteShadow> {
+        let index = self.shadows.iter().position(|shadow| shadow.id == id)?;
+        Some(self.shadows.remove(index))
+    }
+
     /// Returns a mutable elite shadow selected by its player-visible name.
     pub fn named_mut(&mut self, name: &str) -> Option<&mut EliteShadow> {
         self.shadows
@@ -625,6 +637,7 @@ impl EliteShadowRoster {
 #[cfg(test)]
 mod tests {
     use steel_utils::Identifier;
+    use uuid::Uuid;
 
     use super::{
         BOSS_EXTRACTION_ATTEMPTS, MAX_ELITE_SHADOW_SLOTS, Shadow, ShadowOrigin, ShadowRoster,
@@ -867,6 +880,63 @@ mod tests {
                 red: false,
             },
         )
+    }
+
+    #[test]
+    fn removing_a_shadow_returns_it_and_shifts_the_roster() {
+        let mut roster = ShadowRoster::default();
+        roster.arise(Identifier::vanilla_static("zombie"));
+        let kept_id = roster.arise(Identifier::vanilla_static("skeleton")).id;
+        let removed_id = roster.arise(Identifier::vanilla_static("zombie")).id;
+
+        let removed = roster.remove(removed_id).expect("shadow should be removed");
+        assert_eq!(removed.id, removed_id);
+        assert_eq!(roster.shadows.len(), 2);
+        assert!(roster.shadows.iter().any(|shadow| shadow.id == kept_id));
+        assert!(roster.remove(removed_id).is_none());
+        assert!(roster.remove(Uuid::new_v4()).is_none());
+    }
+
+    #[test]
+    fn removing_an_elite_shadow_returns_it_and_frees_the_slot() {
+        let mut roster = super::EliteShadowRoster::default();
+        roster
+            .add(sample_elite_shadow())
+            .expect("slot should be free");
+        let id = roster.shadows[0].id;
+
+        let removed = roster.remove(id).expect("elite shadow should be removed");
+        assert_eq!(removed.id, id);
+        assert!(roster.shadows.is_empty());
+        // The freed slot can hold a new elite shadow again.
+        roster
+            .add(sample_elite_shadow())
+            .expect("slot should be free again");
+        assert!(roster.remove(id).is_none());
+    }
+
+    #[test]
+    fn legacy_shadows_without_origin_or_recovery_still_load() {
+        // Shadows saved before origins and recovery existed carry neither field.
+        let legacy = r#"{
+            "shadows": [{
+                "id": "9f0f9b6e-5c3b-4f0a-9c6d-2b1a8e4d7c3f",
+                "name": "Shadow 1",
+                "entity_type": "minecraft:zombie",
+                "level": 3,
+                "experience": 20,
+                "unspent_points": 2,
+                "health": 1,
+                "attack": 0,
+                "speed": 1
+            }]
+        }"#;
+        let restored: ShadowRoster = serde_json::from_str(legacy).expect("legacy roster");
+        assert_eq!(restored.shadows.len(), 1);
+        let shadow = &restored.shadows[0];
+        assert_eq!(shadow.level, 3);
+        assert!(shadow.origin.is_none());
+        assert!(!shadow.is_recovering());
     }
 
     #[test]

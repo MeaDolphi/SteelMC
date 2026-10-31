@@ -89,14 +89,14 @@ fn is_mob(entity: &dyn Entity) -> bool {
             .is_none_or(|mob| mob.allied_owner().is_none())
 }
 
-fn chance(fraction: f32) -> bool {
+pub(super) fn chance(fraction: f32) -> bool {
     fraction > 0.0 && rand::random_range(0.0_f32..1.0) < fraction
 }
 
 /// Rolls the on-hit effects of a melee hit on `target`.
 fn hit_procs(summary: &EnchantSummary, target: i32, damage: f32, double_strike: bool) -> Vec<Proc> {
     let mut procs = Vec::new();
-    if summary.cleave > 0.0 {
+    if summary.cleave > 0.0 && chance(summary.cleave_proc) {
         procs.push(Proc::Cleave {
             struck: target,
             damage: damage * summary.cleave,
@@ -118,7 +118,7 @@ fn hit_procs(summary: &EnchantSummary, target: i32, damage: f32, double_strike: 
             amplifier: 1,
         });
     }
-    if summary.flame {
+    if summary.flame && chance(summary.flame_proc) {
         procs.push(Proc::Ignite { target, ticks: 60 });
     }
     if double_strike {
@@ -378,13 +378,17 @@ impl SoloLevelingState {
         let mage = class == Some(HunterClass::Mage);
         let double_strike = self
             .with_session_mut(uuid, |session| {
-                if magic && mage {
+                if magic && mage && chance(summary.bloodsucker_proc) {
                     session.class_heal += damage * summary.bloodsucker;
                 }
                 if melee {
                     session.class_heal += damage * summary.bloodthirst;
                 }
-                if mage && (melee || magic) && summary.mana_feed > 0.0 {
+                if mage
+                    && (melee || magic)
+                    && summary.mana_feed > 0.0
+                    && chance(summary.mana_feed_proc)
+                {
                     let maximum = spell::max_mana(session.stats.intelligence);
                     let mana = session.magic.mana.get_or_insert(maximum);
                     *mana += summary.mana_feed;
@@ -442,6 +446,7 @@ impl SoloLevelingState {
         }
         let damage = amount * factor.max(0.0);
         if summary.reflect > 0.0
+            && chance(summary.reflect_proc)
             && source.is_direct()
             && let Some(attacker) = source.causing_entity()
             && attacker.as_player().is_none()
@@ -593,5 +598,19 @@ impl SoloLevelingState {
             self.with_session_mut(uuid, |session| session.enchant.rush_due = true);
         }
         (extra, essence)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chance;
+
+    #[test]
+    fn chance_always_procs_at_full_and_never_at_zero() {
+        for _ in 0..64 {
+            assert!(chance(1.0));
+            assert!(!chance(0.0));
+            assert!(!chance(-0.5));
+        }
     }
 }

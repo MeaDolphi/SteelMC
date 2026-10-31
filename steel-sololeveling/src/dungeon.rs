@@ -300,6 +300,16 @@ struct PersistedGateBreak {
 }
 
 impl GateBreak {
+    /// Returns whether the next wave may spawn at `tick`.
+    ///
+    /// A wave that fell fast must still wait out
+    /// [`GATE_BREAK_WAVE_INTERVAL_TICKS`]; without the gate the waves run
+    /// back to back and swamp the defenders.
+    #[must_use]
+    pub const fn wave_due(&self, tick: u64) -> bool {
+        tick >= self.next_wave_tick
+    }
+
     fn persisted(&self) -> PersistedGateBreak {
         PersistedGateBreak {
             gate: PersistedGate::from_gate(&self.gate),
@@ -1314,6 +1324,28 @@ mod tests {
         assert_eq!(break_state.gate.id, gate.id);
         assert!(gates.breaks().iter().any(|b| b.gate.id == gate.id));
         assert!(gates.committed_gate(gate.id).is_none());
+    }
+
+    #[test]
+    fn wave_waits_for_next_wave_tick_even_after_a_fast_clear() {
+        let mut gates = GateRegistry::default();
+        let gate = gates.create_ranked(
+            Identifier::from_steel("overworld"),
+            BlockPos::new(20, 70, 20),
+            0,
+            HunterRank::C,
+            false,
+        );
+        let mut break_state = gates.start_break(gate.id).expect("gate should break");
+        break_state.wave = 1;
+        break_state.next_wave_tick = 500;
+
+        assert!(
+            !break_state.wave_due(499),
+            "the wave before its interval must not spawn"
+        );
+        assert!(break_state.wave_due(500));
+        assert!(break_state.wave_due(501));
     }
 
     #[test]

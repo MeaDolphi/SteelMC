@@ -566,8 +566,10 @@ impl IslandRuntime {
             while nest.ants.len() < restore_target {
                 let offset =
                     (nest.ants.len() as i32).rem_euclid(2 * HATCH_RADIUS + 1) - HATCH_RADIUS;
-                let spot =
-                    BlockPos::new(nest.pos.x() + offset, nest.pos.y(), nest.pos.z() - offset);
+                let Some(spot) = hatch_spot(&|pos| world.get_block_state(pos), nest.pos, offset)
+                else {
+                    break;
+                };
                 if let Some(id) = spawn_ant(world, nest.zone, spot) {
                     nest.ants.push(id);
                 } else {
@@ -578,9 +580,9 @@ impl IslandRuntime {
             if nest.ants.len() < ANTS_PER_NEST && now >= nest.next_hatch {
                 nest.next_hatch = now + HATCH_SECONDS;
                 let offset = (tick as i32).rem_euclid(2 * HATCH_RADIUS + 1) - HATCH_RADIUS;
-                let spot =
-                    BlockPos::new(nest.pos.x() + offset, nest.pos.y(), nest.pos.z() - offset);
-                if let Some(id) = spawn_ant(world, nest.zone, spot) {
+                if let Some(spot) = hatch_spot(&|pos| world.get_block_state(pos), nest.pos, offset)
+                    && let Some(id) = spawn_ant(world, nest.zone, spot)
+                {
                     nest.ants.push(id);
                 }
             }
@@ -751,7 +753,10 @@ impl IslandRuntime {
                 ants: Vec::new(),
                 destroyed: saved.map_or(false, |nest| nest.destroyed),
                 next_hatch: saved.map_or(0, |nest| nest.next_hatch_at),
-                swept: saved.map_or(false, |nest| nest.swept),
+                // Leftovers from an earlier run survive in the chunks and the
+                // live track does not, so every nest sweeps once when it
+                // wakes, whether or not a previous session already did.
+                swept: false,
                 restore_ants: saved.map_or(0, |nest| nest.ant_count),
             });
         }
@@ -835,6 +840,31 @@ fn alive(world: &World, id: i32) -> bool {
     })
 }
 
+/// How many blocks above the nest column the mound ring can raise a hatch
+/// column: packed mud on the first ring layer, mud bricks on every other
+/// column of it (see `IslandChunkGenerator::place_column`).
+const MAX_MOUND_RISE: i32 = 2;
+
+/// The highest spot an ant can stand on in the hatch column `offset` blocks
+/// diagonally from its nest. Hatch columns can sit inside the nest mound
+/// ring, so the ant is raised onto the first free position with solid ground
+/// under it — the same passability rule [`World::safe_surface_position`]
+/// applies for gate-break mobs.
+fn hatch_spot(
+    block_at: &impl Fn(BlockPos) -> BlockStateId,
+    nest: BlockPos,
+    offset: i32,
+) -> Option<BlockPos> {
+    for lift in 0..=MAX_MOUND_RISE {
+        let spot = BlockPos::new(nest.x() + offset, nest.y() + lift, nest.z() - offset);
+        let state = block_at(spot);
+        if !state.blocks_motion() && !state.has_fluid() && block_at(spot.below()).is_solid() {
+            return Some(spot);
+        }
+    }
+    None
+}
+
 fn show_status(world: &World, line: &str) {
     world.players.iter_players(|_, player| {
         player.send_action_bar(TextComponent::plain(line.to_owned()).color(Color::Gold));
@@ -880,12 +910,84 @@ fn is_stray_ant(entity: &dyn Entity) -> bool {
 
 /// Tuning of one island mob body: scale, stats, optional fixed speed and the
 /// themed nameplate.
+#[derive(Debug)]
 struct MobTuning {
     scale: f64,
     health: f64,
     damage: f64,
     speed: Option<f64>,
     name: TextComponent,
+    /// Whether the body never ages out or despawns while unattended. Nest
+    /// bodies and the King are endermites, which discard themselves once
+    /// their vanilla lifetime runs out; a nest that vanishes on its own can
+    /// never be cleared.
+    persistent: bool,
+}
+
+/// Applies the tuning to a freshly spawned body: attributes, plate and, for
+/// persistent bodies, the flag that exempts them from aging and despawning.
+/// Kept separate from [`spawn_island_mob`] so tests can exercise it without
+/// a world.
+fn tune_island_mob(entity: &SharedEntity, tuning: &MobTuning) -> Option<()> {
+    let living = entity.as_living_entity()?;
+    living.set_base_attribute_value(vanilla_attributes::SCALE, tuning.scale);
+    living.set_base_attribute_value(vanilla_attributes::MAX_HEALTH, tuning.health);
+    living.set_base_attribute_value(vanilla_attributes::ATTACK_DAMAGE, tuning.damage);
+    if let Some(speed) = tuning.speed {
+        living.set_base_attribute_value(vanilla_attributes::MOVEMENT_SPEED, speed);
+        living.set_base_attribute_value(vanilla_attributes::KNOCKBACK_RESISTANCE, 1.0);
+    }
+    living.set_health(tuning.health as f32);
+    entity.set_custom_name(Some(tuning.name.clone()));
+    entity.set_custom_name_visible(true);
+    entity.refresh_dimensions();
+    if tuning.persistent
+        && let Some(mob) = entity.as_mob()
+    {
+        mob.set_persistence_required();
+    }
+    Some(())
+}
+
+/// Tuning of a soldier ant of `zone`: a quick, squishy attacker.
+fn ant_tuning(zone: Zone) -> MobTuning {
+    let wave = wave_for_rank(zone.rank());
+    MobTuning {
+        scale: 1.8,
+        health: 24.0 * wave.health_multiplier,
+        damage: 4.0 * wave.damage_multiplier,
+        speed: None,
+        name: TextComponent::plain(format!("Муравей-солдат [{}]", zone.rank().name()))
+            .color(Color::Red),
+        persistent: false,
+    }
+}
+
+/// Tuning of a nest body of `zone`: an immobile, persistent brood mother.
+fn nest_tuning(zone: Zone) -> MobTuning {
+    let wave = wave_for_rank(zone.rank());
+    MobTuning {
+        scale: 4.0,
+        health: 160.0 * wave.health_multiplier,
+        damage: 3.0 * wave.damage_multiplier,
+        speed: Some(0.0),
+        name: TextComponent::plain(format!("Гнездо [{}]", zone.display_name()))
+            .color(Color::DarkPurple),
+        persistent: true,
+    }
+}
+
+/// Tuning of the Ant King: the island's endgame bruiser.
+fn king_tuning() -> MobTuning {
+    let wave = wave_for_rank(HunterRank::S);
+    MobTuning {
+        scale: 6.0,
+        health: 900.0 * wave.health_multiplier,
+        damage: 5.0 * wave.damage_multiplier,
+        speed: None,
+        name: TextComponent::plain("Король муравьёв").color(Color::DarkRed),
+        persistent: true,
+    }
 }
 
 /// Spawns one island mob: a scaled and strengthened hostile body with a
@@ -897,18 +999,8 @@ fn spawn_island_mob(
     tuning: MobTuning,
 ) -> Option<i32> {
     let entity: SharedEntity = spawn_mob(world, body, pos).ok()?;
+    tune_island_mob(&entity, &tuning)?;
     let living = entity.as_living_entity()?;
-    living.set_base_attribute_value(vanilla_attributes::SCALE, tuning.scale);
-    living.set_base_attribute_value(vanilla_attributes::MAX_HEALTH, tuning.health);
-    living.set_base_attribute_value(vanilla_attributes::ATTACK_DAMAGE, tuning.damage);
-    if let Some(speed) = tuning.speed {
-        living.set_base_attribute_value(vanilla_attributes::MOVEMENT_SPEED, speed);
-        living.set_base_attribute_value(vanilla_attributes::KNOCKBACK_RESISTANCE, 1.0);
-    }
-    living.set_health(tuning.health as f32);
-    entity.set_custom_name(Some(tuning.name));
-    entity.set_custom_name_visible(true);
-    entity.refresh_dimensions();
     mobs::show_health_line(world, living, &health_label());
     Some(entity.id())
 }
@@ -935,52 +1027,19 @@ pub fn refresh_health_line(world: &World, entity: &dyn LivingEntity) {
 }
 
 fn spawn_ant(world: &Arc<World>, zone: Zone, pos: BlockPos) -> Option<i32> {
-    let wave = wave_for_rank(zone.rank());
-    spawn_island_mob(
-        world,
-        ANT_BODY,
-        pos,
-        MobTuning {
-            scale: 1.8,
-            health: 24.0 * wave.health_multiplier,
-            damage: 4.0 * wave.damage_multiplier,
-            speed: None,
-            name: TextComponent::plain(format!("Муравей-солдат [{}]", zone.rank().name()))
-                .color(Color::Red),
-        },
-    )
+    spawn_island_mob(world, ANT_BODY, pos, ant_tuning(zone))
 }
 
 fn spawn_nest(world: &Arc<World>, zone: Zone, pos: BlockPos) -> Option<i32> {
-    let wave = wave_for_rank(zone.rank());
-    spawn_island_mob(
-        world,
-        &vanilla_entities::ENDERMITE,
-        pos,
-        MobTuning {
-            scale: 4.0,
-            health: 160.0 * wave.health_multiplier,
-            damage: 3.0 * wave.damage_multiplier,
-            speed: Some(0.0),
-            name: TextComponent::plain(format!("Гнездо [{}]", zone.display_name()))
-                .color(Color::DarkPurple),
-        },
-    )
+    spawn_island_mob(world, &vanilla_entities::ENDERMITE, pos, nest_tuning(zone))
 }
 
 fn spawn_king(world: &Arc<World>) -> Option<i32> {
-    let wave = wave_for_rank(HunterRank::S);
     spawn_island_mob(
         world,
         &vanilla_entities::ENDERMITE,
         BlockPos::new(0, GROUND_Y + 1, 0),
-        MobTuning {
-            scale: 6.0,
-            health: 900.0 * wave.health_multiplier,
-            damage: 5.0 * wave.damage_multiplier,
-            speed: None,
-            name: TextComponent::plain("Король муравьёв").color(Color::DarkRed),
-        },
+        king_tuning(),
     )
 }
 
@@ -1017,11 +1076,14 @@ mod tests {
 
     use steel_core::entity::entities::{EndermiteEntity, SpiderEntity, ZombieEntity};
     use steel_core::entity::{Entity as _, SharedEntity};
-    use steel_registry::{init_vanilla_registry, vanilla_entities};
+    use steel_registry::{init_vanilla_registry, vanilla_blocks, vanilla_entities};
+    use steel_utils::BlockPos;
+    use steel_utils::Downcast as _;
     use uuid::Uuid;
 
     use super::{
-        ANT_BODY, ISLAND_RADIUS, IslandRuntime, IslandSnapshot, LANDING, NestSnapshot, Zone, nests,
+        ANT_BODY, GROUND_Y, HATCH_RADIUS, ISLAND_RADIUS, IslandRuntime, IslandSnapshot, LANDING,
+        NestSnapshot, Zone, nests,
     };
 
     #[test]
@@ -1079,7 +1141,10 @@ mod tests {
         assert!(restored.fighters.contains(&fighter));
         assert_eq!(restored.nests.len(), island.nests.len());
         assert!(restored.nests[0].destroyed);
-        assert!(restored.nests[0].swept);
+        assert!(
+            !restored.nests[0].swept,
+            "restore sweeps leftovers once, even around a nest a previous session swept"
+        );
         assert_eq!(restored.nests[0].next_hatch, 123);
         assert_eq!(restored.nests[0].restore_ants, 0);
         assert_eq!(restored.nests[1].restore_ants, 2);
@@ -1144,5 +1209,86 @@ mod tests {
         let label = super::health_label();
         let text = format!("{:?}", label.health_text(12.2, 28.0));
         assert!(text.contains("❤ 13/28"), "{text}");
+    }
+
+    #[test]
+    fn hatch_spot_stays_out_of_the_nest_mound() {
+        init_vanilla_registry();
+        let nest = BlockPos::new(10, GROUND_Y + 1, 10);
+
+        // Open ground: the ant hatches right at the nest's own level.
+        let flat = |pos: BlockPos| {
+            if pos.y() <= GROUND_Y {
+                vanilla_blocks::MUD.default_state()
+            } else {
+                vanilla_blocks::AIR.default_state()
+            }
+        };
+        for offset in -HATCH_RADIUS..=HATCH_RADIUS {
+            let expected = BlockPos::new(nest.x() + offset, nest.y(), nest.z() - offset);
+            assert_eq!(
+                super::hatch_spot(&flat, nest, offset),
+                Some(expected),
+                "{offset}"
+            );
+        }
+
+        // A full two-block mound ring column: the ant is raised onto the
+        // mound top instead of hatching inside the mud.
+        let mound = |pos: BlockPos| {
+            if pos.y() <= GROUND_Y {
+                vanilla_blocks::MUD.default_state()
+            } else if pos.y() == GROUND_Y + 1 {
+                vanilla_blocks::PACKED_MUD.default_state()
+            } else if pos.y() == GROUND_Y + 2 {
+                vanilla_blocks::MUD_BRICKS.default_state()
+            } else {
+                vanilla_blocks::AIR.default_state()
+            }
+        };
+        assert_eq!(
+            super::hatch_spot(&mound, nest, 3),
+            Some(BlockPos::new(13, GROUND_Y + 3, 7))
+        );
+    }
+
+    #[test]
+    fn nest_and_king_bodies_are_persistent_but_ants_are_not() {
+        init_vanilla_registry();
+        for zone in [Zone::Shore, Zone::Jungle, Zone::Nests, Zone::Royal] {
+            assert!(super::nest_tuning(zone).persistent, "nest body of {zone:?}");
+            assert!(!super::ant_tuning(zone).persistent, "ant of {zone:?}");
+        }
+        assert!(super::king_tuning().persistent);
+
+        // The bodies are endermites: vanilla discards them after 2400 ticks
+        // of life (steel-core `endermite.rs` MAX_LIFETIME) unless persistence
+        // is required, which freezes the lifetime counter. A nest that
+        // self-discards can never be cleared.
+        for tuning in [super::nest_tuning(Zone::Nests), super::king_tuning()] {
+            let body: SharedEntity = Arc::new(EndermiteEntity::new(
+                &vanilla_entities::ENDERMITE,
+                5,
+                glam::DVec3::ZERO,
+                Weak::new(),
+            ));
+            super::tune_island_mob(&body, &tuning).expect("endermite body should tune");
+            #[expect(
+                clippy::redundant_closure_for_method_calls,
+                reason = "Mob is pub(crate) in steel-core, so a method reference cannot name it"
+            )]
+            let persisted = body
+                .as_mob()
+                .is_some_and(|mob| mob.is_persistence_required());
+            assert!(persisted, "tuning {tuning:?} must persist the body");
+            let endermite = body
+                .downcast_ref::<EndermiteEntity>()
+                .expect("endermite body");
+            endermite.set_lifetime(2_400);
+            assert!(
+                !endermite.is_removed(),
+                "a persistent endermite at the vanilla lifetime cap stays: aging is frozen below it"
+            );
+        }
     }
 }

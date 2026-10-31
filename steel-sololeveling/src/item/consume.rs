@@ -62,8 +62,7 @@ pub fn use_item(
     if let Some(entity) = shadow::entity(stack) {
         let Some(name) = state.arise_shadow_from_item(owner, &entity) else {
             player.send_message(
-                &TextComponent::plain("Армия теней заполнена: повысьте уровень охотника.")
-                    .color(Color::Red),
+                &TextComponent::plain("Ваши данные охотника ещё не загружены.").color(Color::Red),
             );
             return Some(InteractionResult::Fail);
         };

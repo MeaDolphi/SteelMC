@@ -12,6 +12,9 @@ use steel_core::inventory::container::Container as _;
 use steel_core::inventory::prelude::*;
 use steel_core::player::player_inventory::PlayerInventory;
 use steel_registry::vanilla_items;
+use steel_registry::vanilla_menu_types;
+use steel_utils::locks::IntoShared;
+use steel_utils::{DowncastType, DowncastTypeKey};
 use text_components::Modifier as _;
 use text_components::TextComponent;
 use text_components::format::Color;
@@ -46,48 +49,102 @@ fn visible_lots(state: &SoloLevelingState, viewer: Uuid, mine: bool) -> Vec<LotV
     }
 }
 
+/// One lot as the board renders it. Equality ignores sub-minute drift of the
+/// remaining time, since the board only shows whole minutes.
+#[derive(Debug, Clone)]
+struct Row(LotView);
+
+impl PartialEq for Row {
+    fn eq(&self, other: &Self) -> bool {
+        let (a, b) = (&self.0, &other.0);
+        a.id == b.id
+            && a.seller == b.seller
+            && a.seller_name == b.seller_name
+            && a.item_name == b.item_name
+            && a.count == b.count
+            && a.kind == b.kind
+            && a.price == b.price
+            && a.bid == b.bid
+            && a.item == b.item
+            && a.seconds_left / 60 == b.seconds_left / 60
+    }
+}
+
+impl Eq for Row {}
+
+/// Everything the board shows; a change redraws it.
+#[derive(Debug, Clone, PartialEq)]
+struct View {
+    viewer: Uuid,
+    lots: Vec<Row>,
+    owed_won: u64,
+    owed_items: usize,
+    mine: bool,
+    page: usize,
+}
+
+fn view(state: &SoloLevelingState, viewer: Uuid, page: usize, mine: bool) -> Option<View> {
+    let lots = visible_lots(state, viewer, mine);
+    let (_, owed_won, owed_items) = state.auction_personal(viewer);
+    let pages = lots.len().div_ceil(LOTS_PER_PAGE).max(1);
+    Some(View {
+        viewer,
+        lots: lots.into_iter().map(Row).collect(),
+        owed_won,
+        owed_items,
+        mine,
+        page: page.min(pages - 1),
+    })
+}
+
 fn open_board(player: &Player, state: Arc<SoloLevelingState>, page: usize, mine: bool) {
     let viewer = player.gameprofile.id();
-    let mut page = page;
-    let items = board_items(&state, viewer, &mut page, mine);
-    ui::open_buttons(
-        player,
+    let view = view(&state, viewer, page, mine);
+    let container = SimpleContainer::from_items(menu_items(view.as_ref())).into_shared();
+    player.open_menu(
         TextComponent::plain(if mine {
             "Мои лоты"
         } else {
             "Аукцион охотников"
         })
         .color(Color::Gold),
-        6,
-        items,
-        Box::new(move |player, slot, button| {
-            board_click(&state, player, &mut page, mine, slot, button)
-        }),
+        move |context| {
+            let mut builder =
+                MenuBuilder::new(&vanilla_menu_types::GENERIC_9X6, context.container_id);
+            let buttons = builder.section_all(Arc::clone(&container));
+            builder.player_inventory(&context.player.inventory);
+            builder.build(AuctionMenuKind {
+                state,
+                buttons,
+                container,
+                view,
+                page,
+                mine,
+            })
+        },
     );
 }
 
-fn board_items(
-    state: &SoloLevelingState,
-    viewer: Uuid,
-    page: &mut usize,
-    mine: bool,
-) -> Vec<ItemStack> {
-    let lots = visible_lots(state, viewer, mine);
-    let pages = lots.len().div_ceil(LOTS_PER_PAGE).max(1);
-    *page = (*page).min(pages - 1);
+fn menu_items(view: Option<&View>) -> Vec<ItemStack> {
     let mut items = vec![ItemStack::empty(); 54];
-    for (slot, lot) in lots
+    let Some(view) = view else {
+        return items;
+    };
+    let pages = view.lots.len().div_ceil(LOTS_PER_PAGE).max(1);
+    for (slot, row) in view
+        .lots
         .iter()
-        .skip(*page * LOTS_PER_PAGE)
+        .skip(view.page * LOTS_PER_PAGE)
         .take(LOTS_PER_PAGE)
         .enumerate()
     {
-        items[slot] = lot_item(lot, lot.seller == viewer);
+        let lot = &row.0;
+        items[slot] = lot_item(lot, lot.seller == view.viewer);
     }
-    if lots.is_empty() {
+    if view.lots.is_empty() {
         items[22] = ui::button(
             &vanilla_items::BARREL,
-            if mine {
+            if view.mine {
                 "У вас нет лотов"
             } else {
                 "Лотов пока нет"
@@ -108,22 +165,22 @@ fn board_items(
             &format!("Комиссия {COMMISSION_PERCENT}%, до {MAX_ACTIVE_LOTS} лотов."),
         ],
     );
-    let (_, owed_won, owed_items) = state.auction_personal(viewer);
     items[MINE_SLOT] = ui::button(
         &vanilla_items::CHEST,
-        if mine {
+        if view.mine {
             "Все лоты"
         } else {
             "Мои лоты"
         },
         Color::Gold,
         &[&format!(
-            "К получению: {owed_won} Won и предметов: {owed_items}."
+            "К получению: {} Won и предметов: {}.",
+            view.owed_won, view.owed_items
         )],
     );
     items[INFO_SLOT] = ui::button(
         &vanilla_items::GOLD_INGOT,
-        format!("Страница {} / {pages}", *page + 1),
+        format!("Страница {} / {pages}", view.page + 1),
         Color::Gold,
         &[
             "ЛКМ по лоту — купить или минимальная ставка.",
@@ -133,6 +190,185 @@ fn board_items(
         ],
     );
     items
+}
+
+/// The auction board as a chest menu: clicks queue [`AuctionRequest`]s and
+/// every tick the board diff-redraws, so a finished buy or bid never leaves
+/// stale lots on display.
+pub(crate) struct AuctionMenuKind {
+    state: Arc<SoloLevelingState>,
+    buttons: Section,
+    container: Shared<SimpleContainer>,
+    view: Option<View>,
+    page: usize,
+    mine: bool,
+}
+
+// SAFETY: This Solo Leveling-owned key uniquely identifies the concrete menu kind.
+unsafe impl DowncastType for AuctionMenuKind {
+    const TYPE_KEY: DowncastTypeKey = DowncastTypeKey::new("sololeveling:menu/auction");
+}
+
+impl AuctionMenuKind {
+    /// Recomputes the view and redraws when it changed; the page is adopted
+    /// clamped, so lots vanishing under it cannot strand the board.
+    fn refresh(&mut self, guard: &mut ContainerLockGuard, player: &Player) {
+        let view = view(&self.state, player.gameprofile.id(), self.page, self.mine);
+        if let Some(view) = &view {
+            self.page = view.page;
+        }
+        let container_id = ContainerId::from_arc(&self.container);
+        if let Some(container) = guard.get_typed_mut::<SimpleContainer>(container_id) {
+            for (index, item) in menu_items(view.as_ref()).into_iter().enumerate() {
+                container.set_item(index, item);
+            }
+        }
+        self.view = view;
+    }
+}
+
+impl MenuKind for AuctionMenuKind {
+    fn on_tick(
+        &mut self,
+        _behavior: &mut MenuBehavior,
+        guard: &mut ContainerLockGuard,
+        player: &Player,
+    ) {
+        if player.tick_count() % 20 != 0 {
+            return;
+        }
+        let view = view(&self.state, player.gameprofile.id(), self.page, self.mine);
+        if self.view == view {
+            return;
+        }
+        let container_id = ContainerId::from_arc(&self.container);
+        if let Some(container) = guard.get_typed_mut::<SimpleContainer>(container_id) {
+            for (index, item) in menu_items(view.as_ref()).into_iter().enumerate() {
+                container.set_item(index, item);
+            }
+        }
+        if let Some(view) = &view {
+            self.page = view.page;
+        }
+        self.view = view;
+    }
+
+    fn on_slot_clicked(
+        &mut self,
+        _behavior: &mut MenuBehavior,
+        guard: &mut ContainerLockGuard,
+        click: Click,
+        player: &Player,
+    ) -> ClickOutcome {
+        let Click::Pickup { slot, button } = click else {
+            return if click.slot().is_some_and(|slot| self.buttons.contains(slot)) {
+                ClickOutcome::Consume
+            } else {
+                ClickOutcome::Fallthrough
+            };
+        };
+        if !self.buttons.contains(slot) {
+            return ClickOutcome::Fallthrough;
+        }
+        let local = slot - self.buttons.start();
+        let viewer = player.gameprofile.id();
+        match local {
+            PREVIOUS_SLOT => self.page = self.page.saturating_sub(1),
+            NEXT_SLOT => self.page = self.page.saturating_add(1),
+            INFO_SLOT => {}
+            MINE_SLOT => {
+                self.mine = !self.mine;
+                self.page = 0;
+            }
+            // The picker reads the inventory, which this click has locked.
+            SELL_SLOT => {
+                self.state.defer_auction_sell_menu(viewer);
+                return ClickOutcome::Consume;
+            }
+            lot_slot if lot_slot < LOTS_PER_PAGE => {
+                let Some(view) = self.view.as_ref() else {
+                    return ClickOutcome::Consume;
+                };
+                let Some(row) = view.lots.get(view.page * LOTS_PER_PAGE + lot_slot) else {
+                    return ClickOutcome::Consume;
+                };
+                let lot = row.0.clone();
+                let Some(handle) = shared(&self.state, player) else {
+                    return ClickOutcome::Consume;
+                };
+                let own = lot.seller == viewer;
+                match (button == MouseButton::Right, own, lot.kind) {
+                    (true, true, _) => submit(
+                        &self.state,
+                        player,
+                        AuctionRequest::Cancel {
+                            player: handle,
+                            lot: lot.id,
+                        },
+                    ),
+                    (true, false, LotKind::Bidding) => {
+                        let minimum = lot.bid.map_or(lot.price, |bid| bid.saturating_add(1));
+                        let balance = self
+                            .state
+                            .with_session_mut(viewer, |session| session.won.amount())
+                            .unwrap_or(0);
+                        if balance < minimum {
+                            ui::tell(
+                                player,
+                                &format!("Для ставки нужно не меньше {minimum} Won."),
+                                Color::Red,
+                            );
+                            return ClickOutcome::Consume;
+                        }
+                        let bid_state = Arc::clone(&self.state);
+                        let bid_handle = Weak::clone(&handle);
+                        ui::pick_amount(
+                            player,
+                            &format!("Ставка на лот #{}", lot.id),
+                            "Won",
+                            minimum,
+                            minimum,
+                            balance,
+                            Arc::new(move |player, amount| {
+                                submit(
+                                    &bid_state,
+                                    player,
+                                    AuctionRequest::Bid {
+                                        player: Weak::clone(&bid_handle),
+                                        lot: lot.id,
+                                        amount,
+                                    },
+                                );
+                                open(player, Arc::clone(&bid_state));
+                            }),
+                        );
+                        return ClickOutcome::Consume;
+                    }
+                    (false, false, LotKind::FixedPrice) => submit(
+                        &self.state,
+                        player,
+                        AuctionRequest::Buy {
+                            player: handle,
+                            lot: lot.id,
+                        },
+                    ),
+                    (false, false, LotKind::Bidding) => submit(
+                        &self.state,
+                        player,
+                        AuctionRequest::Bid {
+                            player: handle,
+                            lot: lot.id,
+                            amount: lot.bid.map_or(lot.price, |bid| bid.saturating_add(1)),
+                        },
+                    ),
+                    _ => return ClickOutcome::Consume,
+                }
+            }
+            _ => return ClickOutcome::Consume,
+        }
+        self.refresh(guard, player);
+        ClickOutcome::Consume
+    }
 }
 
 fn lot_item(lot: &LotView, own: bool) -> ItemStack {
@@ -187,107 +423,6 @@ fn shared(state: &SoloLevelingState, player: &Player) -> Option<Weak<Player>> {
 fn submit(state: &SoloLevelingState, player: &Player, request: AuctionRequest) {
     state.request_auction(request);
     ui::tell(player, "Запрос отправлен аукциону.", Color::Gold);
-}
-
-fn board_click(
-    state: &Arc<SoloLevelingState>,
-    player: &Player,
-    page: &mut usize,
-    mine: bool,
-    slot: usize,
-    button: MouseButton,
-) -> After {
-    let viewer = player.gameprofile.id();
-    match slot {
-        PREVIOUS_SLOT => *page = page.saturating_sub(1),
-        NEXT_SLOT => *page = page.saturating_add(1),
-        INFO_SLOT => {}
-        MINE_SLOT => {
-            open_board(player, Arc::clone(state), 0, !mine);
-            return After::Replaced;
-        }
-        // The picker reads the inventory, which this click has locked.
-        SELL_SLOT => {
-            state.defer_auction_sell_menu(viewer);
-            return After::Replaced;
-        }
-        lot_slot if lot_slot < LOTS_PER_PAGE => {
-            let lots = visible_lots(state, viewer, mine);
-            let Some(lot) = lots.get(*page * LOTS_PER_PAGE + lot_slot).cloned() else {
-                return After::Keep;
-            };
-            let Some(handle) = shared(state, player) else {
-                return After::Keep;
-            };
-            let own = lot.seller == viewer;
-            match (button == MouseButton::Right, own, lot.kind) {
-                (true, true, _) => submit(
-                    state,
-                    player,
-                    AuctionRequest::Cancel {
-                        player: handle,
-                        lot: lot.id,
-                    },
-                ),
-                (true, false, LotKind::Bidding) => {
-                    let minimum = lot.bid.map_or(lot.price, |bid| bid.saturating_add(1));
-                    let balance = state
-                        .with_session_mut(viewer, |session| session.won.amount())
-                        .unwrap_or(0);
-                    if balance < minimum {
-                        ui::tell(
-                            player,
-                            &format!("Для ставки нужно не меньше {minimum} Won."),
-                            Color::Red,
-                        );
-                        return After::Keep;
-                    }
-                    let bid_state = Arc::clone(state);
-                    ui::pick_amount(
-                        player,
-                        &format!("Ставка на лот #{}", lot.id),
-                        "Won",
-                        minimum,
-                        minimum,
-                        balance,
-                        Arc::new(move |player, amount| {
-                            submit(
-                                &bid_state,
-                                player,
-                                AuctionRequest::Bid {
-                                    player: Weak::clone(&handle),
-                                    lot: lot.id,
-                                    amount,
-                                },
-                            );
-                            open(player, Arc::clone(&bid_state));
-                        }),
-                    );
-                    return After::Replaced;
-                }
-                (false, false, LotKind::FixedPrice) => submit(
-                    state,
-                    player,
-                    AuctionRequest::Buy {
-                        player: handle,
-                        lot: lot.id,
-                    },
-                ),
-                (false, false, LotKind::Bidding) => submit(
-                    state,
-                    player,
-                    AuctionRequest::Bid {
-                        player: handle,
-                        lot: lot.id,
-                        amount: lot.bid.map_or(lot.price, |bid| bid.saturating_add(1)),
-                    },
-                ),
-                _ => return After::Keep,
-            }
-        }
-        _ => return After::Keep,
-    }
-    After::Redraw(board_items(state, viewer, page, mine))
 }
 
 const FIXED_SLOT: usize = 11;
@@ -419,8 +554,39 @@ fn open_sell(player: &Player, state: Arc<SoloLevelingState>, chosen: (usize, Ite
 #[cfg(test)]
 mod tests {
     use super::{
-        INFO_SLOT, LOTS_PER_PAGE, MINE_SLOT, NEXT_SLOT, PREVIOUS_SLOT, SELL_SLOT, remaining,
+        INFO_SLOT, LOTS_PER_PAGE, MINE_SLOT, NEXT_SLOT, PREVIOUS_SLOT, Row, SELL_SLOT, View,
+        menu_items, remaining,
     };
+    use crate::auction::LotKind;
+    use crate::state::LotView;
+    use steel_registry::init_vanilla_registry;
+    use uuid::Uuid;
+
+    fn lot_view(id: u64, bid: Option<u64>, seconds_left: u64) -> LotView {
+        LotView {
+            id,
+            seller: Uuid::from_u128(id as u128),
+            seller_name: "seller".to_owned(),
+            item_name: "item".to_owned(),
+            item: None,
+            count: 1,
+            kind: LotKind::Bidding,
+            price: 100,
+            bid,
+            seconds_left,
+        }
+    }
+
+    fn view(lots: Vec<Row>, page: usize) -> View {
+        View {
+            viewer: Uuid::new_v4(),
+            lots,
+            owed_won: 0,
+            owed_items: 0,
+            mine: false,
+            page,
+        }
+    }
 
     #[test]
     fn board_buttons_sit_below_the_lots() {
@@ -433,5 +599,32 @@ mod tests {
     fn remaining_time_reads_in_hours_and_minutes() {
         assert_eq!(remaining(3 * 3600 + 120), "3 ч 2 мин");
         assert_eq!(remaining(59), "0 мин");
+    }
+
+    #[test]
+    fn rows_ignore_sub_minute_expiry_drift_but_not_a_new_bid() {
+        let listed = Row(lot_view(7, None, 595));
+        assert_eq!(listed, Row(lot_view(7, None, 580)), "drift under a minute");
+        assert_ne!(
+            listed,
+            Row(lot_view(7, None, 539)),
+            "a crossed minute changes the board"
+        );
+        assert_ne!(listed, Row(lot_view(7, Some(150), 600)), "a new bid");
+        assert_ne!(listed, Row(lot_view(8, None, 600)), "another lot");
+    }
+
+    #[test]
+    fn the_board_renders_from_its_view() {
+        init_vanilla_registry();
+        let empty = menu_items(Some(&view(Vec::new(), 0)));
+        assert!(!empty[22].is_empty(), "an empty board explains itself");
+
+        let lots: Vec<Row> = (0..2).map(|id| Row(lot_view(id, None, 3600))).collect();
+        let items = menu_items(Some(&view(lots, 0)));
+        assert!(!items[0].is_empty());
+        assert!(!items[1].is_empty());
+        let info = format!("{:?}", items[INFO_SLOT]);
+        assert!(info.contains("Страница 1 / 1"), "{info}");
     }
 }

@@ -860,13 +860,12 @@ impl SoloLevelingState {
 
     /// Adds the shadow of a summon item to a hunter's roster.
     ///
-    /// Returns the new shadow's name, or `None` when the army is already at its
-    /// level-dependent limit, so a refused activation can keep its item.
+    /// The roster itself is uncapped like shadows arisen from kills; only the
+    /// number of simultaneously summoned bodies is level-limited (enforced by
+    /// the shadow runtime). Returns the new shadow's name, or `None` when the
+    /// hunter has no live session.
     pub fn arise_shadow_from_item(&self, player_uuid: Uuid, entity: &Identifier) -> Option<String> {
         let name = self.sessions.with_mut(player_uuid, |session| {
-            if session.shadows.shadows.len() >= army_limit(session.stats.level) {
-                return None;
-            }
             Some(session.shadows.arise(entity.clone()).name.clone())
         })??;
         self.record_goal(player_uuid, Goal::ShadowRaise, 1);
@@ -1190,6 +1189,25 @@ impl SoloLevelingState {
         self.shadow_runtime.lock().dismiss(player_uuid, shadow_id)
     }
 
+    /// Disbands one roster shadow: recalls its live body, if any, and forgets
+    /// the shadow permanently.
+    pub fn disband_shadow(&self, player_uuid: Uuid, shadow_id: Uuid) -> Result<(), &'static str> {
+        let removed = self
+            .sessions
+            .with_mut(player_uuid, |session| session.shadows.remove(shadow_id))
+            .flatten();
+        if removed.is_none() {
+            return Err("Тень с таким именем не найдена.");
+        }
+        self.shadow_runtime.lock().dismiss(player_uuid, shadow_id);
+        if let Err(error) = self.save_session(player_uuid) {
+            log::warn!(
+                "sololeveling: failed to persist disbanded shadow for {player_uuid}: {error}"
+            );
+        }
+        Ok(())
+    }
+
     /// Returns the army-wide mode of a hunter's shadows.
     pub fn shadow_mode(&self, player_uuid: Uuid) -> AlliedMode {
         self.shadow_runtime.lock().mode(player_uuid)
@@ -1440,6 +1458,33 @@ impl SoloLevelingState {
             .dismiss_elite(player_uuid, shadow_id)
     }
 
+    /// Disbands one elite roster shadow: recalls its live body, if any, and
+    /// forgets the elite shadow permanently.
+    pub fn disband_elite_shadow(
+        &self,
+        player_uuid: Uuid,
+        shadow_id: Uuid,
+    ) -> Result<(), &'static str> {
+        let removed = self
+            .sessions
+            .with_mut(player_uuid, |session| {
+                session.elite_shadows.remove(shadow_id)
+            })
+            .flatten();
+        if removed.is_none() {
+            return Err("Элитная тень с таким именем не найдена.");
+        }
+        self.shadow_runtime
+            .lock()
+            .dismiss_elite(player_uuid, shadow_id);
+        if let Err(error) = self.save_session(player_uuid) {
+            log::warn!(
+                "sololeveling: failed to persist disbanded elite shadow for {player_uuid}: {error}"
+            );
+        }
+        Ok(())
+    }
+
     /// Returns a snapshot of the player's persistent elite roster.
     pub fn elite_shadows(&self, player_uuid: Uuid) -> Option<Vec<EliteShadow>> {
         self.sessions
@@ -1624,6 +1669,93 @@ mod tests {
         assert_eq!(loaded.elite_shadows.shadows.len(), 1);
         assert_eq!(loaded.elite_shadows.shadows[0].id, shadow.id);
         assert_eq!(loaded.elite_shadows.shadows[0].source, shadow.source);
+
+        fs::remove_dir_all(directory).expect("cleanup should succeed");
+    }
+
+    fn new_test_state(player_uuid: Uuid) -> (SoloLevelingState, std::path::PathBuf) {
+        let directory = env::temp_dir().join(format!("sololeveling-state-test-{}", Uuid::new_v4()));
+        let service = SoloLevelingState::new(directory.clone()).expect("state should initialize");
+        service.begin_session(player_uuid, sample_player_data(player_uuid));
+        (service, directory)
+    }
+
+    fn sample_player_data(player_uuid: Uuid) -> SoloLevelingPlayerData {
+        SoloLevelingPlayerData {
+            uuid: player_uuid,
+            stats: HunterStats::new(),
+            won: Won::starting_balance(),
+            system_points: SystemPoints::zero(),
+            quest: SystemQuest::default(),
+            shadows: ShadowRoster::default(),
+            elite_shadows: EliteShadowRoster::default(),
+            shop: ShopDay::unset(),
+            organization: OrganizationBook::new(),
+            cooldowns: AbilityCooldowns::default(),
+            class: ClassChoice::default(),
+            gear: SavedGear::default(),
+            deferred_inventory: Vec::new(),
+            class_vault: Vec::new(),
+            starter: StarterKit::default(),
+            merchant: MerchantRecord::default(),
+            castle: CastleProgress::default(),
+            spells: SpellBook::default(),
+            quests: QuestBook::default(),
+        }
+    }
+
+    #[test]
+    fn shadow_item_arises_beyond_the_old_roster_limit() {
+        let player_uuid = Uuid::new_v4();
+        let (service, directory) = new_test_state(player_uuid);
+        // A level-1 hunter's old cap was army_limit(1) == 3 shadows.
+        for expected in 1..=4 {
+            let name = service
+                .arise_shadow_from_item(
+                    player_uuid,
+                    &steel_utils::Identifier::vanilla_static("zombie"),
+                )
+                .expect("roster has no cap; the item must always join the army");
+            assert_eq!(name, format!("Shadow {expected}"));
+        }
+        assert_eq!(service.shadows(player_uuid).expect("session").len(), 4);
+
+        fs::remove_dir_all(directory).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn disband_removes_the_shadow_and_unknown_ids_refuse() {
+        let player_uuid = Uuid::new_v4();
+        let (service, directory) = new_test_state(player_uuid);
+        let kept = service
+            .arise_shadow_from_item(
+                player_uuid,
+                &steel_utils::Identifier::vanilla_static("zombie"),
+            )
+            .expect("first shadow");
+        let dismissed = service
+            .arise_shadow_from_item(
+                player_uuid,
+                &steel_utils::Identifier::vanilla_static("skeleton"),
+            )
+            .expect("second shadow");
+        let dismissed_id = service
+            .shadows(player_uuid)
+            .expect("session")
+            .into_iter()
+            .find(|shadow| shadow.name == dismissed)
+            .expect("second shadow in roster")
+            .id;
+
+        service
+            .disband_shadow(player_uuid, dismissed_id)
+            .expect("disband");
+
+        let roster = service.shadows(player_uuid).expect("session");
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].name, kept);
+        assert!(!service.active_shadows(player_uuid).contains(&dismissed_id));
+        assert!(service.disband_shadow(player_uuid, dismissed_id).is_err());
 
         fs::remove_dir_all(directory).expect("cleanup should succeed");
     }

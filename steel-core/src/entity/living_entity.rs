@@ -295,6 +295,20 @@ pub trait LivingEntity: Entity {
         }
     }
 
+    /// Restores vanilla-shaped living state written by `save_command_nbt`.
+    ///
+    /// Mirrors vanilla `LivingEntity.readAdditionalSaveData`: attributes are
+    /// applied before `Health` so restored health clamps against the restored
+    /// maximum health.
+    fn load_command_nbt(&self, nbt: BorrowedNbtCompoundView<'_, '_>) {
+        if let Some(attributes) = nbt.list("attributes") {
+            self.attributes().lock().load_vanilla_nbt(attributes);
+        }
+        if let Some(health) = nbt.float("Health") {
+            self.set_health(health);
+        }
+    }
+
     /// Gets the current health of the entity.
     fn get_health(&self) -> f32;
 
@@ -3326,4 +3340,64 @@ pub(crate) fn shearing_loot_items_with_rng<R: rand::Rng, E: LivingEntity + ?Size
         context = context.with_game_time(level.game_time());
     }
     loot_table.get_random_items(&mut context)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::sync::Weak;
+
+    use crate::entity::DVec3;
+    use crate::entity::entities::ZombieEntity;
+    use simdnbt::borrow::read_compound as read_borrowed_compound;
+    use simdnbt::owned::NbtCompound;
+    use steel_registry::{init_vanilla_registry, vanilla_attributes, vanilla_entities};
+
+    use super::*;
+
+    #[test]
+    fn modified_attributes_and_partial_health_survive_save_load() {
+        init_vanilla_registry();
+
+        let zombie = ZombieEntity::new(&vanilla_entities::ZOMBIE, 1, DVec3::ZERO, Weak::new());
+        {
+            let mut attributes = zombie.attributes().lock();
+            attributes.set_base_value(vanilla_attributes::MAX_HEALTH, 60.0);
+            attributes.set_base_value(vanilla_attributes::SCALE, 2.0);
+            attributes.set_base_value(vanilla_attributes::MOVEMENT_SPEED, 0.5);
+        }
+        zombie.set_health(17.5);
+
+        let mut nbt = NbtCompound::new();
+        zombie.save_additional(&mut nbt);
+
+        let mut bytes = Vec::new();
+        nbt.write(&mut bytes);
+        let borrowed = read_borrowed_compound(&mut Cursor::new(&bytes))
+            .unwrap_or_else(|error| panic!("test nbt should reborrow: {error}"));
+
+        let loaded = ZombieEntity::new(&vanilla_entities::ZOMBIE, 2, DVec3::ZERO, Weak::new());
+        loaded.load_additional((&borrowed).into());
+
+        assert_eq!(loaded.get_health().to_bits(), 17.5_f32.to_bits());
+        let attributes = loaded.attributes().lock();
+        assert_eq!(
+            attributes
+                .get_value(vanilla_attributes::MAX_HEALTH)
+                .map(f64::to_bits),
+            Some(60.0_f64.to_bits())
+        );
+        assert_eq!(
+            attributes
+                .get_value(vanilla_attributes::SCALE)
+                .map(f64::to_bits),
+            Some(2.0_f64.to_bits())
+        );
+        assert_eq!(
+            attributes
+                .get_value(vanilla_attributes::MOVEMENT_SPEED)
+                .map(f64::to_bits),
+            Some(0.5_f64.to_bits())
+        );
+    }
 }

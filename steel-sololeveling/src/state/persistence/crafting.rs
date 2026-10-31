@@ -13,11 +13,10 @@ use steel_registry::item_stack::ItemStack;
 use text_components::TextComponent;
 use uuid::Uuid;
 
-use super::{Request, account, stage_inventory_item};
-use crate::crafting::{self, available};
+use super::{Request, account};
+use crate::crafting::{self};
 use crate::crafting_menu::CraftingMenuKind;
-use crate::item::serial::{self, SerialId};
-use crate::item::{binding, material, nbt};
+use crate::item::serial::SerialId;
 use crate::quest_book::Goal;
 use crate::sound::SystemSound;
 use crate::state::SoloLevelingState;
@@ -130,61 +129,26 @@ impl SoloLevelingState {
         if !snapshot.won.debit(recipe.work) {
             return fail(CraftingError::InsufficientWon.message());
         }
-        let mut slots: Vec<ItemStack> = (0..INVENTORY_SLOTS)
+        let slots: Vec<ItemStack> = (0..INVENTORY_SLOTS)
             .map(|slot| {
                 reservation
                     .item(slot)
                     .unwrap_or_else(|_| ItemStack::empty())
             })
             .collect();
-        let have = available(&recipe, &slots);
-        if recipe
-            .materials
-            .iter()
-            .zip(&have)
-            .any(|((_, needed), have)| have < needed)
-        {
-            return fail("Не хватает материалов для заказа.");
-        }
-        for (wanted, needed) in &recipe.materials {
-            let mut left = i32::try_from(*needed).unwrap_or(i32::MAX);
-            for (slot, stack) in slots.iter_mut().enumerate() {
-                if left == 0 {
-                    break;
-                }
-                if binding::bound_owner(stack).is_some()
-                    || material::of(stack) != Some((*wanted, recipe.quality))
-                {
-                    continue;
-                }
-                let taken = stack.count.min(left);
-                left -= taken;
-                let remaining = stack.count - taken;
-                let replacement = if remaining > 0 {
-                    stack.copy_with_count(remaining)
-                } else {
-                    ItemStack::empty()
-                };
-                if reservation.set_item(slot, replacement.clone()).is_err() {
-                    return fail("Не удалось подготовить инвентарь к заказу.");
-                }
-                *stack = replacement;
+        // The materials, the previous tier and the new item stage as one
+        // plan: unless everything fits, no slot is touched.
+        let plan = match crafting::plan(&recipe, uuid, &slots) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.release_shop_purchase(uuid);
+                player.send_message(&TextComponent::plain(error.message()));
+                return false;
             }
-        }
-        let item = serial::stack(output, None);
-        let mut stored = false;
-        if stage_inventory_item(&mut reservation, item.clone()).is_err() {
-            match nbt::encode(&item) {
-                Ok(bytes) => {
-                    snapshot.deferred_inventory.push(bytes);
-                    stored = true;
-                }
-                Err(error) => {
-                    log::error!(
-                        "sololeveling: could not encode a crafted item for {uuid}: {error}"
-                    );
-                    return fail("Не удалось подготовить заказ.");
-                }
+        };
+        for (slot, replacement) in plan.replacements {
+            if reservation.set_item(slot, replacement).is_err() {
+                return fail("Не удалось подготовить инвентарь к заказу.");
             }
         }
         let expected = self.persistence.lock().expected.get(&uuid).cloned();
@@ -226,11 +190,8 @@ impl SoloLevelingState {
                         });
                         SystemSound::Reward.play(&completion_player);
                         let name = output.serial().name;
-                        completion_player.send_message(&TextComponent::plain(if stored {
-                            format!("Изготовлено: {name}. Инвентарь полон — предмет в Хранилище.")
-                        } else {
-                            format!("Изготовлено: {name}.")
-                        }));
+                        completion_player
+                            .send_message(&TextComponent::plain(format!("Изготовлено: {name}.")));
                         if commit == TransactionCommit::DurabilityUncertain {
                             completion_player.send_message(&TextComponent::plain(
                                 "Заказ выполнен, но подтверждение диска не получено.",

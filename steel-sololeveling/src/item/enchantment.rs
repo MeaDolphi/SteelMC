@@ -40,6 +40,25 @@ pub const LIFESTEAL_FRACTION: f32 = 0.1;
 /// Health a recoil hit takes from the wielder; recoil never kills.
 pub const RECOIL_DAMAGE: f32 = 1.0;
 
+// Proc chances of the chance-based enchantments, in percent. Balance: the
+// strong on-hit effects must stay a bonus rather than the default outcome of
+// every hit, so each rolls separately against its chance. Recoil is a
+// drawback and always applies.
+/// Proc chance of Lifesteal on a hit.
+pub const LIFESTEAL_PROC_PERCENT: u8 = 10;
+/// Proc chance of Cleave spreading part of a hit.
+pub const CLEAVE_PROC_PERCENT: u8 = 25;
+/// Proc chance of Flame igniting the target.
+pub const FLAME_PROC_PERCENT: u8 = 20;
+/// Proc chance of Thorns reflecting a hit.
+pub const THORNS_PROC_PERCENT: u8 = 15;
+/// Proc chance of Reflection reflecting a hit.
+pub const REFLECTION_PROC_PERCENT: u8 = 15;
+/// Proc chance of Mana Feed granting mana.
+pub const MANA_FEED_PROC_PERCENT: u8 = 30;
+/// Proc chance of Bloodsucker healing on a destruction spell.
+pub const BLOODSUCKER_PROC_PERCENT: u8 = 25;
+
 /// Returns the enchantment points an artifact of `rarity` carries.
 #[must_use]
 pub const fn budget(rarity: Rarity) -> i64 {
@@ -134,6 +153,8 @@ struct Spec {
     cost: i64,
     kinds: u16,
     effect: Effect,
+    /// Proc chance in percent; 0 means the effect does not roll a chance.
+    proc: u8,
 }
 
 const fn attribute(attribute: AttributeRef, amount: f64, multiplied: bool) -> Effect {
@@ -149,7 +170,7 @@ const fn attribute(attribute: AttributeRef, amount: f64, multiplied: bool) -> Ef
 }
 
 macro_rules! enchantments {
-    ($($variant:ident => $key:literal, $name:literal, $description:literal, $cost:expr, $kinds:expr, $effect:expr;)*) => {
+    ($($variant:ident => $key:literal, $name:literal, $description:literal, $cost:expr, $kinds:expr, $effect:expr, $proc:expr;)*) => {
         /// One enchantment the item maker offers.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
         pub enum Enchantment {
@@ -172,6 +193,7 @@ macro_rules! enchantments {
                         cost: $cost,
                         kinds: $kinds,
                         effect: $effect,
+                        proc: $proc,
                     },)*
                 }
             }
@@ -181,86 +203,86 @@ macro_rules! enchantments {
 
 enchantments! {
     // Simple enchantments: general effects for several item types.
-    Lifesteal => "lifesteal", "Вампиризм", "Удар лечит на 10% нанесённого урона", 300, MELEE, Effect::Lifesteal;
-    Bloodsucker => "bloodsucker", "Кровопийца", "Заклинание разрушения лечит на 8% урона", 300, STAFF, Effect::Mechanic;
-    Regeneration => "regeneration", "Регенерация", "+1 HP каждые 10 с", 200, ARMOR | JEWELRY, Effect::Mechanic;
-    SecondWind => "second_wind", "Второе дыхание", "Ниже 30% здоровья: +4 HP, раз в 60 с", 250, ARMOR | JEWELRY, Effect::Mechanic;
-    Fury => "fury", "Ярость", "Ниже 50% здоровья: +15% урона", 200, MELEE | BOW | STAFF | JEWELRY, Effect::Mechanic;
-    Evasion => "evasion", "Уклонение", "5% шанс полностью избежать удара", 300, ARMOR | JEWELRY, Effect::Mechanic;
-    Reflection => "reflection", "Отражение", "10% урона ближнего боя возвращается атакующему", 200, ARMOR, Effect::Mechanic;
-    Flight => "flight", "Бегство", "Получив урон: +20% скорости на 3 с, раз в 15 с", 120, ARMOR | JEWELRY, Effect::Mechanic;
-    Hunter => "hunter", "Охотник", "+10% опыта охотника за убийства", 250, MELEE | BOW | STAFF | JEWELRY, Effect::Mechanic;
-    Gatherer => "gatherer", "Добытчик", "+10% очков Системы за убийства", 250, MELEE | BOW | STAFF | JEWELRY, Effect::Mechanic;
-    Antidote => "antidote", "Противоядие", "Иммунитет к яду и иссушению", 150, ARMOR | JEWELRY, Effect::Mechanic;
-    ManaFeed => "mana_feed", "Подпитка маны", "Удар или заклинание даёт магу +2 маны", 150, MELEE | BOW | STAFF | JEWELRY, Effect::Mechanic;
-    Focus => "focus", "Сосредоточенность", "−10% перезарядки способностей артефактов", 200, MELEE | BOW | STAFF | JEWELRY, Effect::Mechanic;
-    Fortress => "fortress", "Крепость", "−5% входящего урона", 250, ARMOR | JEWELRY, Effect::Mechanic;
+    Lifesteal => "lifesteal", "Вампиризм", "Удар лечит на 10% нанесённого урона", 300, MELEE, Effect::Lifesteal, LIFESTEAL_PROC_PERCENT;
+    Bloodsucker => "bloodsucker", "Кровопийца", "Заклинание разрушения лечит на 8% урона", 300, STAFF, Effect::Mechanic, BLOODSUCKER_PROC_PERCENT;
+    Regeneration => "regeneration", "Регенерация", "+1 HP каждые 10 с", 200, ARMOR | JEWELRY, Effect::Mechanic, 0;
+    SecondWind => "second_wind", "Второе дыхание", "Ниже 30% здоровья: +4 HP, раз в 60 с", 250, ARMOR | JEWELRY, Effect::Mechanic, 0;
+    Fury => "fury", "Ярость", "Ниже 50% здоровья: +15% урона", 200, MELEE | BOW | STAFF | JEWELRY, Effect::Mechanic, 0;
+    Evasion => "evasion", "Уклонение", "5% шанс полностью избежать удара", 300, ARMOR | JEWELRY, Effect::Mechanic, 0;
+    Reflection => "reflection", "Отражение", "10% урона ближнего боя возвращается атакующему", 200, ARMOR, Effect::Mechanic, REFLECTION_PROC_PERCENT;
+    Flight => "flight", "Бегство", "Получив урон: +20% скорости на 3 с, раз в 15 с", 120, ARMOR | JEWELRY, Effect::Mechanic, 0;
+    Hunter => "hunter", "Охотник", "+10% опыта охотника за убийства", 250, MELEE | BOW | STAFF | JEWELRY, Effect::Mechanic, 0;
+    Gatherer => "gatherer", "Добытчик", "+10% очков Системы за убийства", 250, MELEE | BOW | STAFF | JEWELRY, Effect::Mechanic, 0;
+    Antidote => "antidote", "Противоядие", "Иммунитет к яду и иссушению", 150, ARMOR | JEWELRY, Effect::Mechanic, 0;
+    ManaFeed => "mana_feed", "Подпитка маны", "Удар или заклинание даёт магу +2 маны", 150, MELEE | BOW | STAFF | JEWELRY, Effect::Mechanic, MANA_FEED_PROC_PERCENT;
+    Focus => "focus", "Сосредоточенность", "−10% перезарядки способностей артефактов", 200, MELEE | BOW | STAFF | JEWELRY, Effect::Mechanic, 0;
+    Fortress => "fortress", "Крепость", "−5% входящего урона", 250, ARMOR | JEWELRY, Effect::Mechanic, 0;
     // Melee weapons.
-    Sharpness => "sharpness", "Острота", "+1 урона атаки", 150, MELEE, attribute(vanilla_attributes::ATTACK_DAMAGE, 1.0, false);
-    Swiftblade => "swiftblade", "Быстрый клинок", "+10% скорости атаки", 120, MELEE, attribute(vanilla_attributes::ATTACK_SPEED, 0.1, true);
-    Executioner => "executioner", "Палач", "+25% урона по целям ниже 30% здоровья", 200, MELEE, Effect::Mechanic;
-    Bossbane => "bossbane", "Гроза боссов", "+15% урона по боссам врат", 250, MELEE, Effect::Mechanic;
-    Crush => "crush", "Сокрушение", "10% шанс удара ×1,5", 200, MELEE, Effect::Mechanic;
-    Cleave => "cleave", "Рассечение", "30% урона удара задевает мобов в радиусе 2", 300, MELEE, Effect::Mechanic;
-    Venom => "venom", "Яд", "20% шанс отравить цель на 4 с", 150, MELEE, Effect::Mechanic;
-    FrostEdge => "frost_edge", "Ледяная кромка", "20% шанс замедлить цель на 2 с", 150, MELEE, Effect::Mechanic;
-    Flame => "flame", "Пламя", "Удар поджигает цель на 3 с", 150, MELEE, Effect::Mechanic;
-    Reach => "reach", "Длинная рука", "+0,5 блока дальности удара", 120, MELEE, attribute(vanilla_attributes::ENTITY_INTERACTION_RANGE, 0.5, false);
-    Knockback => "knockback", "Отброс", "Сильнее отбрасывает цель", 80, MELEE, attribute(vanilla_attributes::ATTACK_KNOCKBACK, 0.5, false);
+    Sharpness => "sharpness", "Острота", "+1 урона атаки", 150, MELEE, attribute(vanilla_attributes::ATTACK_DAMAGE, 1.0, false), 0;
+    Swiftblade => "swiftblade", "Быстрый клинок", "+10% скорости атаки", 120, MELEE, attribute(vanilla_attributes::ATTACK_SPEED, 0.1, true), 0;
+    Executioner => "executioner", "Палач", "+25% урона по целям ниже 30% здоровья", 200, MELEE, Effect::Mechanic, 0;
+    Bossbane => "bossbane", "Гроза боссов", "+15% урона по боссам врат", 250, MELEE, Effect::Mechanic, 0;
+    Crush => "crush", "Сокрушение", "10% шанс удара ×1,5", 200, MELEE, Effect::Mechanic, 0;
+    Cleave => "cleave", "Рассечение", "30% урона удара задевает мобов в радиусе 2", 300, MELEE, Effect::Mechanic, CLEAVE_PROC_PERCENT;
+    Venom => "venom", "Яд", "20% шанс отравить цель на 4 с", 150, MELEE, Effect::Mechanic, 0;
+    FrostEdge => "frost_edge", "Ледяная кромка", "20% шанс замедлить цель на 2 с", 150, MELEE, Effect::Mechanic, 0;
+    Flame => "flame", "Пламя", "Удар поджигает цель на 3 с", 150, MELEE, Effect::Mechanic, FLAME_PROC_PERCENT;
+    Reach => "reach", "Длинная рука", "+0,5 блока дальности удара", 120, MELEE, attribute(vanilla_attributes::ENTITY_INTERACTION_RANGE, 0.5, false), 0;
+    Knockback => "knockback", "Отброс", "Сильнее отбрасывает цель", 80, MELEE, attribute(vanilla_attributes::ATTACK_KNOCKBACK, 0.5, false), 0;
     // Mage staffs.
-    Spellpower => "spellpower", "Сила чар", "+8% магического урона", 200, STAFF, Effect::Mechanic;
-    ManaWell => "mana_well", "Источник", "+25 маны", 150, STAFF, Effect::Mechanic;
-    Flow => "flow", "Поток", "+15% восстановления маны", 150, STAFF, Effect::Mechanic;
-    Quickcast => "quickcast", "Скорописание", "−8% перезарядки заклинаний", 250, STAFF, Effect::Mechanic;
-    Thrift => "thrift", "Бережливость", "−8% стоимости заклинаний", 250, STAFF, Effect::Mechanic;
-    Grace => "grace", "Благодать", "+12% силы исцеления", 200, STAFF, Effect::Mechanic;
-    Echo => "echo", "Эхо", "+5% шанс повторить заклинание разрушения", 300, STAFF, Effect::Mechanic;
-    Embers => "embers", "Тлеющий жар", "Огненные заклинания поджигают вдвое дольше", 120, STAFF, Effect::Mechanic;
+    Spellpower => "spellpower", "Сила чар", "+8% магического урона", 200, STAFF, Effect::Mechanic, 0;
+    ManaWell => "mana_well", "Источник", "+25 маны", 150, STAFF, Effect::Mechanic, 0;
+    Flow => "flow", "Поток", "+15% восстановления маны", 150, STAFF, Effect::Mechanic, 0;
+    Quickcast => "quickcast", "Скорописание", "−8% перезарядки заклинаний", 250, STAFF, Effect::Mechanic, 0;
+    Thrift => "thrift", "Бережливость", "−8% стоимости заклинаний", 250, STAFF, Effect::Mechanic, 0;
+    Grace => "grace", "Благодать", "+12% силы исцеления", 200, STAFF, Effect::Mechanic, 0;
+    Echo => "echo", "Эхо", "+5% шанс повторить заклинание разрушения", 300, STAFF, Effect::Mechanic, 0;
+    Embers => "embers", "Тлеющий жар", "Огненные заклинания поджигают вдвое дольше", 120, STAFF, Effect::Mechanic, 0;
     // Pickaxes.
-    Quarrying => "quarrying", "Проворство", "+30% скорости добычи", 120, PICKAXE, attribute(vanilla_attributes::BLOCK_BREAK_SPEED, 0.3, true);
-    Prospector => "prospector", "Старатель", "+15% шанс лишнего кристалла", 250, PICKAXE, Effect::Mechanic;
-    EssenceSense => "essence_sense", "Чутьё на эссенцию", "3% шанс эссенции из кристальной руды", 300, PICKAXE, Effect::Mechanic;
-    LongSwing => "long_swing", "Дальний замах", "+1 блок дальности добычи", 100, PICKAXE, attribute(vanilla_attributes::BLOCK_INTERACTION_RANGE, 1.0, false);
-    MiningRush => "mining_rush", "Азарт добычи", "Добыча кристалла: +20% скорости добычи на 5 с", 100, PICKAXE, Effect::Mechanic;
+    Quarrying => "quarrying", "Проворство", "+30% скорости добычи", 120, PICKAXE, attribute(vanilla_attributes::BLOCK_BREAK_SPEED, 0.3, true), 0;
+    Prospector => "prospector", "Старатель", "+15% шанс лишнего кристалла", 250, PICKAXE, Effect::Mechanic, 0;
+    EssenceSense => "essence_sense", "Чутьё на эссенцию", "3% шанс эссенции из кристальной руды", 300, PICKAXE, Effect::Mechanic, 0;
+    LongSwing => "long_swing", "Дальний замах", "+1 блок дальности добычи", 100, PICKAXE, attribute(vanilla_attributes::BLOCK_INTERACTION_RANGE, 1.0, false), 0;
+    MiningRush => "mining_rush", "Азарт добычи", "Добыча кристалла: +20% скорости добычи на 5 с", 100, PICKAXE, Effect::Mechanic, 0;
     // Armor and jewelry.
-    Protection => "protection", "Защита", "+1 брони", 150, HELMET | CHEST | LEGS | BOOTS, attribute(vanilla_attributes::ARMOR, 1.0, false);
-    Vitality => "vitality", "Живучесть", "+2 максимального здоровья", 200, HELMET | CHEST | JEWELRY, attribute(vanilla_attributes::MAX_HEALTH, 2.0, false);
-    ClearSight => "clear_sight", "Ясный взор", "Иммунитет к слепоте и тьме", 150, HELMET, Effect::Mechanic;
-    DeepBreath => "deep_breath", "Глубокий вдох", "+2 к запасу воздуха", 80, HELMET, attribute(vanilla_attributes::OXYGEN_BONUS, 2.0, false);
-    ColdMind => "cold_mind", "Холодный разум", "+20 маны (только магу)", 150, HELMET, Effect::Mechanic;
-    Toughness => "toughness", "Закалка", "+1 прочности брони", 150, CHEST, attribute(vanilla_attributes::ARMOR_TOUGHNESS, 1.0, false);
-    Thorns => "thorns", "Шипы", "Возвращает 15% урона ближнего боя атакующему", 250, CHEST, Effect::Mechanic;
-    Restoration => "restoration", "Восстановление", "+1 HP каждые 8 с", 250, CHEST, Effect::Mechanic;
-    FireWard => "fire_ward", "Огнеупорность", "−50% урона от огня", 120, CHEST, Effect::Mechanic;
-    BlastWard => "blast_ward", "Взрывостойкость", "−30% урона от взрывов", 120, CHEST, Effect::Mechanic;
-    Steadfast => "steadfast", "Стойкость", "+10% сопротивления отбрасыванию", 100, LEGS, attribute(vanilla_attributes::KNOCKBACK_RESISTANCE, 0.1, false);
-    ArrowWard => "arrow_ward", "Укрытие от стрел", "−25% урона снарядами", 150, LEGS, Effect::Mechanic;
-    Dash => "dash", "Рывок", "+8% скорости", 200, LEGS, attribute(vanilla_attributes::MOVEMENT_SPEED, 0.08, true);
-    Fleetness => "fleetness", "Лёгкость", "+5% скорости", 150, BOOTS | JEWELRY, attribute(vanilla_attributes::MOVEMENT_SPEED, 0.05, true);
-    SoftFall => "soft_fall", "Мягкое падение", "−40% урона от падения", 100, BOOTS, attribute(vanilla_attributes::FALL_DAMAGE_MULTIPLIER, -0.4, false);
-    Leaping => "leaping", "Прыгучесть", "Выше прыжок", 100, BOOTS, attribute(vanilla_attributes::JUMP_STRENGTH, 0.1, false);
-    Stride => "stride", "Широкий шаг", "Перешагивает блоки высотой 1", 120, BOOTS, attribute(vanilla_attributes::STEP_HEIGHT, 0.5, false);
-    Grip => "grip", "Хватка", "+8% скорости атаки", 150, GLOVES, attribute(vanilla_attributes::ATTACK_SPEED, 0.08, true);
-    Brawler => "brawler", "Кулак бойца", "+1 урона атаки", 150, GLOVES, attribute(vanilla_attributes::ATTACK_DAMAGE, 1.0, false);
-    NimbleFingers => "nimble_fingers", "Ловкие пальцы", "+20% скорости добычи", 100, GLOVES, attribute(vanilla_attributes::BLOCK_BREAK_SPEED, 0.2, true);
-    Wisdom => "wisdom", "Мудрость", "+10% опыта охотника за убийства", 300, JEWELRY, Effect::Mechanic;
-    Greed => "greed", "Алчность", "+10% очков Системы за убийства", 300, JEWELRY, Effect::Mechanic;
-    ProspectorsLuck => "prospectors_luck", "Удача старателя", "+10% шанс лишнего кристалла", 200, JEWELRY, Effect::Mechanic;
-    ManaResonance => "mana_resonance", "Резонанс маны", "+30 маны (только магу)", 200, JEWELRY, Effect::Mechanic;
+    Protection => "protection", "Защита", "+1 брони", 150, HELMET | CHEST | LEGS | BOOTS, attribute(vanilla_attributes::ARMOR, 1.0, false), 0;
+    Vitality => "vitality", "Живучесть", "+2 максимального здоровья", 200, HELMET | CHEST | JEWELRY, attribute(vanilla_attributes::MAX_HEALTH, 2.0, false), 0;
+    ClearSight => "clear_sight", "Ясный взор", "Иммунитет к слепоте и тьме", 150, HELMET, Effect::Mechanic, 0;
+    DeepBreath => "deep_breath", "Глубокий вдох", "+2 к запасу воздуха", 80, HELMET, attribute(vanilla_attributes::OXYGEN_BONUS, 2.0, false), 0;
+    ColdMind => "cold_mind", "Холодный разум", "+20 маны (только магу)", 150, HELMET, Effect::Mechanic, 0;
+    Toughness => "toughness", "Закалка", "+1 прочности брони", 150, CHEST, attribute(vanilla_attributes::ARMOR_TOUGHNESS, 1.0, false), 0;
+    Thorns => "thorns", "Шипы", "Возвращает 15% урона ближнего боя атакующему", 250, CHEST, Effect::Mechanic, THORNS_PROC_PERCENT;
+    Restoration => "restoration", "Восстановление", "+1 HP каждые 8 с", 250, CHEST, Effect::Mechanic, 0;
+    FireWard => "fire_ward", "Огнеупорность", "−50% урона от огня", 120, CHEST, Effect::Mechanic, 0;
+    BlastWard => "blast_ward", "Взрывостойкость", "−30% урона от взрывов", 120, CHEST, Effect::Mechanic, 0;
+    Steadfast => "steadfast", "Стойкость", "+10% сопротивления отбрасыванию", 100, LEGS, attribute(vanilla_attributes::KNOCKBACK_RESISTANCE, 0.1, false), 0;
+    ArrowWard => "arrow_ward", "Укрытие от стрел", "−25% урона снарядами", 150, LEGS, Effect::Mechanic, 0;
+    Dash => "dash", "Рывок", "+8% скорости", 200, LEGS, attribute(vanilla_attributes::MOVEMENT_SPEED, 0.08, true), 0;
+    Fleetness => "fleetness", "Лёгкость", "+5% скорости", 150, BOOTS | JEWELRY, attribute(vanilla_attributes::MOVEMENT_SPEED, 0.05, true), 0;
+    SoftFall => "soft_fall", "Мягкое падение", "−40% урона от падения", 100, BOOTS, attribute(vanilla_attributes::FALL_DAMAGE_MULTIPLIER, -0.4, false), 0;
+    Leaping => "leaping", "Прыгучесть", "Выше прыжок", 100, BOOTS, attribute(vanilla_attributes::JUMP_STRENGTH, 0.1, false), 0;
+    Stride => "stride", "Широкий шаг", "Перешагивает блоки высотой 1", 120, BOOTS, attribute(vanilla_attributes::STEP_HEIGHT, 0.5, false), 0;
+    Grip => "grip", "Хватка", "+8% скорости атаки", 150, GLOVES, attribute(vanilla_attributes::ATTACK_SPEED, 0.08, true), 0;
+    Brawler => "brawler", "Кулак бойца", "+1 урона атаки", 150, GLOVES, attribute(vanilla_attributes::ATTACK_DAMAGE, 1.0, false), 0;
+    NimbleFingers => "nimble_fingers", "Ловкие пальцы", "+20% скорости добычи", 100, GLOVES, attribute(vanilla_attributes::BLOCK_BREAK_SPEED, 0.2, true), 0;
+    Wisdom => "wisdom", "Мудрость", "+10% опыта охотника за убийства", 300, JEWELRY, Effect::Mechanic, 0;
+    Greed => "greed", "Алчность", "+10% очков Системы за убийства", 300, JEWELRY, Effect::Mechanic, 0;
+    ProspectorsLuck => "prospectors_luck", "Удача старателя", "+10% шанс лишнего кристалла", 200, JEWELRY, Effect::Mechanic, 0;
+    ManaResonance => "mana_resonance", "Резонанс маны", "+30 маны (только магу)", 200, JEWELRY, Effect::Mechanic, 0;
     // Side effects.
-    Sluggish => "sluggish", "Медлительность", "−5% скорости", -150, EVERY, attribute(vanilla_attributes::MOVEMENT_SPEED, -0.05, true);
-    Frail => "frail", "Хрупкость", "−2 максимального здоровья", -200, EVERY, attribute(vanilla_attributes::MAX_HEALTH, -2.0, false);
-    Vulnerability => "vulnerability", "Уязвимость", "+10% входящего урона", -250, EVERY, Effect::Mechanic;
-    BloodCurse => "blood_curse", "Проклятие крови", "Лечение на 20% слабее", -150, EVERY, Effect::Mechanic;
-    Distraction => "distraction", "Рассеянность", "−10% опыта охотника", -100, EVERY, Effect::Mechanic;
-    Heavy => "heavy", "Тяжесть", "−10% скорости атаки", -150, MELEE, attribute(vanilla_attributes::ATTACK_SPEED, -0.1, true);
-    Recoil => "recoil", "Отдача", "Попадание отнимает 1 HP у владельца (не убивает)", -250, MELEE, Effect::Recoil;
-    Dull => "dull", "Тупое лезвие", "−1 урона атаки", -150, MELEE, attribute(vanilla_attributes::ATTACK_DAMAGE, -1.0, false);
-    ShortReach => "short_reach", "Короткая рука", "−0,5 блока дальности удара", -100, MELEE, attribute(vanilla_attributes::ENTITY_INTERACTION_RANGE, -0.5, false);
-    ManaLeak => "mana_leak", "Утечка маны", "−15% восстановления маны", -150, STAFF, Effect::Mechanic;
-    Unstable => "unstable", "Нестабильность", "Заклинания на 15% дороже", -200, STAFF, Effect::Mechanic;
-    Clumsy => "clumsy", "Неуклюжесть", "−20% скорости добычи", -120, PICKAXE, attribute(vanilla_attributes::BLOCK_BREAK_SPEED, -0.2, true);
-    HeavyTread => "heavy_tread", "Тяжёлая поступь", "−10% сопротивления отбрасыванию", -80, ARMOR, attribute(vanilla_attributes::KNOCKBACK_RESISTANCE, -0.1, false);
+    Sluggish => "sluggish", "Медлительность", "−5% скорости", -150, EVERY, attribute(vanilla_attributes::MOVEMENT_SPEED, -0.05, true), 0;
+    Frail => "frail", "Хрупкость", "−2 максимального здоровья", -200, EVERY, attribute(vanilla_attributes::MAX_HEALTH, -2.0, false), 0;
+    Vulnerability => "vulnerability", "Уязвимость", "+10% входящего урона", -250, EVERY, Effect::Mechanic, 0;
+    BloodCurse => "blood_curse", "Проклятие крови", "Лечение на 20% слабее", -150, EVERY, Effect::Mechanic, 0;
+    Distraction => "distraction", "Рассеянность", "−10% опыта охотника", -100, EVERY, Effect::Mechanic, 0;
+    Heavy => "heavy", "Тяжесть", "−10% скорости атаки", -150, MELEE, attribute(vanilla_attributes::ATTACK_SPEED, -0.1, true), 0;
+    Recoil => "recoil", "Отдача", "Попадание отнимает 1 HP у владельца (не убивает)", -250, MELEE, Effect::Recoil, 0;
+    Dull => "dull", "Тупое лезвие", "−1 урона атаки", -150, MELEE, attribute(vanilla_attributes::ATTACK_DAMAGE, -1.0, false), 0;
+    ShortReach => "short_reach", "Короткая рука", "−0,5 блока дальности удара", -100, MELEE, attribute(vanilla_attributes::ENTITY_INTERACTION_RANGE, -0.5, false), 0;
+    ManaLeak => "mana_leak", "Утечка маны", "−15% восстановления маны", -150, STAFF, Effect::Mechanic, 0;
+    Unstable => "unstable", "Нестабильность", "Заклинания на 15% дороже", -200, STAFF, Effect::Mechanic, 0;
+    Clumsy => "clumsy", "Неуклюжесть", "−20% скорости добычи", -120, PICKAXE, attribute(vanilla_attributes::BLOCK_BREAK_SPEED, -0.2, true), 0;
+    HeavyTread => "heavy_tread", "Тяжёлая поступь", "−10% сопротивления отбрасыванию", -80, ARMOR, attribute(vanilla_attributes::KNOCKBACK_RESISTANCE, -0.1, false), 0;
 }
 
 impl Enchantment {
@@ -324,10 +346,21 @@ impl Enchantment {
         self.spec().effect
     }
 
+    /// Returns the proc chance in percent; 0 means the effect always applies
+    /// or never rolls a chance.
+    #[must_use]
+    pub fn proc_percent(self) -> u8 {
+        self.spec().proc
+    }
+
     /// Returns a one-line Russian description for tooltips.
     #[must_use]
-    pub fn describe(self) -> &'static str {
-        self.spec().description
+    pub fn describe(self) -> String {
+        let spec = self.spec();
+        if spec.proc == 0 {
+            return spec.description.to_owned();
+        }
+        format!("{}% шанс: {}", spec.proc, spec.description)
     }
 }
 
@@ -336,6 +369,8 @@ impl Enchantment {
 pub struct EnchantSummary {
     /// Share of destruction-spell damage healed.
     pub bloodsucker: f32,
+    /// Chance Bloodsucker heals on a destruction spell, as a fraction.
+    pub bloodsucker_proc: f32,
     /// Health regenerated per second.
     pub regen_per_second: f32,
     /// Second Wind is worn.
@@ -346,6 +381,8 @@ pub struct EnchantSummary {
     pub evasion: f32,
     /// Share of melee damage returned to the attacker.
     pub reflect: f32,
+    /// Chance a melee hit is reflected, as a fraction.
+    pub reflect_proc: f32,
     /// Flight is worn.
     pub flight: bool,
     /// Change of hunter experience from kills, as a fraction.
@@ -356,6 +393,8 @@ pub struct EnchantSummary {
     pub antidote: bool,
     /// Mana a Mage gains per hit or spell.
     pub mana_feed: f32,
+    /// Chance Mana Feed grants mana, as a fraction.
+    pub mana_feed_proc: f32,
     /// Reduction of artifact ability cooldowns, as a fraction.
     pub focus: f32,
     /// Change of incoming damage, as a fraction; negative reduces it.
@@ -370,12 +409,16 @@ pub struct EnchantSummary {
     pub crush: f32,
     /// Share of a hit that cleaves nearby mobs.
     pub cleave: f32,
+    /// Chance Cleave spreads a hit, as a fraction.
+    pub cleave_proc: f32,
     /// Chance to poison on hit.
     pub venom: f32,
     /// Chance to slow on hit.
     pub frost: f32,
     /// Hits set the target on fire.
     pub flame: bool,
+    /// Chance Flame ignites the target, as a fraction.
+    pub flame_proc: f32,
     /// Immunity to blindness and darkness.
     pub clear_sight: bool,
     /// Reduction of fire damage.
@@ -410,16 +453,19 @@ impl EnchantSummary {
     /// Nothing worn.
     pub const NONE: Self = Self {
         bloodsucker: 0.0,
+        bloodsucker_proc: 0.0,
         regen_per_second: 0.0,
         second_wind: false,
         fury: 0.0,
         evasion: 0.0,
         reflect: 0.0,
+        reflect_proc: 0.0,
         flight: false,
         experience: 0.0,
         points: 0.0,
         antidote: false,
         mana_feed: 0.0,
+        mana_feed_proc: 0.0,
         focus: 0.0,
         incoming: 0.0,
         healing_received: 0.0,
@@ -427,9 +473,11 @@ impl EnchantSummary {
         bossbane: 0.0,
         crush: 0.0,
         cleave: 0.0,
+        cleave_proc: 0.0,
         venom: 0.0,
         frost: 0.0,
         flame: false,
+        flame_proc: 0.0,
         clear_sight: false,
         fire_ward: 0.0,
         blast_ward: 0.0,
@@ -486,20 +534,32 @@ impl EnchantSummary {
     fn add(&mut self, enchantment: Enchantment) {
         let spell = &mut self.spell;
         match enchantment {
-            Enchantment::Bloodsucker => self.bloodsucker += 0.08,
+            Enchantment::Bloodsucker => {
+                self.bloodsucker += 0.08;
+                self.bloodsucker_proc += f32::from(BLOODSUCKER_PROC_PERCENT) / 100.0;
+            }
             Enchantment::Regeneration => self.regen_per_second += 0.1,
             Enchantment::Restoration => self.regen_per_second += 0.125,
             Enchantment::SecondWind => self.second_wind = true,
             Enchantment::Fury => self.fury += 0.15,
             Enchantment::Evasion => self.evasion += 0.05,
-            Enchantment::Reflection => self.reflect += 0.10,
-            Enchantment::Thorns => self.reflect += 0.15,
+            Enchantment::Reflection => {
+                self.reflect += 0.10;
+                self.reflect_proc += f32::from(REFLECTION_PROC_PERCENT) / 100.0;
+            }
+            Enchantment::Thorns => {
+                self.reflect += 0.15;
+                self.reflect_proc += f32::from(THORNS_PROC_PERCENT) / 100.0;
+            }
             Enchantment::Flight => self.flight = true,
             Enchantment::Hunter | Enchantment::Wisdom => self.experience += 0.10,
             Enchantment::Distraction => self.experience -= 0.10,
             Enchantment::Gatherer | Enchantment::Greed => self.points += 0.10,
             Enchantment::Antidote => self.antidote = true,
-            Enchantment::ManaFeed => self.mana_feed += 2.0,
+            Enchantment::ManaFeed => {
+                self.mana_feed += 2.0;
+                self.mana_feed_proc += f32::from(MANA_FEED_PROC_PERCENT) / 100.0;
+            }
             Enchantment::Focus => self.focus += 0.10,
             Enchantment::Fortress => self.incoming -= 0.05,
             Enchantment::Vulnerability => self.incoming += 0.10,
@@ -507,10 +567,16 @@ impl EnchantSummary {
             Enchantment::Executioner => self.executioner += 0.25,
             Enchantment::Bossbane => self.bossbane += 0.15,
             Enchantment::Crush => self.crush += 0.10,
-            Enchantment::Cleave => self.cleave += 0.30,
+            Enchantment::Cleave => {
+                self.cleave += 0.30;
+                self.cleave_proc += f32::from(CLEAVE_PROC_PERCENT) / 100.0;
+            }
             Enchantment::Venom => self.venom += 0.20,
             Enchantment::FrostEdge => self.frost += 0.20,
-            Enchantment::Flame => self.flame = true,
+            Enchantment::Flame => {
+                self.flame = true;
+                self.flame_proc += f32::from(FLAME_PROC_PERCENT) / 100.0;
+            }
             Enchantment::ClearSight => self.clear_sight = true,
             Enchantment::FireWard => self.fire_ward += 0.50,
             Enchantment::BlastWard => self.blast_ward += 0.30,
@@ -870,5 +936,84 @@ mod tests {
         ];
         assert_eq!(decode(&encode(&applied)), applied);
         assert_eq!(decode(""), Vec::<Enchantment>::new());
+    }
+
+    #[test]
+    fn proc_chances_match_the_balance_table() {
+        assert_eq!(
+            Enchantment::Lifesteal.proc_percent(),
+            LIFESTEAL_PROC_PERCENT
+        );
+        assert_eq!(Enchantment::Cleave.proc_percent(), CLEAVE_PROC_PERCENT);
+        assert_eq!(Enchantment::Flame.proc_percent(), FLAME_PROC_PERCENT);
+        assert_eq!(Enchantment::Thorns.proc_percent(), THORNS_PROC_PERCENT);
+        assert_eq!(
+            Enchantment::Reflection.proc_percent(),
+            REFLECTION_PROC_PERCENT
+        );
+        assert_eq!(Enchantment::ManaFeed.proc_percent(), MANA_FEED_PROC_PERCENT);
+        assert_eq!(
+            Enchantment::Bloodsucker.proc_percent(),
+            BLOODSUCKER_PROC_PERCENT
+        );
+        // Recoil is a drawback and always applies; every other enchantment is
+        // not chance-based either.
+        assert_eq!(Enchantment::Recoil.proc_percent(), 0);
+        for enchantment in ALL {
+            if !matches!(
+                enchantment,
+                Enchantment::Lifesteal
+                    | Enchantment::Cleave
+                    | Enchantment::Flame
+                    | Enchantment::Thorns
+                    | Enchantment::Reflection
+                    | Enchantment::ManaFeed
+                    | Enchantment::Bloodsucker
+            ) {
+                assert_eq!(enchantment.proc_percent(), 0, "{enchantment:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn proc_chances_sum_into_the_summary() {
+        let summary = EnchantSummary::of([
+            Enchantment::Lifesteal,
+            Enchantment::Cleave,
+            Enchantment::Flame,
+            Enchantment::Thorns,
+            Enchantment::Reflection,
+            Enchantment::ManaFeed,
+            Enchantment::Bloodsucker,
+        ]);
+        assert!((summary.cleave_proc - 0.25).abs() < 1e-6);
+        assert!((summary.flame_proc - 0.20).abs() < 1e-6);
+        assert!((summary.reflect_proc - 0.30).abs() < 1e-6);
+        assert!((summary.mana_feed_proc - 0.30).abs() < 1e-6);
+        assert!((summary.bloodsucker_proc - 0.25).abs() < 1e-6);
+        assert_eq!(EnchantSummary::NONE.cleave_proc, 0.0);
+    }
+
+    #[test]
+    fn describe_prefixes_the_proc_chance() {
+        assert_eq!(
+            Enchantment::Lifesteal.describe(),
+            "10% шанс: Удар лечит на 10% нанесённого урона"
+        );
+        for enchantment in [
+            Enchantment::Cleave,
+            Enchantment::Flame,
+            Enchantment::Thorns,
+            Enchantment::Reflection,
+            Enchantment::ManaFeed,
+            Enchantment::Bloodsucker,
+        ] {
+            let description = enchantment.describe();
+            assert!(
+                description.starts_with(&format!("{}% шанс: ", enchantment.proc_percent())),
+                "{description}"
+            );
+        }
+        assert!(!Enchantment::Recoil.describe().contains("шанс"));
     }
 }

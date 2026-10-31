@@ -1341,6 +1341,10 @@ pub trait Mob: LivingEntity + Leashable {
     }
 
     fn save_mob(&self, nbt: &mut NbtCompound) {
+        // Vanilla `Mob.addAdditionalSaveData` chains to `LivingEntity`, which
+        // writes Health/attributes; Steel keeps that data here so chunk
+        // serialization (`save_additional`) carries it.
+        self.save_command_nbt(nbt);
         self.save_equipment(nbt);
         nbt.insert("CanPickUpLoot", i8::from(self.can_pick_up_loot()));
         nbt.insert(
@@ -1379,6 +1383,9 @@ pub trait Mob: LivingEntity + Leashable {
     }
 
     fn load_mob(&self, nbt: BorrowedNbtCompoundView<'_, '_>) {
+        // Mirror of `save_mob`: living-level Health/attributes are restored
+        // before equipment so health clamps against the loaded max health.
+        self.load_command_nbt(nbt);
         self.load_equipment(nbt);
         self.set_can_pick_up_loot(nbt.byte("CanPickUpLoot").is_some_and(|value| value != 0));
         *self.mob_base().persistence_required().lock() = nbt

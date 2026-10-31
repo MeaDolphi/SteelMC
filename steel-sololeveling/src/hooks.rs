@@ -448,14 +448,9 @@ impl GameplayHooks for SoloLevelingHooks {
     }
 
     fn keep_item_on_death(&self, player: &Player, stack: &ItemStack) -> bool {
-        // Items that may never leave their owner survive every death; inside
-        // a run, everything but the run's own mob drops does.
         // Death drops may run under the inventory lock, so this never asks
         // the drop hook, which reads the off hand.
-        item::grimoire::is_grimoire(stack)
-            || item::menu_book::is_menu_book(stack)
-            || !item::binding::may_drop(stack)
-            || (is_instance_world(&player.get_world()) && !item::loot::is_marked(stack))
+        keeps_item_on_death(stack, is_instance_world(&player.get_world()))
     }
 
     fn allow_item_storage(&self, _player: &Player, stack: &ItemStack) -> bool {
@@ -825,6 +820,18 @@ fn keeps_projectile_ammo(ammo: &ItemStack) -> bool {
     ammo.is(&vanilla_items::ARROW)
 }
 
+/// Solo Leveling death rule: the System books, every serial and artifact item
+/// and everything personal stay with the hunter; inside a run, anything that
+/// is not the run's own marked loot stays as well. Materials and loot drop.
+fn keeps_item_on_death(stack: &ItemStack, instance_world: bool) -> bool {
+    item::grimoire::is_grimoire(stack)
+        || item::menu_book::is_menu_book(stack)
+        || item::serial::of(stack).is_some()
+        || item::artifact::of(stack).is_some()
+        || !item::binding::may_drop(stack)
+        || (instance_world && !item::loot::is_marked(stack))
+}
+
 /// Gives a mined stack to the hunter first; only the remainder that does not
 /// fit becomes a normal drop next to the broken block.
 fn give_or_drop(
@@ -952,7 +959,7 @@ fn announce_quest(state: &SoloLevelingState, player: &Player, update: QuestUpdat
 mod tests {
     use super::{
         allows_city_mutation, allows_instance_mutation, allows_player_damage, give_or_drop,
-        is_shadow_tank, keeps_projectile_ammo,
+        is_shadow_tank, keeps_item_on_death, keeps_projectile_ammo,
     };
     use glam::DVec3;
     use std::sync::Weak;
@@ -964,6 +971,44 @@ mod tests {
     use steel_registry::item_stack::ItemStack;
     use steel_registry::{init_vanilla_registry, vanilla_entities, vanilla_items};
     use uuid::Uuid;
+
+    #[test]
+    fn serial_and_artifact_gear_survives_death_but_materials_and_loot_drop() {
+        init_vanilla_registry();
+        let owner = Uuid::new_v4();
+
+        // Personal and transferable serial gear stays in the inventory.
+        let personal =
+            crate::item::serial::stack(crate::item::serial::SerialId::HunterSword, Some(owner));
+        assert!(keeps_item_on_death(&personal, false));
+        let tradable =
+            crate::item::serial::stack(crate::item::serial::SerialId::ImprovedHunterBow, None);
+        assert!(keeps_item_on_death(&tradable, false));
+
+        // Artifact equipment stays as well.
+        let artifact = crate::item::artifact::stack(
+            crate::item::artifact::ArtifactId::AssassinsShoes,
+            Some(owner),
+        );
+        assert!(keeps_item_on_death(&artifact, false));
+
+        // Materials drop on death in the city; inside a run the existing
+        // instance rule still keeps whatever is not the run's own loot.
+        let materials = material_stack();
+        assert!(!keeps_item_on_death(&materials, false));
+        assert!(keeps_item_on_death(&materials, true));
+
+        // Run loot drops inside a run.
+        let mut loot = material_stack();
+        crate::item::loot::mark(&mut loot);
+        assert!(!keeps_item_on_death(&loot, true));
+    }
+
+    fn material_stack() -> ItemStack {
+        let mut stack = ItemStack::new(&vanilla_items::DIAMOND);
+        stack.count = 3;
+        stack
+    }
 
     #[test]
     fn ordinary_arrows_are_kept_but_special_ammunition_is_consumed() {

@@ -1,7 +1,9 @@
 //! Runtime entity attribute system.
 //!
 use core::iter;
+use core::str::FromStr;
 
+use simdnbt::borrow::{NbtCompound as BorrowedNbtCompoundView, NbtList as BorrowedNbtListView};
 use simdnbt::owned::{NbtCompound, NbtList};
 use steel_protocol::packets::game::{AttributeModifierData, AttributeSnapshot};
 pub use steel_registry::attribute::AttributeModifierOperation;
@@ -262,6 +264,20 @@ impl AttributeInstance {
     }
 }
 
+/// Parses one vanilla `AttributeInstance.Packed.modifiers` entry.
+fn parse_vanilla_modifier(modifier: BorrowedNbtCompoundView<'_, '_>) -> Option<AttributeModifier> {
+    let id = modifier.string("id")?;
+    let id = Identifier::from_str(id.to_str().as_ref()).ok()?;
+    let amount = modifier.double("amount")?;
+    let operation = modifier.string("operation")?;
+    let operation = AttributeModifierOperation::by_name(operation.to_str().as_ref())?;
+    Some(AttributeModifier {
+        id,
+        amount,
+        operation,
+    })
+}
+
 /// Per-entity container for attribute instances with dirty tracking
 ///
 /// Indexed by attribute registry ID. Two dirty sets match vanilla's design:
@@ -389,6 +405,58 @@ impl AttributeMap {
             })
             .collect();
         NbtList::Compound(attributes)
+    }
+
+    /// Restores base values and permanent modifiers from the vanilla
+    /// `LivingEntity.attributes` list.
+    ///
+    /// Mirrors vanilla `AttributeMap.apply` driven by
+    /// `AttributeInstance.Packed.LIST_CODEC`: entries for attributes the
+    /// entity does not have are skipped, a missing `base` defaults to `0.0`,
+    /// and modifiers replace any stored modifier with the same id.
+    pub(crate) fn load_vanilla_nbt(&mut self, attributes: BorrowedNbtListView<'_, '_>) {
+        let Self {
+            instances,
+            to_update,
+            to_sync,
+        } = self;
+        let Some(entries) = attributes.compounds() else {
+            return;
+        };
+        for entry in entries {
+            let Some(id) = entry.string("id") else {
+                continue;
+            };
+            let Ok(key) = Identifier::from_str(id.to_str().as_ref()) else {
+                continue;
+            };
+            let Some(attribute_id) = REGISTRY.attributes.id_from_key(&key) else {
+                continue;
+            };
+            let Some(Some(instance)) = instances.get_mut(attribute_id) else {
+                continue;
+            };
+
+            if instance.set_base_value(entry.double("base").unwrap_or(0.0)) {
+                to_update.mark(attribute_id as u16);
+                if instance.attribute.syncable {
+                    to_sync.mark(attribute_id as u16);
+                }
+            }
+            if let Some(modifiers) = entry.list("modifiers").and_then(|list| list.compounds()) {
+                for modifier in modifiers {
+                    let Some(modifier) = parse_vanilla_modifier(modifier) else {
+                        continue;
+                    };
+                    if instance.set_modifier(modifier, true) {
+                        to_update.mark(attribute_id as u16);
+                        if instance.attribute.syncable {
+                            to_sync.mark(attribute_id as u16);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Returns whether an attribute has a modifier with the given ID.
@@ -698,6 +766,83 @@ mod tests {
             modifiers[0].string("operation").map(ToString::to_string),
             Some("add_multiplied_base".to_owned())
         );
+    }
+
+    /// Serializes an attribute map the way `save_command_nbt` does and returns
+    /// the reborrowable encoded bytes.
+    fn vanilla_attributes_round_trip_bytes(source: &AttributeMap) -> Vec<u8> {
+        let mut root = NbtCompound::new();
+        root.insert("attributes", source.to_vanilla_nbt());
+        let mut bytes = Vec::new();
+        root.write(&mut bytes);
+        bytes
+    }
+
+    fn load_round_tripped_vanilla_nbt(source: &AttributeMap) -> AttributeMap {
+        let bytes = vanilla_attributes_round_trip_bytes(source);
+        let borrowed = simdnbt::borrow::read_compound(&mut std::io::Cursor::new(&bytes))
+            .unwrap_or_else(|error| panic!("test nbt should reborrow: {error}"));
+        let view = simdnbt::borrow::NbtCompound::from(&borrowed);
+        let packed = view
+            .list("attributes")
+            .unwrap_or_else(|| panic!("attributes list should reborrow"));
+        let mut loaded = AttributeMap::new_for_entity(&vanilla_entities::ZOMBIE);
+        loaded.load_vanilla_nbt(packed);
+        loaded
+    }
+
+    #[test]
+    fn load_vanilla_nbt_restores_base_values_and_permanent_modifiers() {
+        init_vanilla_registry();
+        let mut source = AttributeMap::new_for_entity(&vanilla_entities::ZOMBIE);
+        source.set_base_value(vanilla_attributes::MAX_HEALTH, 40.0);
+        source.set_base_value(vanilla_attributes::SCALE, 1.5);
+        assert!(source.add_modifier(
+            vanilla_attributes::MOVEMENT_SPEED,
+            AttributeModifier {
+                id: Identifier::vanilla_static("speed_test"),
+                amount: 0.25,
+                operation: AttributeModifierOperation::AddMultipliedBase,
+            },
+            true,
+        ));
+        let speed_base = source
+            .get_base_value(vanilla_attributes::MOVEMENT_SPEED)
+            .unwrap_or_else(|| panic!("zombies have movement speed"));
+
+        let loaded = load_round_tripped_vanilla_nbt(&source);
+
+        assert_eq!(
+            loaded
+                .get_value(vanilla_attributes::MAX_HEALTH)
+                .map(f64::to_bits),
+            Some(40.0_f64.to_bits())
+        );
+        assert_eq!(
+            loaded
+                .get_value(vanilla_attributes::SCALE)
+                .map(f64::to_bits),
+            Some(1.5_f64.to_bits())
+        );
+        // Base plus the restored permanent `add_multiplied_base` modifier.
+        assert_eq!(
+            loaded
+                .get_value(vanilla_attributes::MOVEMENT_SPEED)
+                .map(f64::to_bits),
+            Some((speed_base * 1.25).to_bits())
+        );
+    }
+
+    #[test]
+    fn load_vanilla_nbt_skips_attributes_the_entity_does_not_have() {
+        init_vanilla_registry();
+        // Players have luck; zombies do not.
+        let mut player = AttributeMap::new_for_entity(&vanilla_entities::PLAYER);
+        player.set_base_value(vanilla_attributes::LUCK, 5.0);
+
+        let zombie = load_round_tripped_vanilla_nbt(&player);
+
+        assert_eq!(zombie.get_value(vanilla_attributes::LUCK), None);
     }
 
     #[test]

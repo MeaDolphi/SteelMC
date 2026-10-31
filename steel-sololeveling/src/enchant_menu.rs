@@ -191,6 +191,14 @@ fn build(
     item: Enchantable,
     applied: Vec<Enchantment>,
 ) -> Menu {
+    let balance = state
+        .with_session_mut(player.gameprofile.id(), |session| session.won.amount())
+        .unwrap_or(0);
+    let view = View {
+        held: held.clone(),
+        balance,
+        applied: applied.clone(),
+    };
     let mut kind = EnchantMenuKind {
         state,
         buttons: None,
@@ -201,6 +209,7 @@ fn build(
         applied,
         queued: None,
         completion: None,
+        view: Some(view),
     };
     let items = kind.items(player);
     let container = SimpleContainer::from_items(items).into_shared();
@@ -209,6 +218,14 @@ fn build(
     kind.container = Some(container);
     builder.player_inventory(&player.inventory);
     builder.build(kind)
+}
+
+/// Everything the menu renders; a change redraws it.
+#[derive(Debug, Clone, PartialEq)]
+struct View {
+    held: ItemStack,
+    balance: u64,
+    applied: Vec<Enchantment>,
 }
 
 /// Returns the enchantments a menu offers, each with its menu slot.
@@ -251,6 +268,7 @@ pub(crate) struct EnchantMenuKind {
     applied: Vec<Enchantment>,
     queued: Option<Enchantment>,
     completion: Option<Arc<SyncMutex<Option<EnchantTarget>>>>,
+    view: Option<View>,
 }
 
 impl EnchantMenuKind {
@@ -265,6 +283,71 @@ impl EnchantMenuKind {
         self.queued = None;
         self.completion = None;
         true
+    }
+
+    /// Reads the state the menu renders: the held stack, the balance and the
+    /// enchantments actually on the stack.
+    fn current_view(&self, guard: &mut ContainerLockGuard, player: &Player) -> Option<View> {
+        let held = match self.target {
+            EnchantTarget::Inventory(slot) => {
+                let id = ContainerId::from_arc(&player.inventory);
+                guard
+                    .get_typed::<PlayerInventory>(id)?
+                    .get_item(slot)
+                    .clone()
+            }
+            EnchantTarget::Gear(index) => self
+                .state
+                .with_session_mut(player.gameprofile.id(), |session| {
+                    session.gear.get(index).cloned()
+                })
+                .flatten()
+                .unwrap_or_else(ItemStack::empty),
+        };
+        let balance = self
+            .state
+            .with_session_mut(player.gameprofile.id(), |session| session.won.amount())
+            .unwrap_or(0);
+        Some(View {
+            applied: enchantments_of(&held),
+            held,
+            balance,
+        })
+    }
+
+    /// Writes the current items into the menu container.
+    fn redraw(&self, guard: &mut ContainerLockGuard, player: &Player) {
+        let Some(container) = self.container.as_ref() else {
+            return;
+        };
+        let id = ContainerId::from_arc(container);
+        let items = self.items(player);
+        if let Some(container) = guard.get_typed_mut::<SimpleContainer>(id) {
+            for (index, item) in items.into_iter().enumerate() {
+                container.set_item(index, item);
+            }
+        }
+    }
+
+    /// Re-reads the rendered state and redraws on a change, so the menu
+    /// never freezes on a balance change or a finished operation.
+    fn sync(&mut self, guard: &mut ContainerLockGuard, player: &Player) {
+        let Some(view) = self.current_view(guard, player) else {
+            return;
+        };
+        if self.view.as_ref() == Some(&view) {
+            return;
+        }
+        let Some(item) = held_enchantable(&view.held) else {
+            // The item under work left its slot; the menu has nothing to show.
+            player.close_container();
+            return;
+        };
+        self.held = view.held.clone();
+        self.applied = view.applied.clone();
+        self.item = item;
+        self.view = Some(view);
+        self.redraw(guard, player);
     }
 
     fn items(&self, player: &Player) -> Vec<ItemStack> {
@@ -362,42 +445,40 @@ impl MenuKind for EnchantMenuKind {
         guard: &mut ContainerLockGuard,
         player: &Player,
     ) {
-        let Some(target) = self
+        if let Some(target) = self
             .completion
             .as_ref()
             .and_then(|completion| *completion.lock())
-        else {
-            return;
-        };
-        let held = match target {
-            EnchantTarget::Inventory(slot) => {
-                let id = ContainerId::from_arc(&player.inventory);
-                let Some(inventory) = guard.get_typed::<PlayerInventory>(id) else {
-                    return;
-                };
-                inventory.get_item(slot).clone()
-            }
-            EnchantTarget::Gear(index) => self
-                .state
-                .with_session_mut(player.gameprofile.id(), |session| {
-                    session.gear.get(index).cloned()
-                })
-                .flatten()
-                .unwrap_or_else(ItemStack::empty),
-        };
-        if !self.finish(target, held) {
-            player.close_container();
-            return;
-        }
-        let items = self.items(player);
-        if let Some(container) = self.container.as_ref() {
-            let id = ContainerId::from_arc(container);
-            if let Some(container) = guard.get_typed_mut::<SimpleContainer>(id) {
-                for (index, item) in items.into_iter().enumerate() {
-                    container.set_item(index, item);
+        {
+            let held = match target {
+                EnchantTarget::Inventory(slot) => {
+                    let id = ContainerId::from_arc(&player.inventory);
+                    let Some(inventory) = guard.get_typed::<PlayerInventory>(id) else {
+                        return;
+                    };
+                    inventory.get_item(slot).clone()
                 }
+                EnchantTarget::Gear(index) => self
+                    .state
+                    .with_session_mut(player.gameprofile.id(), |session| {
+                        session.gear.get(index).cloned()
+                    })
+                    .flatten()
+                    .unwrap_or_else(ItemStack::empty),
+            };
+            if !self.finish(target, held) {
+                player.close_container();
+                return;
             }
+            self.view = self.current_view(guard, player);
+            self.redraw(guard, player);
         }
+        // While a transaction owns the reserved inventory the slots under it
+        // may not reflect the commit, so only the completion may resync then.
+        if player.tick_count() % 20 != 0 || self.queued.is_some() {
+            return;
+        }
+        self.sync(guard, player);
     }
 
     fn on_slot_clicked(
@@ -428,10 +509,10 @@ impl MenuKind for EnchantMenuKind {
             return ClickOutcome::Consume;
         };
         if self.queued.is_some() {
-            player.send_message(
-                &TextComponent::plain("Предыдущее зачарование ещё обрабатывается.")
-                    .color(Color::Red),
-            );
+            // The transaction still holds the reservation: the click is
+            // consumed, and the action bar says why instead of chat spam.
+            player
+                .send_action_bar(TextComponent::plain("Операция сохраняется…").color(Color::Gold));
             return ClickOutcome::Consume;
         }
         // The click owns the inventory lock, so the request runs on the next
@@ -445,15 +526,7 @@ impl MenuKind for EnchantMenuKind {
         );
         self.queued = Some(enchantment);
         self.completion = Some(completion);
-        if let Some(container) = self.container.as_ref() {
-            let id = ContainerId::from_arc(container);
-            let items = self.items(player);
-            if let Some(container) = guard.get_typed_mut::<SimpleContainer>(id) {
-                for (index, item) in items.into_iter().enumerate() {
-                    container.set_item(index, item);
-                }
-            }
-        }
+        self.redraw(guard, player);
         ClickOutcome::Consume
     }
 }
@@ -486,6 +559,7 @@ mod tests {
             applied: Vec::new(),
             queued: Some(enchantment),
             completion: Some(Arc::new(SyncMutex::new(None))),
+            view: None,
         };
 
         // A failed transaction retains the old artifact but releases the queued row.
@@ -507,6 +581,42 @@ mod tests {
         assert_ne!(available, menu.offer_item(enchantment, u64::MAX));
         drop(menu);
         std::fs::remove_dir_all(directory).expect("remove state directory");
+    }
+
+    #[test]
+    fn view_diff_tracks_held_balance_and_applied() {
+        let held = artifact::stack(ArtifactId::AssassinsShoes, None);
+        let base = super::View {
+            held: held.clone(),
+            balance: 100,
+            applied: Vec::new(),
+        };
+        assert_eq!(base, base.clone());
+        assert_ne!(
+            base,
+            super::View {
+                balance: 99,
+                ..base.clone()
+            },
+            "a balance change must redraw the offers"
+        );
+        assert_ne!(
+            base,
+            super::View {
+                applied: vec![Enchantment::Protection],
+                ..base.clone()
+            },
+            "an applied enchantment must redraw the offers"
+        );
+        let other = artifact::stack(ArtifactId::KnightsKiller, None);
+        assert_ne!(
+            base,
+            super::View {
+                held: other,
+                ..base.clone()
+            },
+            "a changed stack must redraw"
+        );
     }
 
     #[test]

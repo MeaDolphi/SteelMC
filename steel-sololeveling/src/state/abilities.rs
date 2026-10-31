@@ -25,6 +25,7 @@ use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
 use super::SoloLevelingState;
+use super::enchants::chance;
 use crate::abilities::{self, AbilityEffect};
 use crate::dungeon::runtime::find_player;
 use crate::gear;
@@ -312,7 +313,8 @@ impl SoloLevelingState {
 
     /// Applies the on-hit enchantments of the wielded weapon.
     ///
-    /// Recoil is applied straight to health rather than as damage, so it can
+    /// Lifesteal heals only when its chance rolls; Recoil is a drawback and
+    /// always applies, straight to health rather than as damage, so it can
     /// never kill, never trigger another hook, and never count as a hit.
     fn enchantment_hit(&self, attacker: &Player, amount: f32) {
         let weapon = equipped(attacker, EquipmentSlot::MainHand);
@@ -328,9 +330,11 @@ impl SoloLevelingState {
         for enchantment in artifact::enchantments_of(&weapon) {
             match enchantment.effect() {
                 Effect::Lifesteal => {
-                    health = (health
-                        + summary.healed(amount.max(0.0) * enchantment::LIFESTEAL_FRACTION))
-                    .min(attacker.get_max_health());
+                    if chance(f32::from(enchantment.proc_percent()) / 100.0) {
+                        health = (health
+                            + summary.healed(amount.max(0.0) * enchantment::LIFESTEAL_FRACTION))
+                        .min(attacker.get_max_health());
+                    }
                 }
                 Effect::Recoil => {
                     health = (health - enchantment::RECOIL_DAMAGE).max(1.0);
