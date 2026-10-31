@@ -287,6 +287,9 @@ pub struct GateBreak {
     pub next_wave_tick: u64,
     /// Entity ids of mobs spawned for the current wave.
     pub remaining_mobs: Vec<i32>,
+    /// Highest wave whose defense reward was already paid; the reward is a
+    /// one-time transition, not a per-tick state of an empty wave.
+    pub rewarded_wave: u8,
     /// Whether the initial city-wide warning has already been sent.
     pub announced: bool,
 }
@@ -310,6 +313,16 @@ impl GateBreak {
         tick >= self.next_wave_tick
     }
 
+    /// Marks the current wave's defense reward paid; returns whether it was
+    /// still due, so an empty wave pays exactly once.
+    pub fn take_wave_reward(&mut self) -> bool {
+        if self.wave <= self.rewarded_wave {
+            return false;
+        }
+        self.rewarded_wave = self.wave;
+        true
+    }
+
     fn persisted(&self) -> PersistedGateBreak {
         PersistedGateBreak {
             gate: PersistedGate::from_gate(&self.gate),
@@ -324,6 +337,9 @@ impl GateBreak {
             wave: persisted.wave,
             next_wave_tick: persisted.next_wave_tick.max(current_tick),
             remaining_mobs: Vec::new(),
+            // The restored wave's mobs are gone; its reward was paid before
+            // the shutdown (or is forfeited), never paid twice.
+            rewarded_wave: persisted.wave,
             announced: false,
         })
     }
@@ -730,6 +746,7 @@ impl GateRegistry {
             wave: 0,
             next_wave_tick: 0,
             remaining_mobs: Vec::new(),
+            rewarded_wave: 0,
             announced: false,
         };
         self.breaks.insert(id, break_state.clone());
@@ -1324,6 +1341,61 @@ mod tests {
         assert_eq!(break_state.gate.id, gate.id);
         assert!(gates.breaks().iter().any(|b| b.gate.id == gate.id));
         assert!(gates.committed_gate(gate.id).is_none());
+    }
+
+    #[test]
+    fn a_wave_reward_is_paid_exactly_once() {
+        let mut gates = GateRegistry::default();
+        let gate = gates.create_ranked(
+            Identifier::from_steel("overworld"),
+            BlockPos::new(20, 70, 20),
+            0,
+            HunterRank::E,
+            false,
+        );
+        let mut break_state = gates.start_break(gate.id).expect("gate should break");
+        break_state.wave = 1;
+
+        assert!(break_state.take_wave_reward());
+        assert!(
+            !break_state.take_wave_reward(),
+            "an empty wave must not pay twice"
+        );
+        break_state.wave = 2;
+        assert!(break_state.take_wave_reward(), "the next wave pays again");
+    }
+
+    #[test]
+    fn a_restored_break_does_not_repay_the_cleared_wave() {
+        let mut gates = GateRegistry::default();
+        let gate = gates.create_ranked(
+            Identifier::from_steel("overworld"),
+            BlockPos::new(20, 70, 20),
+            0,
+            HunterRank::E,
+            false,
+        );
+        let mut break_state = gates.start_break(gate.id).expect("gate should break");
+        break_state.wave = 3;
+        break_state.next_wave_tick = 500;
+        *gates.break_mut(gate.id).unwrap() = break_state.clone();
+
+        let write = gates.begin_persistence().expect("break is dirty");
+        let bytes = serde_json::to_vec(&write.snapshot).expect("snapshot should serialize");
+        let snapshot: GateRegistrySnapshot =
+            serde_json::from_slice(&bytes).expect("snapshot should deserialize");
+        let mut restored = GateRegistry::default();
+        restored.restore(snapshot, 1_000).expect("should restore");
+        let breaks = restored.breaks();
+        let restored_break = breaks
+            .iter()
+            .find(|b| b.gate.id == gate.id)
+            .expect("break restored");
+        assert_eq!(restored_break.wave, 3);
+        assert!(
+            restored_break.rewarded_wave >= 3,
+            "a wave cleared before the shutdown must not be paid again"
+        );
     }
 
     #[test]

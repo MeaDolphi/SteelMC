@@ -1286,6 +1286,16 @@ impl DungeonRuntime {
                 return;
             }
         }
+        for break_state in self.gates.breaks_mut() {
+            if let Some(index) = break_state
+                .remaining_mobs
+                .iter()
+                .position(|id| *id == entity_id)
+            {
+                break_state.remaining_mobs.swap_remove(index);
+                break;
+            }
+        }
     }
 
     /// Returns the nameplate of a dungeon, penalty or gate-break mob in `world`.
@@ -1653,9 +1663,14 @@ impl DungeonRuntime {
             let Some(world) = server.worlds.get(&break_state.gate.world) else {
                 continue;
             };
-            break_state
-                .remaining_mobs
-                .retain(|id| world.get_entity_by_id(*id).is_some());
+            // A mob out of sight is unloaded, not dead: keep it on the wave.
+            // Only mobs removed from the world count as fallen; deaths also
+            // remove ids explicitly in `on_living_death`.
+            break_state.remaining_mobs.retain(|id| {
+                world
+                    .get_entity_by_id(*id)
+                    .is_none_or(|entity| !entity.is_removed())
+            });
             if break_state.wave > 0 && tick.is_multiple_of(20) {
                 Self::adopt_gate_break_orphans(
                     &mut self.gate_break_tracks,
@@ -1675,7 +1690,10 @@ impl DungeonRuntime {
             if !break_state.remaining_mobs.is_empty() {
                 continue;
             }
-            if break_state.wave > 0 {
+            // The defense reward is a one-time transition: between waves the
+            // list is empty for the whole interval, and an empty list must
+            // never pay twice.
+            if break_state.take_wave_reward() {
                 let participants = Self::gate_break_participants(server, &break_state.gate);
                 actions.push(RunAction::CityDefenseWave {
                     participants,
