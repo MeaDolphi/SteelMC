@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use super::RangedAttackMob;
 use super::*;
 use crate::entity::leash::Leashable;
 use steel_math::DEGREE_90;
@@ -1591,6 +1592,16 @@ pub trait Entity: EntityEventSource + ErasedType + Send + Sync + 'static {
     /// Returns the `Enemy` marker, equivalent to vanilla's `instanceof Enemy`.
     fn as_enemy(&self) -> Option<&dyn Enemy> {
         try_as_dyn::<Self, dyn Enemy>(self)
+    }
+
+    /// Returns true for entities that implement vanilla ranged-attack behavior.
+    fn is_ranged_attack_mob(&self) -> bool {
+        self.as_ranged_attack_mob().is_some()
+    }
+
+    /// Returns this entity as a ranged attacker when it has ranged attack behavior.
+    fn as_ranged_attack_mob(&self) -> Option<&dyn RangedAttackMob> {
+        try_as_dyn::<Self, dyn RangedAttackMob>(self)
     }
 
     /// Returns true for entities that implement vanilla ageable-mob behavior.

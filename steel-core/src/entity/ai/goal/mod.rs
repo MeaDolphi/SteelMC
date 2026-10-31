@@ -25,8 +25,10 @@ mod random_look_around;
 mod random_pos;
 mod random_stroll;
 mod random_swimming;
+mod ranged_bow_attack;
 mod restrict_sun;
 mod selector;
+mod swell;
 mod target_goal;
 mod tempt_goal;
 mod try_find_water;
@@ -38,14 +40,17 @@ pub(crate) use eat_block_goal::EatBlockGoal;
 pub(crate) use float_goal::FloatGoal;
 pub(crate) use follow_parent::FollowParentGoal;
 pub(crate) use hurt_by_target::HurtByTargetGoal;
+pub(crate) use leap_at_target::LeapAtTargetGoal;
 pub(crate) use look_at_player::LookAtPlayerGoal;
 pub(crate) use melee_attack::MeleeAttackGoal;
 pub(crate) use nearest_attackable_target::NearestAttackableTargetGoal;
 pub(crate) use panic_goal::PanicGoal;
 pub(crate) use random_look_around::RandomLookAroundGoal;
+pub(crate) use ranged_bow_attack::RangedBowAttackGoal;
 #[cfg(test)]
 pub(crate) use selector::GoalControls;
 pub(crate) use selector::{Goal, GoalControl, GoalSelector};
+pub(crate) use swell::SwellGoal;
 pub(crate) use tempt_goal::TemptGoal;
 pub(crate) use water_avoiding_random_stroll::WaterAvoidingRandomStrollGoal;
 

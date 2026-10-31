@@ -855,6 +855,15 @@ impl LivingEntityBase {
         self.state.lock().active_item_use.is_some()
     }
 
+    /// Returns how many ticks the currently used item has been in use.
+    #[must_use]
+    pub fn get_ticks_using_item(&self) -> i32 {
+        let Some(active) = self.state.lock().active_item_use else {
+            return 0;
+        };
+        active.duration() - active.remaining_ticks()
+    }
+
     /// Starts vanilla active item use.
     pub fn start_using_item(&self, hand: InteractionHand, item: &ItemStack, duration: i32) -> bool {
         if item.is_empty() || duration <= 0 {

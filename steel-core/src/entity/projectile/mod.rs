@@ -9,6 +9,7 @@
 //!
 //! The block + entity move-vector raycast mirrors `ProjectileUtil`.
 
+mod abstract_arrow;
 mod throwable;
 mod throwable_item;
 mod thrown_potion;
@@ -46,6 +47,7 @@ use super::{
     BUBBLE_COLUMN_INSIDE_UP_ACCELERATION,
 };
 
+pub use abstract_arrow::{AbstractArrow, AbstractArrowBase};
 pub use throwable::ThrowableProjectile;
 pub use throwable_item::ThrowableItemProjectile;
 pub use thrown_potion::{

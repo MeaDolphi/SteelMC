@@ -54,6 +54,11 @@ pub trait LivingEntity: Entity {
         self.living_base().advance_rotation_for_base_tick();
     }
 
+    /// Returns how many ticks the currently used item has been in use.
+    fn get_ticks_using_item(&self) -> i32 {
+        self.living_base().get_ticks_using_item()
+    }
+
     /// Runs the shared per-tick living-entity behavior: rotation/animation
     /// snapshots, base entity tick, and environmental damage.
     fn base_tick_living_entity(&self) {
