@@ -359,8 +359,9 @@ impl FilePlayerDataStorage {
         })
     }
 
-    async fn recover_missing_atomic_path_locked(final_path: &Path) -> io::Result<bool> {
+    pub(crate) async fn recover_missing_atomic_path_locked(final_path: &Path) -> io::Result<bool> {
         if fs::try_exists(final_path).await? {
+            Self::discard_stale_temp_locked(final_path).await;
             return Ok(true);
         }
 
@@ -374,16 +375,7 @@ impl FilePlayerDataStorage {
                 ));
             };
             Self::sync_parent(parent).await?;
-            let temp_path = Self::atomic_temp_path(final_path);
-            if fs::try_exists(&temp_path).await?
-                && let Err(error) = fs::remove_file(&temp_path).await
-            {
-                tracing::warn!(
-                    %error,
-                    path = %temp_path.display(),
-                    "Failed to remove an uncommitted atomic-write temporary file"
-                );
-            }
+            Self::discard_stale_temp_locked(final_path).await;
             tracing::warn!(
                 path = %final_path.display(),
                 backup = %backup_path.display(),
@@ -392,23 +384,31 @@ impl FilePlayerDataStorage {
             return Ok(true);
         }
 
-        let temp_path = Self::atomic_temp_path(final_path);
-        if fs::try_exists(&temp_path).await? {
-            if let Err(error) = fs::remove_file(&temp_path).await {
-                tracing::warn!(
-                    %error,
-                    path = %temp_path.display(),
-                    "Failed to remove an uncommitted atomic-write temporary file"
-                );
-            }
+        if Self::discard_stale_temp_locked(final_path).await {
             tracing::warn!(
                 path = %final_path.display(),
-                temporary = %temp_path.display(),
+                temporary = %Self::atomic_temp_path(final_path).display(),
                 "Discarded an interrupted data-file publication with no committed generation"
             );
         }
 
         Ok(false)
+    }
+
+    /// Removes a leftover atomic-write temporary file; the committed final file
+    /// already exists, so the temporary bytes are an uncommitted generation.
+    /// Returns whether a temporary file was present at all.
+    async fn discard_stale_temp_locked(final_path: &Path) -> bool {
+        let temp_path = Self::atomic_temp_path(final_path);
+        let exists = fs::try_exists(&temp_path).await.unwrap_or(false);
+        if exists && let Err(error) = fs::remove_file(&temp_path).await {
+            tracing::warn!(
+                %error,
+                path = %temp_path.display(),
+                "Failed to remove an uncommitted atomic-write temporary file"
+            );
+        }
+        exists
     }
 
     async fn write_synced_file(path: &Path, bytes: &[u8]) -> io::Result<()> {

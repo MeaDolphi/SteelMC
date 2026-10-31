@@ -1,6 +1,6 @@
 //! Atomic transfers between stored inventory and System equipment.
 
-use std::{mem, sync::Arc};
+use std::{io, mem, sync::Arc};
 
 use steel_core::player::Player;
 use steel_core::player::player_data_storage::transaction::{
@@ -192,14 +192,22 @@ impl SoloLevelingState {
                     completion_player.send_message(&TextComponent::plain(message));
                 } else {
                     log::error!("sololeveling: gear persistence failed for {uuid}: {result:?}");
-                    state.persistence.lock().failed.insert(uuid);
+                    let conflicted = result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|error| error.kind() == io::ErrorKind::WouldBlock);
+                    if !conflicted {
+                        state.persistence.lock().failed.insert(uuid);
+                    }
                     state
                         .sessions
                         .with_mut(uuid, |session| session.economic_busy = false);
                     state.defer_gear_menu(uuid);
-                    completion_player.send_message(&TextComponent::plain(
-                        "Перенос не сохранён; предметы не изменены.",
-                    ));
+                    completion_player.send_message(&TextComponent::plain(if conflicted {
+                        "Данные изменились; повторите попытку позже."
+                    } else {
+                        "Перенос не сохранён; предметы не изменены."
+                    }));
                 }
                 state.persistence.lock().busy = false;
             },

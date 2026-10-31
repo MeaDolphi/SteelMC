@@ -66,6 +66,8 @@ pub const EVOLVED_ASSASSIN_MELEE_BONUS: f32 = 0.10;
 pub const EVOLVED_ASSASSIN_SPEED: f64 = 0.05;
 /// Extra Ranger projectile damage after the Second Awakening.
 pub const EVOLVED_RANGER_PROJECTILE_BONUS: f32 = 0.15;
+/// Arrows a newly chosen Ranger receives with the starter bow.
+pub const RANGER_STARTER_ARROWS: i32 = 64;
 /// Extra Mage magic damage after the Second Awakening.
 pub const EVOLVED_MAGE_MAGIC_BONUS: f32 = 0.20;
 
@@ -381,6 +383,10 @@ pub struct ClassChoice {
     /// Whether the class has undergone the Second Awakening.
     #[serde(default)]
     pub evolved: bool,
+    /// A Ranger kit (starter bow and arrows) is owed and handed out on the
+    /// next player tick; set when the class is picked, cleared on handout.
+    #[serde(default)]
+    pub ranger_kit_due: bool,
 }
 
 /// [`ClassChoice`] as saved, where the class may name a removed class.
@@ -394,6 +400,8 @@ struct SavedClassChoice {
     free_change: bool,
     #[serde(default)]
     evolved: bool,
+    #[serde(default)]
+    ranger_kit_due: bool,
 }
 
 impl From<SavedClassChoice> for ClassChoice {
@@ -405,6 +413,7 @@ impl From<SavedClassChoice> for ClassChoice {
             // A class that no longer exists, the Healer, frees the next pick.
             free_change: saved.free_change || (saved.class.is_some() && class.is_none()),
             evolved: saved.evolved,
+            ranger_kit_due: saved.ranger_kit_due,
         }
     }
 }
@@ -443,6 +452,7 @@ impl ClassChoice {
         self.class = Some(class);
         self.changed_at = now;
         self.free_change = false;
+        self.ranger_kit_due = class == HunterClass::Ranger;
         Ok(price)
     }
 
@@ -579,6 +589,7 @@ mod tests {
             changed_at: 100,
             free_change: true,
             evolved: false,
+            ranger_kit_due: false,
         };
         let mut won = Won::zero();
         assert_eq!(
@@ -586,6 +597,28 @@ mod tests {
             Ok(0)
         );
         assert!(!choice.free_change);
+    }
+
+    #[test]
+    fn picking_the_ranger_owes_the_starter_kit_once() {
+        let mut choice = ClassChoice::default();
+        let mut won = Won::zero();
+        assert_eq!(
+            choice.choose(HunterClass::Ranger, HunterRank::D, 100, &mut won),
+            Ok(0)
+        );
+        assert!(choice.ranger_kit_due);
+        let later = 100 + CHANGE_COOLDOWN_SECONDS;
+        won.credit(CHANGE_PRICE);
+        assert_eq!(
+            choice.choose(HunterClass::Fighter, HunterRank::D, later, &mut won),
+            Ok(CHANGE_PRICE)
+        );
+        assert!(!choice.ranger_kit_due);
+        // An old save without the field owes nothing.
+        let old: ClassChoice =
+            serde_json::from_str(r#"{"class":"ranger","changed_at":500}"#).expect("old save");
+        assert!(!old.ranger_kit_due);
     }
 
     #[test]

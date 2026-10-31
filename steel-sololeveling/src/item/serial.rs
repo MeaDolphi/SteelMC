@@ -218,6 +218,22 @@ pub enum SerialId {
     SupremeHunterAxe,
     /// Common Mage staff sold by the city merchant.
     ApprenticeStaff,
+    /// Common starter bow sold by the city merchant.
+    HunterBow,
+    /// Common starter crossbow sold by the city merchant.
+    HunterCrossbow,
+    /// Improved starter-line bow.
+    ImprovedHunterBow,
+    /// Improved starter-line crossbow.
+    ImprovedHunterCrossbow,
+    /// Elite starter-line bow.
+    EliteHunterBow,
+    /// Elite starter-line crossbow.
+    EliteHunterCrossbow,
+    /// Supreme starter-line bow.
+    SupremeHunterBow,
+    /// Supreme starter-line crossbow.
+    SupremeHunterCrossbow,
 }
 
 pub(crate) mod tiered;
@@ -392,6 +408,14 @@ impl SerialId {
             Self::SupremeHunterDagger => "supreme_hunter_dagger",
             Self::SupremeHunterAxe => "supreme_hunter_axe",
             Self::ApprenticeStaff => "apprentice_staff",
+            Self::HunterBow => "hunter_bow",
+            Self::HunterCrossbow => "hunter_crossbow",
+            Self::ImprovedHunterBow => "improved_hunter_bow",
+            Self::ImprovedHunterCrossbow => "improved_hunter_crossbow",
+            Self::EliteHunterBow => "elite_hunter_bow",
+            Self::EliteHunterCrossbow => "elite_hunter_crossbow",
+            Self::SupremeHunterBow => "supreme_hunter_bow",
+            Self::SupremeHunterCrossbow => "supreme_hunter_crossbow",
         }
     }
 
@@ -488,6 +512,14 @@ impl SerialId {
             Self::SupremeHunterDagger => &tiered::SUPREME_HUNTER_DAGGER,
             Self::SupremeHunterAxe => &tiered::SUPREME_HUNTER_AXE,
             Self::ApprenticeStaff => &APPRENTICE_STAFF,
+            Self::HunterBow => &HUNTER_BOW,
+            Self::HunterCrossbow => &HUNTER_CROSSBOW,
+            Self::ImprovedHunterBow => &IMPROVED_HUNTER_BOW,
+            Self::ImprovedHunterCrossbow => &IMPROVED_HUNTER_CROSSBOW,
+            Self::EliteHunterBow => &tiered::ELITE_HUNTER_BOW,
+            Self::EliteHunterCrossbow => &tiered::ELITE_HUNTER_CROSSBOW,
+            Self::SupremeHunterBow => &tiered::SUPREME_HUNTER_BOW,
+            Self::SupremeHunterCrossbow => &tiered::SUPREME_HUNTER_CROSSBOW,
         }
     }
 
@@ -572,6 +604,14 @@ impl SerialId {
             None => match self {
                 Self::HunterShield => return None,
                 Self::HunterPickaxe => ItemKind::Pickaxe,
+                Self::HunterBow
+                | Self::HunterCrossbow
+                | Self::ImprovedHunterBow
+                | Self::ImprovedHunterCrossbow
+                | Self::EliteHunterBow
+                | Self::EliteHunterCrossbow
+                | Self::SupremeHunterBow
+                | Self::SupremeHunterCrossbow => ItemKind::Bow,
                 _ if self.spell_gear().is_some() => ItemKind::Staff,
                 _ => ItemKind::Melee,
             },
@@ -657,7 +697,7 @@ pub const IMPROVED_HEAVY_STRENGTH: u32 = 20;
 
 /// Improved serial gear made to order from dungeon materials: four pieces
 /// per armor line in [`ArmorLine::ALL`] order, then the weapons.
-pub const IMPROVED: [SerialId; 19] = [
+pub const IMPROVED: [SerialId; 21] = [
     SerialId::ImprovedLightHelmet,
     SerialId::ImprovedLightChestplate,
     SerialId::ImprovedLightLeggings,
@@ -677,6 +717,8 @@ pub const IMPROVED: [SerialId; 19] = [
     SerialId::ImprovedHunterSword,
     SerialId::ImprovedHunterDagger,
     SerialId::ImprovedHunterAxe,
+    SerialId::ImprovedHunterBow,
+    SerialId::ImprovedHunterCrossbow,
 ];
 
 /// Specialization armor sold by the city merchant, four pieces per line.
@@ -732,8 +774,11 @@ pub const STARTER_OUTFIT: [SerialId; 6] = [
 /// Mage serial items sold by the city merchant.
 pub const MAGE_SHOP: [SerialId; 1] = [SerialId::ApprenticeStaff];
 
+/// Ranged starter-line weapons always sold by the city merchant.
+pub const WEAPON_SHOP: [SerialId; 2] = [SerialId::HunterBow, SerialId::HunterCrossbow];
+
 /// Every serial item.
-pub const ALL: [SerialId; 83] = {
+pub const ALL: [SerialId; 91] = {
     let all = [
         SerialId::HunterSword,
         SerialId::HunterDagger,
@@ -818,6 +863,14 @@ pub const ALL: [SerialId; 83] = {
         SerialId::SupremeHunterDagger,
         SerialId::SupremeHunterAxe,
         SerialId::ApprenticeStaff,
+        SerialId::HunterBow,
+        SerialId::HunterCrossbow,
+        SerialId::ImprovedHunterBow,
+        SerialId::ImprovedHunterCrossbow,
+        SerialId::EliteHunterBow,
+        SerialId::EliteHunterCrossbow,
+        SerialId::SupremeHunterBow,
+        SerialId::SupremeHunterCrossbow,
     ];
     // Const assertions are not stable for enum array lengths, so keep the
     // literal size in sync with the actual item count manually.
@@ -1030,8 +1083,15 @@ static IMPROVED_ROBE_BOOTS_MODIFIERS: [Modifier; 1] = armor_modifier(1.0, FEET);
 static IMPROVED_HUNTER_SWORD_MODIFIERS: [Modifier; 2] = weapon_modifiers(6.0, 1.6);
 static IMPROVED_HUNTER_DAGGER_MODIFIERS: [Modifier; 2] = weapon_modifiers(4.0, 2.4);
 static IMPROVED_HUNTER_AXE_MODIFIERS: [Modifier; 2] = weapon_modifiers(9.0, 0.9);
+static IMPROVED_HUNTER_BOW_MODIFIERS: [Modifier; 2] = weapon_modifiers(6.0, 1.6);
+static IMPROVED_HUNTER_CROSSBOW_MODIFIERS: [Modifier; 2] = weapon_modifiers(9.0, 0.9);
 
 static APPRENTICE_STAFF_MODIFIERS: [Modifier; 2] = weapon_modifiers(1.0, 1.2);
+
+// Ranged starter numbers mirror the melee table: the bow follows the sword
+// line, the crossbow the heavy axe line.
+static HUNTER_BOW_MODIFIERS: [Modifier; 2] = weapon_modifiers(5.0, 1.6);
+static HUNTER_CROSSBOW_MODIFIERS: [Modifier; 2] = weapon_modifiers(8.0, 0.9);
 
 static HUNTER_SWORD: Serial = Serial {
     id: SerialId::HunterSword,
@@ -1483,6 +1543,26 @@ static IMPROVED_HUNTER_AXE: Serial = Serial {
     line: None,
     spell_gear: None,
 };
+static IMPROVED_HUNTER_BOW: Serial = Serial {
+    id: SerialId::ImprovedHunterBow,
+    name: "Охотничий лук II",
+    category: Category::Weapon,
+    holder: &vanilla_items::BOW,
+    modifiers: &IMPROVED_HUNTER_BOW_MODIFIERS,
+    gear_kind: None,
+    line: None,
+    spell_gear: None,
+};
+static IMPROVED_HUNTER_CROSSBOW: Serial = Serial {
+    id: SerialId::ImprovedHunterCrossbow,
+    name: "Арбалет охотника II",
+    category: Category::Weapon,
+    holder: &vanilla_items::CROSSBOW,
+    modifiers: &IMPROVED_HUNTER_CROSSBOW_MODIFIERS,
+    gear_kind: None,
+    line: None,
+    spell_gear: None,
+};
 
 static APPRENTICE_STAFF: Serial = Serial {
     id: SerialId::ApprenticeStaff,
@@ -1506,6 +1586,27 @@ static APPRENTICE_STAFF: Serial = Serial {
         burning: false,
         free_meditation: false,
     }),
+};
+
+static HUNTER_BOW: Serial = Serial {
+    id: SerialId::HunterBow,
+    name: "Охотничий лук",
+    category: Category::Weapon,
+    holder: &vanilla_items::BOW,
+    modifiers: &HUNTER_BOW_MODIFIERS,
+    gear_kind: None,
+    line: None,
+    spell_gear: None,
+};
+static HUNTER_CROSSBOW: Serial = Serial {
+    id: SerialId::HunterCrossbow,
+    name: "Арбалет охотника",
+    category: Category::Weapon,
+    holder: &vanilla_items::CROSSBOW,
+    modifiers: &HUNTER_CROSSBOW_MODIFIERS,
+    gear_kind: None,
+    line: None,
+    spell_gear: None,
 };
 
 /// Builds the item stack of one serial item.
@@ -1897,13 +1998,69 @@ mod tests {
                 .map(|modifier| modifier.amount)
                 .unwrap_or(0.0)
         }
-        for index in 16..19 {
+        for index in 16..21 {
             let improved = damage(IMPROVED[index]);
             let elite = damage(tiered::ELITE[index]);
             let supreme = damage(tiered::SUPREME[index]);
             assert!(improved < elite, "index {index}");
             assert!(elite < supreme, "index {index}");
         }
+    }
+
+    #[test]
+    fn ranged_serials_use_bow_holders_and_enchant_as_bows() {
+        init_vanilla_registry();
+        for id in [
+            SerialId::HunterBow,
+            SerialId::ImprovedHunterBow,
+            SerialId::EliteHunterBow,
+            SerialId::SupremeHunterBow,
+            SerialId::HunterCrossbow,
+            SerialId::ImprovedHunterCrossbow,
+            SerialId::EliteHunterCrossbow,
+            SerialId::SupremeHunterCrossbow,
+        ] {
+            assert_eq!(id.enchant_kind(), Some(ItemKind::Bow), "{id:?}");
+            assert!(id.gear_kind().is_none(), "{id:?} is held, not worn");
+            assert_eq!(id.line(), None, "{id:?} is no armor line");
+            let stack = stack(id, None);
+            assert_eq!(of(&stack), Some(id));
+        }
+    }
+
+    #[test]
+    fn a_bow_enchants_like_a_weapon_and_keeps_its_enchantments() {
+        init_vanilla_registry();
+        let owner = Uuid::new_v4();
+        // Both enchantments are attribute effects, so each adds one modifier.
+        let applied = [Enchantment::Frail, Enchantment::Sluggish];
+        for id in [SerialId::HunterBow, SerialId::SupremeHunterCrossbow] {
+            let stack = enchanted_stack(id, Some(owner), &applied);
+            assert_eq!(of(&stack), Some(id));
+            assert_eq!(binding::bound_owner(&stack), Some(owner));
+            assert_eq!(enchantments_of(&stack), applied);
+            let modifiers = stack.get(ATTRIBUTE_MODIFIERS).expect("modifiers");
+            assert_eq!(
+                modifiers.modifiers.len(),
+                id.serial().modifiers.len() + applied.len()
+            );
+            assert!(
+                modifiers
+                    .modifiers
+                    .iter()
+                    .all(|modifier| modifier.slot == ATTACK)
+            );
+        }
+    }
+
+    #[test]
+    fn bow_powers_and_drawbacks_fit_the_bow_kind() {
+        assert!(Enchantment::Fury.fits(ItemKind::Bow));
+        assert!(Enchantment::Hunter.fits(ItemKind::Bow));
+        assert!(Enchantment::Sluggish.fits(ItemKind::Bow));
+        assert!(!Enchantment::Sharpness.fits(ItemKind::Bow));
+        assert!(!Enchantment::Lifesteal.fits(ItemKind::Bow));
+        assert!(!Enchantment::Spellpower.fits(ItemKind::Bow));
     }
 
     #[test]

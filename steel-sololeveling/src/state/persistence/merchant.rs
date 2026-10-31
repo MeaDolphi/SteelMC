@@ -13,7 +13,7 @@ use text_components::TextComponent;
 use uuid::Uuid;
 
 use super::{Request, account, stage_inventory_item};
-use crate::item::{nbt, serial};
+use crate::item::nbt;
 use crate::merchant::{self, MerchantOffer, Showcase};
 use crate::merchant_menu::MerchantMenuKind;
 use crate::rank::HunterRank;
@@ -44,7 +44,7 @@ impl MerchantError {
         match self {
             Self::Expired => "Витрина обновилась; выберите товар заново.",
             Self::AlreadyBought => "Это предложение уже куплено.",
-            Self::RankTooLow => "Броню специализаций продают охотникам с ранга D.",
+            Self::RankTooLow => "Этот товар продают охотникам более высокого ранга.",
             Self::InsufficientWon => "Недостаточно Won.",
             Self::Busy => "Предыдущая операция ещё обрабатывается.",
             Self::Storage => "Данные охотника сейчас недоступны для записи.",
@@ -165,7 +165,7 @@ impl SoloLevelingState {
         if offer.showcase == Showcase::Personal {
             snapshot.merchant.mark(offer.period, offer.index);
         }
-        let item = serial::stack(offer.item, None);
+        let item = offer.item.stack();
         let mut stored = false;
         if stage_inventory_item(&mut reservation, item.clone()).is_err() {
             match nbt::encode(&item) {
@@ -220,7 +220,7 @@ impl SoloLevelingState {
                             session.economic_busy = false;
                         });
                         SystemSound::Reward.play(&completion_player);
-                        let name = offer.item.serial().name;
+                        let name = offer.item.display_name();
                         completion_player.send_message(&TextComponent::plain(if stored {
                             format!("Куплено: {name}. Инвентарь полон — товар в Хранилище.")
                         } else {

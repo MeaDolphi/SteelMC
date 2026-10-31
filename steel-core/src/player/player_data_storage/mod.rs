@@ -60,7 +60,60 @@ pub struct PlayerDataStorage {
     backend: PlayerDataStorageBackend,
     transactions: Option<FileTransactions>,
     /// Serializes player snapshots, extension documents and recovery.
-    transaction_gate: AsyncMutex<FxHashMap<(String, Uuid), u64>>,
+    transaction_gate: AsyncMutex<TransactionGate>,
+}
+
+/// Upper bound for the per-player snapshot-order guard map, so long-running
+/// servers do not accumulate an entry for every player ever seen.
+const MAX_TRACKED_SAVE_ORDERS: usize = 4096;
+
+/// Latest accepted snapshot order per player, with an LRU touch sequence so
+/// players who stopped saving can be evicted without guarding recent writers.
+#[derive(Default)]
+struct TransactionGate {
+    orders: FxHashMap<(String, Uuid), TrackedSaveOrder>,
+    touch_sequence: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrackedSaveOrder {
+    order: u64,
+    touched: u64,
+}
+
+impl TransactionGate {
+    fn tracked_order(&self, key: &(String, Uuid)) -> Option<u64> {
+        self.orders.get(key).map(|tracked| tracked.order)
+    }
+
+    fn accepts(&self, key: &(String, Uuid), order: u64) -> bool {
+        self.tracked_order(key)
+            .is_none_or(|tracked| tracked <= order)
+    }
+
+    fn track(&mut self, key: (String, Uuid), order: u64) {
+        self.touch_sequence = self.touch_sequence.wrapping_add(1);
+        if !self.orders.contains_key(&key) && self.orders.len() >= MAX_TRACKED_SAVE_ORDERS {
+            // Evict the least recently saved player; a stale delayed write for
+            // them can be accepted once, but never beats their next snapshot,
+            // whose order always exceeds the evicted one.
+            if let Some(oldest) = self
+                .orders
+                .iter()
+                .min_by_key(|(_, tracked)| tracked.touched)
+                .map(|(key, _)| key.clone())
+            {
+                self.orders.remove(&oldest);
+            }
+        }
+        self.orders.insert(
+            key,
+            TrackedSaveOrder {
+                order,
+                touched: self.touch_sequence,
+            },
+        );
+    }
 }
 
 enum PlayerDataStorageBackend {
@@ -175,7 +228,7 @@ impl PlayerDataStorage {
             Ok(Self {
                 backend: PlayerDataStorageBackend::Sqlite(backend),
                 transactions: None,
-                transaction_gate: AsyncMutex::new(FxHashMap::default()),
+                transaction_gate: AsyncMutex::new(TransactionGate::default()),
             })
         } else {
             Err(io::Error::new(
@@ -204,7 +257,7 @@ impl PlayerDataStorage {
         Ok(Self {
             backend,
             transactions: Some(transactions),
-            transaction_gate: AsyncMutex::new(FxHashMap::default()),
+            transaction_gate: AsyncMutex::new(TransactionGate::default()),
         })
     }
 
@@ -214,7 +267,7 @@ impl PlayerDataStorage {
         Self {
             backend: PlayerDataStorageBackend::Memory(MemoryPlayerDataStorage::default()),
             transactions: None,
-            transaction_gate: AsyncMutex::new(FxHashMap::default()),
+            transaction_gate: AsyncMutex::new(TransactionGate::default()),
         }
     }
 
@@ -251,13 +304,10 @@ impl PlayerDataStorage {
                 "inventory transaction has not finished",
             ));
         }
-        let mut orders = self.transaction_gate.lock().await;
+        let mut gate = self.transaction_gate.lock().await;
         self.recover_transaction().await?;
         let key = (domain.to_owned(), uuid);
-        if orders
-            .get(&key)
-            .is_some_and(|order| *order > data.save_order)
-        {
+        if !gate.accepts(&key, data.save_order) {
             return Ok(());
         }
         match &self.backend {
@@ -272,7 +322,7 @@ impl PlayerDataStorage {
                 storage.save_domain_data(domain, uuid, data).await
             }
         }?;
-        orders.insert(key, data.save_order);
+        gate.track(key, data.save_order);
         Ok(())
     }
 
@@ -315,6 +365,29 @@ impl PlayerDataStorage {
         }
     }
 
+    /// Republishes the last committed backup of one gameplay document over its
+    /// current bytes, returning the restored bytes.
+    ///
+    /// Gameplay owners call this when the current document no longer decodes,
+    /// so a corrupted document does not keep refusing admission. Backends
+    /// without per-document backups return `Ok(None)`.
+    pub async fn restore_extension_backup(&self, key: &Identifier) -> io::Result<Option<Vec<u8>>> {
+        transaction::validate_key(key)?;
+        let _guard = self.transaction_gate.lock().await;
+        self.recover_transaction().await?;
+        match &self.backend {
+            PlayerDataStorageBackend::File(_) => {
+                let Some(transactions) = &self.transactions else {
+                    return Err(io::Error::other(
+                        "player storage transaction backend is unavailable",
+                    ));
+                };
+                transactions.restore_extension_backup(key).await
+            }
+            PlayerDataStorageBackend::Memory(_) | PlayerDataStorageBackend::Sqlite(_) => Ok(None),
+        }
+    }
+
     /// Publishes vanilla after-images and opaque gameplay documents together.
     ///
     /// A returned commit, including uncertain durability, is not a rejection:
@@ -324,7 +397,7 @@ impl PlayerDataStorage {
         &self,
         transaction: &PlayerStorageTransaction,
     ) -> io::Result<TransactionCommit> {
-        let mut orders = self.transaction_gate.lock().await;
+        let mut gate = self.transaction_gate.lock().await;
         self.recover_transaction().await?;
         let mut players = FxHashSet::default();
         let mut extensions = FxHashSet::default();
@@ -343,10 +416,7 @@ impl PlayerDataStorage {
                     "duplicate transaction player",
                 ));
             }
-            if orders
-                .get(&key)
-                .is_some_and(|order| *order > player.data.save_order)
-            {
+            if !gate.accepts(&key, player.data.save_order) {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "stale player snapshot",
@@ -379,7 +449,7 @@ impl PlayerDataStorage {
             }
         };
         for player in &transaction.players {
-            orders.insert((player.domain.clone(), player.uuid), player.data.save_order);
+            gate.track((player.domain.clone(), player.uuid), player.data.save_order);
         }
         Ok(outcome)
     }

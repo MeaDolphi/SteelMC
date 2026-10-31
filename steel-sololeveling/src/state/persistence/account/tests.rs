@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use steel_core::{
     config::StorageSelection,
     player::player_data_storage::{
-        PlayerDataStorage as CoreStorage, transaction::TransactionCommit,
+        PlayerDataStorage as CoreStorage,
+        transaction::{ExtensionStorageWrite, PlayerStorageTransaction, TransactionCommit},
     },
 };
 use steel_utils::Identifier;
@@ -369,6 +370,134 @@ fn won_updates_and_progress_updates_share_one_commit() {
     assert_eq!(
         state.with_session_mut(recipient, |session| session.won.amount()),
         Some(30)
+    );
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn a_conflict_commit_keeps_the_account_writable() {
+    let (state, directory) = state("account-conflict");
+    let uuid = Uuid::new_v4();
+    begin(&state, uuid, 0);
+    let reward = HunterReward {
+        experience: 40,
+        system_points: 8,
+    };
+    let prepared = PreparedCommit::rewards(&state, vec![(uuid, reward)]).expect("prepared");
+    let report = prepared.complete(
+        &state,
+        &Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "gameplay document changed",
+        )),
+    );
+    assert!(!report.committed);
+    assert!(
+        !state.persistence.lock().failed.contains(&uuid),
+        "a transient concurrency conflict must not fence the account"
+    );
+    assert!(
+        state.save_session(uuid).is_ok(),
+        "later saves for the account stay accepted"
+    );
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[tokio::test]
+async fn corrupt_account_document_is_restored_from_its_backup() {
+    let directory =
+        env::temp_dir().join(format!("sololeveling-account-restore-{}", Uuid::new_v4()));
+    let selection = StorageSelection {
+        kind: Identifier::from_steel("disk"),
+        config: None,
+    };
+    let storage = CoreStorage::from_selection(directory.join("database"), &selection)
+        .await
+        .expect("storage");
+    let uuid = Uuid::new_v4();
+    let mut account = SoloLevelingPlayerData::new(uuid);
+    account.won = Won::zero();
+    account.won.credit(100);
+    let first = serde_json::to_vec(&account).expect("encode first generation");
+    storage
+        .commit_transaction(&PlayerStorageTransaction {
+            players: Vec::new(),
+            extensions: vec![ExtensionStorageWrite {
+                key: super::key(uuid),
+                expected: None,
+                replacement: first.clone(),
+            }],
+        })
+        .await
+        .expect("commit first generation");
+    account.won.credit(50);
+    let second = serde_json::to_vec(&account).expect("encode second generation");
+    storage
+        .commit_transaction(&PlayerStorageTransaction {
+            players: Vec::new(),
+            extensions: vec![ExtensionStorageWrite {
+                key: super::key(uuid),
+                expected: Some(first.clone()),
+                replacement: second,
+            }],
+        })
+        .await
+        .expect("commit second generation");
+
+    let document = directory.join(format!(
+        "database/global/extensions/sololeveling/players/{uuid}.document"
+    ));
+    fs::write(&document, b"not json").expect("corrupt the published document");
+
+    let legacy = PlayerDataStorage::new(directory.join("legacy"));
+    let loaded = load_account(&storage, legacy, uuid)
+        .await
+        .expect("corrupt account restores from its backup");
+    assert_eq!(
+        serde_json::to_vec(&loaded.data).expect("re-encode"),
+        first,
+        "the previous committed generation is recovered"
+    );
+    assert_eq!(loaded.bytes, Some(first));
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[tokio::test]
+async fn corrupt_account_document_without_backup_reports_the_damage() {
+    let directory =
+        env::temp_dir().join(format!("sololeveling-account-corrupt-{}", Uuid::new_v4()));
+    let selection = StorageSelection {
+        kind: Identifier::from_steel("disk"),
+        config: None,
+    };
+    let storage = CoreStorage::from_selection(directory.join("database"), &selection)
+        .await
+        .expect("storage");
+    let uuid = Uuid::new_v4();
+    storage
+        .commit_transaction(&PlayerStorageTransaction {
+            players: Vec::new(),
+            extensions: vec![ExtensionStorageWrite {
+                key: super::key(uuid),
+                expected: None,
+                replacement: b"{}".to_vec(),
+            }],
+        })
+        .await
+        .expect("commit first generation");
+    let document = directory.join(format!(
+        "database/global/extensions/sololeveling/players/{uuid}.document"
+    ));
+    fs::write(&document, b"not json").expect("corrupt the published document");
+
+    let legacy = PlayerDataStorage::new(directory.join("legacy"));
+    let error = load_account(&storage, legacy, uuid)
+        .await
+        .err()
+        .expect("an unrecoverable account read names the damage");
+    assert!(
+        error.to_string().contains("no committed backup"),
+        "unexpected error: {error}"
     );
     fs::remove_dir_all(directory).expect("cleanup");
 }

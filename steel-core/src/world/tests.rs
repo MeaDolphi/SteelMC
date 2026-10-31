@@ -14,7 +14,9 @@ use uuid::Uuid;
 
 use crate::behavior::init_behaviors;
 use crate::chunk::chunk_ticket_manager::ChunkTicketLevel;
-use crate::entity::{EntityBase, LivingEntity as _, entities::PigEntity};
+use crate::entity::{
+    EntityBase, EntityOwnership, EntityVisibility, LivingEntity as _, entities::PigEntity,
+};
 use crate::player::ResetReason;
 use crate::test_support::{
     TestPlayerBuilder, fresh_test_world, insert_ready_full_chunk, test_world,
@@ -756,4 +758,118 @@ fn fluid_clip_height_treats_source_and_flowing_variants_as_same_fluid_above() {
     );
 
     assert_eq!(height.to_bits(), 1.0_f64.to_bits());
+}
+
+#[test]
+fn tracker_update_player_despawns_entities_left_far_outside_the_view() {
+    init_vanilla_registry();
+    let world_fixture = fresh_test_world("tracker_far_outside_view_despawn");
+    let world = &world_fixture.world;
+    let player = TestPlayerBuilder::new(Arc::clone(world), "Teleporter", 1).build();
+    assert!(player.try_set_position(DVec3::new(8.0, 64.0, 8.0)).is_ok());
+
+    let nearby = TrackerTestEntity::shared(2);
+    nearby.base().set_position_local(DVec3::new(8.0, 64.0, 8.0));
+    let far = TrackerTestEntity::shared(3);
+    far.base()
+        .set_position_local(DVec3::new(10_000.0, 64.0, 0.0));
+    world
+        .entity_tracker()
+        .add(&nearby, |_| Vec::new(), |_| None);
+    world.entity_tracker().add(&far, |_| Vec::new(), |_| None);
+
+    let spawn_view = PlayerChunkView::new(ChunkPos::new(0, 0), player.view_distance());
+    world
+        .entity_tracker()
+        .update_player(&player, &spawn_view, |_| true);
+    assert_eq!(world.entity_tracker().tracking_player_ids(2), [player.id()]);
+    assert!(world.entity_tracker().tracking_player_ids(3).is_empty());
+
+    // Teleporting far away must despawn the now-distant entity through the
+    // fast-path rejection branch, while the local entity at the destination
+    // becomes visible.
+    assert!(
+        player
+            .try_set_position(DVec3::new(10_000.0, 64.0, 8.0))
+            .is_ok()
+    );
+    let teleported_view = PlayerChunkView::new(ChunkPos::new(625, 0), player.view_distance());
+    world
+        .entity_tracker()
+        .update_player(&player, &teleported_view, |_| true);
+
+    assert!(
+        world.entity_tracker().tracking_player_ids(2).is_empty(),
+        "entity left far outside the view must be despawned"
+    );
+    assert_eq!(world.entity_tracker().tracking_player_ids(3), [player.id()]);
+}
+
+#[test]
+fn empty_time_freezes_and_resumes_entity_ticking_like_vanilla() {
+    init_vanilla_registry();
+    let world_fixture = fresh_test_world("empty_time_freeze_resume");
+    let world = &world_fixture.world;
+    let chunk = ChunkPos::new(0, 0);
+    world.entity_manager.on_chunk_loaded(chunk);
+    world
+        .entity_manager
+        .update_chunk_visibility(chunk, EntityVisibility::Ticking);
+    let ticking = TrackerTestEntity::shared(2);
+    assert!(
+        world
+            .entity_manager
+            .add_live_entity(Arc::clone(&ticking), EntityOwnership::ManagerOwned)
+            .is_ok()
+    );
+
+    world.tick_game(1, true);
+    assert_eq!(ticking.tick_count(), 1);
+
+    // Vanilla ticks entities only while emptyTime stays below 300 after the
+    // per-tick increment, so 299 is the last ticking value.
+    world
+        .empty_time
+        .store(298, std::sync::atomic::Ordering::Relaxed);
+    world.tick_game(2, true);
+    assert_eq!(ticking.tick_count(), 2);
+    assert_eq!(
+        world.empty_time.load(std::sync::atomic::Ordering::Relaxed),
+        299
+    );
+
+    // The increment to 300 freezes entity ticking.
+    world.tick_game(3, true);
+    assert_eq!(
+        ticking.tick_count(),
+        2,
+        "entities stop ticking once emptyTime reaches 300"
+    );
+    assert_eq!(
+        world.empty_time.load(std::sync::atomic::Ordering::Relaxed),
+        300
+    );
+
+    // An active chunk ticket resets emptyTime and resumes ticking.
+    let ticket_owner = Uuid::from_u128(7);
+    let receipt = world
+        .chunk_map
+        .queue_test_player_ticket_add(ChunkPos::new(1000, 1000), ticket_owner);
+    advance_scheduling_until(world, || {
+        world.chunk_map.is_ticket_receipt_committed(receipt)
+    });
+
+    world.tick_game(4, true);
+    assert_eq!(
+        world.empty_time.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(ticking.tick_count(), 3);
+
+    world.chunk_map.stop_generation_refill_loop();
+    world.chunk_map.task_tracker.close();
+    world
+        .chunk_map
+        .chunk_runtime
+        .block_on(world.chunk_map.task_tracker.wait());
 }

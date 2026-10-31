@@ -12,6 +12,7 @@ use tokio::{fs, io, io::AsyncWriteExt};
 use uuid::Uuid;
 use wincode::{SchemaRead, SchemaWrite};
 
+use super::file_storage::FilePlayerDataStorage;
 use super::stats::{PlayerStatsFile, serialize_player_stats_file};
 use super::{PlayerDataFile, encode_player_file};
 use crate::player::player_data::PersistentPlayerData;
@@ -118,11 +119,39 @@ impl FileTransactions {
 
     pub(super) async fn load_extension(&self, key: &Identifier) -> io::Result<Option<Vec<u8>>> {
         let path = self.target_path(&extension_target(key))?;
+        if !FilePlayerDataStorage::recover_missing_atomic_path_locked(&path).await? {
+            return Ok(None);
+        }
         match fs::read(path).await {
             Ok(contents) => Ok(Some(contents)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    /// Republishes the last committed backup over the current document bytes.
+    ///
+    /// Gameplay owners call this when the current document no longer decodes;
+    /// the backup file itself is kept, so the restore stays repeatable until
+    /// the next committed write refreshes it.
+    pub(super) async fn restore_extension_backup(
+        &self,
+        key: &Identifier,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let path = self.target_path(&extension_target(key))?;
+        let backup = FilePlayerDataStorage::atomic_backup_path(&path);
+        let bytes = match fs::read(&backup).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let parent = parent_of(&path)?;
+        create_synced_directories(parent).await?;
+        let temp = FilePlayerDataStorage::atomic_temp_path(&path);
+        write_synced(&temp, &bytes).await?;
+        fs::rename(&temp, &path).await?;
+        sync_directory(parent).await?;
+        Ok(Some(bytes))
     }
 
     pub(super) async fn commit(
@@ -233,12 +262,9 @@ impl FileTransactions {
         self.validate_record(&record)?;
         for write in &record.writes {
             let target = self.target_path(&write.target)?;
-            let parent = parent_of(&target)?;
-            create_synced_directories(parent).await?;
-            let temp = target.with_extension("transaction-tmp");
-            write_synced(&temp, &write.contents).await?;
-            fs::rename(temp, &target).await?;
-            sync_directory(parent).await?;
+            // Replay through the same atomic publication as ordinary saves so
+            // every checkpointed target keeps its `_old` backup for recovery.
+            FilePlayerDataStorage::write_atomic_path_locked(&target, &write.contents).await?;
         }
         fs::remove_file(&path).await?;
         sync_directory(parent_of(&path)?).await

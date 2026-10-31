@@ -3,11 +3,15 @@
 //! Two showcases sell transferable, ordinary-wear copies:
 //!
 //! - the **shared** showcase is the same for every hunter and changes once an
-//!   hour. It always carries replacements of the starter kit and adds four
-//!   rotating specialization pieces;
+//!   hour. It always carries replacements of the starter kit, the starter-line
+//!   weapons (swords, axes, bows and crossbows) and the Mage staff, adds four
+//!   rotating specialization pieces, and closes with three arrow packs;
 //! - the **personal** showcase changes every twenty minutes, offers three
 //!   specialization pieces for the hunter's class at a discount, and each of
 //!   its offers can be bought once per period.
+//!
+//! The arrow packs are always the same: ordinary arrows for everyone,
+//! spectral arrows from rank C and poison-tipped arrows from rank A.
 //!
 //! Both are derived from the wall-clock period (and the hunter for the
 //! personal one), so reconnecting or restarting can never reroll them; only
@@ -19,14 +23,16 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use steel_registry::data_components::PotionContents;
 use steel_registry::item_stack::ItemStack;
+use steel_registry::{vanilla_items, vanilla_potions};
 use uuid::Uuid;
 
 use crate::class::HunterClass;
 use crate::item::artifact::{self, ArmorLine, Rarity};
 use crate::item::binding;
 use crate::item::material::{self, Material, Quality};
-use crate::item::serial::{self, MAGE_SHOP, SPECIALIZATION, STARTER, SerialId};
+use crate::item::serial::{self, MAGE_SHOP, SPECIALIZATION, STARTER, SerialId, WEAPON_SHOP};
 use crate::rank::HunterRank;
 
 /// Seconds one shared showcase stays up.
@@ -51,6 +57,126 @@ pub enum Showcase {
     Personal,
 }
 
+/// A pack of arrows sold by the shared showcase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrowPack {
+    /// Ordinary arrows, on sale from the start.
+    Arrow,
+    /// Spectral arrows, on sale from rank C.
+    Spectral,
+    /// Poison-tipped arrows, on sale from rank A.
+    Tipped,
+}
+
+/// Arrow packs always listed by the shared showcase, worst first.
+pub const ARROW_PACKS: [ArrowPack; 3] = [ArrowPack::Arrow, ArrowPack::Spectral, ArrowPack::Tipped];
+
+/// Ordinary arrows in one pack.
+pub const ARROW_PACK_COUNT: i32 = 16;
+/// Spectral arrows in one pack.
+pub const SPECTRAL_PACK_COUNT: i32 = 8;
+/// Tipped arrows in one pack.
+pub const TIPPED_PACK_COUNT: i32 = 8;
+/// Price of one ordinary arrow pack, in Won.
+pub const ARROW_PACK_PRICE: u64 = 50;
+/// Price of one spectral arrow pack, in Won.
+pub const SPECTRAL_PACK_PRICE: u64 = 200;
+/// Price of one tipped arrow pack, in Won.
+pub const TIPPED_PACK_PRICE: u64 = 450;
+
+impl ArrowPack {
+    /// Returns the Russian display name.
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Arrow => "Обычные стрелы",
+            Self::Spectral => "Спектральные стрелы",
+            Self::Tipped => "Отравленные стрелы",
+        }
+    }
+
+    /// Returns how many arrows one pack holds.
+    #[must_use]
+    pub const fn count(self) -> i32 {
+        match self {
+            Self::Arrow => ARROW_PACK_COUNT,
+            Self::Spectral => SPECTRAL_PACK_COUNT,
+            Self::Tipped => TIPPED_PACK_COUNT,
+        }
+    }
+
+    /// Returns the price of one pack in Won.
+    #[must_use]
+    pub const fn price(self) -> u64 {
+        match self {
+            Self::Arrow => ARROW_PACK_PRICE,
+            Self::Spectral => SPECTRAL_PACK_PRICE,
+            Self::Tipped => TIPPED_PACK_PRICE,
+        }
+    }
+
+    /// Returns the lowest rank that may buy this pack.
+    #[must_use]
+    pub const fn rank(self) -> HunterRank {
+        match self {
+            Self::Arrow => HunterRank::E,
+            Self::Spectral => HunterRank::C,
+            Self::Tipped => HunterRank::A,
+        }
+    }
+
+    /// Builds the stack one pack grants.
+    #[must_use]
+    pub fn stack(self) -> ItemStack {
+        match self {
+            Self::Arrow => ItemStack::with_count(&vanilla_items::ARROW, ARROW_PACK_COUNT),
+            Self::Spectral => {
+                ItemStack::with_count(&vanilla_items::SPECTRAL_ARROW, SPECTRAL_PACK_COUNT)
+            }
+            // Poison matches the vanilla default tipped arrow of this core.
+            Self::Tipped => {
+                let mut stack = PotionContents::create_item_stack(
+                    &vanilla_items::TIPPED_ARROW,
+                    &vanilla_potions::POISON,
+                );
+                stack.set_count(TIPPED_PACK_COUNT);
+                stack
+            }
+        }
+    }
+}
+
+/// What one merchant offer sells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Goods {
+    /// A transferable serial catalog item.
+    Serial(SerialId),
+    /// A pack of arrows.
+    Arrows(ArrowPack),
+}
+
+impl Goods {
+    /// Builds the stack the hunter receives.
+    #[must_use]
+    pub fn stack(self) -> ItemStack {
+        match self {
+            Self::Serial(id) => serial::stack(id, None),
+            Self::Arrows(pack) => pack.stack(),
+        }
+    }
+
+    /// Returns the Russian name used in purchase messages.
+    #[must_use]
+    pub fn display_name(self) -> String {
+        match self {
+            Self::Serial(id) => id.serial().name.to_owned(),
+            Self::Arrows(pack) => {
+                format!("{} ×{}", pack.display_name(), pack.count())
+            }
+        }
+    }
+}
+
 /// One merchant offer, as shown and as requested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MerchantOffer {
@@ -60,8 +186,8 @@ pub struct MerchantOffer {
     pub period: u64,
     /// Position in its showcase.
     pub index: usize,
-    /// The item sold.
-    pub item: SerialId,
+    /// The goods sold.
+    pub item: Goods,
     /// Price in Won.
     pub price: u64,
 }
@@ -106,12 +232,13 @@ pub const fn base_price(item: SerialId) -> Option<u64> {
         | SerialId::HunterDagger
         | SerialId::HunterAxe
         | SerialId::HunterLeggings
-        | SerialId::ApprenticeStaff => 300,
+        | SerialId::ApprenticeStaff
+        | SerialId::HunterBow => 300,
         SerialId::HunterShield
         | SerialId::HunterHelmet
         | SerialId::HunterBoots
         | SerialId::HunterPickaxe => 150,
-        SerialId::HunterChestplate => 350,
+        SerialId::HunterChestplate | SerialId::HunterCrossbow => 350,
         SerialId::LightHelmet
         | SerialId::LightBoots
         | SerialId::ReinforcedHelmet
@@ -196,22 +323,30 @@ pub const fn seconds_left(unix_seconds: u64, length: u64) -> u64 {
 }
 
 /// Returns the shared showcase of `period`: the starter replacements first,
-/// then the rotating specialization pieces.
+/// then the always-on-sale weapons and the rotating specialization pieces,
+/// then the arrow packs.
 #[must_use]
 pub fn shared_showcase(period: u64) -> Vec<MerchantOffer> {
     let rotating = pick_distinct(&SPECIALIZATION, SHARED_ROTATING, period ^ 0x5348_4152_4544);
     STARTER
         .into_iter()
         .chain(MAGE_SHOP)
+        .chain(WEAPON_SHOP)
         .chain(rotating)
+        .map(Goods::Serial)
+        .chain(ARROW_PACKS.into_iter().map(Goods::Arrows))
         .enumerate()
         .filter_map(|(index, item)| {
+            let price = match item {
+                Goods::Serial(id) => base_price(id)?,
+                Goods::Arrows(pack) => pack.price(),
+            };
             Some(MerchantOffer {
                 showcase: Showcase::Shared,
                 period,
                 index,
                 item,
-                price: base_price(item)?,
+                price,
             })
         })
         .collect()
@@ -242,7 +377,7 @@ pub fn personal_showcase(
                 showcase: Showcase::Personal,
                 period,
                 index,
-                item,
+                item: Goods::Serial(item),
                 price,
             })
         })
@@ -255,8 +390,11 @@ fn fits(line: ArmorLine, class: HunterClass) -> bool {
 
 /// Returns whether a hunter of `rank` may buy `item`.
 #[must_use]
-pub fn may_buy(item: SerialId, rank: HunterRank) -> bool {
-    item.line().is_none() || rank >= SPECIALIZATION_RANK
+pub fn may_buy(item: Goods, rank: HunterRank) -> bool {
+    match item {
+        Goods::Serial(id) => id.line().is_none() || rank >= SPECIALIZATION_RANK,
+        Goods::Arrows(pack) => rank >= pack.rank(),
+    }
 }
 
 /// Picks `count` distinct entries of `pool` from `seed`.
@@ -284,19 +422,21 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        MerchantRecord, PERSONAL_OFFERS, SHARED_ROTATING, Showcase, base_price, may_buy,
-        personal_showcase, shared_showcase,
+        ARROW_PACKS, Goods, MerchantRecord, PERSONAL_OFFERS, SHARED_ROTATING, Showcase, base_price,
+        may_buy, personal_showcase, shared_showcase,
     };
     use crate::class::HunterClass;
-    use crate::item::serial::{MAGE_SHOP, SPECIALIZATION, STARTER, SerialId};
+    use crate::item::serial::{MAGE_SHOP, SPECIALIZATION, STARTER, SerialId, WEAPON_SHOP};
     use crate::rank::HunterRank;
 
     #[test]
     fn every_sold_item_has_a_price() {
-        for item in STARTER.into_iter().chain(SPECIALIZATION) {
+        for item in STARTER.into_iter().chain(SPECIALIZATION).chain(WEAPON_SHOP) {
             assert!(base_price(item).is_some(), "{item:?}");
         }
         assert_eq!(base_price(SerialId::ImprovedHunterSword), None);
+        assert_eq!(base_price(SerialId::HunterBow), Some(300));
+        assert_eq!(base_price(SerialId::HunterCrossbow), Some(350));
     }
 
     #[test]
@@ -305,13 +445,52 @@ mod tests {
             let offers = shared_showcase(period);
             assert_eq!(
                 offers.len(),
-                STARTER.len() + MAGE_SHOP.len() + SHARED_ROTATING
+                STARTER.len()
+                    + MAGE_SHOP.len()
+                    + WEAPON_SHOP.len()
+                    + SHARED_ROTATING
+                    + ARROW_PACKS.len()
             );
-            for item in STARTER {
-                assert!(offers.iter().any(|offer| offer.item == item));
+            for item in STARTER.into_iter().chain(WEAPON_SHOP) {
+                assert!(offers.iter().any(|offer| offer.item == Goods::Serial(item)));
             }
             assert_eq!(shared_showcase(period), offers, "a period never rerolls");
         }
+    }
+
+    #[test]
+    fn arrow_packs_are_always_on_sale_and_rank_gated() {
+        let offers = shared_showcase(7);
+        for pack in ARROW_PACKS {
+            let offer = offers
+                .iter()
+                .find(|offer| offer.item == Goods::Arrows(pack))
+                .unwrap_or_else(|| panic!("{pack:?} must be on sale"));
+            assert_eq!(offer.price, pack.price());
+            assert_eq!(offer.showcase, Showcase::Shared);
+            let stack = offer.item.stack();
+            assert_eq!(stack.count, pack.count(), "{pack:?}");
+        }
+        assert!(may_buy(
+            Goods::Arrows(super::ArrowPack::Arrow),
+            HunterRank::E
+        ));
+        assert!(!may_buy(
+            Goods::Arrows(super::ArrowPack::Spectral),
+            HunterRank::D
+        ));
+        assert!(may_buy(
+            Goods::Arrows(super::ArrowPack::Spectral),
+            HunterRank::C
+        ));
+        assert!(!may_buy(
+            Goods::Arrows(super::ArrowPack::Tipped),
+            HunterRank::B
+        ));
+        assert!(may_buy(
+            Goods::Arrows(super::ArrowPack::Tipped),
+            HunterRank::A
+        ));
     }
 
     #[test]
@@ -322,13 +501,14 @@ mod tests {
             assert_eq!(offers.len(), PERSONAL_OFFERS);
             for offer in &offers {
                 assert_eq!(offer.showcase, Showcase::Personal);
+                let Goods::Serial(id) = offer.item else {
+                    panic!("personal offers are always serials");
+                };
                 assert!(
-                    offer
-                        .item
-                        .allowed_classes()
+                    id.allowed_classes()
                         .is_some_and(|classes| { classes.contains(&HunterClass::Mage) })
                 );
-                assert!(offer.price < base_price(offer.item).unwrap_or(0));
+                assert!(offer.price < base_price(id).unwrap_or(0));
             }
             assert_eq!(
                 personal_showcase(hunter, Some(HunterClass::Mage), period),
@@ -339,9 +519,16 @@ mod tests {
 
     #[test]
     fn specialization_needs_rank_d() {
-        assert!(may_buy(SerialId::HunterSword, HunterRank::E));
-        assert!(!may_buy(SerialId::LightChestplate, HunterRank::E));
-        assert!(may_buy(SerialId::LightChestplate, HunterRank::D));
+        assert!(may_buy(Goods::Serial(SerialId::HunterSword), HunterRank::E));
+        assert!(may_buy(Goods::Serial(SerialId::HunterBow), HunterRank::E));
+        assert!(!may_buy(
+            Goods::Serial(SerialId::LightChestplate),
+            HunterRank::E
+        ));
+        assert!(may_buy(
+            Goods::Serial(SerialId::LightChestplate),
+            HunterRank::D
+        ));
     }
 
     #[test]

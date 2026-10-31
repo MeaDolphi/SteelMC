@@ -7,7 +7,7 @@ mod java;
 
 pub use java::{
     BundleBuilder, JavaConnection, JavaNetworkReader, JavaNetworkWriter, JavaTransportRead,
-    JavaTransportWrite, OutboundPacket,
+    JavaTransportWrite, OUTBOUND_QUEUE_CAPACITY, OutboundPacket,
 };
 pub(crate) use java::{ScheduledPacketExecution, ScheduledPlayPacket};
 

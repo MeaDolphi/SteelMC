@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn every_crafted_item_has_one_recipe_with_essence() {
-        assert_eq!(all().len(), 57);
+        assert_eq!(all().len(), 63);
         for recipe in all() {
             let expected_essence = match recipe.output.crafted_tier() {
                 Some(CraftedTier::Improved) => 1,
@@ -207,6 +207,34 @@ mod tests {
     }
 
     #[test]
+    fn ranged_weapons_are_ordered_by_tier_like_melee() {
+        for id in [
+            SerialId::ImprovedHunterBow,
+            SerialId::ImprovedHunterCrossbow,
+            SerialId::EliteHunterBow,
+            SerialId::EliteHunterCrossbow,
+            SerialId::SupremeHunterBow,
+            SerialId::SupremeHunterCrossbow,
+        ] {
+            let made = recipe(id).expect("recipe");
+            assert_eq!(made.output, id);
+            assert_eq!(made.quality, id.crafted_tier().expect("tier").quality());
+            assert_eq!(made.rank, id.crafted_tier().expect("tier").rank());
+            assert!(
+                made.materials
+                    .iter()
+                    .any(|(material, _)| *material == Material::StableEssence)
+            );
+        }
+        let improved = recipe(SerialId::ImprovedHunterBow).expect("recipe");
+        let elite = recipe(SerialId::EliteHunterBow).expect("recipe");
+        let supreme = recipe(SerialId::SupremeHunterBow).expect("recipe");
+        assert!(improved.work < elite.work && elite.work < supreme.work);
+        assert_eq!(recipe(SerialId::HunterBow), None);
+        assert_eq!(recipe(SerialId::HunterCrossbow), None);
+    }
+
+    #[test]
     fn costs_grow_with_tier_and_piece() {
         let improved = recipe(SerialId::ImprovedHeavyChestplate).expect("recipe");
         let elite = recipe(SerialId::EliteHeavyChestplate).expect("recipe");
@@ -224,9 +252,9 @@ mod tests {
 
     #[test]
     fn tier_recipes_match_tier_arrays() {
-        assert_eq!(tier_recipes(CraftedTier::Improved).len(), 19);
-        assert_eq!(tier_recipes(CraftedTier::Elite).len(), 19);
-        assert_eq!(tier_recipes(CraftedTier::Supreme).len(), 19);
+        assert_eq!(tier_recipes(CraftedTier::Improved).len(), 21);
+        assert_eq!(tier_recipes(CraftedTier::Elite).len(), 21);
+        assert_eq!(tier_recipes(CraftedTier::Supreme).len(), 21);
         for recipe in tier_recipes(CraftedTier::Elite) {
             assert_eq!(recipe.quality, Quality::Reinforced);
             assert_eq!(recipe.rank, ELITE_RANK);

@@ -394,6 +394,13 @@ impl ChunkSchedulingCoordinator {
         ingress.record_changes(changes);
     }
 
+    /// Mirrors vanilla `ChunkMap.hasActiveTickets`: any live chunk ticket
+    /// (player, portal, ender pearl, or request lease) keeps the world active.
+    #[must_use]
+    pub(crate) fn has_active_tickets(&self) -> bool {
+        self.ticket_ingress.lock().storage.has_tickets()
+    }
+
     #[must_use]
     pub(crate) fn persistent_chunk_tickets(&self) -> PersistentChunkTickets {
         self.ticket_ingress.lock().storage.to_persistent()

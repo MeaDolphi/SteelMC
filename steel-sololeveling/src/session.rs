@@ -140,6 +140,7 @@ impl HunterSession {
                 changed_at: 0,
                 free_change: false,
                 evolved: false,
+                ranger_kit_due: false,
             },
             gear: Vec::new(),
             saved_gear: SavedGear { slots: Vec::new() },

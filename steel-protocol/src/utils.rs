@@ -7,7 +7,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use aes::cipher::{Array, BlockModeDecrypt, BlockModeEncrypt, BlockSizeUser};
+use aes::cipher::{BlockModeDecrypt, BlockSizeUser};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -142,81 +142,78 @@ impl From<io::Error> for PacketError {
     }
 }
 
-///NOTE: This makes lots of small writes; make sure there is a buffer somewhere down the line
+///NOTE: Buffered writes go through `pending` when the inner writer stalls; make sure there is a buffer somewhere down the line
 pub struct StreamEncryptor<W: AsyncWrite + Unpin> {
     cipher: Aes128Cfb8Enc,
     write: W,
-    last_unwritten_encrypted_byte: Option<u8>,
+    /// Encrypted bytes the inner writer has not accepted yet.
+    pending: Vec<u8>,
 }
 
 impl<W: AsyncWrite + Unpin> StreamEncryptor<W> {
     /// Creates a new `StreamEncryptor`.
-    pub fn new(cipher: Aes128Cfb8Enc, stream: W) -> Self {
-        debug_assert_eq!(Aes128Cfb8Enc::block_size(), 1);
+    pub const fn new(cipher: Aes128Cfb8Enc, stream: W) -> Self {
         Self {
             cipher,
             write: stream,
-            last_unwritten_encrypted_byte: None,
+            pending: Vec::new(),
         }
     }
 }
 
 impl<W: AsyncWrite + Unpin> AsyncWrite for StreamEncryptor<W> {
-    #[expect(
-        clippy::unwrap_used,
-        reason = "CFB8 block size is one byte, so each chunk fits the cipher block type"
-    )]
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let ref_self = self.get_mut();
-        let cipher = &mut ref_self.cipher;
 
-        let mut total_written = 0;
-        // Decrypt the raw data, note that our block size is 1 byte, so this is always safe
-        for block in buf.chunks(Aes128Cfb8Enc::block_size()) {
-            let mut out = [0u8];
-
-            if let Some(out_to_use) = ref_self.last_unwritten_encrypted_byte {
-                // This assumes that this `poll_write` is called on the same stream of bytes which I
-                // think is a fair assumption, since thats an invariant for the TCP stream anyway.
-
-                // This should never panic
-                out[0] = out_to_use;
-            } else {
-                // This is a stream cipher, so this value must be used
-                let out_block: &mut Array<u8, _> = (&mut out).into();
-                cipher.encrypt_block_b2b(block.try_into().unwrap(), out_block);
-            }
-
-            let write = Pin::new(&mut ref_self.write);
-            match write.poll_write(cx, &out) {
-                Poll::Pending => {
-                    ref_self.last_unwritten_encrypted_byte = Some(out[0]);
-                    if total_written == 0 {
-                        //If we didn't write anything, return pending
-                        return Poll::Pending;
-                    }
-                    // Otherwise, we actually did write something
-                    return Poll::Ready(Ok(total_written));
-                }
-                Poll::Ready(result) => {
-                    ref_self.last_unwritten_encrypted_byte = None;
-                    match result {
-                        Ok(written) => total_written += written,
-                        Err(err) => return Poll::Ready(Err(err)),
-                    }
-                }
-            }
+        if !buf.is_empty() {
+            // Encrypt the whole buffer in one pass, mirroring `StreamDecryptor::poll_read`.
+            // CFB8 feedback is strictly sequential, so encrypting here is safe even if the
+            // inner writer accepts the bytes across several polls.
+            let start = ref_self.pending.len();
+            ref_self.pending.extend_from_slice(buf);
+            ref_self.cipher.encrypt(&mut ref_self.pending[start..]);
+        }
+        if ref_self.pending.is_empty() {
+            return Poll::Ready(Ok(0));
         }
 
-        Poll::Ready(Ok(total_written))
+        // The pending buffer is handed to the inner writer as a shared slice, so take the
+        // accepted length first and then drop the written prefix.
+        let write = Pin::new(&mut ref_self.write);
+        match write.poll_write(cx, &ref_self.pending) {
+            Poll::Ready(Ok(written)) => {
+                ref_self.pending.drain(..written);
+                Poll::Ready(Ok(buf.len()))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            // `buf` was already encrypted into `pending`, so it is consumed even though the
+            // inner writer stalled; `poll_flush` drains the rest.
+            Poll::Pending => Poll::Ready(Ok(buf.len())),
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let ref_self = self.get_mut();
+        while !ref_self.pending.is_empty() {
+            let write = Pin::new(&mut ref_self.write);
+            match write.poll_write(cx, &ref_self.pending) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to flush buffered encrypted data",
+                    )));
+                }
+                Poll::Ready(Ok(written)) => {
+                    ref_self.pending.drain(..written);
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
         let write = Pin::new(&mut ref_self.write);
         write.poll_flush(cx)
     }
@@ -271,5 +268,125 @@ impl<R: AsyncRead + Unpin> AsyncRead for StreamDecryptor<R> {
         }
 
         internal_poll
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aes::cipher::KeyIvInit;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    use super::*;
+
+    fn cipher_pair() -> (Aes128Cfb8Enc, Aes128Cfb8Dec) {
+        let key = [0x5Au8; 16];
+        (
+            Aes128Cfb8Enc::new_from_slices(&key, &key).expect("test key should initialize"),
+            Aes128Cfb8Dec::new_from_slices(&key, &key).expect("test key should initialize"),
+        )
+    }
+
+    #[tokio::test]
+    async fn encryptor_write_round_trips_with_decryptor_read() {
+        let (encrypt_cipher, decrypt_cipher) = cipher_pair();
+        let (mut client_end, server_end) = duplex(64 * 1024);
+        let mut encryptor = StreamEncryptor::new(encrypt_cipher, server_end);
+
+        let plaintext: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        // Split writes exercise the carry of the CFB8 feedback across `poll_write` calls.
+        encryptor
+            .write_all(&plaintext[..137])
+            .await
+            .expect("first encrypted write should succeed");
+        encryptor
+            .write_all(&plaintext[137..])
+            .await
+            .expect("second encrypted write should succeed");
+        encryptor
+            .flush()
+            .await
+            .expect("encrypted flush should succeed");
+        drop(encryptor);
+
+        let mut encrypted = Vec::new();
+        client_end
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("encrypted bytes should be readable");
+
+        let mut decryptor = StreamDecryptor::new(decrypt_cipher, encrypted.as_slice());
+        let mut decrypted = Vec::new();
+        decryptor
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("decryption should succeed");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[tokio::test]
+    async fn encryptor_whole_buffer_write_matches_per_byte_encryption() {
+        let (encrypt_cipher, _) = cipher_pair();
+        let plaintext: Vec<u8> = (0..=255u8).cycle().take(611).collect();
+
+        let mut reference_cipher = Aes128Cfb8Enc::new_from_slices(&[0x5Au8; 16], &[0x5Au8; 16])
+            .expect("reference cipher should initialize");
+        let mut expected = plaintext.clone();
+        reference_cipher.encrypt(&mut expected);
+
+        let (mut client_end, server_end) = duplex(64 * 1024);
+        let mut encryptor = StreamEncryptor::new(encrypt_cipher, server_end);
+        encryptor
+            .write_all(&plaintext)
+            .await
+            .expect("encrypted write should succeed");
+        encryptor
+            .flush()
+            .await
+            .expect("encrypted flush should succeed");
+        drop(encryptor);
+
+        let mut encrypted = Vec::new();
+        client_end
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("encrypted bytes should be readable");
+        assert_eq!(encrypted, expected);
+    }
+
+    #[tokio::test]
+    async fn encryptor_flush_drains_bytes_a_stalled_writer_buffered() {
+        let (encrypt_cipher, decrypt_cipher) = cipher_pair();
+        // A tiny duplex forces the inner writer to accept fewer bytes than a packet holds.
+        let (mut client_end, server_end) = duplex(64);
+        let mut encryptor = StreamEncryptor::new(encrypt_cipher, server_end);
+
+        let plaintext: Vec<u8> = (0..=255u8).cycle().take(1024).collect();
+        encryptor
+            .write_all(&plaintext)
+            .await
+            .expect("write should buffer through the stalled writer");
+
+        let reader = tokio::spawn(async move {
+            let mut encrypted = Vec::new();
+            client_end
+                .read_to_end(&mut encrypted)
+                .await
+                .expect("encrypted bytes should be readable");
+            encrypted
+        });
+        encryptor
+            .flush()
+            .await
+            .expect("flush should drain the buffered encrypted bytes");
+        drop(encryptor);
+        let encrypted = reader.await.expect("reader task should finish");
+
+        let mut decryptor = StreamDecryptor::new(decrypt_cipher, encrypted.as_slice());
+        let mut decrypted = Vec::new();
+        decryptor
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("decryption should succeed");
+        assert_eq!(decrypted, plaintext);
     }
 }

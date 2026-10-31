@@ -1,6 +1,59 @@
 use super::*;
 
 #[test]
+fn tick_list_remove_swap_removes_and_keeps_positions_for_remaining_entities() {
+    let manager = WorldEntityManager::new();
+    let chunk = ChunkPos::new(0, 0);
+    load_chunk(&manager, chunk);
+
+    let first = entity(1, 1, DVec3::new(1.0, 64.0, 1.0));
+    let second = entity(2, 2, DVec3::new(2.0, 64.0, 1.0));
+    let third = entity(3, 3, DVec3::new(3.0, 64.0, 1.0));
+    for candidate in [&first, &second, &third] {
+        assert!(
+            manager
+                .add_live_entity(Arc::clone(candidate), EntityOwnership::ManagerOwned)
+                .is_ok()
+        );
+    }
+
+    // Removing the middle id swap-removes: the last id takes its slot.
+    assert!(
+        manager
+            .remove_live_entity(2, RemovalReason::Discarded)
+            .is_some()
+    );
+
+    let state = manager.state.read();
+    assert_eq!(state.tick_list.order, vec![1, 3]);
+    assert_eq!(state.tick_list.positions.len(), 2);
+    assert_eq!(state.tick_list.positions[&1], 0);
+    assert_eq!(state.tick_list.positions[&3], 1);
+    drop(state);
+
+    let snapshot_ids = manager
+        .ticking_entities_snapshot()
+        .into_iter()
+        .map(|entity| entity.id())
+        .collect::<Vec<_>>();
+    assert_eq!(snapshot_ids, vec![1, 3]);
+
+    // Removing the same id again is a no-op and does not disturb the list.
+    assert!(
+        manager
+            .remove_live_entity(2, RemovalReason::Discarded)
+            .is_none()
+    );
+    let state = manager.state.read();
+    assert_eq!(state.tick_list.order, vec![1, 3]);
+    drop(state);
+
+    manager.tick_entities(0, true);
+    assert_eq!(first.tick_count(), 1);
+    assert_eq!(third.tick_count(), 1);
+}
+
+#[test]
 fn tick_entities_skips_external_entities() {
     let manager = WorldEntityManager::new();
     let chunk = ChunkPos::new(0, 0);

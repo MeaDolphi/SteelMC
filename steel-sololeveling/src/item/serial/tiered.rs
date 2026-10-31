@@ -37,6 +37,8 @@ pub(crate) static ELITE_ROBE_BOOTS_MODIFIERS: [Modifier; 1] = armor_modifier(1.4
 pub(crate) static ELITE_HUNTER_SWORD_MODIFIERS: [Modifier; 2] = weapon_modifiers(8.4, 1.68);
 pub(crate) static ELITE_HUNTER_DAGGER_MODIFIERS: [Modifier; 2] = weapon_modifiers(5.6, 2.52);
 pub(crate) static ELITE_HUNTER_AXE_MODIFIERS: [Modifier; 2] = weapon_modifiers(12.6, 0.945);
+pub(crate) static ELITE_HUNTER_BOW_MODIFIERS: [Modifier; 2] = weapon_modifiers(8.4, 1.68);
+pub(crate) static ELITE_HUNTER_CROSSBOW_MODIFIERS: [Modifier; 2] = weapon_modifiers(12.6, 0.945);
 // Supreme armor modifiers
 pub(crate) static SUPREME_LIGHT_HELMET_MODIFIERS: [Modifier; 2] =
     light_modifiers(4.0, 0.033, HELMET);
@@ -70,6 +72,8 @@ pub(crate) static SUPREME_ROBE_BOOTS_MODIFIERS: [Modifier; 1] = armor_modifier(2
 pub(crate) static SUPREME_HUNTER_SWORD_MODIFIERS: [Modifier; 2] = weapon_modifiers(12.0, 1.76);
 pub(crate) static SUPREME_HUNTER_DAGGER_MODIFIERS: [Modifier; 2] = weapon_modifiers(8.0, 2.64);
 pub(crate) static SUPREME_HUNTER_AXE_MODIFIERS: [Modifier; 2] = weapon_modifiers(18.0, 0.99);
+pub(crate) static SUPREME_HUNTER_BOW_MODIFIERS: [Modifier; 2] = weapon_modifiers(12.0, 1.76);
+pub(crate) static SUPREME_HUNTER_CROSSBOW_MODIFIERS: [Modifier; 2] = weapon_modifiers(18.0, 0.99);
 
 // Serial statics
 
@@ -262,6 +266,26 @@ pub(crate) static ELITE_HUNTER_AXE: Serial = Serial {
     category: Category::Weapon,
     holder: &vanilla_items::IRON_AXE,
     modifiers: &ELITE_HUNTER_AXE_MODIFIERS,
+    gear_kind: None,
+    line: None,
+    spell_gear: None,
+};
+pub(crate) static ELITE_HUNTER_BOW: Serial = Serial {
+    id: SerialId::EliteHunterBow,
+    name: "Элитный лук охотника",
+    category: Category::Weapon,
+    holder: &vanilla_items::BOW,
+    modifiers: &ELITE_HUNTER_BOW_MODIFIERS,
+    gear_kind: None,
+    line: None,
+    spell_gear: None,
+};
+pub(crate) static ELITE_HUNTER_CROSSBOW: Serial = Serial {
+    id: SerialId::EliteHunterCrossbow,
+    name: "Элитный арбалет охотника",
+    category: Category::Weapon,
+    holder: &vanilla_items::CROSSBOW,
+    modifiers: &ELITE_HUNTER_CROSSBOW_MODIFIERS,
     gear_kind: None,
     line: None,
     spell_gear: None,
@@ -460,9 +484,29 @@ pub(crate) static SUPREME_HUNTER_AXE: Serial = Serial {
     line: None,
     spell_gear: None,
 };
+pub(crate) static SUPREME_HUNTER_BOW: Serial = Serial {
+    id: SerialId::SupremeHunterBow,
+    name: "Высший лук охотника",
+    category: Category::Weapon,
+    holder: &vanilla_items::BOW,
+    modifiers: &SUPREME_HUNTER_BOW_MODIFIERS,
+    gear_kind: None,
+    line: None,
+    spell_gear: None,
+};
+pub(crate) static SUPREME_HUNTER_CROSSBOW: Serial = Serial {
+    id: SerialId::SupremeHunterCrossbow,
+    name: "Высший арбалет охотника",
+    category: Category::Weapon,
+    holder: &vanilla_items::CROSSBOW,
+    modifiers: &SUPREME_HUNTER_CROSSBOW_MODIFIERS,
+    gear_kind: None,
+    line: None,
+    spell_gear: None,
+};
 
 /// Elite serial gear made to order from dungeon materials.
-pub const ELITE: [SerialId; 19] = [
+pub const ELITE: [SerialId; 21] = [
     SerialId::EliteLightHelmet,
     SerialId::EliteLightChestplate,
     SerialId::EliteLightLeggings,
@@ -482,10 +526,12 @@ pub const ELITE: [SerialId; 19] = [
     SerialId::EliteHunterSword,
     SerialId::EliteHunterDagger,
     SerialId::EliteHunterAxe,
+    SerialId::EliteHunterBow,
+    SerialId::EliteHunterCrossbow,
 ];
 
 /// Supreme serial gear made to order from dungeon materials.
-pub const SUPREME: [SerialId; 19] = [
+pub const SUPREME: [SerialId; 21] = [
     SerialId::SupremeLightHelmet,
     SerialId::SupremeLightChestplate,
     SerialId::SupremeLightLeggings,
@@ -505,4 +551,6 @@ pub const SUPREME: [SerialId; 19] = [
     SerialId::SupremeHunterSword,
     SerialId::SupremeHunterDagger,
     SerialId::SupremeHunterAxe,
+    SerialId::SupremeHunterBow,
+    SerialId::SupremeHunterCrossbow,
 ];

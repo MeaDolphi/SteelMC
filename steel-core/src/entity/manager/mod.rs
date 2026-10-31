@@ -444,28 +444,46 @@ struct ManagerState {
 #[derive(Default)]
 struct OrderedEntityIds {
     ids: Vec<i32>,
+    /// Position of each id in `ids` for O(1) removal.
+    positions: FxHashMap<i32, usize>,
 }
 
 impl OrderedEntityIds {
     fn insert(&mut self, entity_id: i32) -> bool {
-        if self.ids.contains(&entity_id) {
+        if self.positions.contains_key(&entity_id) {
             return false;
         }
+        self.positions.insert(entity_id, self.ids.len());
         self.ids.push(entity_id);
         true
     }
 
     fn remove(&mut self, entity_id: i32) -> bool {
-        let Some(index) = self.ids.iter().position(|id| *id == entity_id) else {
+        let Some(index) = self.positions.remove(&entity_id) else {
             return false;
         };
-        self.ids.remove(index);
+        // Swap-remove instead of a shifting removal: this index feeds queries
+        // whose vanilla order comes from `EntityQueryOrder` sorting, not from
+        // list order.
+        let moved = self.ids.swap_remove(index);
+        assert_eq!(moved, entity_id, "ordered entity id index desync");
+        if let Some(swapped) = self.ids.get(index)
+            && let Some(position) = self.positions.get_mut(swapped)
+        {
+            *position = index;
+        }
         true
     }
 
     fn insert_at(&mut self, index: usize, entity_id: i32) {
-        assert!(!self.ids.contains(&entity_id));
+        assert!(!self.positions.contains_key(&entity_id));
         self.ids.insert(index, entity_id);
+        for position in self.positions.values_mut() {
+            if *position >= index {
+                *position += 1;
+            }
+        }
+        self.positions.insert(entity_id, index);
     }
 
     const fn is_empty(&self) -> bool {
@@ -481,6 +499,8 @@ impl OrderedEntityIds {
 struct EntityTickList {
     active: FxHashMap<i32, SharedEntity>,
     order: Vec<i32>,
+    /// Position of each id in `order` for O(1) removal.
+    positions: FxHashMap<i32, usize>,
 }
 
 impl EntityTickList {
@@ -489,13 +509,27 @@ impl EntityTickList {
         if self.active.insert(entity_id, Arc::clone(entity)).is_some() {
             return false;
         }
+        self.positions.insert(entity_id, self.order.len());
         self.order.push(entity_id);
         true
     }
 
     fn remove(&mut self, entity_id: i32) -> Option<SharedEntity> {
         let removed = self.active.remove(&entity_id)?;
-        self.order.retain(|id| *id != entity_id);
+        let index = self
+            .positions
+            .remove(&entity_id)
+            .expect("tick list position index desync");
+        // Swap-remove keeps removal O(1); vanilla's linked tick list preserves
+        // insertion order across removals, which can only affect rare same-tick
+        // gameplay tie-breaks, never protocol output.
+        let moved = self.order.swap_remove(index);
+        assert_eq!(moved, entity_id, "tick list position index desync");
+        if let Some(swapped) = self.order.get(index)
+            && let Some(position) = self.positions.get_mut(swapped)
+        {
+            *position = index;
+        }
         Some(removed)
     }
 
@@ -1322,10 +1356,14 @@ impl WorldEntityManager {
         }
 
         if let [cell] = populated_cells.as_slice() {
-            return cell
+            // Cell lists are no longer order-stable after swap-removal, so the
+            // single-cell fast path sorts by query order like the multi-cell path.
+            let mut entries = cell
                 .iter()
                 .filter_map(|entity_id| state.live_by_id.get(entity_id))
-                .collect();
+                .collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|entry| entry.query_order());
+            return entries;
         }
 
         let mut entity_ids = FxHashSet::default();
@@ -1343,11 +1381,20 @@ impl WorldEntityManager {
     fn entity_ids_in_chunk_order(state: &ManagerState, chunk: ChunkPos) -> Vec<i32> {
         let first = PackedSectionPos::from(SectionPos::new(chunk.0.x, 0, chunk.0.y));
         let last = PackedSectionPos::from(SectionPos::new(chunk.0.x, -1, chunk.0.y));
-        state
+        let mut entity_ids = state
             .by_section
             .range(first..=last)
             .flat_map(|(_, entity_ids)| entity_ids.iter().copied())
-            .collect()
+            .collect::<Vec<_>>();
+        // Section lists are not order-stable after swap-removal; consumers need
+        // vanilla section-then-insertion order, so resolve it explicitly.
+        entity_ids.sort_unstable_by_key(|entity_id| {
+            state
+                .live_by_id
+                .get(entity_id)
+                .map(|entry| entry.query_order())
+        });
+        entity_ids
     }
 
     /// Reports saveable entities whose chunks were not part of a chunk save pass.

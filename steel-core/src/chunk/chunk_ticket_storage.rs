@@ -377,6 +377,12 @@ impl ChunkTicketStorage {
         changes
     }
 
+    /// Mirrors vanilla `ChunkMap.hasActiveTickets`: any live ticket keeps the world active.
+    #[must_use]
+    pub(crate) fn has_tickets(&self) -> bool {
+        !self.tickets.is_empty()
+    }
+
     /// Converts every active ticket whose type has Vanilla's persist flag.
     #[must_use]
     pub(crate) fn to_persistent(&self) -> PersistentChunkTickets {

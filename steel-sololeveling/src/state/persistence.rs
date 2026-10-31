@@ -76,6 +76,47 @@ const fn party_document_key() -> Identifier {
     Identifier::new_static("sololeveling", "parties")
 }
 
+/// A prepared account that is not claimed by the admission hook within this
+/// many lane ticks is dropped, so abandoned joins do not leak account data.
+const PREPARED_JOIN_TTL_TICKS: u64 = 20 * 60 * 5;
+
+/// Decodes one gameplay document, restoring the previous committed backup
+/// once when the current bytes no longer decode.
+///
+/// Returns the decoded value and, when a restore happened, the backup bytes,
+/// so callers can store them as the new document concurrency token.
+async fn decode_document_with_backup<T>(
+    server: &Server,
+    key: &Identifier,
+    label: &str,
+    bytes: &[u8],
+    decode: impl Fn(&[u8]) -> Result<T, String>,
+) -> Result<(T, Option<Vec<u8>>), String> {
+    match decode(bytes) {
+        Ok(value) => Ok((value, None)),
+        Err(error) => {
+            log::error!(
+                "sololeveling: {label} document is corrupt, trying the last committed backup: {error}"
+            );
+            match server.player_data_storage.restore_extension_backup(key).await {
+                Ok(Some(backup)) => decode(&backup)
+                    .map(|value| (value, Some(backup)))
+                    .map_err(|backup_error| {
+                        format!(
+                            "the document and its committed backup are both corrupt: {error}; backup error: {backup_error}"
+                        )
+                    }),
+                Ok(None) => Err(format!(
+                    "{error}; there is no committed backup to restore"
+                )),
+                Err(restore_error) => {
+                    Err(format!("{error}; restoring the committed backup failed: {restore_error}"))
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Request {
     Load {
@@ -183,7 +224,9 @@ pub(super) struct Persistence {
     requests: VecDeque<Request>,
     saves: FxHashSet<Uuid>,
     expected: FxHashMap<Uuid, Option<Vec<u8>>>,
-    prepared: FxHashMap<Uuid, SoloLevelingPlayerData>,
+    prepared: FxHashMap<Uuid, (SoloLevelingPlayerData, u64)>,
+    /// Lane tick counter driving the prepared-account expiry.
+    tick: u64,
     failed: FxHashSet<Uuid>,
     document_expected: FxHashMap<Identifier, Option<Vec<u8>>>,
     guild_document_failed: bool,
@@ -213,6 +256,12 @@ impl Persistence {
             )
         })
     }
+
+    /// Drops prepared accounts whose owner never finished joining.
+    fn evict_stale_prepared(&mut self) {
+        self.prepared
+            .retain(|_, (_, prepared_at)| self.tick - *prepared_at <= PREPARED_JOIN_TTL_TICKS);
+    }
 }
 
 impl SoloLevelingState {
@@ -240,21 +289,26 @@ impl SoloLevelingState {
             && server
                 .player_data_storage
                 .allows_legacy_player_data_import();
-        let registry = bytes
-            .as_deref()
-            .map_or_else(
-                || {
-                    if import_legacy {
-                        GuildRegistry::load_legacy(self.storage.base_dir())
-                    } else {
-                        Ok(GuildRegistry::empty())
-                    }
-                },
-                GuildRegistry::from_document,
-            )
-            .map_err(|error| format!("failed to decode guild registry: {error}"))?;
+        let (registry, restored) = match bytes.as_deref() {
+            Some(document) => {
+                decode_document_with_backup(server, &key, "guild registry", document, |bytes| {
+                    GuildRegistry::from_document(bytes).map_err(|error| error.to_string())
+                })
+                .await
+                .map_err(|error| format!("failed to decode guild registry: {error}"))?
+            }
+            None if import_legacy => (
+                GuildRegistry::load_legacy(self.storage.base_dir())
+                    .map_err(|error| format!("failed to decode guild registry: {error}"))?,
+                None,
+            ),
+            None => (GuildRegistry::empty(), None),
+        };
         *self.guilds.lock() = registry;
-        self.persistence.lock().document_expected.insert(key, bytes);
+        self.persistence
+            .lock()
+            .document_expected
+            .insert(key, restored.or(bytes));
         if import_legacy {
             self.queue_guild_save(None)
                 .map_err(|error| format!("failed to queue guild import: {error}"))?;
@@ -270,17 +324,25 @@ impl SoloLevelingState {
             .load_extension(&key)
             .await
             .map_err(|error| format!("failed to load gate registry: {error}"))?;
-        let snapshot = bytes
-            .as_deref()
-            .map(serde_json::from_slice::<GateRegistrySnapshot>)
-            .transpose()
-            .map_err(|error| format!("failed to decode gate registry: {error}"))?
-            .unwrap_or_default();
+        let (snapshot, restored) = match bytes.as_deref() {
+            Some(document) => {
+                decode_document_with_backup(server, &key, "gate registry", document, |bytes| {
+                    serde_json::from_slice::<GateRegistrySnapshot>(bytes)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .map_err(|error| format!("failed to decode gate registry: {error}"))?
+            }
+            None => (GateRegistrySnapshot::default(), None),
+        };
         self.dungeon_runtime
             .lock()
             .restore_gate_registry(snapshot)
             .map_err(|error| format!("failed to restore gate registry: {error}"))?;
-        self.persistence.lock().document_expected.insert(key, bytes);
+        self.persistence
+            .lock()
+            .document_expected
+            .insert(key, restored.or(bytes));
         Ok(())
     }
 
@@ -292,12 +354,24 @@ impl SoloLevelingState {
             .load_extension(&key)
             .await
             .map_err(|error| format!("failed to load island state: {error}"))?;
-        if let Some(bytes) = bytes.as_deref() {
-            let snapshot = serde_json::from_slice::<crate::island::IslandSnapshot>(bytes)
-                .map_err(|error| format!("failed to decode island state: {error}"))?;
-            self.island.lock().restore(snapshot);
-        }
-        self.persistence.lock().document_expected.insert(key, bytes);
+        let restored = match bytes.as_deref() {
+            Some(document) => {
+                let (snapshot, restored) =
+                    decode_document_with_backup(server, &key, "island state", document, |bytes| {
+                        serde_json::from_slice::<crate::island::IslandSnapshot>(bytes)
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| format!("failed to decode island state: {error}"))?;
+                self.island.lock().restore(snapshot);
+                restored
+            }
+            None => None,
+        };
+        self.persistence
+            .lock()
+            .document_expected
+            .insert(key, restored.or(bytes));
         Ok(())
     }
 
@@ -309,12 +383,24 @@ impl SoloLevelingState {
             .load_extension(&key)
             .await
             .map_err(|error| format!("failed to load party state: {error}"))?;
-        if let Some(bytes) = bytes.as_deref() {
-            let snapshot = serde_json::from_slice::<crate::party::PartyRegistrySnapshot>(bytes)
-                .map_err(|error| format!("failed to decode party state: {error}"))?;
-            self.party_runtime.lock().restore(snapshot);
-        }
-        self.persistence.lock().document_expected.insert(key, bytes);
+        let restored = match bytes.as_deref() {
+            Some(document) => {
+                let (snapshot, restored) =
+                    decode_document_with_backup(server, &key, "party state", document, |bytes| {
+                        serde_json::from_slice::<crate::party::PartyRegistrySnapshot>(bytes)
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| format!("failed to decode party state: {error}"))?;
+                self.party_runtime.lock().restore(snapshot);
+                restored
+            }
+            None => None,
+        };
+        self.persistence
+            .lock()
+            .document_expected
+            .insert(key, restored.or(bytes));
         Ok(())
     }
 
@@ -977,13 +1063,19 @@ impl SoloLevelingState {
             .await
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())?;
-        self.persistence.lock().prepared.insert(uuid, data);
+        let mut persistence = self.persistence.lock();
+        let tick = persistence.tick;
+        persistence.prepared.insert(uuid, (data, tick));
         Ok(())
     }
 
     /// Transfers prepared data to the player's tick-owned admission hook.
     pub fn take_prepared_player(&self, uuid: Uuid) -> Option<SoloLevelingPlayerData> {
-        self.persistence.lock().prepared.remove(&uuid)
+        self.persistence
+            .lock()
+            .prepared
+            .remove(&uuid)
+            .map(|(data, _)| data)
     }
 
     /// Queues a current-state save; this is not a durable acknowledgement.
@@ -1375,6 +1467,8 @@ impl SoloLevelingState {
     pub fn tick_persistence(self: &Arc<Self>, server: &Arc<Server>) {
         let request = {
             let mut persistence = self.persistence.lock();
+            persistence.tick = persistence.tick.wrapping_add(1);
+            persistence.evict_stale_prepared();
             if persistence.busy {
                 return;
             }
@@ -2214,7 +2308,7 @@ impl SoloLevelingState {
         prepared: io::Result<PreparedCommit>,
         completion: impl FnOnce(&Self, CommitReport) + Send + 'static,
     ) {
-        let prepared = match prepared {
+        let mut prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.persistence.lock().busy = false;
@@ -2233,10 +2327,11 @@ impl SoloLevelingState {
         let server_task = Arc::clone(server);
         server.jobs.spawn_io(
             async move {
-                let result = server_task
-                    .player_data_storage
-                    .commit_transaction(&prepared.transaction)
-                    .await;
+                let result = account::commit_with_conflict_retry(
+                    &server_task.player_data_storage,
+                    &mut prepared.transaction,
+                )
+                .await;
                 (prepared, result)
             },
             move |result| {
@@ -2351,8 +2446,43 @@ fn insert_stack(slots: &mut [Option<ItemStack>], item: ItemStack) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use steel_registry::{init_vanilla_registry, item_stack::ItemStack, vanilla_items};
+    use uuid::Uuid;
 
-    use super::insert_stack;
+    use super::{PREPARED_JOIN_TTL_TICKS, Persistence, insert_stack};
+    use crate::player_data::SoloLevelingPlayerData;
+
+    #[test]
+    fn stale_prepared_accounts_are_dropped_without_a_join() {
+        let mut persistence = Persistence::default();
+        let stale = Uuid::new_v4();
+        let fresh = Uuid::new_v4();
+        persistence.tick = PREPARED_JOIN_TTL_TICKS + 10;
+        persistence
+            .prepared
+            .insert(stale, (SoloLevelingPlayerData::new(stale), 5));
+        persistence.prepared.insert(
+            fresh,
+            (
+                SoloLevelingPlayerData::new(fresh),
+                persistence.tick - PREPARED_JOIN_TTL_TICKS,
+            ),
+        );
+
+        persistence.evict_stale_prepared();
+
+        assert!(
+            !persistence.prepared.contains_key(&stale),
+            "an unclaimed account older than the TTL is dropped"
+        );
+        assert!(
+            persistence.prepared.contains_key(&fresh),
+            "a recently prepared account survives"
+        );
+        assert_eq!(
+            persistence.prepared.get(&fresh).map(|(data, _)| data.uuid),
+            Some(fresh)
+        );
+    }
 
     #[test]
     fn shop_delivery_merges_matching_stacks_before_using_an_empty_slot() {

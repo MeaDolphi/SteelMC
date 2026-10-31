@@ -655,6 +655,13 @@ impl ChunkMap {
         self.scheduling.persistent_chunk_tickets()
     }
 
+    /// Returns whether any chunk ticket is active, mirroring vanilla
+    /// `ChunkMap.hasActiveTickets` for the `ServerLevel.emptyTime` gate.
+    #[must_use]
+    pub(crate) fn has_active_tickets(&self) -> bool {
+        self.scheduling.has_active_tickets()
+    }
+
     fn can_timed_ticket_expire(&self, pos: ChunkPos) -> bool {
         self.chunks
             .read_sync(&pos, |_, holder| holder.is_ready_for_saving())

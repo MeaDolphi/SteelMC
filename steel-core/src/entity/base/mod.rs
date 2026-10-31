@@ -801,7 +801,13 @@ impl EntityBase {
 
     /// Gets this entity's direct passengers, pruning stale weak references.
     pub fn passengers(&self) -> Vec<SharedEntity> {
-        self.relationships.lock().passengers()
+        let mut relationships = self.relationships.lock();
+        // Fast path: nearly all entities have no passengers, and the tracker
+        // asks on every visibility check.
+        if relationships.passengers.is_empty() {
+            return Vec::new();
+        }
+        relationships.passengers()
     }
 
     /// Gets this entity's first direct passenger, if present.

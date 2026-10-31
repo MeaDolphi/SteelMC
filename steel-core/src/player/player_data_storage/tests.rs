@@ -825,3 +825,29 @@ async fn in_memory_permission_subjects_round_trip() {
         subjects
     );
 }
+
+#[test]
+fn transaction_gate_evicts_least_recently_saved_players() {
+    let mut gate = TransactionGate::default();
+    let key = |n: u64| ("lobby".to_owned(), Uuid::from_u128(u128::from(n)));
+    for n in 0..MAX_TRACKED_SAVE_ORDERS as u64 {
+        gate.track(key(n), n);
+    }
+    assert_eq!(gate.orders.len(), MAX_TRACKED_SAVE_ORDERS);
+    // A saved-again player refreshes its guard instead of evicting anyone.
+    gate.track(key(0), MAX_TRACKED_SAVE_ORDERS as u64);
+    assert_eq!(gate.orders.len(), MAX_TRACKED_SAVE_ORDERS);
+    assert_eq!(
+        gate.tracked_order(&key(0)),
+        Some(MAX_TRACKED_SAVE_ORDERS as u64)
+    );
+    assert!(gate.tracked_order(&key(1)).is_some());
+
+    gate.track(
+        key(MAX_TRACKED_SAVE_ORDERS as u64),
+        MAX_TRACKED_SAVE_ORDERS as u64,
+    );
+    assert_eq!(gate.orders.len(), MAX_TRACKED_SAVE_ORDERS);
+    assert_eq!(gate.tracked_order(&key(1)), None, "oldest guard is evicted");
+    assert!(gate.tracked_order(&key(0)).is_some());
+}

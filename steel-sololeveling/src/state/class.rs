@@ -4,17 +4,25 @@ use std::mem;
 
 use steel_core::entity::damage::DamageSource;
 use steel_core::entity::{Entity as _, LivingEntity};
+use steel_core::inventory::container::Container as _;
 use steel_core::player::Player;
+use steel_core::player::player_inventory::Prediction;
+use steel_registry::item_stack::ItemStack;
 use steel_registry::vanilla_damage_type_tags::DamageTypeTag;
+use steel_registry::vanilla_items;
+use text_components::format::Color;
 use uuid::Uuid;
 
 use super::SoloLevelingState;
 use crate::abilities;
-use crate::class::{self, ClassError, HunterClass};
+use crate::class::{self, ClassError, HunterClass, RANGER_STARTER_ARROWS};
 use crate::gear;
-use crate::item::serial;
+use crate::item::binding;
+use crate::item::enchantment::ItemKind;
+use crate::item::serial::{self, SerialId};
 use crate::quest_book::Goal;
 use crate::rank::HunterRank;
+use crate::ui;
 
 /// Returns whether `source` is magic: artifact storms and potion-style damage.
 fn is_magic(source: &DamageSource) -> bool {
@@ -234,8 +242,49 @@ impl SoloLevelingState {
         if heal > 0.0 {
             let _ = self.heal_hunter(player, heal);
         }
+        self.give_ranger_kit(player);
         self.tick_mana(player);
         self.tick_enchantments(player);
         self.tick_quests(player);
+    }
+
+    /// Hands a newly chosen Ranger their bound starter bow and arrows.
+    ///
+    /// Mirrors the Mage grimoire: the pick only owes the kit, the player tick
+    /// delivers it once the inventory is free of transactions.
+    fn give_ranger_kit(&self, player: &Player) {
+        let uuid = player.gameprofile.id();
+        let due = self
+            .with_session_mut(uuid, |session| {
+                session.class.class == Some(HunterClass::Ranger) && session.class.ranger_kit_due
+            })
+            .unwrap_or(false);
+        if !due || player.inventory_transaction_active() {
+            return;
+        }
+        let has_bow = {
+            let inventory = player.inventory.lock();
+            (0..inventory.get_container_size()).any(|slot| {
+                serial::of(inventory.get_item(slot))
+                    .is_some_and(|id| id.enchant_kind() == Some(ItemKind::Bow))
+            })
+        };
+        if !has_bow {
+            player.add_item_or_drop(
+                serial::stack(SerialId::HunterBow, Some(uuid)),
+                Prediction::ServerOnly,
+            );
+            let arrows = binding::bound(
+                ItemStack::with_count(&vanilla_items::ARROW, RANGER_STARTER_ARROWS),
+                uuid,
+            );
+            player.add_item_or_drop(arrows, Prediction::ServerOnly);
+            ui::tell(
+                player,
+                "Получен стартовый набор Стрелка: лук и стрелы.",
+                Color::LightPurple,
+            );
+        }
+        self.with_session_mut(uuid, |session| session.class.ranger_kit_due = false);
     }
 }

@@ -33,7 +33,7 @@ use text_components::resolving::TextResolutor;
 use text_components::{Modifier, TextComponent, format::Color};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter};
 use tokio::select;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, error::TryRecvError};
+use tokio::sync::mpsc::{Receiver, Sender, error::TryRecvError, error::TrySendError};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
@@ -52,6 +52,15 @@ pub type JavaNetworkWriter =
     Arc<AsyncMutex<Option<TCPNetworkEncoder<BufWriter<JavaTransportWrite>>>>>;
 
 const DISCONNECT_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Maximum number of packets queued for one client before the connection is treated as stalled.
+///
+/// Vanilla writes on the event loop and relies on channel writability, so a dead client only
+/// blocks its own writes; Steel's game threads must never block on a client socket. The bounded
+/// queue is the backpressure point instead: it comfortably fits a full chunk resend (a 32-chunk
+/// view distance is ~4.2k chunk packets), and exceeding it means the client stopped draining the
+/// socket, at which point the connection is closed like vanilla's pending-task overflow.
+pub const OUTBOUND_QUEUE_CAPACITY: usize = 16 * 1024;
 
 /// Outbound packet queue message for Java connections.
 pub enum OutboundPacket {
@@ -407,11 +416,12 @@ struct KeepAliveTracker {
 
 /// A connection to a Java client.
 pub struct JavaConnection {
-    outgoing_packets: UnboundedSender<OutboundPacket>,
+    outgoing_packets: Sender<OutboundPacket>,
     cancel_token: CancellationToken,
     compression: Option<CompressionInfo>,
     network_writer: JavaNetworkWriter,
     id: u64,
+    unknown_packet_count: SyncMutex<u32>,
 
     session: Arc<PlayerSession>,
     keep_alive_tracker: SyncMutex<KeepAliveTracker>,
@@ -421,7 +431,7 @@ pub struct JavaConnection {
 impl JavaConnection {
     /// Creates a new `JavaConnection`.
     pub const fn new(
-        outgoing_packets: UnboundedSender<OutboundPacket>,
+        outgoing_packets: Sender<OutboundPacket>,
         cancel_token: CancellationToken,
         compression: Option<CompressionInfo>,
         network_writer: JavaNetworkWriter,
@@ -434,6 +444,7 @@ impl JavaConnection {
             compression,
             network_writer,
             id,
+            unknown_packet_count: SyncMutex::new(0),
             session,
             keep_alive_tracker: SyncMutex::new(KeepAliveTracker {
                 alive_time: 0,
@@ -488,12 +499,14 @@ impl JavaConnection {
             .expect("System time before UNIX EPOCH")
             .as_millis() as u64;
 
-        if now - tracker.alive_time >= 15000 {
+        if now.saturating_sub(tracker.alive_time) >= 15_000 {
             if tracker.alive_pending {
                 self.disconnect(translations::DISCONNECT_TIMEOUT.msg());
             } else {
                 tracker.alive_pending = true;
-                tracker.alive_id = now;
+                // Vanilla reuses the current millis as the challenge; a random one stops
+                // clients from answering keep-alives they never received.
+                tracker.alive_id = rand::random();
                 tracker.alive_time = now;
                 self.send_packet(CKeepAlive::new(tracker.alive_id as i64));
             }
@@ -547,9 +560,11 @@ impl JavaConnection {
                 return;
             }
         };
+        // A full queue means the client stopped draining the socket; the socket closes
+        // without a reason packet in that case.
         if self
             .outgoing_packets
-            .send(OutboundPacket::Disconnect(packet))
+            .try_send(OutboundPacket::Disconnect(packet))
             .is_err()
         {
             self.close();
@@ -558,35 +573,34 @@ impl JavaConnection {
         self.close();
     }
 
+    /// Queues a packet for sending, closing the connection if the client stopped draining it.
+    fn queue_outbound(&self, packet: OutboundPacket) {
+        match self.outgoing_packets.try_send(packet) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                log::warn!(
+                    "Outbound queue full for client {}; disconnecting stalled connection",
+                    self.id
+                );
+                self.close();
+            }
+            Err(TrySendError::Closed(_)) => self.close(),
+        }
+    }
+
     /// Sends a packet to the client.
     ///
     /// # Panics
     /// - If the packet fails to be encoded.
-    /// - If the packet fails to be sent through the channel.
     pub fn send_packet<P: ClientPacket>(&self, packet: P) {
         let packet = EncodedPacket::from_bare(packet, self.compression, ConnectionProtocol::Play)
             .expect("Failed to encode packet");
-        if self
-            .outgoing_packets
-            .send(OutboundPacket::Packet(packet))
-            .is_err()
-        {
-            self.close();
-        }
+        self.queue_outbound(OutboundPacket::Packet(packet));
     }
 
     /// Sends an encoded packet to the client.
-    ///
-    /// # Panics
-    /// - If the packet fails to be sent through the channel.
     pub fn send_encoded_packet(&self, packet: EncodedPacket) {
-        if self
-            .outgoing_packets
-            .send(OutboundPacket::Packet(packet))
-            .is_err()
-        {
-            self.close();
-        }
+        self.queue_outbound(OutboundPacket::Packet(packet));
     }
 
     /// Closes the connection.
@@ -839,7 +853,18 @@ impl JavaConnection {
                     .lock()
                     .on_chunk_batch_received_by_client(packet.desired_chunks_per_tick);
             }
-            ImmediatePlayPacket::Unknown(id) => log::info!("play packet id {id} is not known"),
+            ImmediatePlayPacket::Unknown(id) => {
+                log::debug!("play packet id {id} is not known");
+                let mut unknown_count = self.unknown_packet_count.lock();
+                *unknown_count += 1;
+                if (*unknown_count).is_multiple_of(64) {
+                    log::info!(
+                        "client {} sent {} packets with unknown play ids (latest: {id})",
+                        self.id,
+                        *unknown_count
+                    );
+                }
+            }
         }
     }
 
@@ -856,8 +881,14 @@ impl JavaConnection {
                             if let Some(player) = self.session.current_player()
                                 && let Err(err) = self.process_packet(packet, player, &server) {
                                 log::warn!(
-                                    "Failed to get packet from client {}: {err}",
+                                    "Failed to process packet from client {}: {err}",
                                     self.id
+                                );
+                                // Mirrors vanilla `Connection.exceptionCaught`: a packet that
+                                // fails to parse or handle disconnects instead of being skipped.
+                                self.disconnect(
+                                    translations::DISCONNECT_GENERIC_REASON
+                                        .message([format!("Internal Exception: {err}")]),
                                 );
                             }
                         }
@@ -873,7 +904,7 @@ impl JavaConnection {
 
     /// Sends packets to the client.
     ///
-    pub async fn sender(&self, mut sender_recv: UnboundedReceiver<OutboundPacket>) {
+    pub async fn sender(&self, mut sender_recv: Receiver<OutboundPacket>) {
         let disconnect_packet = loop {
             select! {
                 biased;
@@ -921,9 +952,7 @@ impl JavaConnection {
         self.finish_disconnect(disconnect_packet).await;
     }
 
-    fn take_queued_disconnect(
-        sender_recv: &mut UnboundedReceiver<OutboundPacket>,
-    ) -> Option<EncodedPacket> {
+    fn take_queued_disconnect(sender_recv: &mut Receiver<OutboundPacket>) -> Option<EncodedPacket> {
         let mut disconnect_packet = None;
         loop {
             match sender_recv.try_recv() {
@@ -990,25 +1019,32 @@ impl NetworkConnection for JavaConnection {
 
 #[cfg(test)]
 mod tests {
-    use std::array;
+    use std::{array, slice};
 
     use crate::{
+        config::ResolvedDomainConfig,
         entity::{Entity as _, LivingEntity as _},
-        test_support::{TestPlayerBuilder, fresh_test_world},
+        permission::PermissionSubjectIndex,
+        server::test_server_with_worlds_and_config,
+        test_support::{TestConnection, TestPlayerBuilder, fresh_test_world, test_runtime_config},
     };
     use rustc_hash::FxHashMap;
+    use steel_protocol::packet_reader::TCPNetworkDecoder;
     use steel_protocol::packets::common::{ChatVisibility, HumanoidArm, ParticleStatus};
     use steel_protocol::packets::game::{ClickType, ClientCommandAction, HashedStack};
     use steel_registry::{blocks::properties::Direction, item_stack::ItemStack};
     use steel_utils::{BlockPos, codec::VarInt, types::SignTextSlot};
     use tokio::{
-        io::{AsyncReadExt as _, duplex},
+        io::{AsyncReadExt as _, AsyncWriteExt as _, duplex},
+        runtime::Builder,
         sync::mpsc,
         task,
+        time::timeout,
     };
     use uuid::Uuid;
 
     use super::*;
+    use crate::player::{ClientInformation, GameProfile, PlayerConnection};
 
     fn decode(packet: RawPacket) -> DecodedPlayPacket {
         let Ok(decoded) = JavaConnection::decode_play_packet(packet) else {
@@ -1412,7 +1448,7 @@ mod tests {
         let network_writer: JavaNetworkWriter = Arc::new(AsyncMutex::new(Some(
             TCPNetworkEncoder::new(BufWriter::new(transport)),
         )));
-        let (outgoing_packets, outgoing_receiver) = mpsc::unbounded_channel();
+        let (outgoing_packets, outgoing_receiver) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
         let cancel_token = CancellationToken::new();
         let connection = Arc::new(JavaConnection::new(
             outgoing_packets,
@@ -1445,5 +1481,106 @@ mod tests {
         let Ok(()) = sender.await else {
             panic!("sender task should finish after cancellation");
         };
+    }
+
+    #[test]
+    fn full_outbound_queue_disconnects_stalled_client() {
+        // Capacity 1 with no draining sender task: the second packet overflows the queue.
+        let (outgoing_packets, _receiver) = mpsc::channel(1);
+        let connection = JavaConnection::new(
+            outgoing_packets,
+            CancellationToken::new(),
+            None,
+            Arc::new(AsyncMutex::new(None)),
+            1,
+            Arc::new(PlayerSession::new(10, 10)),
+        );
+
+        connection.send_packet(CKeepAlive::new(1));
+        assert!(!connection.closed());
+
+        connection.send_packet(CKeepAlive::new(2));
+        assert!(connection.closed());
+    }
+
+    #[test]
+    fn malformed_play_packet_disconnects_like_vanilla_exception_caught() {
+        let world_fixture = fresh_test_world("play_decode_error_disconnect");
+        let world = Arc::clone(&world_fixture.world);
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should initialize");
+
+        runtime.block_on(async {
+            let domain = ResolvedDomainConfig {
+                name: world.domain().to_owned(),
+                default_world: world.key.clone(),
+                worlds: vec![world.key.clone()],
+            };
+            let server = test_server_with_worlds_and_config(
+                domain.name.clone(),
+                slice::from_ref(&domain),
+                slice::from_ref(&world),
+                PermissionSubjectIndex::new(),
+                test_runtime_config(1),
+            )
+            .await
+            .expect("test server should initialize");
+
+            let session = Arc::new(PlayerSession::new(10, 10));
+            let (outgoing_packets, mut outgoing_receiver) = mpsc::channel(4);
+            let connection = Arc::new(JavaConnection::new(
+                outgoing_packets,
+                CancellationToken::new(),
+                None,
+                Arc::new(AsyncMutex::new(None)),
+                7,
+                Arc::clone(&session),
+            ));
+            let player = Arc::new(Player::new(
+                GameProfile::new(Uuid::from_u128(1), "DecodeErrTester".to_owned(), Vec::new())
+                    .expect("valid test profile"),
+                Arc::new(PlayerConnection::Other(Box::new(TestConnection::default()))),
+                Arc::clone(&session),
+                world,
+                Arc::downgrade(&server),
+                Arc::clone(&server.config),
+                1,
+                ClientInformation::default(),
+            ));
+            assert!(session.bind_initial_player(&player));
+
+            let (mut client_end, server_end) = duplex(1024);
+            let reader: JavaNetworkReader =
+                TCPNetworkDecoder::new(BufReader::new(Box::new(server_end) as JavaTransportRead));
+            let listener = task::spawn({
+                let connection = Arc::clone(&connection);
+                let server = Arc::clone(&server);
+                async move { connection.listener(reader, server).await }
+            });
+
+            // A keep-alive frame with a truncated (empty) payload fails to decode.
+            client_end
+                .write_all(&[0x01, play::S_KEEP_ALIVE as u8])
+                .await
+                .expect("malformed frame should be written");
+
+            timeout(Duration::from_secs(5), connection.wait_for_close())
+                .await
+                .expect("decode error should close the connection");
+            listener.await.expect("listener task should finish");
+
+            let mut disconnect_packet = None;
+            while let Ok(outbound) = outgoing_receiver.try_recv() {
+                if let OutboundPacket::Disconnect(packet) = outbound {
+                    disconnect_packet = Some(packet);
+                }
+            }
+            assert!(
+                disconnect_packet.is_some(),
+                "decode error should queue a disconnect packet"
+            );
+        });
     }
 }

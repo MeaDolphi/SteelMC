@@ -17,7 +17,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    player::connection::{JavaConnection, JavaNetworkWriter, NetworkConnection, OutboundPacket},
+    player::connection::{
+        JavaConnection, JavaNetworkWriter, NetworkConnection, OUTBOUND_QUEUE_CAPACITY,
+        OutboundPacket,
+    },
     player::{ClientInformation, GameProfile, Player, PlayerConnection, PlayerSession},
     server::DuplicatePlayerWaitError,
     world::World,
@@ -31,10 +34,10 @@ fn java_test_player(
     uuid: Uuid,
 ) -> (
     Arc<Player>,
-    mpsc::UnboundedReceiver<OutboundPacket>,
+    mpsc::Receiver<OutboundPacket>,
     JavaNetworkWriter,
 ) {
-    let (outgoing_packets, receiver) = mpsc::unbounded_channel();
+    let (outgoing_packets, receiver) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
     let cancel_token = CancellationToken::new();
     let network_writer = Arc::new(AsyncMutex::new(None));
     let session = Arc::new(PlayerSession::new(10, 10));

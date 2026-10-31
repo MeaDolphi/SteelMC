@@ -129,22 +129,66 @@ impl SoloLevelingState {
 }
 
 /// Returns the boss data for the Smiling God at `rank`.
+///
+/// The temple key can drop from a clear of any gate, so the boss sits only
+/// slightly above a regular gate boss of the hunter's rank — unlike Igris,
+/// who stays deliberately harsh regardless of rank.
 #[must_use]
 pub fn smiling_god_boss(rank: HunterRank) -> DungeonBoss {
     let gear = BossGear::for_rank(rank);
-    let damage_multiplier = 5.0;
+    // A notch above `boss_for_gate` of the same rank.
+    let (health_multiplier, damage_multiplier, armor, armor_toughness) = match rank {
+        HunterRank::E => (10.0, 2.4, 3.0, 1.0),
+        HunterRank::D => (12.0, 2.8, 4.0, 2.0),
+        HunterRank::C => (16.0, 3.2, 5.0, 3.0),
+        HunterRank::B => (21.0, 3.8, 6.0, 4.0),
+        HunterRank::A => (27.0, 4.4, 7.0, 6.0),
+        HunterRank::S => (36.0, 5.2, 9.0, 8.0),
+    };
     DungeonBoss {
         kind: BossKind::Warlord,
         scale: 1.8,
-        health_multiplier: 35.0,
+        health_multiplier,
         damage_multiplier,
         speed_multiplier: 0.9,
         power: ZOMBIE_ATTACK_DAMAGE * damage_multiplier,
-        armor: 8.0,
-        armor_toughness: 6.0,
+        armor,
+        armor_toughness,
         knockback_resistance: 0.7,
         attack_knockback: 1.2,
         gear,
         abilities: BossKind::Warlord.abilities(rank),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::smiling_god_boss;
+    use crate::dungeon::boss::{BossKind, boss_for_gate};
+    use crate::rank::HunterRank;
+
+    #[test]
+    fn smiling_god_scales_monotonically_with_rank() {
+        let ranks = [
+            HunterRank::E,
+            HunterRank::D,
+            HunterRank::C,
+            HunterRank::B,
+            HunterRank::A,
+            HunterRank::S,
+        ];
+        let mut previous_health = 0.0;
+        let mut previous_damage = 0.0;
+        for rank in ranks {
+            let boss = smiling_god_boss(rank);
+            assert!(boss.health_multiplier > previous_health, "{rank:?}");
+            assert!(boss.damage_multiplier > previous_damage, "{rank:?}");
+            previous_health = boss.health_multiplier;
+            previous_damage = boss.damage_multiplier;
+            // A step above a regular gate boss of the same rank.
+            let gate = boss_for_gate(BossKind::Warlord, rank, false);
+            assert!(boss.health_multiplier > gate.health_multiplier, "{rank:?}");
+            assert!(boss.damage_multiplier > gate.damage_multiplier, "{rank:?}");
+        }
     }
 }

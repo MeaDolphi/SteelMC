@@ -383,3 +383,112 @@ async fn a_relative_save_root_is_created_under_the_working_directory() {
     );
     fs::remove_dir_all(root).await.expect("cleanup");
 }
+
+async fn commit_document(
+    storage: &PlayerDataStorage,
+    path: &'static str,
+    expected: Option<&[u8]>,
+    replacement: &[u8],
+) {
+    storage
+        .commit_transaction(&PlayerStorageTransaction {
+            players: vec![],
+            extensions: vec![document(path, expected, replacement)],
+        })
+        .await
+        .expect("commit");
+}
+
+fn extension_file(root: &Path, path: &'static str) -> PathBuf {
+    FileTransactions::new(root.to_path_buf())
+        .target_path(&extension_target(&Identifier::new("test", path)))
+        .expect("target path")
+}
+
+#[tokio::test]
+async fn corrupted_extension_document_is_restored_from_its_backup() {
+    let root = directory();
+    let storage = PlayerDataStorage::on_disk(root.clone())
+        .await
+        .expect("storage");
+    commit_document(&storage, "account", None, b"first").await;
+    commit_document(&storage, "account", Some(b"first"), b"second").await;
+    let key = Identifier::new("test", "account");
+    assert_eq!(
+        storage.load_extension(&key).await.expect("load"),
+        Some(b"second".to_vec())
+    );
+
+    write_synced(&extension_file(&root, "account"), b"garbage")
+        .await
+        .expect("corrupt the published document");
+
+    let restored = storage
+        .restore_extension_backup(&key)
+        .await
+        .expect("restore");
+    assert_eq!(restored, Some(b"first".to_vec()));
+    assert_eq!(
+        storage.load_extension(&key).await.expect("load"),
+        Some(b"first".to_vec())
+    );
+    // The backup file is kept, so a repeated restore stays possible.
+    assert_eq!(
+        storage
+            .restore_extension_backup(&key)
+            .await
+            .expect("restore again"),
+        Some(b"first".to_vec())
+    );
+    fs::remove_dir_all(root).await.expect("cleanup");
+}
+
+#[tokio::test]
+async fn missing_extension_document_recovers_from_backup_on_load() {
+    let root = directory();
+    let storage = PlayerDataStorage::on_disk(root.clone())
+        .await
+        .expect("storage");
+    commit_document(&storage, "account", None, b"first").await;
+    commit_document(&storage, "account", Some(b"first"), b"second").await;
+
+    fs::remove_file(extension_file(&root, "account"))
+        .await
+        .expect("remove the published document");
+
+    assert_eq!(
+        storage
+            .load_extension(&Identifier::new("test", "account"))
+            .await
+            .expect("load"),
+        Some(b"first".to_vec())
+    );
+    fs::remove_dir_all(root).await.expect("cleanup");
+}
+
+#[tokio::test]
+async fn stale_extension_temp_is_discarded_when_the_document_exists() {
+    let root = directory();
+    let storage = PlayerDataStorage::on_disk(root.clone())
+        .await
+        .expect("storage");
+    commit_document(&storage, "account", None, b"committed").await;
+
+    let temp = FilePlayerDataStorage::atomic_temp_path(&extension_file(&root, "account"));
+    write_synced(&temp, b"uncommitted generation")
+        .await
+        .expect("stale temporary");
+
+    assert_eq!(
+        storage
+            .load_extension(&Identifier::new("test", "account"))
+            .await
+            .expect("load"),
+        Some(b"committed".to_vec())
+    );
+    assert!(
+        !fs::try_exists(&temp).await.expect("probe"),
+        "a leftover temporary must not survive a successful load"
+    );
+    fs::remove_dir_all(root).await.expect("cleanup");
+}

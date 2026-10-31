@@ -192,7 +192,13 @@ impl SoloLevelingState {
                         log::error!(
                             "sololeveling: deferred inventory commit failed for {uuid}: {result:?}"
                         );
-                        state.persistence.lock().failed.insert(uuid);
+                        let conflicted = result
+                            .as_ref()
+                            .err()
+                            .is_some_and(|error| error.kind() == io::ErrorKind::WouldBlock);
+                        if !conflicted {
+                            state.persistence.lock().failed.insert(uuid);
+                        }
                         if reopen_menu {
                             state
                                 .sessions
@@ -201,9 +207,11 @@ impl SoloLevelingState {
                         if reopen_menu {
                             state.defer_deferred_menu(uuid);
                         }
-                        completion_player.send_message(&TextComponent::plain(
-                            "Передача не сохранена; предметы не изменены.",
-                        ));
+                        completion_player.send_message(&TextComponent::plain(if conflicted {
+                            "Данные изменились; повторите попытку позже."
+                        } else {
+                            "Передача не сохранена; предметы не изменены."
+                        }));
                     }
                     state.persistence.lock().busy = false;
                 },
@@ -247,7 +255,7 @@ impl SoloLevelingState {
                 snapshot.deferred_inventory.push(nbt::encode(&item)?);
                 let deferred_inventory = snapshot.deferred_inventory.clone();
                 let replacement = serde_json::to_vec(&snapshot).map_err(io::Error::other)?;
-                let transaction = PlayerStorageTransaction {
+                let mut transaction = PlayerStorageTransaction {
                     players: Vec::new(),
                     extensions: vec![ExtensionStorageWrite {
                         key: account::key(uuid),
@@ -255,10 +263,11 @@ impl SoloLevelingState {
                         replacement: replacement.clone(),
                     }],
                 };
-                let commit = server_task
-                    .player_data_storage
-                    .commit_transaction(&transaction)
-                    .await?;
+                let commit = account::commit_with_conflict_retry(
+                    &server_task.player_data_storage,
+                    &mut transaction,
+                )
+                .await?;
                 Ok::<_, io::Error>((replacement, deferred_inventory, commit))
             },
             move |result| {

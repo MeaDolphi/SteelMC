@@ -18,7 +18,6 @@ use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
 use crate::crafting_menu;
-use crate::item::serial;
 use crate::item::{append_lore, named, with_lore};
 use crate::merchant::{
     self, MerchantOffer, MerchantRecord, PERSONAL_DISCOUNT_PERCENT, PERSONAL_PERIOD_SECONDS,
@@ -31,8 +30,11 @@ use crate::ui::{self, After};
 const MENU_SLOTS: usize = 54;
 const INFO_SLOT: usize = 4;
 const SHARED_LABEL_SLOT: usize = 9;
-/// Menu slots of the shared showcase, in showcase order.
-const SHARED_SLOTS: [usize; 14] = [10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24];
+/// Menu slots of the shared showcase, in showcase order: sixteen serial
+/// offers in three rows, then three arrow packs.
+const SHARED_SLOTS: [usize; 19] = [
+    10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 28, 29, 30, 31, 32,
+];
 const PERSONAL_LABEL_SLOT: usize = 36;
 /// Menu slots of the personal showcase, in showcase order.
 const PERSONAL_SLOTS: [usize; 3] = [38, 40, 42];
@@ -123,6 +125,7 @@ fn menu_items(view: Option<&View>) -> Vec<ItemStack> {
         ),
         vec![
             TextComponent::plain("Одна для всех охотников, меняется раз в час.").color(Color::Gray),
+            TextComponent::plain("Внизу — пачки стрел для луков и арбалетов.").color(Color::Gray),
             TextComponent::plain(format!("До обновления: {} мин.", view.shared_minutes))
                 .color(Color::Aqua),
         ],
@@ -177,19 +180,31 @@ fn offer_item(view: &View, offer: MerchantOffer) -> ItemStack {
     if offer.showcase == Showcase::Personal && view.record.bought(offer.period, offer.index) {
         return named(
             ItemStack::new(&vanilla_items::GRAY_STAINED_GLASS_PANE),
-            TextComponent::plain(format!("Куплено: {}", offer.item.serial().name))
+            TextComponent::plain(format!("Куплено: {}", offer.item.display_name()))
                 .color(Color::DarkGray),
         );
     }
     let (status, color) = if !merchant::may_buy(offer.item, view.rank) {
-        ("Продаётся охотникам с ранга D.", Color::Red)
+        match offer.item {
+            crate::merchant::Goods::Serial(item) if item.line().is_some() => {
+                ("Продаётся охотникам с ранга D.".to_owned(), Color::Red)
+            }
+            crate::merchant::Goods::Arrows(pack) => (
+                format!("Продаётся охотникам с ранга {}.", pack.rank().name()),
+                Color::Red,
+            ),
+            _ => (
+                "Продаётся охотникам более высокого ранга.".to_owned(),
+                Color::Red,
+            ),
+        }
     } else if view.won < offer.price {
-        ("Не хватает Won.", Color::Red)
+        ("Не хватает Won.".to_owned(), Color::Red)
     } else {
-        ("Клик — купить.", Color::Yellow)
+        ("Клик — купить.".to_owned(), Color::Yellow)
     };
     append_lore(
-        serial::stack(offer.item, None),
+        offer.item.stack(),
         vec![
             TextComponent::plain(format!("Цена: {} Won", offer.price)).color(Color::Gold),
             TextComponent::plain(status).color(color),
@@ -269,7 +284,7 @@ impl MenuKind for MerchantMenuKind {
             Ok(()) => player.send_message(
                 &TextComponent::plain(format!(
                     "Покупка «{}» обрабатывается.",
-                    offer.item.serial().name
+                    offer.item.display_name()
                 ))
                 .color(Color::Gold),
             ),
@@ -345,6 +360,7 @@ fn buyback_items(choices: &[(usize, ItemStack)]) -> Vec<ItemStack> {
 
 #[cfg(test)]
 mod tests {
+    use steel_registry::data_components::vanilla_components::LORE;
     use steel_registry::init_vanilla_registry;
     use uuid::Uuid;
 
@@ -384,14 +400,36 @@ mod tests {
         init_vanilla_registry();
         let mut view = sample();
         let first = view.personal[0];
+        let crate::merchant::Goods::Serial(id) = first.item else {
+            panic!("personal offers are always serials");
+        };
         assert_eq!(
             serial::of(&menu_items(Some(&view))[PERSONAL_SLOTS[0]]),
-            Some(first.item)
+            Some(id)
         );
         view.record.mark(first.period, first.index);
         assert_eq!(
             serial::of(&menu_items(Some(&view))[PERSONAL_SLOTS[0]]),
             None
         );
+    }
+
+    #[test]
+    fn arrow_packs_render_with_price_and_gate() {
+        init_vanilla_registry();
+        let view = sample();
+        let items = menu_items(Some(&view));
+        let offers: Vec<_> = view
+            .shared
+            .iter()
+            .filter(|offer| matches!(offer.item, crate::merchant::Goods::Arrows(_)))
+            .collect();
+        assert_eq!(offers.len(), crate::merchant::ARROW_PACKS.len());
+        for offer in offers {
+            let stack = &items[SHARED_SLOTS[offer.index]];
+            assert!(!stack.is_empty(), "arrow pack must render");
+            let lore = format!("{:?}", stack.get(LORE));
+            assert!(lore.contains("Цена:"), "{lore}");
+        }
     }
 }

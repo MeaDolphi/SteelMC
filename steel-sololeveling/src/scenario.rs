@@ -11,8 +11,8 @@ use std::sync::{Arc, LazyLock};
 use rustc_hash::FxHashMap;
 use steel_core::chunk::chunk_request::{ChunkRequest, ChunkTicketKind};
 use steel_core::chunk::status::ChunkStatus;
-use steel_core::entity::LivingEntity;
 use steel_core::entity::spawn_mob;
+use steel_core::entity::{LivingEntity, RemovalReason};
 use steel_core::gameplay_hooks::BlockMutationCause;
 use steel_core::player::Player;
 use steel_core::server::Server;
@@ -152,7 +152,10 @@ pub fn start(
                 return;
             };
             let Some(player) = find_player(&server, uuid) else {
-                RUNS.lock().remove(&uuid);
+                let removed = RUNS.lock().remove(&uuid);
+                if let Some(run) = removed {
+                    discard_boss(&run);
+                }
                 return;
             };
             build_arena(&instance_for_job, region, kind);
@@ -183,7 +186,10 @@ pub fn start(
                 server.queue_player_world_selection(Arc::clone(&player), &player.get_world())
             {
                 log::warn!("sololeveling: could not move hunter {uuid} into scenario: {error}");
-                RUNS.lock().remove(&uuid);
+                let removed = RUNS.lock().remove(&uuid);
+                if let Some(run) = removed {
+                    discard_boss(&run);
+                }
             }
         },
     ));
@@ -257,6 +263,7 @@ fn tick_runs(state: &SoloLevelingState, server: &Arc<Server>, tick: u64) {
     }
     for uuid in to_remove {
         if let Some(run) = runs.remove(&uuid) {
+            discard_boss(&run);
             if let Some(player) = find_player(server, uuid) {
                 return_player(server, &player, &run.source_world);
             }
@@ -277,12 +284,35 @@ pub fn on_boss_death(world: &World, entity_id: i32) {
 
 /// Drops a scenario run when its player dies.
 pub fn on_player_death(uuid: Uuid) {
-    RUNS.lock().remove(&uuid);
+    let removed = RUNS.lock().remove(&uuid);
+    if let Some(run) = removed {
+        discard_boss(&run);
+    }
 }
 
 /// Drops a scenario run when its player disconnects.
 pub fn on_disconnect(uuid: Uuid) {
-    RUNS.lock().remove(&uuid);
+    let removed = RUNS.lock().remove(&uuid);
+    if let Some(run) = removed {
+        discard_boss(&run);
+    }
+}
+
+/// Returns whether a run torn down before its boss fell still owns a live boss
+/// body that must not be left waiting in the instance world.
+const fn should_discard_boss(completed: bool, boss_id: i32) -> bool {
+    !completed && boss_id != 0
+}
+
+/// Discards the boss body of a run that ended without a kill, such as when the
+/// hunter died, disconnected, or ran out of time.
+fn discard_boss(run: &ScenarioRun) {
+    if !should_discard_boss(run.completed, run.boss_id) {
+        return;
+    }
+    if let Some(entity) = run.instance_world.get_entity_by_id(run.boss_id) {
+        entity.set_removed(RemovalReason::Discarded);
+    }
 }
 
 fn complete_run(
@@ -324,7 +354,7 @@ fn grant_scenario_experience(state: &SoloLevelingState, uuid: Uuid, rank: Hunter
         clippy::cast_possible_truncation,
         reason = "the multiplier is a small positive constant of the rank"
     )]
-    let experience = (1_000.0 * rank.rank_multiplier()) as u64;
+    let experience = (1_000.0 * rank.scenario_scale()) as u64;
     if let Some((stats, level_up)) = state.grant_experience(uuid, experience) {
         state.notify_progress(
             uuid,
@@ -377,8 +407,8 @@ fn spawn_adds(run: &ScenarioRun, player: &Player, count: usize, tick: u64) {
         let pos = center.offset(offset_x, 0, offset_z);
         if let Ok(entity) = spawn_mob(&run.instance_world, &vanilla_entities::ZOMBIE, pos) {
             if let Some(living) = entity.as_living_entity() {
-                let health = 20.0 * f64::from(run.rank.rank_multiplier());
-                let damage = 3.0 * f64::from(run.rank.rank_multiplier());
+                let health = 20.0 * f64::from(run.rank.scenario_scale());
+                let damage = 3.0 * f64::from(run.rank.scenario_scale());
                 living.set_base_attribute_value(
                     steel_registry::vanilla_attributes::MAX_HEALTH,
                     health,
@@ -504,7 +534,11 @@ impl SoloLevelingState {
 }
 
 impl HunterRank {
-    fn rank_multiplier(self) -> f32 {
+    /// Soft scenario scaling (adds health, experience) for scripted fights.
+    ///
+    /// Named apart from `organization::rank_multiplier`, the much steeper
+    /// reward multiplier, to keep the two from being confused at call sites.
+    fn scenario_scale(self) -> f32 {
         match self {
             HunterRank::E => 1.0,
             HunterRank::D => 1.25,
@@ -513,5 +547,20 @@ impl HunterRank {
             HunterRank::A => 2.5,
             HunterRank::S => 3.0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_discard_boss;
+
+    #[test]
+    fn failed_runs_discard_their_boss() {
+        // Entry refused or spawn failed before any boss existed: nothing to do.
+        assert!(!should_discard_boss(false, 0));
+        // A completed run lets the death hook clean the corpse up instead.
+        assert!(!should_discard_boss(true, 87));
+        // Death, disconnect, or timeout mid-fight must remove the boss body.
+        assert!(should_discard_boss(false, 87));
     }
 }

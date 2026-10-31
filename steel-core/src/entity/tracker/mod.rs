@@ -231,22 +231,43 @@ impl EntityTracker {
         let mut entities_to_spawn = Vec::new();
         let mut dead_entities = Vec::new();
 
+        // Chunk-space rejection bound: `view.contains` can only pass within
+        // `view_distance + 2` chunks of the view center, so farther entities are
+        // invisible. They still need the despawn path when the player is in
+        // their seen_by set (e.g. after the player teleported away), which is
+        // the only case that takes locks for them.
+        let view_reach = i64::from(player_view_distance) + 2;
+
         self.entities.iter_sync(|entity_id, tracked| {
             let entity_id = *entity_id;
+            if tracked.entity.strong_count() == 0 {
+                dead_entities.push(entity_id);
+                return true;
+            }
+
+            let chunk = tracked.registered_chunk;
+            let chunk_dx = i64::from(chunk.0.x) - i64::from(view.center.0.x);
+            let chunk_dz = i64::from(chunk.0.y) - i64::from(view.center.0.y);
+            if (chunk_dx.abs() > view_reach || chunk_dz.abs() > view_reach)
+                && !tracked.seen_by.read().contains(&player_id)
+            {
+                return true;
+            }
+
             let Some(entity) = tracked.entity.upgrade() else {
                 dead_entities.push(entity_id);
                 return true;
             };
 
-            let visible = !entity.is_removed()
-                && entity_id != player_id
-                && view.contains(tracked.registered_chunk)
-                && is_chunk_sent(tracked.registered_chunk)
+            let visible = entity_id != player_id
+                && !entity.is_removed()
+                && view.contains(chunk)
+                && is_chunk_sent(chunk)
                 && entity.broadcast_to_player(player)
-                && is_within_tracking_distance(
-                    entity.position(),
+                && is_within_player_tracking_distance(
+                    entity.as_ref(),
                     player_pos,
-                    effective_tracking_range(entity.as_ref(), tracked.tracking_range),
+                    tracked.tracking_range,
                     player_view_distance,
                 );
 
@@ -822,6 +843,26 @@ fn is_within_tracking_distance(
     let x = player_pos.x - entity_pos.x;
     let z = player_pos.z - entity_pos.z;
     x * x + z * z <= visible_radius * visible_radius
+}
+
+/// Checks the vanilla horizontal tracking predicate, only widening the entity
+/// range to the effective vehicle range when passengers can extend it.
+fn is_within_player_tracking_distance(
+    entity: &dyn Entity,
+    player_pos: DVec3,
+    base_range: EntityTrackingRange,
+    player_view_distance: u8,
+) -> bool {
+    let entity_pos = entity.position();
+    if is_within_tracking_distance(entity_pos, player_pos, base_range, player_view_distance) {
+        return true;
+    }
+    is_within_tracking_distance(
+        entity_pos,
+        player_pos,
+        effective_tracking_range(entity, base_range),
+        player_view_distance,
+    )
 }
 
 fn effective_tracking_range(

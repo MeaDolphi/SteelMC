@@ -5,7 +5,7 @@ use std::{
     path::Path,
     sync::{
         Arc, LazyLock, Weak,
-        atomic::{AtomicBool, AtomicI8, Ordering},
+        atomic::{AtomicBool, AtomicI8, AtomicI32, Ordering},
     },
     time::Duration,
 };
@@ -287,6 +287,9 @@ pub struct World {
     tick_runs_normally: AtomicBool,
     /// Whether vanilla's scheduled/chunk/block-event tick phase is active.
     handling_tick: AtomicBool,
+    /// Vanilla `ServerLevel.emptyTime`: ticks without active chunk tickets.
+    /// Entities and block entities stop ticking once it reaches 300.
+    empty_time: AtomicI32,
     /// Ordered, duplicate-suppressing server block events awaiting execution.
     block_events: SyncMutex<BlockEventQueue>,
     /// Vanilla collecting neighbor updater shared by all live block mutations.
@@ -452,6 +455,7 @@ impl World {
                 default_gamemode: AtomicI8::new(default_gamemode.into()),
                 tick_runs_normally: AtomicBool::new(true),
                 handling_tick: AtomicBool::new(false),
+                empty_time: AtomicI32::new(0),
                 block_events: SyncMutex::new(BlockEventQueue::default()),
                 neighbor_updater: CollectingNeighborUpdater::new(max_chained_neighbor_updates),
                 entity_manager: WorldEntityManager::new(),
@@ -568,7 +572,18 @@ impl World {
         // Vanilla clears this before ticking entities and block entities.
         self.handling_tick.store(false, Ordering::Relaxed);
 
-        let entity_tick = {
+        // Vanilla `ServerLevel.emptyTime`: chunk tickets from players, portals,
+        // and ender pearls keep the world active; without any, entities and
+        // block entities stop ticking after 300 ticks.
+        if self.chunk_map.has_active_tickets() {
+            self.empty_time.store(0, Ordering::Relaxed);
+        }
+        if runs_normally {
+            self.empty_time.fetch_add(1, Ordering::Relaxed);
+        }
+        let ticks_dormant_systems = self.empty_time.load(Ordering::Relaxed) < 300;
+
+        let entity_tick = if ticks_dormant_systems {
             let _span = tracing::trace_span!("entity_tick").entered();
             let start = Instant::now();
             let dirty_chunks = self
@@ -578,9 +593,11 @@ impl World {
                 self.mark_chunk_dirty(chunk);
             }
             start.elapsed()
+        } else {
+            Duration::ZERO
         };
 
-        {
+        if ticks_dormant_systems {
             let _span = tracing::trace_span!("block_entities").entered();
             let start = Instant::now();
             self.block_entity_tickers.tick(self, runs_normally);

@@ -17,7 +17,8 @@ use crossbeam::atomic::AtomicCell;
 use steel_core::player::{
     ClientInformation, PlayerConnection,
     connection::{
-        JavaNetworkReader, JavaNetworkWriter, JavaTransportRead, JavaTransportWrite, OutboundPacket,
+        JavaNetworkReader, JavaNetworkWriter, JavaTransportRead, JavaTransportWrite,
+        OUTBOUND_QUEUE_CAPACITY, OutboundPacket,
     },
 };
 use steel_core::server::Server;
@@ -51,7 +52,7 @@ use tokio::{
     sync::{
         Notify,
         broadcast::{self, Sender, error::RecvError},
-        mpsc::{self, UnboundedReceiver, UnboundedSender, error::TryRecvError},
+        mpsc::{self, Receiver, Sender as MpscSender, error::TryRecvError},
     },
     time::timeout,
 };
@@ -210,7 +211,10 @@ pub struct JavaTcpClient {
     pub cancel_token: CancellationToken,
 
     /// A queue of encoded packets to send to the network.
-    pub outgoing_queue: UnboundedSender<OutboundPacket>,
+    ///
+    /// Bounded by [`OUTBOUND_QUEUE_CAPACITY`]: a client that stops draining the socket fills the
+    /// queue instead of the server's memory, and senders drop the connection on overflow.
+    pub outgoing_queue: MpscSender<OutboundPacket>,
     /// The packet encoder for outgoing packets.
     pub network_writer: JavaNetworkWriter,
     /// Current compression settings.
@@ -244,7 +248,7 @@ impl JavaTcpClient {
         server: Arc<Server>,
         connection_session: Arc<ServerConnectionSession>,
         task_tracker: TaskTracker,
-    ) -> (Self, UnboundedReceiver<OutboundPacket>, JavaNetworkReader) {
+    ) -> (Self, Receiver<OutboundPacket>, JavaNetworkReader) {
         let (read, write) = tcp_stream.into_split();
         Self::from_transport(
             Box::new(read),
@@ -278,8 +282,8 @@ impl JavaTcpClient {
         server: Arc<Server>,
         connection_session: Arc<ServerConnectionSession>,
         task_tracker: TaskTracker,
-    ) -> (Self, UnboundedReceiver<OutboundPacket>, JavaNetworkReader) {
-        let (outgoing_queue, recv) = mpsc::unbounded_channel();
+    ) -> (Self, Receiver<OutboundPacket>, JavaNetworkReader) {
+        let (outgoing_queue, recv) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
         let (connection_updates, _) = broadcast::channel(128);
 
         let client = Self {
@@ -363,9 +367,12 @@ impl JavaTcpClient {
     }
 
     /// Queues an already encoded packet to be sent.
+    ///
+    /// # Errors
+    /// If the client stopped draining the socket and the bounded queue is full.
     pub fn send_packet(&self, packet: EncodedPacket) -> Result<(), PacketError> {
         self.outgoing_queue
-            .send(OutboundPacket::Packet(packet))
+            .try_send(OutboundPacket::Packet(packet))
             .map_err(|e| {
                 PacketError::SendError(format!(
                     "Failed to send packet to client {}: {}",
@@ -377,10 +384,7 @@ impl JavaTcpClient {
 
     /// Starts a task that will send packets to the client from the outgoing packet queue.
     /// This task will run until the client is closed or the cancellation token is cancelled.
-    pub fn start_outgoing_packet_task(
-        self: &Arc<Self>,
-        mut sender_recv: UnboundedReceiver<OutboundPacket>,
-    ) {
+    pub fn start_outgoing_packet_task(self: &Arc<Self>, mut sender_recv: Receiver<OutboundPacket>) {
         let cancel_token = self.cancel_token.clone();
         let network_writer = Arc::clone(&self.network_writer);
         let id = self.id;
@@ -479,7 +483,7 @@ impl JavaTcpClient {
 
     async fn write_queued_disconnect(
         network_writer: &JavaNetworkWriter,
-        sender_recv: &mut UnboundedReceiver<OutboundPacket>,
+        sender_recv: &mut Receiver<OutboundPacket>,
         id: u64,
     ) {
         let mut disconnect_packet = None;

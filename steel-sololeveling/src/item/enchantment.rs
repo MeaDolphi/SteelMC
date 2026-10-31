@@ -56,6 +56,8 @@ pub const fn budget(rarity: Rarity) -> i64 {
 pub enum ItemKind {
     /// Swords, daggers and axes.
     Melee,
+    /// A bow or crossbow.
+    Bow,
     /// A Mage staff.
     Staff,
     /// A pickaxe.
@@ -78,6 +80,7 @@ impl ItemKind {
     const fn bit(self) -> u16 {
         match self {
             Self::Melee => MELEE,
+            Self::Bow => BOW,
             Self::Staff => STAFF,
             Self::Pickaxe => PICKAXE,
             Self::Helmet => HELMET,
@@ -91,16 +94,17 @@ impl ItemKind {
 }
 
 const MELEE: u16 = 1;
-const STAFF: u16 = 1 << 1;
-const PICKAXE: u16 = 1 << 2;
-const HELMET: u16 = 1 << 3;
-const CHEST: u16 = 1 << 4;
-const LEGS: u16 = 1 << 5;
-const BOOTS: u16 = 1 << 6;
-const GLOVES: u16 = 1 << 7;
-const JEWELRY: u16 = 1 << 8;
+const BOW: u16 = 1 << 1;
+const STAFF: u16 = 1 << 2;
+const PICKAXE: u16 = 1 << 3;
+const HELMET: u16 = 1 << 4;
+const CHEST: u16 = 1 << 5;
+const LEGS: u16 = 1 << 6;
+const BOOTS: u16 = 1 << 7;
+const GLOVES: u16 = 1 << 8;
+const JEWELRY: u16 = 1 << 9;
 const ARMOR: u16 = HELMET | CHEST | LEGS | BOOTS | GLOVES;
-const EVERY: u16 = MELEE | STAFF | PICKAXE | ARMOR | JEWELRY;
+const EVERY: u16 = MELEE | BOW | STAFF | PICKAXE | ARMOR | JEWELRY;
 
 /// What an enchantment does once applied.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -181,15 +185,15 @@ enchantments! {
     Bloodsucker => "bloodsucker", "Кровопийца", "Заклинание разрушения лечит на 8% урона", 300, STAFF, Effect::Mechanic;
     Regeneration => "regeneration", "Регенерация", "+1 HP каждые 10 с", 200, ARMOR | JEWELRY, Effect::Mechanic;
     SecondWind => "second_wind", "Второе дыхание", "Ниже 30% здоровья: +4 HP, раз в 60 с", 250, ARMOR | JEWELRY, Effect::Mechanic;
-    Fury => "fury", "Ярость", "Ниже 50% здоровья: +15% урона", 200, MELEE | STAFF | JEWELRY, Effect::Mechanic;
+    Fury => "fury", "Ярость", "Ниже 50% здоровья: +15% урона", 200, MELEE | BOW | STAFF | JEWELRY, Effect::Mechanic;
     Evasion => "evasion", "Уклонение", "5% шанс полностью избежать удара", 300, ARMOR | JEWELRY, Effect::Mechanic;
     Reflection => "reflection", "Отражение", "10% урона ближнего боя возвращается атакующему", 200, ARMOR, Effect::Mechanic;
     Flight => "flight", "Бегство", "Получив урон: +20% скорости на 3 с, раз в 15 с", 120, ARMOR | JEWELRY, Effect::Mechanic;
-    Hunter => "hunter", "Охотник", "+10% опыта охотника за убийства", 250, MELEE | STAFF | JEWELRY, Effect::Mechanic;
-    Gatherer => "gatherer", "Добытчик", "+10% очков Системы за убийства", 250, MELEE | STAFF | JEWELRY, Effect::Mechanic;
+    Hunter => "hunter", "Охотник", "+10% опыта охотника за убийства", 250, MELEE | BOW | STAFF | JEWELRY, Effect::Mechanic;
+    Gatherer => "gatherer", "Добытчик", "+10% очков Системы за убийства", 250, MELEE | BOW | STAFF | JEWELRY, Effect::Mechanic;
     Antidote => "antidote", "Противоядие", "Иммунитет к яду и иссушению", 150, ARMOR | JEWELRY, Effect::Mechanic;
-    ManaFeed => "mana_feed", "Подпитка маны", "Удар или заклинание даёт магу +2 маны", 150, MELEE | STAFF | JEWELRY, Effect::Mechanic;
-    Focus => "focus", "Сосредоточенность", "−10% перезарядки способностей артефактов", 200, MELEE | STAFF | JEWELRY, Effect::Mechanic;
+    ManaFeed => "mana_feed", "Подпитка маны", "Удар или заклинание даёт магу +2 маны", 150, MELEE | BOW | STAFF | JEWELRY, Effect::Mechanic;
+    Focus => "focus", "Сосредоточенность", "−10% перезарядки способностей артефактов", 200, MELEE | BOW | STAFF | JEWELRY, Effect::Mechanic;
     Fortress => "fortress", "Крепость", "−5% входящего урона", 250, ARMOR | JEWELRY, Effect::Mechanic;
     // Melee weapons.
     Sharpness => "sharpness", "Острота", "+1 урона атаки", 150, MELEE, attribute(vanilla_attributes::ATTACK_DAMAGE, 1.0, false);
@@ -710,8 +714,9 @@ pub fn decode(stored: &str) -> Vec<Enchantment> {
 mod tests {
     use super::*;
 
-    const KINDS: [ItemKind; 9] = [
+    const KINDS: [ItemKind; 10] = [
         ItemKind::Melee,
+        ItemKind::Bow,
         ItemKind::Staff,
         ItemKind::Pickaxe,
         ItemKind::Helmet,

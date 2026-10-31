@@ -249,6 +249,9 @@ impl PreparedCommit {
     ) -> CommitReport {
         let committed = result.is_ok();
         let confirmed = matches!(result, Ok(TransactionCommit::Committed));
+        let conflicted = result
+            .as_ref()
+            .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock);
         {
             let mut persistence = state.persistence.lock();
             persistence.busy = false;
@@ -267,7 +270,18 @@ impl PreparedCommit {
                         .document_expected
                         .insert(document.key, Some(document.replacement));
                 }
+            } else if conflicted {
+                // A concurrency conflict after the bounded commit retries: the
+                // account stays writable and the next save reloads the stored
+                // document bytes, so this transient failure must not fence the
+                // account until restart.
+                log::error!(
+                    "sololeveling: gameplay persistence hit a concurrency conflict; the account stays writable and the next save will reload the document: {result:?}"
+                );
             } else {
+                log::error!(
+                    "sololeveling: gameplay persistence failed; account writes are disabled: {result:?}"
+                );
                 persistence.failed.extend(self.owners);
             }
         }
@@ -277,7 +291,7 @@ impl PreparedCommit {
         if committed && let Some(guild_registry) = self.guild_registry {
             *state.guilds.lock() = guild_registry;
         }
-        if !confirmed {
+        if committed && !confirmed {
             log::error!("sololeveling: gameplay persistence not confirmed: {result:?}");
         }
         CommitReport {
@@ -287,14 +301,75 @@ impl PreparedCommit {
     }
 }
 
+/// Publishes one prepared transaction, treating an optimistic-concurrency
+/// conflict as transient: the observed document bytes are reloaded from
+/// storage and the commit retried a bounded number of times before the error
+/// is returned to the caller.
+pub(super) async fn commit_with_conflict_retry(
+    storage: &CoreStorage,
+    transaction: &mut PlayerStorageTransaction,
+) -> io::Result<TransactionCommit> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut attempts = 0;
+    loop {
+        match storage.commit_transaction(transaction).await {
+            Ok(commit) => return Ok(commit),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock && attempts < MAX_ATTEMPTS => {
+                attempts += 1;
+                log::warn!(
+                    "sololeveling: gameplay document changed during commit; reloading it and retrying ({attempts}/{MAX_ATTEMPTS})"
+                );
+                for extension in &mut transaction.extensions {
+                    extension.expected = storage.load_extension(&extension.key).await?;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 pub(super) async fn load_account(
     storage: &CoreStorage,
     legacy: PlayerDataStorage,
     uuid: Uuid,
 ) -> io::Result<Loaded> {
-    if let Some(bytes) = storage.load_extension(&key(uuid)).await? {
-        let data: SoloLevelingPlayerData =
-            serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    if let Some(mut bytes) = storage.load_extension(&key(uuid)).await? {
+        let data: SoloLevelingPlayerData = match serde_json::from_slice(&bytes) {
+            Ok(data) => data,
+            Err(error) => {
+                log::error!(
+                    "sololeveling: account document for {uuid} is corrupt, trying the last committed backup: {error}"
+                );
+                let backup = storage
+                    .restore_extension_backup(&key(uuid))
+                    .await
+                    .map_err(|restore_error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "gameplay account for {uuid} is corrupt ({error}) and its backup could not be restored: {restore_error}"
+                            ),
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "gameplay account for {uuid} is corrupt ({error}) and no committed backup exists; remove the document or restore it from a save backup"
+                            ),
+                        )
+                    })?;
+                bytes = backup;
+                serde_json::from_slice(&bytes).map_err(|backup_error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "gameplay account for {uuid} and its committed backup are both corrupt: {error}; backup error: {backup_error}"
+                        ),
+                    )
+                })?
+            }
+        };
         if data.uuid != uuid {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

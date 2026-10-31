@@ -30,7 +30,7 @@ const BACK_SLOT: usize = 49;
 /// Tab slots for Improved / Elite / Supreme.
 const TAB_SLOTS: [usize; 3] = [0, 1, 2];
 /// Slots of the weapons, in catalog order after the armor.
-const WEAPON_SLOTS: [usize; 3] = [15, 24, 33];
+const WEAPON_SLOTS: [usize; 5] = [15, 24, 33, 42, 51];
 /// Main-inventory slots materials are counted in.
 const INVENTORY_SLOTS: usize = 36;
 
