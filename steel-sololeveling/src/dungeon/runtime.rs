@@ -702,8 +702,10 @@ struct InstanceRun {
     progress: RunProgress,
     /// Gate consumed by this run, removed from the world when the run ends.
     gate: Option<u64>,
-    /// Whether the hunter was already teleported to the region spawn.
-    placed: bool,
+    /// Members already teleported to the region spawn. A member is placed at
+    /// most once, on the first tick their world change into the instance
+    /// world has completed; the rest of the run never re-places anyone.
+    placed: FxHashSet<Uuid>,
     /// Set once an action was queued so the run stops ticking before it ends.
     finishing: bool,
     /// Whether the entrance is locked: no voluntary exit until the boss falls.
@@ -999,6 +1001,55 @@ struct PenaltyProgress {
 }
 
 impl InstanceRun {
+    /// Ends `member`'s participation in the run.
+    ///
+    /// Returns `true` once the last member has left: a run outlives any
+    /// single member, so one departure never ends the dungeon for the rest
+    /// of the party.
+    fn finish_member(&mut self, member: Uuid) -> bool {
+        self.members.retain(|m| *m != member);
+        self.members.is_empty()
+    }
+
+    /// Teleports one member to the region spawn and announces the entry.
+    fn place_member(&self, member: &Player) {
+        let _ = member.teleport(self.region.spawn, 0.0, 0.0);
+        member.send_message(&self.entry_announcement());
+        if self.locked {
+            member.send_message(
+                &TextComponent::plain(
+                    "Красные врата заперты. Выход откроется только после смерти босса.",
+                )
+                .color(Color::Red),
+            );
+        }
+    }
+
+    /// The entry line for a freshly placed member: the dungeon or castle
+    /// theme, or the penalty-zone warning.
+    fn entry_announcement(&self) -> TextComponent {
+        match &self.progress {
+            RunProgress::Dungeon(progress) => TextComponent::plain(format!(
+                "Подземелье: {}.",
+                progress.layout.blueprint.theme.display_name()
+            ))
+            .color(Color::DarkPurple),
+            RunProgress::Castle(progress) => TextComponent::plain(match progress.floor {
+                1 => "Замок демонов: первый этаж башни".to_owned(),
+                floor => format!("Замок демонов: этаж {floor}"),
+            })
+            .color(Color::DarkPurple),
+            RunProgress::Penalty(_) => TextComponent::plain(
+                "Штрафная зона: поднимитесь на вершину башни или продержитесь до конца отсчёта.",
+            )
+            .color(Color::Red),
+            RunProgress::Mine(_) => TextComponent::plain(
+                "Босс повержен. Подземелье открыто как шахта — добудьте кристаллы.",
+            )
+            .color(Color::Gold),
+        }
+    }
+
     /// Removes the run's live mob ids, so their entities can be discarded.
     fn take_mobs(&mut self) -> Vec<i32> {
         match &mut self.progress {
@@ -1479,7 +1530,7 @@ impl DungeonRuntime {
             return RunDeath::None;
         };
         run.hide_boss_bar(player);
-        run.members.retain(|member| *member != uuid);
+        let last = run.finish_member(uuid);
         let death = match &mut run.progress {
             RunProgress::Dungeon(progress) => {
                 progress.deaths += 1;
@@ -1494,7 +1545,7 @@ impl DungeonRuntime {
             },
             RunProgress::Mine(_) => RunDeath::None,
         };
-        if !run.members.is_empty() {
+        if !last {
             log::debug!(
                 "sololeveling: hunter {uuid} died inside an instance; {} participant(s) remain",
                 run.members.len()
@@ -1518,7 +1569,11 @@ impl DungeonRuntime {
         self.flush_spent(server);
     }
 
-    /// Releases a run whose end action was already applied.
+    /// Ends the participation of the player whose end action was applied.
+    ///
+    /// Only that member leaves the run: with a party inside, the run lives
+    /// until its last member has left, so one return never tears the dungeon
+    /// down for everyone else.
     pub fn complete_run(&mut self, player: &Player) {
         let player_uuid = player.gameprofile.id();
         let Some(run_key) = self
@@ -1528,15 +1583,24 @@ impl DungeonRuntime {
         else {
             return;
         };
+        let last = {
+            let Some(run) = self.runs.get_mut(&run_key) else {
+                return;
+            };
+            run.hide_boss_bar(player);
+            run.finish_member(player_uuid)
+        };
+        if !last {
+            return;
+        }
         let Some(run) = self.runs.remove(&run_key) else {
             return;
         };
-        run.hide_boss_bar(player);
         self.release_run(run);
     }
 
-    /// Releases the run of a hunter that is no longer online, whose client can
-    /// no longer receive a boss bar removal.
+    /// Ends the participation of a hunter that is no longer online, whose
+    /// client can no longer receive a boss bar removal.
     pub fn complete_offline_run(&mut self, player_uuid: Uuid) {
         let Some(run_key) = self
             .runs
@@ -1545,6 +1609,15 @@ impl DungeonRuntime {
         else {
             return;
         };
+        let last = {
+            let Some(run) = self.runs.get_mut(&run_key) else {
+                return;
+            };
+            run.finish_member(player_uuid)
+        };
+        if !last {
+            return;
+        }
         let Some(run) = self.runs.remove(&run_key) else {
             return;
         };
@@ -2894,7 +2967,7 @@ impl DungeonRuntime {
                 duration_ticks,
                 progress,
                 gate,
-                placed: false,
+                placed: FxHashSet::default(),
                 finishing: false,
                 locked,
             },
@@ -3525,44 +3598,16 @@ impl DungeonRuntime {
             let region = run.region;
             let source_world = run.source_world.clone();
             let members = run.members.clone();
-            if !run.placed {
-                run.placed = true;
-                let theme = match &run.progress {
-                    RunProgress::Dungeon(progress) => {
-                        Some(progress.layout.blueprint.theme.display_name().to_owned())
-                    }
-                    RunProgress::Castle(progress) => Some(match progress.floor {
-                        1 => "Замок демонов: первый этаж башни".to_owned(),
-                        floor => format!("Замок демонов: этаж {floor}"),
-                    }),
-                    RunProgress::Penalty(_) | RunProgress::Mine(_) => None,
+            let instance_key = run.instance_world.clone();
+            for member in pending_placements(&run.members, &mut run.placed, |member| {
+                players
+                    .get(member)
+                    .is_some_and(|player| player.get_world().key == instance_key)
+            }) {
+                let Some(member) = players.get(&member) else {
+                    continue;
                 };
-                for member in &run.members {
-                    if let Some(member) = players.get(member) {
-                        let _ = member.teleport(region.spawn, 0.0, 0.0);
-                        if let Some(theme) = &theme {
-                            member.send_message(
-                                &TextComponent::plain(format!("Подземелье: {theme}."))
-                                    .color(Color::DarkPurple),
-                            );
-                        } else {
-                            member.send_message(
-                                &TextComponent::plain(
-                                    "Штрафная зона: поднимитесь на вершину башни или продержитесь до конца отсчёта.",
-                                )
-                                .color(Color::Red),
-                            );
-                        }
-                        if run.locked {
-                            member.send_message(
-                                &TextComponent::plain(
-                                    "Красные врата заперты. Выход откроется только после смерти босса.",
-                                )
-                                .color(Color::Red),
-                            );
-                        }
-                    }
-                }
+                run.place_member(member);
             }
             if tick.saturating_sub(run.started_tick) >= run.duration_ticks {
                 run.finishing = true;
@@ -3818,6 +3863,28 @@ pub fn mine_share(rank: HunterRank, mined: u32, participants: usize) -> u64 {
         return 0;
     }
     u64::from(mined) * crystal::sale_price(rank) / participants as u64
+}
+
+/// Marks and returns the run members due their one-time spawn placement:
+/// they have arrived in the instance world and were not placed yet.
+///
+/// A member is placed at most once, no matter how many ticks their world
+/// change took: the set records placements per member, so a late party
+/// member lands on the region spawn exactly like the first one.
+fn pending_placements(
+    members: &[Uuid],
+    placed: &mut FxHashSet<Uuid>,
+    in_instance: impl Fn(&Uuid) -> bool,
+) -> Vec<Uuid> {
+    let mut placed_now = Vec::new();
+    for member in members {
+        if placed.contains(member) || !in_instance(member) {
+            continue;
+        }
+        placed.insert(*member);
+        placed_now.push(*member);
+    }
+    placed_now
 }
 
 /// Applies one deferred run action after the runtime lock was released.
@@ -4153,6 +4220,39 @@ mod tests {
         assert!(runtime.cancel_generating_entry(leader));
         assert!(cancelled.load(Ordering::Relaxed));
         assert!(!runtime.cancel_generating_entry(Uuid::new_v4()));
+    }
+
+    #[test]
+    fn each_member_is_placed_once_when_they_arrive_in_the_instance_world() {
+        use rustc_hash::FxHashSet;
+
+        let leader = Uuid::new_v4();
+        let member = Uuid::new_v4();
+        let members = vec![leader, member];
+        let mut placed = FxHashSet::default();
+        // Only the leader has finished the world change so far.
+        let mut arrived = FxHashSet::from_iter([leader]);
+
+        let first = super::pending_placements(&members, &mut placed, |uuid| arrived.contains(uuid));
+        assert_eq!(first, vec![leader], "the arrived leader is placed");
+
+        // A later tick does not place the leader again while the member is away.
+        assert!(
+            super::pending_placements(&members, &mut placed, |uuid| arrived.contains(uuid))
+                .is_empty(),
+            "a placed member is never placed twice"
+        );
+
+        // The member's world change completes on a later tick.
+        arrived.insert(member);
+        let second =
+            super::pending_placements(&members, &mut placed, |uuid| arrived.contains(uuid));
+        assert_eq!(
+            second,
+            vec![member],
+            "the late member is placed on their own arrival tick"
+        );
+        assert_eq!(placed.len(), 2);
     }
 
     #[test]

@@ -24,7 +24,7 @@ use crate::merchant::MerchantOffer;
 
 use std::{
     collections::VecDeque,
-    fmt, io,
+    fmt, io, mem,
     sync::{Arc, Weak},
 };
 
@@ -2461,15 +2461,20 @@ impl SoloLevelingState {
 
     /// Drains queued writes off-tick, rejecting new admissions during shutdown.
     pub async fn flush_persistence(self: Arc<Self>, server: Arc<Server>) -> Result<(), String> {
-        for uuid in self.sessions.player_ids() {
-            self.save_session(uuid).map_err(|error| error.to_string())?;
+        // Shutdown flushes twice (world save and the final drain): only the
+        // first call queues the snapshots; later calls just drive the queue.
+        let first_flush = {
+            let mut persistence = self.persistence.lock();
+            !mem::replace(&mut persistence.quiescing, true)
+        };
+        if first_flush {
+            for uuid in self.sessions.player_ids() {
+                self.save_session(uuid).map_err(|error| error.to_string())?;
+            }
+            self.queue_island_save()
+                .map_err(|error| error.to_string())?;
+            self.queue_party_save().map_err(|error| error.to_string())?;
         }
-        // Queued before quiescing: those queues refuse new work once shutdown
-        // starts, but a graceful shutdown must still write them.
-        self.queue_island_save()
-            .map_err(|error| error.to_string())?;
-        self.queue_party_save().map_err(|error| error.to_string())?;
-        self.persistence.lock().quiescing = true;
         // A graceful shutdown must not hang on a stuck write: log progress
         // and give up with an error after the deadline, letting the world
         // save proceed (the storage layer is atomic, so nothing corrupts).
