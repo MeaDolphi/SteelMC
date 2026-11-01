@@ -57,6 +57,7 @@ use super::{
 };
 use crate::castle;
 use crate::city;
+use crate::combat_reward::HunterReward;
 use crate::item::chest::{self, ChestKind};
 use crate::item::crystal;
 use crate::item::{key, material, pouch};
@@ -105,6 +106,16 @@ const MAX_LIVE_GATES: usize = 18;
 const GATE_MAX_SITE_ATTEMPTS: u8 = 12;
 /// Ticks between repeated explanations of why a gate refuses a hunter.
 const GATE_REFUSAL_INTERVAL_TICKS: u64 = 60;
+
+/// Share of an ordinary dungeon-mob kill that a Demon Castle floor mob pays
+/// in experience and system points.
+///
+/// The castle is an endless climb: its mobs funnel into one hall, waves
+/// repeat every floor, and every floor clear already pays loot and ranking
+/// progress on top, so per-kill currency runs at half rate to keep the
+/// endless farm from outpacing finite gates. Floor-clear and ranking
+/// payouts are settled separately and stay untouched.
+const CASTLE_MOB_REWARD_PERCENT: u64 = 50;
 
 /// A transition requested by the runtime when a run ends.
 ///
@@ -182,7 +193,16 @@ pub struct DungeonRuntime {
     completed_generations: Arc<SyncMutex<Vec<GenerationResult>>>,
     /// Results produced by castle floor jobs, drained by [`DungeonRuntime::tick_runs`].
     completed_floors: Arc<SyncMutex<Vec<FloorResult>>>,
-    runs: FxHashMap<Uuid, InstanceRun>,
+    /// Live runs by their unique run id, never by a player id: a run outlives
+    /// any single member (the party leaves one by one), so a leader who died
+    /// and entered new gates must not replace the run his party still fights.
+    runs: FxHashMap<RunId, InstanceRun>,
+    /// Chunk tickets keeping each run's region loaded for as long as the run
+    /// lives, stored apart from [`InstanceRun`] as the RAII lease they are
+    /// and released with the run.
+    run_tickets: FxHashMap<RunId, ChunkRequestHandle>,
+    /// Next run id; ids are handed out once and never reused.
+    next_run_id: RunId,
     /// Gate frames to tear down once a [`Server`] handle is available again.
     spent_gates: Vec<u64>,
     /// Gate frames waiting for their chunks to load before removal.
@@ -231,6 +251,8 @@ impl Debug for DungeonRuntime {
             )
             .field("completed_floors", &self.completed_floors.lock().len())
             .field("runs", &self.runs.len())
+            .field("run_tickets", &self.run_tickets.len())
+            .field("next_run_id", &self.next_run_id)
             .field("spent_gates", &self.spent_gates.len())
             .field("pending_gate_cleanup", &self.pending_gate_cleanup.len())
             .field("pending_gate_placement", &self.pending_gate_placement.len())
@@ -566,7 +588,6 @@ impl ServerJob for DungeonGenerationJob {
 
 /// Outcome of one [`CastleFloorJob`], drained by [`DungeonRuntime::tick_runs`].
 struct FloorResult {
-    leader: Uuid,
     region: InstanceRegion,
     /// Floor that was built, as the absolute floor number.
     floor: u32,
@@ -579,7 +600,6 @@ struct FloorResult {
 /// only mirrors [`DungeonGenerationJob`] so the build never happens before the
 /// columns are ready. Cancellation is cooperative via [`AtomicBool`].
 struct CastleFloorJob {
-    leader: Uuid,
     region: InstanceRegion,
     instance_world: Arc<World>,
     seed: u64,
@@ -640,7 +660,6 @@ impl ServerJob for CastleFloorJob {
                 );
                 self.request = None;
                 self.completed.lock().push(FloorResult {
-                    leader: self.leader,
                     region: self.region,
                     floor: self.floor,
                 });
@@ -683,20 +702,20 @@ impl RunStart {
     }
 }
 
+/// Unique identity of one live instance run.
+///
+/// Never a player uuid: a run outlives any single member (the party leaves
+/// one by one after a death), so keying runs by the entering leader would
+/// let his next gate entry replace the run his party is still fighting in.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+struct RunId(u64);
+
 struct InstanceRun {
     /// Members who entered this particular instance, in party join order.
     members: Vec<Uuid>,
     source_world: Identifier,
     instance_world: Identifier,
     region: InstanceRegion,
-    /// Keeps the region's chunks loaded for as long as the run is live: waves
-    /// spawn several rooms ahead of the hunter, past any ticket the hunter's own
-    /// loading distance keeps ready. Held for its tickets only.
-    #[expect(
-        dead_code,
-        reason = "keeps the region's chunk tickets alive until the run ends"
-    )]
-    chunks: ChunkRequestHandle,
     started_tick: u64,
     duration_ticks: u64,
     progress: RunProgress,
@@ -1456,6 +1475,53 @@ impl DungeonRuntime {
         })
     }
 
+    /// Returns the reduced kill reward for a Demon Castle floor mob of the
+    /// climb `hunter` fights in `world`, or `None` for any other mob.
+    ///
+    /// Castle mobs are no ordinary dungeon mobs (`ordinary_mob_rank` skips
+    /// them): their climb already pays floor loot and ranking progress on
+    /// every clear, so the per-kill currency runs at
+    /// [`CASTLE_MOB_REWARD_PERCENT`].
+    #[must_use]
+    pub fn castle_mob_reward(
+        &self,
+        world: &World,
+        entity_id: i32,
+        hunter: Uuid,
+    ) -> Option<HunterReward> {
+        self.castle_mob_reward_key(&world.key, entity_id, hunter)
+    }
+
+    fn castle_mob_reward_key(
+        &self,
+        world_key: &Identifier,
+        entity_id: i32,
+        hunter: Uuid,
+    ) -> Option<HunterReward> {
+        for run in self.runs.values() {
+            if run.instance_world != *world_key || !run.members.contains(&hunter) {
+                continue;
+            }
+            let RunProgress::Castle(progress) = &run.progress else {
+                continue;
+            };
+            // Both lookups must hit: `on_living_death` drops the id from
+            // `remaining_mobs` once the kill is observed, which keeps a
+            // duplicate death event from paying twice before the plates are
+            // pruned.
+            if !progress.remaining_mobs.contains(&entity_id)
+                || !progress.labels.contains_key(&entity_id)
+            {
+                continue;
+            }
+            let mut reward = HunterReward::for_mob(castle::rank_for_floor(progress.floor));
+            reward.experience = reward.experience * CASTLE_MOB_REWARD_PERCENT / 100;
+            reward.system_points = reward.system_points * CASTLE_MOB_REWARD_PERCENT / 100;
+            return Some(reward);
+        }
+        None
+    }
+
     /// Credits a participating hunter for damage that reduced a dungeon boss's health.
     pub fn record_boss_damage(&mut self, world: &World, entity_id: i32, hunter: Uuid, amount: f32) {
         if amount <= 0.0 {
@@ -1552,7 +1618,7 @@ impl DungeonRuntime {
             );
             return death;
         }
-        let Some(run) = self.runs.remove(&run_key) else {
+        let Some(run) = self.take_run(run_key) else {
             return RunDeath::None;
         };
         log::debug!("sololeveling: last hunter {uuid} died inside an instance; {death:?}");
@@ -1593,7 +1659,7 @@ impl DungeonRuntime {
         if !last {
             return;
         }
-        let Some(run) = self.runs.remove(&run_key) else {
+        let Some(run) = self.take_run(run_key) else {
             return;
         };
         self.release_run(run);
@@ -1618,7 +1684,7 @@ impl DungeonRuntime {
         if !last {
             return;
         }
-        let Some(run) = self.runs.remove(&run_key) else {
+        let Some(run) = self.take_run(run_key) else {
             return;
         };
         self.release_run(run);
@@ -1635,6 +1701,25 @@ impl DungeonRuntime {
         self.regions.release(run.region);
         self.spend_gate(run.gate);
         self.spend_mobs(&mut run);
+    }
+
+    /// Admits a finished generation as a live run under a fresh id.
+    ///
+    /// The id identifies the run, never the entering leader: his next entry
+    /// after a death starts a second run next to the one his party still
+    /// fights in, and two live runs must not collide on one key.
+    fn adopt_run(&mut self, run: InstanceRun) -> RunId {
+        let id = self.next_run_id;
+        self.next_run_id.0 += 1;
+        self.runs.insert(id, run);
+        id
+    }
+
+    /// Removes a finished run and releases the chunk tickets that kept its
+    /// region loaded.
+    fn take_run(&mut self, id: RunId) -> Option<InstanceRun> {
+        self.run_tickets.remove(&id);
+        self.runs.remove(&id)
     }
 
     fn cancel_generating_entry(&mut self, player_uuid: Uuid) -> bool {
@@ -2955,23 +3040,23 @@ impl DungeonRuntime {
                 false,
             ),
         };
-        self.runs.insert(
-            leader,
-            InstanceRun {
-                members,
-                source_world,
-                instance_world: instance_world.key.clone(),
-                region,
-                chunks: request,
-                started_tick: tick,
-                duration_ticks,
-                progress,
-                gate,
-                placed: FxHashSet::default(),
-                finishing: false,
-                locked,
-            },
-        );
+        let run_id = self.adopt_run(InstanceRun {
+            members,
+            source_world,
+            instance_world: instance_world.key.clone(),
+            region,
+            started_tick: tick,
+            duration_ticks,
+            progress,
+            gate,
+            placed: FxHashSet::default(),
+            finishing: false,
+            locked,
+        });
+        // Keeps the region's chunks loaded for as long as the run is live:
+        // waves spawn several rooms ahead of the hunter, past any ticket the
+        // hunter's own loading distance keeps ready.
+        self.run_tickets.insert(run_id, request);
     }
 
     /// Advances one dungeon run: waves, then the boss, then the exit.
@@ -3202,7 +3287,6 @@ impl DungeonRuntime {
                     ticket_kind: ChunkTicketKind::Portal,
                 });
                 server.jobs.spawn(CastleFloorJob {
-                    leader: uuid,
                     region,
                     instance_world: Arc::clone(world),
                     seed: progress.seed,
@@ -3241,7 +3325,13 @@ impl DungeonRuntime {
     fn finish_floors(&mut self) {
         let results = mem::take(&mut *self.completed_floors.lock());
         for result in results {
-            let applied = match self.runs.get_mut(&result.leader) {
+            // The job built into one region; the climb holding that region is
+            // its run no matter which member (if any) still belongs to it.
+            let applied = match self
+                .runs
+                .values_mut()
+                .find(|run| run.region.slot == result.region.slot)
+            {
                 Some(run) => {
                     if let RunProgress::Castle(progress) = &mut run.progress
                         && let Some(ascent) = &mut progress.ascent
@@ -4133,7 +4223,7 @@ fn notify_near_gate(server: &Server, gate: &Gate, message: TextComponent) {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use uuid::Uuid;
 
@@ -4141,8 +4231,11 @@ mod tests {
     use steel_utils::BlockPos;
 
     use super::{
-        BossState, DungeonProgress, DungeonRuntime, GateBreakTrack, GeneratingEntry, MineProgress,
+        Ascent, BossState, CASTLE_MOB_REWARD_PERCENT, DungeonProgress, DungeonRuntime, FloorResult,
+        GateBreakTrack, GeneratingEntry, InstanceRun, MineProgress, RunProgress, TowerClimb,
     };
+    use crate::castle::rank_for_floor;
+    use crate::combat_reward::HunterReward;
     use crate::dungeon::InstanceRegion;
     use crate::dungeon::generator::Theme;
     use crate::dungeon::mobs::{MobClass, MobLabel};
@@ -4346,5 +4439,171 @@ mod tests {
         assert_eq!(super::mine_share(HunterRank::D, 5, 3), unit * 5 / 3);
         assert_eq!(super::mine_share(HunterRank::D, 6, 0), 0);
         assert_eq!(super::mine_share(HunterRank::D, 0, 3), 0);
+    }
+
+    fn test_run(members: Vec<Uuid>, progress: RunProgress) -> InstanceRun {
+        use rustc_hash::FxHashSet;
+        use steel_utils::Identifier;
+
+        InstanceRun {
+            members,
+            source_world: Identifier::from_steel("overworld"),
+            instance_world: Identifier::from_steel("instance"),
+            region: InstanceRegion::from_slot(0),
+            started_tick: 0,
+            duration_ticks: 100,
+            progress,
+            gate: None,
+            placed: FxHashSet::default(),
+            finishing: false,
+            locked: false,
+        }
+    }
+
+    fn test_dungeon_progress() -> DungeonProgress {
+        DungeonProgress {
+            rank: HunterRank::C,
+            deaths: 0,
+            floor: None,
+            red: false,
+            wave: wave_for_gate(HunterRank::C, false),
+            layout: DungeonLayout::from_seed(1),
+            combat_room: 0,
+            remaining_mobs: Vec::new(),
+            boss: BossState::Waiting,
+            fight: None,
+            exit: None,
+            contributions: FxHashMap::default(),
+            boss_chest: None,
+            survivors: Vec::new(),
+            labels: FxHashMap::default(),
+            wave_spawned: false,
+            guarded_chambers: Vec::new(),
+            extra_mobs: Vec::new(),
+            skills: MobSkills::default(),
+            pending_skills: Vec::new(),
+            classes: FxHashMap::default(),
+            boss_materials: Vec::new(),
+        }
+    }
+
+    fn test_castle_progress(floor: u32) -> TowerClimb {
+        TowerClimb {
+            floor,
+            seed: 1,
+            wave_spawned: false,
+            remaining_mobs: Vec::new(),
+            labels: FxHashMap::default(),
+            skills: MobSkills::default(),
+            pending_skills: Vec::new(),
+            exit: None,
+            ascent: None,
+            floor_loot: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn leader_reentry_keeps_the_run_his_party_still_fights() {
+        let mut runtime = DungeonRuntime::default();
+        let leader = Uuid::new_v4();
+        let member = Uuid::new_v4();
+        // The leader fell inside; his run outlives him while the member fights on.
+        let surviving = runtime.adopt_run(test_run(
+            vec![member],
+            RunProgress::Dungeon(Box::new(test_dungeon_progress())),
+        ));
+        // The leader respawned and entered new gates: his new run must live
+        // next to the old one, not replace it under his key.
+        let reentered = runtime.adopt_run(test_run(
+            vec![leader],
+            RunProgress::Dungeon(Box::new(test_dungeon_progress())),
+        ));
+
+        assert_ne!(surviving, reentered);
+        assert_eq!(
+            runtime.runs.len(),
+            2,
+            "the reentered leader never evicts the live run"
+        );
+        assert!(
+            runtime.runs.values().any(|run| run.members == [member]),
+            "the member's run still lives"
+        );
+    }
+
+    #[test]
+    fn castle_floor_result_reaches_its_climb_by_region() {
+        let mut runtime = DungeonRuntime::default();
+        let climber = Uuid::new_v4();
+        let mut climb = test_castle_progress(1);
+        climb.ascent = Some(Ascent {
+            floor: 2,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            ready: false,
+        });
+        let run_id = runtime.adopt_run(test_run(vec![climber], RunProgress::Castle(climb)));
+        runtime.completed_floors.lock().push(FloorResult {
+            region: InstanceRegion::from_slot(0),
+            floor: 2,
+        });
+
+        runtime.finish_floors();
+
+        let run = runtime.runs.get(&run_id).expect("climb lives");
+        let RunProgress::Castle(progress) = &run.progress else {
+            panic!("climb stays a castle run");
+        };
+        assert!(
+            progress.ascent.as_ref().is_none_or(|ascent| ascent.ready),
+            "the finished floor is applied to the climb that ordered it"
+        );
+    }
+
+    #[test]
+    fn castle_mob_kill_pays_half_an_ordinary_kill() {
+        use steel_utils::Identifier;
+
+        let mut runtime = DungeonRuntime::default();
+        let hunter = Uuid::new_v4();
+        // Floor 11 ranks as a D gate, like the floor spawn table.
+        let mut climb = test_castle_progress(11);
+        climb.remaining_mobs = vec![7];
+        climb
+            .labels
+            .insert(7, MobLabel::mob(Theme::Crypt, MobClass::Warrior));
+        runtime.adopt_run(test_run(vec![hunter], RunProgress::Castle(climb)));
+        let world = Identifier::from_steel("instance");
+
+        let full = HunterReward::for_mob(rank_for_floor(11));
+        let reward = runtime
+            .castle_mob_reward_key(&world, 7, hunter)
+            .expect("a castle floor mob pays its kill reward");
+        assert_eq!(
+            reward.experience,
+            full.experience * CASTLE_MOB_REWARD_PERCENT / 100
+        );
+        assert_eq!(
+            reward.system_points,
+            full.system_points * CASTLE_MOB_REWARD_PERCENT / 100
+        );
+        // Half of a D-rank kill: 20 experience and 4 system points full.
+        assert_eq!((reward.experience, reward.system_points), (10, 2));
+
+        // Outsiders and untracked mobs get nothing, and neither does a
+        // duplicate death event once the kill was observed.
+        assert!(
+            runtime
+                .castle_mob_reward_key(&world, 7, Uuid::new_v4())
+                .is_none()
+        );
+        assert!(runtime.castle_mob_reward_key(&world, 8, hunter).is_none());
+        // `on_living_death` drops the id from `remaining_mobs` on the first
+        // observation; a second event must not pay again.
+        let run = runtime.runs.values_mut().next().expect("climb lives");
+        let RunProgress::Castle(progress) = &mut run.progress else {
+            panic!("climb stays a castle run");
+        };
+        progress.remaining_mobs.clear();
+        assert!(runtime.castle_mob_reward_key(&world, 7, hunter).is_none());
     }
 }

@@ -1040,11 +1040,17 @@ impl Player {
         if !self.can_drop_items() {
             return;
         }
-        let selected = self.inventory.lock().get_selected_item().clone();
+        let (selected, off_hand) = {
+            let inventory = self.inventory.lock();
+            (
+                inventory.get_selected_item().clone(),
+                inventory.get_item_in_hand(InteractionHand::OffHand).clone(),
+            )
+        };
         if !self
             .get_world()
             .gameplay_hooks
-            .allow_item_drop(self, &selected)
+            .allow_item_drop(self, &selected, &off_hand)
         {
             self.send_inventory_to_remote();
             return;
@@ -1106,7 +1112,18 @@ impl Player {
         }
         // A gameplay layer may keep some of its items from ever leaving the
         // player. Restore a stack already removed by a menu/drop handler.
-        if !self.get_world().gameplay_hooks.allow_item_drop(self, &item) {
+        // No caller holds the inventory lock here, so reading the off hand is
+        // safe; the hook itself must not lock the inventory.
+        let off_hand = self
+            .inventory
+            .lock()
+            .get_item_in_hand(InteractionHand::OffHand)
+            .clone();
+        if !self
+            .get_world()
+            .gameplay_hooks
+            .allow_item_drop(self, &item, &off_hand)
+        {
             let mut item = item;
             let mut inventory = self.inventory.lock();
             let _ = inventory.add(&mut item);

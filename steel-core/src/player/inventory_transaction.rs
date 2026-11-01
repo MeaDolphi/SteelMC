@@ -12,6 +12,7 @@ use std::{
 
 use glam::DVec3;
 use steel_registry::item_stack::ItemStack;
+use steel_utils::types::InteractionHand;
 
 use crate::{
     entity::entities::ExperienceOrbEntity,
@@ -144,9 +145,18 @@ impl Player {
                 .inventory
                 .lock()
                 .take_death_drops_keeping(|item| hooks.keep_item_on_death(self, item));
+            let off_hand = self
+                .inventory
+                .lock()
+                .get_item_in_hand(InteractionHand::OffHand)
+                .clone();
             let mut kept = Vec::new();
             for item in drops {
-                if !self.get_world().gameplay_hooks.allow_item_drop(self, &item) {
+                if !self
+                    .get_world()
+                    .gameplay_hooks
+                    .allow_item_drop(self, &item, &off_hand)
+                {
                     kept.push(item);
                     continue;
                 }

@@ -2,9 +2,14 @@ use super::*;
 use crate::{
     behavior::init_behaviors,
     entity::damage::DamageSource,
+    gameplay_hooks::GameplayHooks,
     inventory::equipment::{EntityEquipment, EquipmentSlot},
-    test_support::{TestPlayerBuilder, fresh_test_world, insert_ready_full_chunk},
+    test_support::{
+        TestPlayerBuilder, fresh_test_world, fresh_test_world_with_gameplay_hooks,
+        insert_ready_full_chunk,
+    },
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use steel_registry::{vanilla_damage_types, vanilla_game_rules, vanilla_items};
 use steel_utils::ChunkPos;
 
@@ -152,4 +157,55 @@ fn held_death_protection_can_still_be_consumed_while_storage_is_reserved() {
         player.inventory.lock().get_item(9).item(),
         &*vanilla_items::DIAMOND
     );
+}
+
+#[derive(Default)]
+struct DeathDropProbeHooks {
+    saw_locked_inventory: AtomicBool,
+}
+
+impl GameplayHooks for DeathDropProbeHooks {
+    fn keep_item_on_death(&self, _player: &Player, _stack: &ItemStack) -> bool {
+        false
+    }
+
+    fn allow_item_drop(&self, player: &Player, _stack: &ItemStack, _off_hand: &ItemStack) -> bool {
+        // Death drops must ask the hook only after releasing the inventory
+        // lock that `keep_item_on_death` legitimately runs under.
+        if player.inventory.try_lock().is_none() {
+            self.saw_locked_inventory.store(true, Ordering::Release);
+        }
+        true
+    }
+}
+
+#[test]
+fn death_drops_ask_the_drop_hook_without_the_inventory_lock() {
+    let probe = Arc::new(DeathDropProbeHooks::default());
+    let fixture = fresh_test_world_with_gameplay_hooks(
+        "death_drop_hook_lock_probe",
+        Arc::clone(&probe) as Arc<dyn GameplayHooks>,
+    );
+    insert_ready_full_chunk(&fixture.world, ChunkPos::new(0, 0));
+    assert!(
+        fixture
+            .world
+            .set_game_rule(&vanilla_game_rules::KEEP_INVENTORY, false)
+    );
+    let player = TestPlayerBuilder::new(Arc::clone(&fixture.world), "Deceased", 1).build();
+    player
+        .inventory
+        .lock()
+        .set_item(9, ItemStack::new(&vanilla_items::DIAMOND));
+
+    player.set_health(0.0);
+    player.die(&DamageSource::environment(
+        &vanilla_damage_types::GENERIC_KILL,
+    ));
+
+    assert!(
+        !probe.saw_locked_inventory.load(Ordering::Acquire),
+        "the death drop hook ran while the inventory lock was held"
+    );
+    assert!(player.inventory.lock().is_empty());
 }

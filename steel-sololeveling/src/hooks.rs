@@ -427,29 +427,25 @@ impl GameplayHooks for SoloLevelingHooks {
         item::consume::use_item(&self.state, player, stack, hand)
     }
 
-    fn allow_item_drop(&self, player: &Player, stack: &ItemStack) -> bool {
+    fn allow_item_drop(&self, player: &Player, stack: &ItemStack, off_hand: &ItemStack) -> bool {
         // The drop key on the grimoire, or on a Mage staff held with the
         // grimoire in the off hand, cycles the prepared spells instead.
-        let staff_with_grimoire = (item::artifact::of(stack)
-            .is_some_and(|id| id.spell_gear().is_some())
-            || item::serial::of(stack).is_some_and(|id| id.spell_gear().is_some()))
-            && item::grimoire::is_grimoire(
-                player
-                    .inventory
-                    .lock()
-                    .get_item_in_hand(InteractionHand::OffHand),
-            );
-        if item::grimoire::is_grimoire(stack) || staff_with_grimoire {
-            self.state.cycle_spell(player);
-            return false;
+        // Core passes the off hand, so this never locks the inventory: the
+        // hook can run while it is held, and locking it here would invert
+        // this crate's lock order against the session-taking tick paths.
+        match drop_decision(stack, off_hand) {
+            DropDecision::CycleSpell => {
+                self.state.cycle_spell(player);
+                false
+            }
+            DropDecision::Destroy => false,
+            DropDecision::Allow => true,
         }
-        // The System book is permanent; personal rewards cannot be passed on.
-        !item::menu_book::is_menu_book(stack) && item::binding::may_drop(stack)
     }
 
     fn keep_item_on_death(&self, player: &Player, stack: &ItemStack) -> bool {
-        // Death drops may run under the inventory lock, so this never asks
-        // the drop hook, which reads the off hand.
+        // Death drops may run under the inventory lock, so this stays
+        // lock-free; core hands the drop hook the off hand itself.
         keeps_item_on_death(stack, is_instance_world(&player.get_world()))
     }
 
@@ -851,6 +847,32 @@ fn keeps_item_on_death(stack: &ItemStack, instance_world: bool) -> bool {
         || (instance_world && !item::loot::is_marked(stack))
 }
 
+/// What dropping `stack` does under the Solo Leveling rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropDecision {
+    /// The drop key on spell gear cycles the prepared spells instead.
+    CycleSpell,
+    /// The stack is destroyed instead of spawning in the world.
+    Destroy,
+    /// The stack drops normally.
+    Allow,
+}
+
+/// Resolves a drop without touching player state: dropping the grimoire, or a
+/// Mage staff while the grimoire sits in the off hand, cycles the prepared
+/// spells; the System book and personally bound stacks never leave the hunter.
+fn drop_decision(stack: &ItemStack, off_hand: &ItemStack) -> DropDecision {
+    let spell_gear = item::artifact::of(stack).is_some_and(|id| id.spell_gear().is_some())
+        || item::serial::of(stack).is_some_and(|id| id.spell_gear().is_some());
+    if item::grimoire::is_grimoire(stack) || (spell_gear && item::grimoire::is_grimoire(off_hand)) {
+        return DropDecision::CycleSpell;
+    }
+    if item::menu_book::is_menu_book(stack) || !item::binding::may_drop(stack) {
+        return DropDecision::Destroy;
+    }
+    DropDecision::Allow
+}
+
 /// Gives a mined stack to the hunter first; only the remainder that does not
 /// fit becomes a normal drop next to the broken block.
 fn give_or_drop(
@@ -977,9 +999,10 @@ fn announce_quest(state: &SoloLevelingState, player: &Player, update: QuestUpdat
 #[cfg(test)]
 mod tests {
     use super::{
-        allows_city_mutation, allows_instance_mutation, allows_player_damage, give_or_drop,
-        is_shadow_tank, keeps_item_on_death, keeps_projectile_ammo,
+        DropDecision, allows_city_mutation, allows_instance_mutation, allows_player_damage,
+        drop_decision, give_or_drop, is_shadow_tank, keeps_item_on_death, keeps_projectile_ammo,
     };
+    use crate::item::{artifact, grimoire, menu_book, serial};
     use glam::DVec3;
     use std::sync::Weak;
     use steel_core::entity::Entity as _;
@@ -1042,6 +1065,48 @@ mod tests {
         assert!(!keeps_projectile_ammo(&ItemStack::new(
             &vanilla_items::TIPPED_ARROW
         )));
+    }
+
+    #[test]
+    fn drop_key_cycles_spells_on_grimoire_and_on_staff_with_grimoire_off_hand() {
+        init_vanilla_registry();
+        let owner = Uuid::new_v4();
+        let grimoire = grimoire::stack(owner);
+        let empty = ItemStack::empty();
+
+        // The grimoire itself cycles from either hand.
+        assert_eq!(drop_decision(&grimoire, &empty), DropDecision::CycleSpell);
+
+        // A bound Mage staff cycles while the grimoire sits in the off hand;
+        // without it the bound stack is destroyed, not dropped.
+        let staff = artifact::stack(artifact::ArtifactId::AshStaff, Some(owner));
+        assert_eq!(drop_decision(&staff, &grimoire), DropDecision::CycleSpell);
+        assert_eq!(drop_decision(&staff, &empty), DropDecision::Destroy);
+
+        // An unbound staff without the grimoire drops normally.
+        let loose = artifact::stack(artifact::ArtifactId::AshStaff, None);
+        assert_eq!(drop_decision(&loose, &empty), DropDecision::Allow);
+    }
+
+    #[test]
+    fn system_book_and_bound_stacks_are_destroyed_instead_of_dropped() {
+        init_vanilla_registry();
+        let owner = Uuid::new_v4();
+        let empty = ItemStack::empty();
+
+        // The System book is permanent.
+        let book = menu_book::stack();
+        assert_eq!(drop_decision(&book, &empty), DropDecision::Destroy);
+
+        // Personal rewards cannot be passed on.
+        let bound = serial::stack(serial::SerialId::HunterSword, Some(owner));
+        assert_eq!(drop_decision(&bound, &empty), DropDecision::Destroy);
+
+        // Ordinary items drop normally.
+        assert_eq!(
+            drop_decision(&material_stack(), &empty),
+            DropDecision::Allow
+        );
     }
 
     #[test]

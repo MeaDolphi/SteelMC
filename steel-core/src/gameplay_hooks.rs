@@ -269,7 +269,14 @@ pub trait GameplayHooks: Send + Sync {
 
     /// Called before a player throws or drops an item, including death drops;
     /// `false` destroys the stack instead of spawning it in the world.
-    fn allow_item_drop(&self, _player: &Player, _stack: &ItemStack) -> bool {
+    ///
+    /// `off_hand` is the player's off-hand stack at the moment of the drop, so
+    /// implementations can inspect what the hands hold without locking
+    /// [`Player::inventory`]. The hook must not take that lock: core may call
+    /// it while the inventory is held (as it does for `keep_item_on_death`),
+    /// and a gameplay layer that locks the inventory here and then its own
+    /// state can invert its lock order against its tick paths.
+    fn allow_item_drop(&self, _player: &Player, _stack: &ItemStack, _off_hand: &ItemStack) -> bool {
         true
     }
 

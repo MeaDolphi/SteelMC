@@ -3,12 +3,15 @@ use std::{
     sync::{
         Arc, Barrier,
         atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+        mpsc,
     },
     thread,
+    time::Duration,
 };
 
 use crate::{
     entity::{Entity, LivingEntity as _, RemovalReason, entities::ItemEntity, next_entity_id},
+    gameplay_hooks::GameplayHooks,
     inventory::{
         click::{Click, ClickOutcome, DragKind, MouseButton, QuickCraft},
         container::{Container, SimpleContainer},
@@ -20,7 +23,10 @@ use crate::{
         },
     },
     player::{Player, PlayerConnection, ResetReason, connection::NetworkConnection},
-    test_support::{TestPlayerBuilder, fresh_test_world, insert_ready_full_chunk, test_world},
+    test_support::{
+        TestPlayerBuilder, fresh_test_world, fresh_test_world_with_gameplay_hooks,
+        insert_ready_full_chunk, test_world,
+    },
     world::World,
 };
 use rustc_hash::FxHashMap;
@@ -35,7 +41,7 @@ use steel_registry::{
 };
 use steel_utils::{
     ChunkPos, Downcast as _, DowncastType, DowncastTypeKey, Identifier, WorldAabb,
-    locks::{IntoShared as _, Shared},
+    locks::{IntoShared as _, Shared, SyncMutex},
     types::{GameType, InteractionHand},
 };
 use text_components::TextComponent;
@@ -2134,4 +2140,140 @@ fn resolve_beacon_effect_separates_absent_from_unknown_ids() {
 
     assert_eq!(Player::resolve_beacon_effect(Some(9999)), Err(()));
     assert_eq!(Player::resolve_beacon_effect(Some(-1)), Err(()));
+}
+
+/// A gameplay layer with session state of its own (like steel-sololeveling's
+/// `SessionRegistry`), used to prove the drop hook is invoked without holding
+/// the player's inventory lock.
+#[derive(Default)]
+struct DropProbeHooks {
+    /// Stands in for the gameplay-layer session lock a hook takes to cycle
+    /// spells or check bindings.
+    sessions: SyncMutex<()>,
+    saw_locked_inventory: AtomicBool,
+    calls: AtomicUsize,
+    off_hands: SyncMutex<Vec<ItemStack>>,
+}
+
+impl GameplayHooks for DropProbeHooks {
+    fn allow_item_drop(&self, player: &Player, _stack: &ItemStack, off_hand: &ItemStack) -> bool {
+        // Gameplay hooks must be able to inspect the inventory (as
+        // steel-sololeveling did before core passed the off hand). parking_lot
+        // mutexes are not reentrant, so a `None` here means core invoked the
+        // hook while holding the inventory lock — the historical hang.
+        if player.inventory.try_lock().is_none() {
+            self.saw_locked_inventory.store(true, Ordering::Release);
+        }
+        self.off_hands.lock().push(off_hand.clone());
+        let _session_guard = self.sessions.lock();
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+}
+
+fn run_with_deadline(name: &str, f: impl FnOnce() + Send + 'static) {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        f();
+        sender.send(()).expect("finished thread should report");
+    });
+    receiver
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|_| panic!("deadlock: {name} did not finish"));
+}
+
+#[test]
+fn q_drop_and_menu_throw_invoke_the_drop_hook_without_the_inventory_lock() {
+    init_vanilla_registry();
+    let hooks = Arc::new(DropProbeHooks::default());
+    let fixture = fresh_test_world_with_gameplay_hooks(
+        "drop_hook_lock_probe",
+        Arc::clone(&hooks) as Arc<dyn GameplayHooks>,
+    );
+    let world = &fixture.world;
+    insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+    let player = test_player(Arc::clone(world));
+    player
+        .inventory
+        .lock()
+        .set_item(0, ItemStack::with_count(&vanilla_items::STONE, 4));
+    player.inventory.lock().set_item_in_hand(
+        InteractionHand::OffHand,
+        ItemStack::new(&vanilla_items::TORCH),
+    );
+
+    // Q on the selected hotbar slot.
+    player.drop_from_selected(false);
+
+    // Q over the hotbar slot of the open inventory menu (menu slot 36 is
+    // hotbar slot 0).
+    player.inventory_menu.lock().clicked(
+        Click::Throw {
+            slot: 36,
+            whole_stack: false,
+        },
+        &player,
+    );
+
+    assert!(
+        !hooks.saw_locked_inventory.load(Ordering::Acquire),
+        "the drop hook ran while the inventory lock was held"
+    );
+    // The pre-drop check and the actual spawn each ask the hook.
+    assert_eq!(hooks.calls.load(Ordering::Acquire), 3);
+    let off_hands = hooks.off_hands.lock();
+    assert!(
+        off_hands
+            .iter()
+            .all(|stack| stack.is(&vanilla_items::TORCH)),
+        "core must hand the hook the off-hand stack"
+    );
+}
+
+#[test]
+fn q_drop_stays_live_against_a_session_holding_inventory_tick() {
+    init_vanilla_registry();
+    let hooks = Arc::new(DropProbeHooks::default());
+    let fixture = fresh_test_world_with_gameplay_hooks(
+        "drop_hook_liveness",
+        Arc::clone(&hooks) as Arc<dyn GameplayHooks>,
+    );
+    let world = &fixture.world;
+    insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+    let player = test_player(Arc::clone(world));
+    player
+        .inventory
+        .lock()
+        .set_item(0, ItemStack::with_count(&vanilla_items::STONE, 1000));
+
+    // A tick-style thread that holds the gameplay session lock and then reads
+    // the inventory — the lock order that hangs if a drop ever takes the
+    // inventory lock before asking the hook for its session lock.
+    let tick_player = Arc::clone(&player);
+    let tick_sessions = Arc::clone(&hooks);
+    run_with_deadline("session-holding tick", move || {
+        for _ in 0..1000 {
+            let _session = tick_sessions.sessions.lock();
+            let _inventory = tick_player.inventory.lock();
+        }
+    });
+
+    // The dropping player, on its own thread.
+    let drop_player = Arc::clone(&player);
+    run_with_deadline("q drop loop", move || {
+        for _ in 0..1000 {
+            if drop_player.inventory.lock().get_selected_item().is_empty() {
+                drop_player
+                    .inventory
+                    .lock()
+                    .set_item(0, ItemStack::with_count(&vanilla_items::STONE, 1000));
+            }
+            drop_player.drop_from_selected(false);
+        }
+    });
+
+    assert!(
+        !hooks.saw_locked_inventory.load(Ordering::Acquire),
+        "the drop hook ran while the inventory lock was held"
+    );
 }

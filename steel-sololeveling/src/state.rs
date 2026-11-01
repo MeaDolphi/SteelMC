@@ -703,7 +703,20 @@ impl SoloLevelingState {
         if !keyed && progress.free_entry_in(now) > 0 {
             return Err("Бесплатный вход ещё не восстановился: нужен ключ Замка демонов.");
         }
-        let floor = progress.next_floor.max(1);
+        // The tower only fits so many floors below the world ceiling; a
+        // hunter who cleared them all re-enters the top one instead of a
+        // floor that would not fit.
+        let max_floor = self
+            .server()
+            .and_then(|server| {
+                server
+                    .worlds
+                    .values()
+                    .find(|world| crate::dungeon::is_instance_world(world))
+                    .map(|world| crate::dungeon::castle_tower::max_floors(world.get_max_y()))
+            })
+            .unwrap_or(u32::MAX);
+        let floor = progress.next_floor.max(1).min(max_floor);
         // The runtime lock is never taken inside a session closure: the
         // runtime itself reads sessions while it holds its lock.
         if !self.dungeon_runtime.lock().request_key_gate(
@@ -808,6 +821,17 @@ impl SoloLevelingState {
                 .ordinary_mob_rank(world, entity_id, hunter)
                 .map(|rank| (hunter, rank))
         });
+        // Castle floor mobs are no ordinary dungeon mobs; their climb pays a
+        // reduced per-kill reward on top of the floor-clear payout.
+        let castle_reward = if reward.is_none() {
+            hunter.and_then(|hunter| {
+                runtime
+                    .castle_mob_reward(world, entity_id, hunter)
+                    .map(|reward| (hunter, reward))
+            })
+        } else {
+            None
+        };
         if let Some(hunter) = hunter {
             runtime.record_mob_kill(world, entity_id, hunter);
         }
@@ -821,6 +845,12 @@ impl SoloLevelingState {
             if rand::random_range(0..100) < pouch::MOB_POUCH_PERCENT {
                 self.queue_system_loot(hunter, pouch::stack(pouch::mob_amount(rank)));
             }
+        }
+        // The castle's endless floors pay only the reduced per-kill currency;
+        // kill goals, pouches and materials stay reserved for ordinary
+        // dungeon mobs, and the climb settles floor clears separately.
+        if let Some((hunter, reward)) = castle_reward {
+            self.award(hunter, self.enchanted_reward(hunter, reward));
         }
         // Materials go to the credited hunter only, like the mob reward.
         if let Some((hunter, class, rank)) = materials {
