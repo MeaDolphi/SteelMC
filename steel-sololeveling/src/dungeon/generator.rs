@@ -10,7 +10,11 @@
 //! chambers branch off it. Neighbouring rooms are joined by corridors whose
 //! doors are offset from each other, so most corridors bend. The shell (floor,
 //! walls, ceiling) is derived from the carved air, which keeps rooms and
-//! corridors airtight wherever they meet.
+//! corridors airtight wherever they meet. A decor pass then dresses the
+//! interior — floor mosaics, doorway arches, hanging lights, walkable
+//! platforms and one themed feature per combat and boss room — only ever
+//! recolouring shell blocks or filling carved air, so it can never open a hole
+//! or seal a path.
 
 use std::collections::VecDeque;
 
@@ -24,6 +28,9 @@ use crate::rank::HunterRank;
 const GRID_RADIUS: i32 = 3;
 /// Blocks between the centres of two neighbouring grid cells.
 const CELL: i32 = 24;
+/// Largest half extent a room may roll; two neighbours in adjacent cells must
+/// keep a wall column between them (`CELL / 2` would let the air touch).
+const MAX_ROOM_HALF: i32 = 11;
 /// Air height of a corridor.
 const CORRIDOR_HEIGHT: u8 = 3;
 /// Blocks between two corridor ceiling lights.
@@ -107,6 +114,10 @@ pub struct Palette {
     pillar: BlockRef,
     ceiling: BlockRef,
     light: BlockRef,
+    /// Half-height platform block; always a slab placed with its `bottom` state.
+    slab: BlockRef,
+    /// Accent block for themed decor: sarcophagi, icicles, obelisks, basin rims.
+    accent: BlockRef,
 }
 
 impl Theme {
@@ -136,6 +147,8 @@ impl Theme {
                 pillar: &vanilla_blocks::CHISELED_STONE_BRICKS,
                 ceiling: &vanilla_blocks::STONE_BRICKS,
                 light: &vanilla_blocks::GLOWSTONE,
+                slab: &vanilla_blocks::STONE_BRICK_SLAB,
+                accent: &vanilla_blocks::CHISELED_STONE_BRICKS,
             },
             Self::Ice => Palette {
                 floor: &vanilla_blocks::PACKED_ICE,
@@ -145,6 +158,8 @@ impl Theme {
                 pillar: &vanilla_blocks::BLUE_ICE,
                 ceiling: &vanilla_blocks::SNOW_BLOCK,
                 light: &vanilla_blocks::SEA_LANTERN,
+                slab: &vanilla_blocks::QUARTZ_SLAB,
+                accent: &vanilla_blocks::BLUE_ICE,
             },
             Self::Nether => Palette {
                 floor: &vanilla_blocks::NETHER_BRICKS,
@@ -154,6 +169,8 @@ impl Theme {
                 pillar: &vanilla_blocks::POLISHED_BLACKSTONE_BRICKS,
                 ceiling: &vanilla_blocks::NETHER_BRICKS,
                 light: &vanilla_blocks::SHROOMLIGHT,
+                slab: &vanilla_blocks::NETHER_BRICK_SLAB,
+                accent: &vanilla_blocks::BLACKSTONE,
             },
             Self::Desert => Palette {
                 floor: &vanilla_blocks::SMOOTH_SANDSTONE,
@@ -163,6 +180,8 @@ impl Theme {
                 pillar: &vanilla_blocks::CHISELED_SANDSTONE,
                 ceiling: &vanilla_blocks::SMOOTH_SANDSTONE,
                 light: &vanilla_blocks::OCHRE_FROGLIGHT,
+                slab: &vanilla_blocks::SMOOTH_SANDSTONE_SLAB,
+                accent: &vanilla_blocks::CHISELED_SANDSTONE,
             },
             Self::Jungle => Palette {
                 floor: &vanilla_blocks::MOSS_BLOCK,
@@ -172,6 +191,8 @@ impl Theme {
                 pillar: &vanilla_blocks::MOSSY_STONE_BRICKS,
                 ceiling: &vanilla_blocks::MOSSY_COBBLESTONE,
                 light: &vanilla_blocks::VERDANT_FROGLIGHT,
+                slab: &vanilla_blocks::MOSSY_COBBLESTONE_SLAB,
+                accent: &vanilla_blocks::MOSSY_STONE_BRICKS,
             },
             Self::DeepDark => Palette {
                 floor: &vanilla_blocks::DEEPSLATE_TILES,
@@ -181,6 +202,8 @@ impl Theme {
                 pillar: &vanilla_blocks::POLISHED_DEEPSLATE,
                 ceiling: &vanilla_blocks::DEEPSLATE_TILES,
                 light: &vanilla_blocks::SEA_LANTERN,
+                slab: &vanilla_blocks::DEEPSLATE_BRICK_SLAB,
+                accent: &vanilla_blocks::SCULK,
             },
             Self::End => Palette {
                 floor: &vanilla_blocks::END_STONE_BRICKS,
@@ -190,6 +213,8 @@ impl Theme {
                 pillar: &vanilla_blocks::PURPUR_PILLAR,
                 ceiling: &vanilla_blocks::PURPUR_BLOCK,
                 light: &vanilla_blocks::PEARLESCENT_FROGLIGHT,
+                slab: &vanilla_blocks::END_STONE_BRICK_SLAB,
+                accent: &vanilla_blocks::PURPUR_BLOCK,
             },
         }
     }
@@ -210,10 +235,20 @@ pub enum Part {
     Pillar,
     /// Ceiling.
     Ceiling,
-    /// A light source set into the ceiling.
+    /// A light source set into the ceiling or hanging from it.
     Light,
     /// Mineable crystal ore in a wall.
     Ore,
+    /// A half-height platform; built as the theme slab in its bottom state.
+    Platform,
+    /// Dressed framing (jambs and lintel) around a doorway.
+    Arch,
+    /// A themed accent block: sarcophagi, icicles, obelisks, basin rims.
+    Decor,
+    /// A chain suspending a hanging light.
+    Chain,
+    /// Still lava inside a rimmed basin; never exposed.
+    Lava,
 }
 
 impl Palette {
@@ -225,10 +260,14 @@ impl Palette {
             Part::FloorAlt => self.floor_alt,
             Part::Wall => self.wall,
             Part::WallAlt => self.wall_alt,
-            Part::Pillar => self.pillar,
+            Part::Pillar | Part::Arch => self.pillar,
             Part::Ceiling => self.ceiling,
             Part::Light => self.light,
             Part::Ore => ore,
+            Part::Platform => self.slab,
+            Part::Decor => self.accent,
+            Part::Chain => &vanilla_blocks::IRON_CHAIN,
+            Part::Lava => &vanilla_blocks::LAVA,
         }
     }
 }
@@ -304,7 +343,7 @@ pub struct Blueprint {
     pub theme: Theme,
     /// Rooms: entrance, combat rooms in order, boss, then side chambers.
     pub rooms: Vec<Room>,
-    /// Every shell block.
+    /// Every block of the built dungeon: the shell plus interior decor.
     pub blocks: Vec<Placement>,
     /// Lowest and highest offsets the shell touches.
     pub bounds: ((i32, i32, i32), (i32, i32, i32)),
@@ -332,7 +371,7 @@ impl Blueprint {
     #[must_use]
     pub fn generate_with_theme(seed: u64, combat_rooms: u8, theme: Theme) -> Self {
         let mut rng = SplitMix(seed);
-        let path = main_path(&mut rng, usize::try_from(combat_rooms).unwrap_or(0) + 2);
+        let path = main_path(&mut rng, usize::from(combat_rooms) + 2);
         let mut cells: Vec<((i32, i32), RoomRole)> = path
             .iter()
             .enumerate()
@@ -361,17 +400,34 @@ impl Blueprint {
             carve_room(&mut air, seed, index, room);
         }
         let mut lights: FxHashSet<(i32, i32)> = FxHashSet::default();
+        let mut doorways: Vec<Doorway> = Vec::new();
         for (from, to) in &links {
-            carve_corridor(&mut rng, &mut air, &mut lights, &rooms[*from], &rooms[*to]);
+            carve_corridor(
+                &mut rng,
+                &mut air,
+                &mut lights,
+                &rooms[*from],
+                *from,
+                &rooms[*to],
+                *to,
+                &mut doorways,
+            );
         }
         for room in &rooms {
             light_room(&air, &mut lights, room);
         }
 
-        let blocks = shell(seed, &air, &lights);
+        let mut solid = shell(seed, &air, &lights);
+        let blocked_ground = decorate(seed, theme, &rooms, &air, &doorways, &mut solid);
+        let blocks: Vec<Placement> = solid
+            .into_iter()
+            .map(|(offset, part)| Placement { offset, part })
+            .collect();
+        let mut blocks = blocks;
+        blocks.sort_by_key(|placement| placement.offset);
         let mut rooms = rooms;
         for (index, room) in rooms.iter_mut().enumerate() {
-            room.spawns = spawn_spots(seed, &air, index, room);
+            room.spawns = spawn_spots(seed, &air, index, room, &blocked_ground);
         }
         let bounds = bounds_of(&blocks);
         Self {
@@ -512,20 +568,20 @@ fn room_for(rng: &mut SplitMix, (x, z): (i32, i32), role: RoomRole) -> Room {
     let (shape, half, height) = match role {
         // The entrance is a plain hall so the arrival column is always free.
         RoomRole::Entrance => (Shape::Hall, (rng.range(4, 5), rng.range(4, 5)), 5),
-        // The boss room must fit the boss and, later, the exit frame.
+        // The boss room must fit the boss, the exit frame and the fight itself.
         RoomRole::Boss => (
             if rng.chance(50) {
                 Shape::Rotunda
             } else {
                 Shape::Colonnade
             },
-            (rng.range(7, 8), rng.range(7, 8)),
-            u8::try_from(rng.range(7, 9)).unwrap_or(7),
+            (rng.range(9, MAX_ROOM_HALF), rng.range(9, MAX_ROOM_HALF)),
+            u8::try_from(rng.range(8, 10)).unwrap_or(8),
         ),
         RoomRole::Combat => (
             SHAPES[usize::try_from(rng.next()).unwrap_or(0) % SHAPES.len()],
-            (rng.range(5, 8), rng.range(5, 8)),
-            u8::try_from(rng.range(5, 8)).unwrap_or(5),
+            (rng.range(7, MAX_ROOM_HALF), rng.range(7, MAX_ROOM_HALF)),
+            u8::try_from(rng.range(6, 9)).unwrap_or(6),
         ),
         RoomRole::Chamber => (
             if rng.chance(50) {
@@ -639,18 +695,43 @@ impl Axes {
     }
 }
 
+/// Where one corridor crosses a room's wall. The boundary is the first column
+/// along the corridor that is not carved air of the room, so it hugs the real
+/// (possibly jittered) wall; decor uses it to frame the doorway and to keep
+/// the approach lane clear.
+#[derive(Debug, Clone, Copy)]
+struct Doorway {
+    /// Room the door belongs to.
+    room: usize,
+    /// Whether the corridor runs along x.
+    along_x: bool,
+    /// World x or z of the wall column just outside the room.
+    boundary: i32,
+    /// World z or x of the door centre.
+    door: i32,
+    /// Direction from the room centre through the door, along the corridor.
+    side: i32,
+}
+
 /// Joins two rooms in neighbouring cells with a three-wide corridor.
 ///
 /// Each door sits at its own offset along its wall, so the corridor runs out
 /// of one room, steps sideways halfway, and enters the other room. The
 /// corridor also reaches a few blocks into both rooms, so an uneven wall or a
 /// pillar can never seal a doorway.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a corridor is fully described by its rng, the maps it carves, both linked rooms and the doorway list"
+)]
 fn carve_corridor(
     rng: &mut SplitMix,
     air: &mut FxHashMap<(i32, i32), Column>,
     lights: &mut FxHashSet<(i32, i32)>,
     from: &Room,
+    from_index: usize,
     to: &Room,
+    to_index: usize,
+    doorways: &mut Vec<Doorway>,
 ) {
     let along_x = from.center.0 != to.center.0;
     // The corridor runs along one axis and steps sideways across the other.
@@ -678,6 +759,37 @@ fn carve_corridor(
     while a != end + sign {
         path.push((a, door_to));
         a += sign;
+    }
+
+    // Record where the corridor leaves each room before carving: a previous
+    // corridor may already have punched room-air columns, so membership of
+    // this specific room decides the boundary.
+    let column_at = |&(a, b): &(i32, i32)| if along_x { (a, b) } else { (b, a) };
+    let boundary_of = |room_index: usize, reversed: bool| {
+        let mut iter: Box<dyn Iterator<Item = (i32, i32)>> = if reversed {
+            Box::new(path.iter().rev().map(column_at))
+        } else {
+            Box::new(path.iter().map(column_at))
+        };
+        iter.find(|column| air.get(column).is_none_or(|c| c.room != Some(room_index)))
+    };
+    if let Some((x, z)) = boundary_of(from_index, false) {
+        doorways.push(Doorway {
+            room: from_index,
+            along_x,
+            boundary: if along_x { x } else { z },
+            door: if along_x { z } else { x },
+            side: sign,
+        });
+    }
+    if let Some((x, z)) = boundary_of(to_index, true) {
+        doorways.push(Doorway {
+            room: to_index,
+            along_x,
+            boundary: if along_x { x } else { z },
+            door: if along_x { z } else { x },
+            side: -sign,
+        });
     }
 
     for (index, (a, b)) in path.iter().enumerate() {
@@ -723,11 +835,14 @@ fn light_room(
 }
 
 /// Wraps the carved air in floor, walls and ceiling.
+///
+/// Returns the solid blocks by offset so a later pass can add decor; the
+/// conversion to sorted placements happens after decorating.
 fn shell(
     seed: u64,
     air: &FxHashMap<(i32, i32), Column>,
     lights: &FxHashSet<(i32, i32)>,
-) -> Vec<Placement> {
+) -> FxHashMap<(i32, i32, i32), Part> {
     let mut solid: FxHashMap<(i32, i32, i32), Part> = FxHashMap::default();
     let mut ore_candidates = FxHashSet::default();
     let is_air = |x: i32, y: i32, z: i32| {
@@ -877,20 +992,570 @@ fn shell(
     {
         solid.insert(position, Part::Ore);
     }
-    let mut blocks: Vec<Placement> = solid
-        .into_iter()
-        .map(|(offset, part)| Placement { offset, part })
-        .collect();
-    blocks.sort_by_key(|placement| placement.offset);
-    blocks
+    solid
+}
+
+/// Carved columns a walker can reach from the entrance at floor level; sealed
+/// pockets (filled back in by [`shell`]) stay undecorated.
+fn reachable_columns(air: &FxHashMap<(i32, i32), Column>) -> FxHashSet<(i32, i32)> {
+    let mut reachable: FxHashSet<(i32, i32)> = FxHashSet::default();
+    let mut queue = VecDeque::from([(0, 0)]);
+    reachable.insert((0, 0));
+    while let Some((x, z)) = queue.pop_front() {
+        for (dx, dz) in DIRECTIONS {
+            let next = (x + dx, z + dz);
+            if air.contains_key(&next) && reachable.insert(next) {
+                queue.push_back(next);
+            }
+        }
+    }
+    reachable
+}
+
+/// Recolours one floor block into the mosaic variant, if there is a floor.
+fn recolour_floor(solid: &mut FxHashMap<(i32, i32, i32), Part>, x: i32, z: i32) {
+    if let Some(part @ Part::Floor) = solid.get_mut(&(x, -1, z)) {
+        *part = Part::FloorAlt;
+    }
+}
+
+/// Keeps decor out of the lane between a room's centre and a doorway. The
+/// corridor opening is three wide, so blocking anything closer than one block
+/// to its edge would narrow the walk through the door.
+fn near_door(doors: &[Doorway], room: &Room, u: i32, v: i32) -> bool {
+    doors.iter().any(|door| {
+        let (along, across, half, door_centre) = if door.along_x {
+            (u, v, room.half.0, door.door - room.center.1)
+        } else {
+            (v, u, room.half.1, door.door - room.center.0)
+        };
+        let outward = along * door.side;
+        (half - 4..=half + 2).contains(&outward) && (across - door_centre).abs() <= 1
+    })
+}
+
+/// The strip of a boss room where the boss waits (far +z side); the exit
+/// frame stands at the centre. Decor stays clear so the fight stays open.
+fn boss_strip(room: &Room, u: i32, v: i32) -> bool {
+    room.role == RoomRole::Boss && u.abs() <= 2 && v >= room.half.1 - 5
+}
+
+/// Maps a wall-relative position to a world column: `along` slides along the
+/// wall and `depth` grows from the wall line (`half - 3`) toward the centre,
+/// so walls are 0..=+z, 1=-z, 2=+x, 3=-x.
+const fn wall_cell(room: &Room, wall: usize, along: i32, depth: i32) -> (i32, i32) {
+    let (cx, cz) = room.center;
+    match wall {
+        0 => (cx + along, cz + room.half.1 - 3 - depth),
+        1 => (cx + along, cz - room.half.1 + 3 + depth),
+        2 => (cx + room.half.0 - 3 - depth, cz + along),
+        _ => (cx - room.half.0 + 3 + depth, cz + along),
+    }
+}
+
+/// (wall, offset) candidates in a hashed order for one room.
+fn wall_candidates(rng: &mut SplitMix, room: &Room, count: usize) -> Vec<(usize, i32)> {
+    let limit = (room.half.0.min(room.half.1) - 4).max(0);
+    let mut candidates = Vec::with_capacity(count * 4);
+    for _ in 0..count.max(1) * 4 {
+        let wall = usize::try_from(rng.next() % 4).unwrap_or(0);
+        let offset = if limit == 0 {
+            0
+        } else {
+            rng.range(-limit, limit)
+        };
+        candidates.push((wall, offset));
+    }
+    candidates
+}
+
+/// Checks every ground cell of a feature: the cell and, for ground features,
+/// one step toward the room centre must be carved and reachable, and the cell
+/// must be free of other decor, door lanes and the boss strip.
+fn fits(
+    cells: &[(i32, i32)],
+    room: &Room,
+    air: &FxHashMap<(i32, i32), Column>,
+    reachable: &FxHashSet<(i32, i32)>,
+    doors: &[Doorway],
+    taken: &FxHashSet<(i32, i32)>,
+    open_inward: bool,
+) -> bool {
+    let (cx, cz) = room.center;
+    cells.iter().all(|&(x, z)| {
+        let column = (x, z);
+        let u = x - cx;
+        let v = z - cz;
+        if !air.contains_key(&column)
+            || !reachable.contains(&column)
+            || taken.contains(&column)
+            || near_door(doors, room, u, v)
+            || boss_strip(room, u, v)
+        {
+            return false;
+        }
+        if !open_inward {
+            return true;
+        }
+        let inward = if u.abs() >= v.abs() {
+            (x - u.signum(), z)
+        } else {
+            (x, z - v.signum())
+        };
+        air.contains_key(&inward)
+    })
+}
+
+/// Recolours floor blocks into a mosaic: a centre medallion, a runner from
+/// the medallion to every doorway and, in the boss room, a ring at the walls.
+fn floor_pattern(room: &Room, doors: &[Doorway], solid: &mut FxHashMap<(i32, i32, i32), Part>) {
+    let (cx, cz) = room.center;
+    let (hx, hz) = room.half;
+    for du in -1..=1 {
+        for dv in -1..=1 {
+            recolour_floor(solid, cx + du, cz + dv);
+        }
+    }
+    for door in doors {
+        let centre = if door.along_x { cx } else { cz };
+        let mut a = centre;
+        loop {
+            let (x, z) = if door.along_x {
+                (a, door.door)
+            } else {
+                (door.door, a)
+            };
+            recolour_floor(solid, x, z);
+            if a == door.boundary - door.side {
+                break;
+            }
+            a += door.side;
+        }
+    }
+    if room.role == RoomRole::Boss {
+        for u in -hx..=hx {
+            recolour_floor(solid, cx + u, cz + hz - 1);
+            recolour_floor(solid, cx + u, cz - hz + 1);
+        }
+        for v in -hz..=hz {
+            recolour_floor(solid, cx + hx - 1, cz + v);
+            recolour_floor(solid, cx - hx + 1, cz + v);
+        }
+    }
+}
+
+/// Dressed doorways: the wall columns flanking the opening and the row above
+/// it take the pillar block. The frame anchors on the visible wall face, the
+/// first wall block walking from the room centre out along the corridor;
+/// carved cells (room air, pillars, the corridor itself) are skipped. Jambs
+/// then scan a couple of blocks either side of the face for wavy walls and
+/// corridor bends. Only existing shell blocks change, so a doorway can never
+/// be narrowed.
+fn frame_doorways(room: &Room, doors: &[Doorway], solid: &mut FxHashMap<(i32, i32, i32), Part>) {
+    for door in doors {
+        let (centre, reach) = if door.along_x {
+            (room.center.0, room.half.0)
+        } else {
+            (room.center.1, room.half.1)
+        };
+        // Scan along the opening's flank line: the door centre line passes
+        // through the carved opening itself, so the first wall block there is
+        // the face of the doorway.
+        let mut face = None;
+        for flank in [door.door + 2, door.door - 2] {
+            for step in 2..=reach + 3 {
+                let along = centre + door.side * step;
+                let position = if door.along_x {
+                    (along, 0, flank)
+                } else {
+                    (flank, 0, along)
+                };
+                if matches!(solid.get(&position), Some(Part::Wall | Part::WallAlt)) {
+                    face = Some(along);
+                    break;
+                }
+            }
+            if face.is_some() {
+                break;
+            }
+        }
+        let Some(face) = face else {
+            continue;
+        };
+        for flank in [door.door - 2, door.door + 2] {
+            for y in 0..=3 {
+                for step in [0, 1, 2, -1, -2] {
+                    let along = face + step * door.side;
+                    let position = if door.along_x {
+                        (along, y, flank)
+                    } else {
+                        (flank, y, along)
+                    };
+                    if matches!(solid.get(&position), Some(Part::Wall | Part::WallAlt)) {
+                        solid.insert(position, Part::Arch);
+                        break;
+                    }
+                }
+            }
+        }
+        for across in door.door - 1..=door.door + 1 {
+            let position = if door.along_x {
+                (face, 3, across)
+            } else {
+                (across, 3, face)
+            };
+            if matches!(solid.get(&position), Some(Part::Ceiling | Part::Wall)) {
+                solid.insert(position, Part::Arch);
+            }
+        }
+    }
+}
+
+/// Hanging lights on chains: every tall enough room gets one in the centre,
+/// wide combat and boss rooms get two more so big floors stay lit.
+fn hang_lanterns(
+    room: &Room,
+    air: &FxHashMap<(i32, i32), Column>,
+    reachable: &FxHashSet<(i32, i32)>,
+    solid: &mut FxHashMap<(i32, i32, i32), Part>,
+) {
+    let height = i32::from(room.height);
+    if height < 5 {
+        return;
+    }
+    let (cx, cz) = room.center;
+    let mut lanterns = vec![(cx, cz)];
+    if matches!(room.role, RoomRole::Combat | RoomRole::Boss) && room.half.0 >= 9 {
+        let spread = room.half.0 / 2;
+        lanterns.extend([(cx + spread, cz), (cx - spread, cz)]);
+    }
+    for (x, z) in lanterns {
+        if !reachable.contains(&(x, z)) || !air.contains_key(&(x, z)) {
+            continue;
+        }
+        solid.insert((x, height - 1, z), Part::Chain);
+        solid.insert((x, height - 2, z), Part::Light);
+    }
+}
+
+/// A wall-hugging terrace of half-height platforms (bottom slabs): walkable
+/// without jumping and big enough to circle behind.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a placement needs the room, the carved and reachable maps, its doors, the occupancy sets and the solid map"
+)]
+fn place_platforms(
+    rng: &mut SplitMix,
+    room: &Room,
+    air: &FxHashMap<(i32, i32), Column>,
+    reachable: &FxHashSet<(i32, i32)>,
+    doors: &[Doorway],
+    taken: &mut FxHashSet<(i32, i32)>,
+    solid: &mut FxHashMap<(i32, i32, i32), Part>,
+    blocked_ground: &mut FxHashSet<(i32, i32)>,
+) {
+    let candidates = wall_candidates(rng, room, 6);
+    for width in [3, 2] {
+        for &(wall, along) in &candidates {
+            let cells: Vec<(i32, i32)> = (0..width)
+                .flat_map(|du| (0..=1).map(move |depth| wall_cell(room, wall, along + du, depth)))
+                .collect();
+            if !fits(&cells, room, air, reachable, doors, taken, true) {
+                continue;
+            }
+            for column in cells {
+                taken.insert(column);
+                blocked_ground.insert(column);
+                solid.insert((column.0, 0, column.1), Part::Platform);
+            }
+            return;
+        }
+    }
+}
+
+/// Waist-high pillar stubs against the walls: cover to circle behind, too
+/// low to block a lane. Colonnades and crosses already carry their own.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a placement needs the room, the carved and reachable maps, its doors, the occupancy sets and the solid map"
+)]
+fn place_pilasters(
+    rng: &mut SplitMix,
+    room: &Room,
+    air: &FxHashMap<(i32, i32), Column>,
+    reachable: &FxHashSet<(i32, i32)>,
+    doors: &[Doorway],
+    taken: &mut FxHashSet<(i32, i32)>,
+    solid: &mut FxHashMap<(i32, i32, i32), Part>,
+    blocked_ground: &mut FxHashSet<(i32, i32)>,
+) {
+    if matches!(room.shape, Shape::Colonnade | Shape::Cross) {
+        return;
+    }
+    let wanted = 1 + i32::from(rng.chance(50));
+    let mut placed = 0;
+    for (wall, along) in wall_candidates(rng, room, 6) {
+        if placed >= wanted {
+            return;
+        }
+        let cells = [wall_cell(room, wall, along, 0)];
+        if !fits(&cells, room, air, reachable, doors, taken, true) {
+            continue;
+        }
+        let height = 1 + i32::from(rng.chance(50));
+        let column = cells[0];
+        taken.insert(column);
+        blocked_ground.insert(column);
+        for y in 0..height {
+            solid.insert((column.0, y, column.1), Part::Pillar);
+        }
+        placed += 1;
+    }
+}
+
+/// One themed feature per combat and boss room, against the first wall where
+/// it fits: crypt sarcophagi, ice icicles, nether lava basins, desert
+/// obelisks, jungle ruin mounds, deep-dark sculk spikes, end chorus stalks.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a feature needs the theme, the room, the carved and reachable maps, its doors and the occupancy sets"
+)]
+fn place_feature(
+    rng: &mut SplitMix,
+    theme: Theme,
+    room: &Room,
+    air: &FxHashMap<(i32, i32), Column>,
+    reachable: &FxHashSet<(i32, i32)>,
+    doors: &[Doorway],
+    taken: &mut FxHashSet<(i32, i32)>,
+    solid: &mut FxHashMap<(i32, i32, i32), Part>,
+    blocked_ground: &mut FxHashSet<(i32, i32)>,
+) {
+    let height = i32::from(room.height);
+    for (wall, along) in wall_candidates(rng, room, 12) {
+        let cells = feature_cells(theme, room, wall, along, height, rng);
+        if place_cells(
+            &cells,
+            room,
+            air,
+            reachable,
+            doors,
+            taken,
+            solid,
+            blocked_ground,
+        ) {
+            return;
+        }
+    }
+    // A crowded room (doors on every wall, pillars everywhere) can reject
+    // every full feature; a single accent column still fits almost anywhere.
+    for (wall, along) in wall_candidates(rng, room, 8) {
+        let cells = vec![(wall_cell(room, wall, along, 0), 0, Part::Decor)];
+        if place_cells(
+            &cells,
+            room,
+            air,
+            reachable,
+            doors,
+            taken,
+            solid,
+            blocked_ground,
+        ) {
+            return;
+        }
+    }
+}
+
+/// Places one feature attempt if every ground cell fits; returns whether it
+/// did. Ground cells become unavailable to later decor and to spawn spots.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "placing cells needs the room, the carved and reachable maps, its doors and the occupancy sets"
+)]
+fn place_cells(
+    cells: &[((i32, i32), i32, Part)],
+    room: &Room,
+    air: &FxHashMap<(i32, i32), Column>,
+    reachable: &FxHashSet<(i32, i32)>,
+    doors: &[Doorway],
+    taken: &mut FxHashSet<(i32, i32)>,
+    solid: &mut FxHashMap<(i32, i32, i32), Part>,
+    blocked_ground: &mut FxHashSet<(i32, i32)>,
+) -> bool {
+    let ground: Vec<(i32, i32)> = cells.iter().map(|&(column, _, _)| column).collect();
+    if !fits(&ground, room, air, reachable, doors, taken, true) {
+        return false;
+    }
+    for &(column, y, part) in cells {
+        if y == 0 {
+            blocked_ground.insert(column);
+        }
+        solid.insert((column.0, y, column.1), part);
+    }
+    taken.extend(ground);
+    true
+}
+
+/// The cells of one themed feature attempt, anchored like the other wall
+/// decor: `(column, y, part)` in world offsets.
+fn feature_cells(
+    theme: Theme,
+    room: &Room,
+    wall: usize,
+    along: i32,
+    height: i32,
+    rng: &mut SplitMix,
+) -> Vec<((i32, i32), i32, Part)> {
+    let mut cells = Vec::new();
+    let mut push = |du: i32, depth: i32, y: i32, part: Part| {
+        cells.push((wall_cell(room, wall, along + du, depth), y, part));
+    };
+    match theme {
+        Theme::Crypt => {
+            // A stone sarcophagus: two long, one deep, two tall.
+            for du in 0..=1 {
+                for y in 0..=1 {
+                    push(du, 0, y, Part::Decor);
+                }
+            }
+        }
+        Theme::Ice => {
+            // Icicles under the ceiling: a three-long tip row and a centre
+            // spike hanging lower.
+            for du in -1..=1 {
+                push(du, 0, height - 1, Part::Decor);
+            }
+            for y in height - 3..height - 1 {
+                push(0, 0, y, Part::Decor);
+            }
+        }
+        Theme::Nether => {
+            // A lava basin behind a full rim: the lava sits one block below
+            // the rim, so it can neither flow out nor be stumbled into.
+            for du in -1..=1 {
+                for depth in 0..=2 {
+                    let part = if du == 0 && depth == 1 {
+                        Part::Lava
+                    } else {
+                        Part::Decor
+                    };
+                    push(du, depth, 0, part);
+                }
+            }
+        }
+        Theme::Desert => {
+            // A chiseled obelisk, three or four blocks tall.
+            let top = 2 + i32::from(rng.chance(50));
+            for y in 0..=top {
+                push(0, 0, y, Part::Decor);
+            }
+        }
+        Theme::Jungle => {
+            // A sunken ruin corner: a slab platform with one idol block.
+            for du in 0..=1 {
+                for depth in 0..=1 {
+                    push(du, depth, 0, Part::Platform);
+                }
+            }
+            push(0, 0, 1, Part::Decor);
+        }
+        Theme::DeepDark => {
+            // Two sculk spikes of different heights.
+            let tall = 1 + i32::from(rng.chance(50));
+            for y in 0..=tall {
+                push(0, 0, y, Part::Decor);
+            }
+            for y in 0..=1 {
+                push(1, 0, y, Part::Decor);
+            }
+        }
+        Theme::End => {
+            // A chorus-like stalk with a purpur cap.
+            for y in 0..=2 {
+                push(0, 0, y, Part::Decor);
+            }
+        }
+    }
+    cells
+}
+
+/// Dresses room interiors on top of the finished shell.
+///
+/// Everything here either recolours an existing shell block (floor mosaic,
+/// doorway arches) or fills carved, reachable air (lights, platforms,
+/// pilasters, themed features), so decor can never open a wall hole or seal
+/// a path. Returns the ground columns occupied by decor, which spawn spots
+/// must stay clear of.
+fn decorate(
+    seed: u64,
+    theme: Theme,
+    rooms: &[Room],
+    air: &FxHashMap<(i32, i32), Column>,
+    doorways: &[Doorway],
+    solid: &mut FxHashMap<(i32, i32, i32), Part>,
+) -> FxHashSet<(i32, i32)> {
+    let reachable = reachable_columns(air);
+    let mut rng = SplitMix(seed ^ 0xDEC0_F173_9B2A_7C15);
+    let mut blocked_ground: FxHashSet<(i32, i32)> = FxHashSet::default();
+    for (index, room) in rooms.iter().enumerate() {
+        let doors: Vec<Doorway> = doorways
+            .iter()
+            .copied()
+            .filter(|door| door.room == index)
+            .collect();
+        floor_pattern(room, &doors, solid);
+        frame_doorways(room, &doors, solid);
+        hang_lanterns(room, air, &reachable, solid);
+        if !matches!(room.role, RoomRole::Combat | RoomRole::Boss) {
+            continue;
+        }
+        let mut taken: FxHashSet<(i32, i32)> = FxHashSet::default();
+        place_platforms(
+            &mut rng,
+            room,
+            air,
+            &reachable,
+            &doors,
+            &mut taken,
+            solid,
+            &mut blocked_ground,
+        );
+        place_pilasters(
+            &mut rng,
+            room,
+            air,
+            &reachable,
+            &doors,
+            &mut taken,
+            solid,
+            &mut blocked_ground,
+        );
+        place_feature(
+            &mut rng,
+            theme,
+            room,
+            air,
+            &reachable,
+            &doors,
+            &mut taken,
+            solid,
+            &mut blocked_ground,
+        );
+    }
+    blocked_ground
 }
 
 /// Picks up to [`SPAWN_SPOTS`] free floor columns spread over a room.
+///
+/// A spot needs open floor around it, away from walls and pillars, and no
+/// ground decor within one block, so a spawned mob never stands inside a
+/// platform or a sarcophagus.
 fn spawn_spots(
     seed: u64,
     air: &FxHashMap<(i32, i32), Column>,
     index: usize,
     room: &Room,
+    blocked_ground: &FxHashSet<(i32, i32)>,
 ) -> Vec<(i32, i32)> {
     let (hx, hz) = room.half;
     let (cx, cz) = room.center;
@@ -905,7 +1570,10 @@ fn spawn_spots(
                         .is_some_and(|c| c.room == Some(index))
                 })
             });
-            if open {
+            let clear_of_decor = (-1..=1).all(|dx| {
+                (-1..=1).all(|dz| !blocked_ground.contains(&(column.0 + dx, column.1 + dz)))
+            });
+            if open && clear_of_decor {
                 spots.push(column);
             }
         }
@@ -934,7 +1602,9 @@ mod tests {
 
     use rustc_hash::FxHashSet;
 
-    use super::{Blueprint, CELL, GRID_RADIUS, Part, RoomRole, THEMES, Theme};
+    use super::{
+        Blueprint, CELL, GRID_RADIUS, MAX_ROOM_HALF, Part, Placement, RoomRole, THEMES, Theme,
+    };
     use crate::rank::HunterRank;
 
     fn air_columns(blueprint: &Blueprint) -> FxHashSet<(i32, i32)> {
@@ -1043,8 +1713,13 @@ mod tests {
         for seed in 0..100 {
             let blueprint = Blueprint::generate(seed, 5);
             let (min, max) = blueprint.bounds;
-            let limit = GRID_RADIUS * CELL + 12;
-            assert!(min.0 >= -limit && min.2 >= -limit && max.0 <= limit && max.2 <= limit);
+            // Farthest room centre plus its half extent, the wall, and the
+            // backing block behind the wall.
+            let limit = GRID_RADIUS * CELL + MAX_ROOM_HALF + 3;
+            assert!(
+                min.0 >= -limit && min.2 >= -limit && max.0 <= limit && max.2 <= limit,
+                "seed {seed}: bounds {min:?}..{max:?} exceed {limit}",
+            );
             let path: Vec<_> = blueprint
                 .rooms
                 .iter()
@@ -1059,6 +1734,167 @@ mod tests {
             }
         }
         assert!(turned > 80, "only {turned} of 100 layouts ever turn");
+    }
+
+    /// Columns carrying full-solid decor at foot level: walkable floor may
+    /// pass everywhere else, but a mob cannot stand on these.
+    fn blocked_ground_columns(blueprint: &Blueprint) -> FxHashSet<(i32, i32)> {
+        blueprint
+            .blocks
+            .iter()
+            .filter(|block| {
+                block.offset.1 == 0 && matches!(block.part, Part::Decor | Part::Lava | Part::Pillar)
+            })
+            .map(|block| (block.offset.0, block.offset.2))
+            .collect()
+    }
+
+    #[test]
+    fn decor_leaves_a_walkable_way_through_every_room() {
+        for seed in 0..200 {
+            let blueprint = Blueprint::generate(seed, 5);
+            let blocked = blocked_ground_columns(&blueprint);
+            let walkable: FxHashSet<(i32, i32)> = air_columns(&blueprint)
+                .difference(&blocked)
+                .copied()
+                .collect();
+            let mut seen = FxHashSet::default();
+            let mut queue = VecDeque::from([(0, 0)]);
+            seen.insert((0, 0));
+            while let Some((x, z)) = queue.pop_front() {
+                for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    let next = (x + dx, z + dz);
+                    if walkable.contains(&next) && seen.insert(next) {
+                        queue.push_back(next);
+                    }
+                }
+            }
+            for room in &blueprint.rooms {
+                assert!(
+                    seen.contains(&room.center),
+                    "seed {seed}: room {:?} at {:?} is cut off by decor",
+                    room.role,
+                    room.center
+                );
+                for spot in &room.spawns {
+                    assert!(
+                        seen.contains(spot),
+                        "seed {seed}: spawn spot {spot:?} of {:?} is cut off",
+                        room.role
+                    );
+                    for dx in -1..=1 {
+                        for dz in -1..=1 {
+                            assert!(
+                                !blocked.contains(&(spot.0 + dx, spot.1 + dz)),
+                                "seed {seed}: spawn spot {spot:?} of {:?} stands in decor",
+                                room.role
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_room_has_a_light_inside_it() {
+        for seed in 0..100 {
+            let blueprint = Blueprint::generate(seed, 4);
+            for room in &blueprint.rooms {
+                let (hx, hz) = room.half;
+                let lit = blueprint.blocks.iter().any(|block| {
+                    block.part == Part::Light
+                        && (block.offset.0 - room.center.0).abs() <= hx
+                        && (block.offset.2 - room.center.1).abs() <= hz
+                        && (0..=i32::from(room.height)).contains(&block.offset.1)
+                });
+                assert!(
+                    lit,
+                    "seed {seed}: room {:?} at {:?} has no light",
+                    room.role, room.center
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn combat_and_boss_rooms_are_dressed() {
+        let mut min_dressed = usize::MAX;
+        for seed in 0..100 {
+            let blueprint = Blueprint::generate(seed, 4);
+            for room in &blueprint.rooms {
+                if !matches!(room.role, RoomRole::Combat | RoomRole::Boss) {
+                    continue;
+                }
+                let (hx, hz) = room.half;
+                let inside = |block: &Placement| {
+                    (block.offset.0 - room.center.0).abs() <= hx
+                        && (block.offset.2 - room.center.1).abs() <= hz
+                };
+                let chains = blueprint
+                    .blocks
+                    .iter()
+                    .filter(|block| inside(block) && block.part == Part::Chain)
+                    .count();
+                let dressed = blueprint
+                    .blocks
+                    .iter()
+                    .filter(|block| {
+                        inside(block)
+                            && matches!(block.part, Part::Platform | Part::Decor | Part::Lava)
+                    })
+                    .count();
+                // Doorway arches frame the wall face, which can sit several
+                // blocks from the room centre: walls are jittered and a
+                // corridor may bend right at the boundary column.
+                let arches = blueprint
+                    .blocks
+                    .iter()
+                    .filter(|block| {
+                        (block.offset.0 - room.center.0).abs() <= hx + 6
+                            && (block.offset.2 - room.center.1).abs() <= hz + 6
+                            && block.part == Part::Arch
+                    })
+                    .count();
+                assert!(
+                    chains >= 1,
+                    "seed {seed}: {:?} has no hanging light",
+                    room.role
+                );
+                min_dressed = min_dressed.min(dressed);
+                assert!(
+                    arches >= 3,
+                    "seed {seed}: {:?} at {:?} has no doorway arch",
+                    room.role,
+                    room.center
+                );
+            }
+        }
+        assert!(
+            min_dressed >= 2,
+            "a combat or boss room ended up with only {min_dressed} dressed cells"
+        );
+    }
+
+    #[test]
+    fn nether_dungeons_usually_have_a_lava_basin() {
+        let mut dungeons = 0;
+        let mut with_lava = 0;
+        for seed in 0..300 {
+            let blueprint = Blueprint::generate_with_theme(seed, 4, Theme::Nether);
+            dungeons += 1;
+            if blueprint
+                .blocks
+                .iter()
+                .any(|block| block.part == Part::Lava)
+            {
+                with_lava += 1;
+            }
+        }
+        assert!(
+            with_lava * 10 >= dungeons * 9,
+            "only {with_lava} of {dungeons} nether dungeons have a lava basin"
+        );
     }
 
     #[test]

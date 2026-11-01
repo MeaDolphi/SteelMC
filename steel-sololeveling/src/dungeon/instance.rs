@@ -9,6 +9,7 @@ use steel_core::gameplay_hooks::BlockMutationCause;
 use steel_core::world::World;
 use steel_registry::blocks::BlockRef;
 use steel_registry::blocks::block_state_ext::BlockStateExt;
+use steel_registry::blocks::properties::{BlockStateProperties, SlabType};
 use steel_registry::entity_type::EntityTypeRef;
 use steel_registry::{vanilla_attributes, vanilla_blocks, vanilla_entities};
 use steel_utils::BlockPos;
@@ -384,12 +385,16 @@ pub fn build_dungeon(
             placement.part
         };
         let block = palette.block(part, CRYSTAL_ORE);
-        set_fixture(
-            world,
-            at(region, placement.offset),
-            block.default_state(),
-            &mut failed,
-        );
+        // Platforms are half-height terraces: their slab must sit in the
+        // bottom state so they stay walkable without jumping.
+        let state = if part == Part::Platform {
+            block
+                .default_state()
+                .set_value(&BlockStateProperties::SLAB_TYPE, SlabType::Bottom)
+        } else {
+            block.default_state()
+        };
+        set_fixture(world, at(region, placement.offset), state, &mut failed);
     }
     warn_unwritten("dungeon", at(region, (0, -1, 0)), failed);
 }
@@ -769,15 +774,35 @@ pub(super) fn warn_unwritten(what: &str, anchor: BlockPos, failed: u32) {
 #[cfg(test)]
 mod tests {
     use glam::DVec3;
+    use steel_registry::blocks::block_state_ext::BlockStateExt as _;
+    use steel_registry::blocks::properties::{BlockStateProperties, SlabType};
     use steel_registry::{init_vanilla_registry, vanilla_blocks};
     use steel_utils::types::BlockStateId;
     use steel_utils::{BlockPos, ChunkPos};
 
     use super::{
-        FrameStyle, INSTANCE_FLOOR_Y, at, dungeon_chunks, frame_block, gate_frame_chunks,
-        gate_is_dry_at, opening_contains, penalty_arena_chunks,
+        CRYSTAL_ORE, FrameStyle, INSTANCE_FLOOR_Y, at, dungeon_chunks, frame_block,
+        gate_frame_chunks, gate_is_dry_at, opening_contains, penalty_arena_chunks,
     };
+    use crate::dungeon::generator::{Part, THEMES};
     use crate::dungeon::{DungeonLayout, Footprint, InstanceRegion};
+
+    #[test]
+    fn every_theme_builds_platforms_from_a_real_slab() {
+        init_vanilla_registry();
+        for theme in THEMES {
+            let palette = theme.palette();
+            let state = palette.block(Part::Platform, CRYSTAL_ORE).default_state();
+            let bottom = state.set_value(&BlockStateProperties::SLAB_TYPE, SlabType::Bottom);
+            let top = state.set_value(&BlockStateProperties::SLAB_TYPE, SlabType::Top);
+            assert_ne!(
+                bottom,
+                top,
+                "{theme:?} platform block {:?} has no slab type states",
+                palette.block(Part::Platform, CRYSTAL_ORE).key,
+            );
+        }
+    }
 
     /// Builds a dry stone shore under `entrance` with air above it.
     fn dry_shore(entrance: BlockPos) -> impl Fn(BlockPos) -> BlockStateId {
