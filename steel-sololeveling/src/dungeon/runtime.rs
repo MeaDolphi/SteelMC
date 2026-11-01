@@ -3279,6 +3279,23 @@ impl DungeonRuntime {
             }
             return None;
         }
+        // Before the exit opens the staircase is a dead end; a hunter who
+        // climbs it early should learn why instead of staring into the void.
+        if progress.exit.is_none()
+            && tick.is_multiple_of(40)
+            && hunters
+                .iter()
+                .any(|hunter| castle_tower::at_ramp_top(region, progress.floor, *hunter))
+        {
+            for member in members {
+                if let Some(hunter) = world.players.get_by_uuid(member) {
+                    hunter.send_action_bar(
+                        TextComponent::plain("Лестница заперта: сначала зачистите этаж.")
+                            .color(Color::Yellow),
+                    );
+                }
+            }
+        }
         if let Some(exit) = progress.exit {
             // A hunter at the staircase top commits the climb: the next floor
             // is generated outside the tick while they climb.

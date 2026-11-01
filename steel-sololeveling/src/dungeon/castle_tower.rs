@@ -613,11 +613,19 @@ pub fn tower_chunks(region: InstanceRegion) -> Vec<ChunkPos> {
 }
 
 /// Builds one floor of the tower and returns the number of blocks written.
+///
+/// Besides the floor itself the build writes the ceiling slab of the floor
+/// above (one more slab up): the climb's next hall is generated lazily, and
+/// without that cap the stairwell looks straight into the sky of the world
+/// until it is built. The slab's own stairwell is rotated away, so no shaft
+/// lines up with the one below.
 pub fn build_floor(world: &Arc<World>, region: InstanceRegion, seed: u64, floor: u32) -> usize {
     let origin = BlockPos::from(region.spawn);
     let surface = floor_surface_y(floor);
     let mut failed = 0;
     let mut blocks = 0;
+    let next_ceiling = floor_surface_y(floor + 1) + CLEARANCE;
+    let with_next_ceiling = next_ceiling <= world.get_max_y();
     for dx in -WALL_OUTER..=WALL_OUTER {
         for dz in -WALL_OUTER..=WALL_OUTER {
             for y in surface - 1..=surface + CLEARANCE {
@@ -628,6 +636,17 @@ pub fn build_floor(world: &Arc<World>, region: InstanceRegion, seed: u64, floor:
                 set_fixture(
                     world,
                     BlockPos::new(origin.x() + dx, y, origin.z() + dz),
+                    block,
+                    &mut failed,
+                );
+            }
+            if with_next_ceiling
+                && let Some(block) = floor_block(seed, floor + 1, dx, dz, next_ceiling)
+            {
+                blocks += 1;
+                set_fixture(
+                    world,
+                    BlockPos::new(origin.x() + dx, next_ceiling, origin.z() + dz),
                     block,
                     &mut failed,
                 );
@@ -842,6 +861,28 @@ mod tests {
                 floor_block(9, floor, 0, 0, surface).is_none(),
                 "floor {floor}: the arena centre is blocked"
             );
+        }
+    }
+
+    #[test]
+    fn the_next_ceiling_covers_every_stairwell_from_below() {
+        init_vanilla_registry();
+        // The cap build_floor writes one slab up must cover every open cell of
+        // the floor's own stairwell, or a climber at the landing still sees
+        // the sky through the ceiling above.
+        for floor in 1_u32..6 {
+            let surface = floor_surface_y(floor);
+            let next_ceiling = floor_surface_y(floor + 1) + CLEARANCE;
+            for dx in -WALL_OUTER..=WALL_OUTER {
+                for dz in -WALL_OUTER..=WALL_OUTER {
+                    if floor_block(7, floor, dx, dz, surface + CLEARANCE).is_none() {
+                        assert!(
+                            floor_block(7, floor + 1, dx, dz, next_ceiling).is_some(),
+                            "floor {floor}: stairwell cell ({dx}, {dz}) sees the sky"
+                        );
+                    }
+                }
+            }
         }
     }
 
