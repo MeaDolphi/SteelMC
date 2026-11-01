@@ -126,7 +126,7 @@ impl Template {
     /// Returns the payment one hunter receives for finishing this contract.
     #[must_use]
     pub const fn payment(self) -> u64 {
-        self.objective.base_payment() * rank_multiplier(self.rank)
+        self.objective.base_payment() * payout_multiplier(self.rank) / 100
     }
 
     /// Returns a short name that fits one sidebar line.
@@ -187,6 +187,25 @@ pub const fn rank_multiplier(rank: HunterRank) -> u64 {
         HunterRank::B => 8,
         HunterRank::A => 16,
         HunterRank::S => 32,
+    }
+}
+
+/// Soft Won payout multiplier of a rank, in hundredths: E 100, D 150, C 200,
+/// B 300, A 400, S 600 (×1.0 through ×6.0).
+///
+/// Combat rewards scale with the steep [`rank_multiplier`] (×1/2/4/8/16/32)
+/// because higher-rank content gets disproportionately deadlier; money
+/// payouts scale with this gentler curve so high-rank Won inflows stay soft
+/// against inflation.
+#[must_use]
+pub const fn payout_multiplier(rank: HunterRank) -> u64 {
+    match rank {
+        HunterRank::E => 100,
+        HunterRank::D => 150,
+        HunterRank::C => 200,
+        HunterRank::B => 300,
+        HunterRank::A => 400,
+        HunterRank::S => 600,
     }
 }
 
@@ -288,6 +307,12 @@ impl Contract {
     #[must_use]
     pub const fn is_complete(self) -> bool {
         self.progress >= self.target()
+    }
+
+    /// Returns whether this contract can count `event` right now.
+    #[must_use]
+    pub fn accepts(&self, event: Event) -> bool {
+        !self.is_complete() && counts(self.template, event)
     }
 
     /// Counts `event` and reports whether this event finished the contract.
@@ -478,12 +503,21 @@ impl OrganizationBook {
         Ok(self.contracts.remove(index))
     }
 
-    /// Counts `event` on every contract, returning the ones it finished.
+    /// Counts `event` on the first active contract it matches, returning the
+    /// contract when that finished it. One event advances one contract, so a
+    /// hunter with several matching contracts progresses only the first.
     pub fn observe(&mut self, event: Event) -> Vec<Contract> {
-        self.contracts
-            .iter_mut()
-            .filter_map(|contract| contract.observe(event).then_some(*contract))
-            .collect()
+        let mut finished = Vec::new();
+        for contract in &mut self.contracts {
+            if !contract.accepts(event) {
+                continue;
+            }
+            if contract.observe(event) {
+                finished.push(*contract);
+            }
+            break;
+        }
+        finished
     }
 }
 
@@ -626,29 +660,31 @@ impl GuildBoard {
 
     /// Counts one event done by `hunters`, all members of this guild.
     ///
-    /// The event counts once per contract however many members took part,
-    /// and every one of them becomes a contributor. Returns whether anything
-    /// changed and the contracts the event finished.
+    /// The event counts once, on the first active contract it matches,
+    /// however many members took part, and every one of them becomes a
+    /// contributor. Returns whether anything changed and the contract if the
+    /// event finished it.
     pub fn observe(&mut self, hunters: &[Uuid], event: Event) -> (bool, Vec<Contract>) {
-        let mut changed = false;
-        let mut finished = Vec::new();
         for group in &mut self.contracts {
-            let before = group.contract.progress;
-            let done = group.contract.observe(event);
-            if group.contract.progress == before {
+            if !group.contract.accepts(event) {
                 continue;
             }
-            changed = true;
+            let done = group.contract.observe(event);
             for hunter in hunters {
                 if !group.contributors.contains(hunter) {
                     group.contributors.push(*hunter);
                 }
             }
-            if done {
-                finished.push(group.contract);
-            }
+            return (
+                true,
+                if done {
+                    vec![group.contract]
+                } else {
+                    Vec::new()
+                },
+            );
         }
-        (changed, finished)
+        (false, Vec::new())
     }
 
     /// Takes everything owed to `hunter`.
@@ -697,11 +733,57 @@ mod tests {
     #[test]
     fn payment_scales_by_rank() {
         assert_eq!(template(Objective::Mobs, HunterRank::E).payment(), 100);
-        assert_eq!(template(Objective::Boss, HunterRank::C).payment(), 600);
+        assert_eq!(template(Objective::Boss, HunterRank::C).payment(), 300);
         assert_eq!(
             template(Objective::Dungeons, HunterRank::S).payment(),
-            16_000
+            3_000
         );
+    }
+
+    #[test]
+    fn payout_multiplier_follows_the_soft_inflation_curve() {
+        use super::payout_multiplier;
+
+        for (rank, hundredths) in [
+            (HunterRank::E, 100),
+            (HunterRank::D, 150),
+            (HunterRank::C, 200),
+            (HunterRank::B, 300),
+            (HunterRank::A, 400),
+            (HunterRank::S, 600),
+        ] {
+            assert_eq!(payout_multiplier(rank), hundredths, "rank {rank:?}");
+        }
+        // Combat progress stays on the steep 1/2/4/8/16/32 curve.
+        assert_eq!(super::rank_multiplier(HunterRank::S), 32);
+    }
+
+    #[test]
+    fn one_event_advances_only_the_first_matching_contract() {
+        let mut book = OrganizationBook::default();
+        book.accept(
+            template(Objective::Dungeons, HunterRank::E),
+            HunterRank::E,
+            1,
+        )
+        .expect("dungeons");
+        book.accept(
+            template(Objective::Dungeons, HunterRank::E),
+            HunterRank::E,
+            2,
+        )
+        .expect("second same day only rolls over");
+        book.accept(
+            template(Objective::RankedDungeon, HunterRank::E),
+            HunterRank::E,
+            2,
+        )
+        .expect("ranked dungeon");
+
+        assert_eq!(book.observe(Event::Dungeon(HunterRank::E)).len(), 0);
+        assert_eq!(book.contracts[0].progress, 1);
+        assert_eq!(book.contracts[1].progress, 0);
+        assert_eq!(book.contracts[2].progress, 0);
     }
 
     #[test]
@@ -857,8 +939,6 @@ mod tests {
         let mut book = OrganizationBook::default();
         book.accept(boss, HunterRank::E, 1).expect("old");
         book.accept(boss, HunterRank::E, 2).expect("new");
-        book.observe(Event::Boss(HunterRank::E));
-        book.turn_in(1).expect("reward");
         book.cancel(0, 2).expect("old cancellation");
         assert_eq!(
             book.accept(boss, HunterRank::E, 2),

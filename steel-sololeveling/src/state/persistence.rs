@@ -24,7 +24,7 @@ use crate::merchant::MerchantOffer;
 
 use std::{
     collections::VecDeque,
-    io,
+    fmt, io,
     sync::{Arc, Weak},
 };
 
@@ -81,6 +81,54 @@ const fn party_document_key() -> Identifier {
 /// A prepared account that is not claimed by the admission hook within this
 /// many lane ticks is dropped, so abandoned joins do not leak account data.
 const PREPARED_JOIN_TTL_TICKS: u64 = 20 * 60 * 5;
+
+/// Organization commission on crystal buyback, in percent of the gross price.
+/// Balance: buyback mints Won, and this commission burns part of every sale to
+/// offset contract payout inflation; 10% keeps buyback close to auction prices,
+/// so selling to the Organization stays a fallback, not the best income source.
+const CRYSTAL_SALE_COMMISSION_PERCENT: u64 = 10;
+
+/// Splits a crystal sale gross price into the hunter's net credit and the
+/// Organization commission that is withheld.
+const fn crystal_sale_split(gross: u64) -> (u64, u64) {
+    let commission = gross.saturating_mul(CRYSTAL_SALE_COMMISSION_PERCENT) / 100;
+    (gross - commission, commission)
+}
+
+/// Reports a completed crystal buyback, stating the net sum and commission.
+fn crystal_sale_message(count: u32, net: u64, commission: u64) -> String {
+    format!(
+        "Организация авантюристов купила {count} кристалл(ов) за {net} Won (комиссия {CRYSTAL_SALE_COMMISSION_PERCENT}%: {commission} Won)."
+    )
+}
+
+/// Why staging a guild contract settlement was refused before committing it.
+#[derive(Debug)]
+enum GuildSettlementError {
+    /// The guild treasury cannot cover one full payment per contributor.
+    TreasuryShortfall,
+    /// Account or document storage failed while staging.
+    Storage(io::Error),
+}
+
+impl GuildSettlementError {
+    /// Returns how the refusal reads in chat.
+    fn message(&self) -> &str {
+        match self {
+            Self::TreasuryShortfall => GuildError::TreasuryShortfall.message(),
+            Self::Storage(_) => "Не удалось подготовить выплату гильдии.",
+        }
+    }
+}
+
+impl fmt::Display for GuildSettlementError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TreasuryShortfall => formatter.write_str(self.message()),
+            Self::Storage(error) => write!(formatter, "storage error: {error}"),
+        }
+    }
+}
 
 /// Decodes one gameplay document, restoring the previous committed backup
 /// once when the current bytes no longer decode.
@@ -809,6 +857,7 @@ impl SoloLevelingState {
             ));
             return false;
         }
+        let (net, commission) = crystal_sale_split(sale.total);
         let Some(mut snapshot) = self
             .sessions
             .with_mut(uuid, |session| session.saved_data(uuid))
@@ -816,7 +865,7 @@ impl SoloLevelingState {
             self.release_shop_purchase(uuid);
             return false;
         };
-        if !snapshot.won.try_credit(sale.total) {
+        if !snapshot.won.try_credit(net) {
             self.release_shop_purchase(uuid);
             player.send_message(&TextComponent::plain(
                 "Баланс Won переполнен; продажа отменена.",
@@ -861,9 +910,8 @@ impl SoloLevelingState {
                     if let Err(error) = state.save_session(uuid) {
                         log::warn!("sololeveling: could not queue sale follow-up save: {error}");
                     }
-                    completion_player.send_message(&TextComponent::plain(format!(
-                        "Организация авантюристов купила {} кристалл(ов) за {} Won.",
-                        sale.count, sale.total
+                    completion_player.send_message(&TextComponent::plain(crystal_sale_message(
+                        sale.count, net, commission,
                     )));
                     state.record_goal(uuid, Goal::CrystalSale, 1);
                 } else {
@@ -2191,12 +2239,7 @@ impl SoloLevelingState {
             match self.prepare_guild_contract_turn_in(actor, index) {
                 Ok(prepared) => prepared,
                 Err(error) => {
-                    self.finish_guild_turn_in_failure(
-                        server,
-                        actor,
-                        index,
-                        "Не удалось подготовить выплату гильдии.",
-                    );
+                    self.finish_guild_turn_in_failure(server, actor, index, error.message());
                     log::error!("sololeveling: could not prepare guild settlement: {error}");
                     return;
                 }
@@ -2229,7 +2272,7 @@ impl SoloLevelingState {
                 let uuid = player.gameprofile.id();
                 if uuid == actor && report.confirmed {
                     player.send_message(&TextComponent::plain(format!(
-                        "Задание гильдии «{}» сдано; участникам начислено по {payment} Won.",
+                        "Задание гильдии «{}» сдано; казна выплатила участникам по {payment} Won.",
                         contract.template.title()
                     )));
                 } else if uuid == actor {
@@ -2238,7 +2281,7 @@ impl SoloLevelingState {
                     ));
                 } else if credited.contains(&uuid) {
                     let message = if report.confirmed {
-                        format!("Гильдия выплатила вам {payment} Won.")
+                        format!("Казна гильдии выплатила вам {payment} Won.")
                     } else {
                         "Выплата зафиксирована, но подтверждение диска не получено; не повторяйте операцию."
                             .to_owned()
@@ -2253,12 +2296,22 @@ impl SoloLevelingState {
         &self,
         actor: Uuid,
         index: usize,
-    ) -> io::Result<(PreparedCommit, Contract, u64, Vec<Uuid>)> {
+    ) -> Result<(PreparedCommit, Contract, u64, Vec<Uuid>), GuildSettlementError> {
         let mut candidate = self.guilds.lock().clone();
         let (contract, paid) = candidate
             .settle_contract(actor, index)
-            .map_err(|error| io::Error::other(error.message()))?;
+            .map_err(|error| GuildSettlementError::Storage(io::Error::other(error.message())))?;
         let payment = contract.payment();
+        // Contract payouts come out of the guild treasury, never from a mint:
+        // one full payment per contributor is debited up front, and a treasury
+        // that cannot cover every contributor refuses the whole settlement.
+        let total = payment.saturating_mul(paid.len() as u64);
+        candidate
+            .debit_treasury(actor, total)
+            .map_err(|error| match error {
+                GuildError::TreasuryShortfall => GuildSettlementError::TreasuryShortfall,
+                _ => GuildSettlementError::Storage(io::Error::other(error.message())),
+            })?;
         let mut snapshots = Vec::new();
         let mut updates = Vec::new();
         let mut credited = Vec::new();
@@ -2293,7 +2346,9 @@ impl SoloLevelingState {
                 }
             }
         }
-        let replacement = candidate.to_document()?;
+        let replacement = candidate
+            .to_document()
+            .map_err(GuildSettlementError::Storage)?;
         let key = guild_document_key();
         let expected = self
             .persistence
@@ -2305,11 +2360,9 @@ impl SoloLevelingState {
         let prepared = if snapshots.is_empty() {
             PreparedCommit::document(key, expected, replacement)
         } else {
-            PreparedCommit::prepare(self, snapshots, updates)?.with_document(
-                key,
-                expected,
-                replacement,
-            )
+            PreparedCommit::prepare(self, snapshots, updates)
+                .map_err(GuildSettlementError::Storage)?
+                .with_document(key, expected, replacement)
         }
         .with_guild_registry(candidate);
         Ok((prepared, contract, payment, credited))
@@ -2530,11 +2583,22 @@ fn insert_stack(slots: &mut [Option<ItemStack>], item: ItemStack) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+
     use steel_registry::{init_vanilla_registry, item_stack::ItemStack, vanilla_items};
     use uuid::Uuid;
 
-    use super::{PREPARED_JOIN_TTL_TICKS, Persistence, insert_stack};
+    use super::{
+        GuildSettlementError, PREPARED_JOIN_TTL_TICKS, Persistence, crystal_sale_message,
+        crystal_sale_split, guild_document_key, insert_stack,
+    };
+    use crate::guild::{GuildRegistry, GuildRole};
+    use crate::organization::{Objective, Template};
     use crate::player_data::SoloLevelingPlayerData;
+    use crate::rank::HunterRank;
+    use crate::state::SoloLevelingState;
 
     #[test]
     fn stale_prepared_accounts_are_dropped_without_a_join() {
@@ -2600,5 +2664,162 @@ mod tests {
             .is_err()
         );
         assert_eq!(slots, before);
+    }
+
+    #[test]
+    fn crystal_sale_pays_ninety_percent_and_reports_the_commission() {
+        assert_eq!(crystal_sale_split(1000), (900, 100));
+        assert_eq!(
+            crystal_sale_split(9),
+            (9, 0),
+            "a sub-percent commission rounds down to zero"
+        );
+        let message = crystal_sale_message(12, 900, 100);
+        assert!(
+            message.contains("купила 12 кристалл(ов) за 900 Won (комиссия 10%: 100 Won)"),
+            "the message must state the net sum and the commission: {message}"
+        );
+    }
+
+    const BOSS_E: Template = Template {
+        objective: Objective::Boss,
+        rank: HunterRank::E,
+    };
+
+    /// A guild whose officer took one finished boss contract with two contributors.
+    fn guild_ready_for_turn_in() -> (SoloLevelingState, PathBuf, Uuid, Uuid, Uuid) {
+        let directory = env::temp_dir().join(format!("sololeveling-treasury-{}", Uuid::new_v4()));
+        let state = SoloLevelingState::new(directory.clone()).expect("state should initialize");
+        let master = Uuid::new_v4();
+        let officer = Uuid::new_v4();
+        let recruit = Uuid::new_v4();
+        for uuid in [master, officer, recruit] {
+            let data = SoloLevelingPlayerData::new(uuid);
+            state.persistence.lock().expected.insert(
+                uuid,
+                Some(serde_json::to_vec(&data).expect("encode account")),
+            );
+            state.begin_session(uuid, data);
+        }
+        state
+            .create_guild("Hunters".to_owned(), master)
+            .expect("create guild");
+        state
+            .add_guild_recruit(master, officer)
+            .expect("recruit officer");
+        state
+            .add_guild_recruit(master, recruit)
+            .expect("recruit member");
+        state
+            .set_guild_role(master, officer, GuildRole::Officer)
+            .expect("promote officer");
+        state
+            .accept_guild_contract(officer, BOSS_E)
+            .expect("take contract");
+        {
+            let mut guilds = state.guilds.lock();
+            let guild = guilds.guild_of_mut(officer).expect("guild");
+            let group = &mut guild.organization.contracts[0];
+            group.contract.progress = group.contract.target();
+            group.contributors = vec![master, recruit];
+        }
+        (state, directory, master, officer, recruit)
+    }
+
+    #[test]
+    fn guild_contract_settlement_pays_contributors_out_of_the_treasury() {
+        let (state, directory, master, officer, recruit) = guild_ready_for_turn_in();
+        state
+            .guilds
+            .lock()
+            .guild_of_mut(master)
+            .expect("guild")
+            .treasury
+            .credit(2000);
+
+        let payout = state
+            .turn_in_guild_contract(officer, 0)
+            .expect("queue turn-in");
+        assert_eq!(payout.paid, vec![master, recruit]);
+        let (prepared, contract, payment, credited) = state
+            .prepare_guild_contract_turn_in(officer, 0)
+            .expect("stage settlement");
+        assert_eq!(payment, 750);
+        assert_eq!(contract.payment(), 750);
+        assert_eq!(credited, vec![master, recruit]);
+
+        let write = prepared
+            .transaction
+            .extensions
+            .iter()
+            .find(|write| write.key == guild_document_key())
+            .expect("the guild document is rewritten");
+        let staged =
+            GuildRegistry::from_document(&write.replacement).expect("decode the staged registry");
+        let staged_guild = staged.guild_of(officer).expect("guild");
+        assert_eq!(
+            staged_guild.treasury.amount(),
+            500,
+            "two payouts of 750 leave 500 of the 2000 Won treasury"
+        );
+        assert!(
+            staged_guild.organization.owed.is_empty(),
+            "online contributors are credited directly, not owed"
+        );
+        drop(prepared);
+        assert_eq!(
+            state.with_session_mut(master, |session| session.won.amount()),
+            Some(0),
+            "live balances still wait for the durable commit"
+        );
+        assert_eq!(
+            state
+                .guilds
+                .lock()
+                .guild_of(officer)
+                .expect("live guild")
+                .treasury
+                .amount(),
+            2000,
+            "the live registry is untouched until the commit lands"
+        );
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn guild_contract_settlement_refuses_a_short_treasury_without_creating_money() {
+        let (state, directory, master, officer, recruit) = guild_ready_for_turn_in();
+        // The treasury stays at zero.
+        state
+            .turn_in_guild_contract(officer, 0)
+            .expect("queue turn-in");
+        let error = match state.prepare_guild_contract_turn_in(officer, 0) {
+            Err(error) => error,
+            Ok(_) => panic!("an empty treasury cannot pay two contributors"),
+        };
+        assert!(matches!(error, GuildSettlementError::TreasuryShortfall));
+        assert_eq!(
+            error.message(),
+            "В казне гильдии недостаточно средств для выплаты."
+        );
+
+        {
+            let guilds = state.guilds.lock();
+            let guild = guilds.guild_of(officer).expect("live guild");
+            assert_eq!(guild.treasury.amount(), 0);
+            assert!(
+                guild.organization.owed.is_empty(),
+                "no liabilities were staged"
+            );
+            assert_eq!(guild.organization.contracts.len(), 1);
+        }
+        for hunter in [master, recruit] {
+            assert_eq!(
+                state.with_session_mut(hunter, |session| session.won.amount()),
+                Some(0),
+                "refusing the settlement mints nothing"
+            );
+        }
+        fs::remove_dir_all(directory).expect("cleanup");
     }
 }

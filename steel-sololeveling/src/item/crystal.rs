@@ -9,6 +9,7 @@ use text_components::format::Color;
 use text_components::{Modifier as _, TextComponent};
 
 use super::{named, read_kind, record, tag_string, with_lore, write_tag};
+use crate::organization::payout_multiplier;
 use crate::rank::HunterRank;
 
 /// Kind stored in the record of a magic crystal.
@@ -53,9 +54,12 @@ pub fn rank(stack: &ItemStack) -> Option<HunterRank> {
 }
 
 /// Returns what the Organization pays for one crystal of `rank`.
+///
+/// Money uses the soft [`payout_multiplier`] curve instead of the steep
+/// combat multiplier, see [`crate::organization`].
 #[must_use]
 pub const fn sale_price(rank: HunterRank) -> u64 {
-    5 * rank.payment_multiplier()
+    5 * payout_multiplier(rank) / 100
 }
 
 /// One sale of magic crystals to the Adventurer Organization.

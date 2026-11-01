@@ -460,7 +460,9 @@ impl SoloLevelingState {
         Ok(group.contract)
     }
 
-    /// Queues an event that personal and group contracts may count.
+    /// Queues an event that contracts may count; each hunter's event lands in
+    /// the single highest-priority matching contract (guild, party, personal)
+    /// when the tick applies it.
     pub fn record_organization_event(&self, hunters: Vec<Uuid>, event: Event) {
         if hunters.is_empty() {
             return;
@@ -486,49 +488,19 @@ impl SoloLevelingState {
     }
 
     /// Counts queued events, returning who finished which contract.
+    ///
+    /// One event counts once per hunter, in the highest-priority book that
+    /// has a contract for it: guild, then party, then personal. A shared
+    /// event still counts once per party or guild contract no matter how many
+    /// of theirs took part in it.
     fn apply_organization_events(&self) -> Vec<(Uuid, Contract)> {
         let events = mem::take(&mut *self.organization_events.lock());
         let mut finished: Vec<(Uuid, Contract)> = Vec::new();
         let mut guild_notices = FxHashSet::default();
         for (hunters, event) in &events {
-            for hunter in hunters {
-                let observed = self.sessions.with_mut(*hunter, |session| {
-                    let before = session.organization.contracts.clone();
-                    let done = session.organization.observe(*event);
-                    (before != session.organization.contracts, done)
-                });
-                let Some((changed, done)) = observed else {
-                    continue;
-                };
-                if changed {
-                    self.queue_organization_save(*hunter);
-                }
-                finished.extend(done.into_iter().map(|contract| (*hunter, contract)));
-            }
-            // A shared goal counts once per event, however many participants
-            // took part in it.
-            let mut parties = self.party_runtime.lock();
-            for party in parties.parties_mut() {
-                for group in &mut party.contracts {
-                    if group.pending_turn_in {
-                        continue;
-                    }
-                    if group
-                        .participants
-                        .iter()
-                        .any(|participant| hunters.contains(participant))
-                        && group.contract.observe(*event)
-                    {
-                        finished.extend(
-                            group
-                                .participants
-                                .iter()
-                                .map(|participant| (*participant, group.contract)),
-                        );
-                    }
-                }
-            }
-            drop(parties);
+            // Hunters whose event already counted toward a guild contract;
+            // the party and personal books skip them.
+            let mut routed: FxHashSet<Uuid> = FxHashSet::default();
 
             let mut guilds = self.guilds.lock();
             let mut changed = false;
@@ -543,9 +515,11 @@ impl SoloLevelingState {
                 }
                 let (counted, done) = guild.organization.observe(&members, *event);
                 changed |= counted;
-                if counted {
-                    guild_notices.extend(members);
+                if !counted {
+                    continue;
                 }
+                routed.extend(members.iter().copied());
+                guild_notices.extend(members);
                 for contract in done {
                     finished.extend(guild.members.keys().map(|member| (*member, contract)));
                 }
@@ -556,6 +530,53 @@ impl SoloLevelingState {
                 && let Some(player) = hunters.first()
             {
                 guild_notices.insert(*player);
+            }
+
+            let mut parties = self.party_runtime.lock();
+            for party in parties.parties_mut() {
+                let present: Vec<Uuid> = hunters
+                    .iter()
+                    .copied()
+                    .filter(|hunter| !routed.contains(hunter) && party.members().contains(hunter))
+                    .collect();
+                if present.is_empty() {
+                    continue;
+                }
+                for group in &mut party.contracts {
+                    if group.pending_turn_in || !group.contract.accepts(*event) {
+                        continue;
+                    }
+                    let done = group.contract.observe(*event);
+                    routed.extend(present.iter().copied());
+                    if done {
+                        finished.extend(
+                            group
+                                .participants
+                                .iter()
+                                .map(|participant| (*participant, group.contract)),
+                        );
+                    }
+                    break;
+                }
+            }
+            drop(parties);
+
+            for hunter in hunters {
+                if routed.contains(hunter) {
+                    continue;
+                }
+                let observed = self.sessions.with_mut(*hunter, |session| {
+                    let before = session.organization.contracts.clone();
+                    let done = session.organization.observe(*event);
+                    (before != session.organization.contracts, done)
+                });
+                let Some((changed, done)) = observed else {
+                    continue;
+                };
+                if changed {
+                    self.queue_organization_save(*hunter);
+                }
+                finished.extend(done.into_iter().map(|contract| (*hunter, contract)));
             }
         }
         for player in guild_notices {
@@ -640,6 +661,29 @@ mod tests {
         objective: Objective::Boss,
         rank: HunterRank::E,
     };
+
+    const DUNGEONS_E: Template = Template {
+        objective: Objective::Dungeons,
+        rank: HunterRank::E,
+    };
+
+    const RANKED_DUNGEON_E: Template = Template {
+        objective: Objective::RankedDungeon,
+        rank: HunterRank::E,
+    };
+
+    fn progress_of(state: &SoloLevelingState, uuid: Uuid) -> Vec<(Template, u32)> {
+        state
+            .with_session_mut(uuid, |session| {
+                session
+                    .organization
+                    .contracts
+                    .iter()
+                    .map(|contract| (contract.template, contract.progress))
+                    .collect()
+            })
+            .expect("session")
+    }
 
     #[test]
     fn group_contract_is_capped_by_the_weakest_member_and_spends_everyones_allowance() {
@@ -729,6 +773,110 @@ mod tests {
             state.turn_in_group_contract(leader, 0),
             Err(OrganizationError::Storage)
         );
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn an_event_counts_in_only_the_highest_priority_contract() {
+        let (state, directory) = state();
+        let master = hunter(&state, 1);
+        let leader = hunter(&state, 1);
+        let member = hunter(&state, 1);
+        state
+            .create_guild("Hunters".to_owned(), master)
+            .expect("create guild");
+        state.add_guild_recruit(master, leader).expect("recruit");
+        state
+            .accept_guild_contract(master, DUNGEONS_E)
+            .expect("guild contract");
+
+        party(&state, leader, &[member]);
+        state
+            .accept_group_contract(leader, DUNGEONS_E)
+            .expect("group contract");
+        state
+            .accept_personal_contract(leader, RANKED_DUNGEON_E)
+            .expect("leader personal");
+        state
+            .accept_personal_contract(member, RANKED_DUNGEON_E)
+            .expect("member personal");
+
+        // The leader is in the guild, so the event belongs to the guild
+        // contract alone; neither the party nor the personal book moves.
+        state.record_organization_event(vec![leader], Event::Dungeon(HunterRank::E));
+        state.apply_organization_events();
+        let guild_progress = state
+            .guilds
+            .lock()
+            .guild_of(leader)
+            .expect("guild")
+            .organization
+            .contracts[0]
+            .contract
+            .progress;
+        assert_eq!(guild_progress, 1);
+        assert_eq!(
+            state.party_of(leader).expect("party").contracts()[0]
+                .contract
+                .progress,
+            0
+        );
+        assert_eq!(progress_of(&state, leader), vec![(RANKED_DUNGEON_E, 0)]);
+
+        // The member is guildless: the party contract outranks the personal.
+        state.record_organization_event(vec![member], Event::Dungeon(HunterRank::E));
+        state.apply_organization_events();
+        assert_eq!(
+            state.party_of(leader).expect("party").contracts()[0]
+                .contract
+                .progress,
+            1
+        );
+        assert_eq!(progress_of(&state, member), vec![(RANKED_DUNGEON_E, 0)]);
+        assert_eq!(
+            state
+                .guilds
+                .lock()
+                .guild_of(leader)
+                .expect("guild")
+                .organization
+                .contracts[0]
+                .contract
+                .progress,
+            1,
+            "the member is not a guild member"
+        );
+
+        // Once the member leaves the party, the event falls through to the
+        // personal contract and finishes it.
+        state.leave_party(member);
+        state.record_organization_event(vec![member], Event::Dungeon(HunterRank::E));
+        let finished = state.apply_organization_events();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].0, member);
+        assert_eq!(progress_of(&state, member), vec![(RANKED_DUNGEON_E, 1)]);
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn contract_payouts_follow_the_soft_payout_multiplier() {
+        let (state, directory) = state();
+        // Level 25 grants C rank, where the soft curve pays ×2.0 instead of
+        // the old combat ×4.
+        let uuid = hunter(&state, 25);
+        let boss_c = Template {
+            objective: Objective::Boss,
+            rank: HunterRank::C,
+        };
+        state
+            .accept_personal_contract(uuid, boss_c)
+            .expect("accept");
+        state.record_organization_event(vec![uuid], Event::Boss(HunterRank::C));
+        state.apply_organization_events();
+        let queued = state
+            .turn_in_personal_contract(uuid, 0)
+            .expect("finished contract is queued");
+        assert_eq!(queued.payment(), 300);
         fs::remove_dir_all(directory).expect("cleanup");
     }
 

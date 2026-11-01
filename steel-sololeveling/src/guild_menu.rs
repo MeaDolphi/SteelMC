@@ -151,6 +151,8 @@ fn guild_items(state: &SoloLevelingState, viewer: Uuid, guild: &Guild) -> Vec<It
         format!("Уровень {}", guild.level),
         format!("Участников: {} / {GUILD_MAX_MEMBERS}", guild.members.len()),
         format!("Казна: {} Won", guild.treasury.amount()),
+        "Выплаты за гильдейские задания идут из казны.".to_owned(),
+        "Казну пополняют взносы участников.".to_owned(),
         format!("Ваш ранг: {}", role_name(role)),
     ];
     if hidden > 0 {

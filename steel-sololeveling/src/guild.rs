@@ -58,7 +58,10 @@ pub struct Guild {
     pub name: String,
     /// Guild progression level.
     pub level: u32,
-    /// Shared Won balance.
+    /// Shared Won balance funded only by member deposits. Guild contract
+    /// payouts are debited from it, never minted, and there is no automatic
+    /// refill: the plan's 20% skim was rejected because paying it would mint
+    /// money again, so the treasury grows solely through voluntary deposits.
     pub treasury: Won,
     /// Members and their respective authority.
     pub members: FxHashMap<Uuid, GuildRole>,
@@ -145,6 +148,7 @@ impl GuildError {
             Self::InsufficientFunds => "Недостаточно Won.",
             Self::TransactionPending => "Дождитесь завершения текущей транзакции.",
             Self::TreasuryOverflow => "В казне недостаточно места для этой суммы.",
+            Self::TreasuryShortfall => "В казне гильдии недостаточно средств для выплаты.",
         }
     }
 }
@@ -180,6 +184,8 @@ pub enum GuildError {
     TransactionPending,
     /// The requested deposit would overflow the guild treasury.
     TreasuryOverflow,
+    /// The treasury cannot cover one full contract payment per contributor.
+    TreasuryShortfall,
 }
 
 /// Legacy JSON source used only when importing into a non-SQLite storage backend.
@@ -432,6 +438,20 @@ impl GuildRegistry {
         Ok(())
     }
 
+    /// Debits `total` Won from the treasury of `player`'s guild to fund a
+    /// contract settlement.
+    ///
+    /// Guild contracts are paid out of the treasury, never minted, so a
+    /// settlement the treasury cannot cover in full is refused without
+    /// changing any funds.
+    pub fn debit_treasury(&mut self, player: Uuid, total: u64) -> Result<(), GuildError> {
+        let guild = self.guild_of_mut(player).ok_or(GuildError::Missing)?;
+        if !guild.treasury.debit(total) {
+            return Err(GuildError::TreasuryShortfall);
+        }
+        Ok(())
+    }
+
     /// Stages one completed guild contract settlement in this registry copy.
     pub fn settle_contract(
         &mut self,
@@ -510,6 +530,41 @@ mod tests {
         assert_eq!(
             loaded.guild_of(recruit).map(|guild| guild.name.as_str()),
             Some("Hunters")
+        );
+    }
+
+    #[test]
+    fn contract_payouts_debit_the_treasury_and_shortfall_refuses_without_changing_funds() {
+        let guildmaster = Uuid::new_v4();
+        let mut guilds = GuildRegistry::empty();
+        guilds
+            .create("Hunters".to_owned(), guildmaster)
+            .expect("create guild");
+        guilds
+            .guild_of_mut(guildmaster)
+            .expect("guild")
+            .treasury
+            .credit(1000);
+
+        guilds
+            .debit_treasury(guildmaster, 750)
+            .expect("a payout of 750 fits");
+        assert_eq!(
+            guilds
+                .guild_of(guildmaster)
+                .map(|guild| guild.treasury.amount()),
+            Some(250)
+        );
+        assert_eq!(
+            guilds.debit_treasury(guildmaster, 251),
+            Err(GuildError::TreasuryShortfall)
+        );
+        assert_eq!(
+            guilds
+                .guild_of(guildmaster)
+                .map(|guild| guild.treasury.amount()),
+            Some(250),
+            "a refused settlement must not create or destroy Won"
         );
     }
 }

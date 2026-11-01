@@ -27,6 +27,7 @@ use steel_utils::{BlockPos, Identifier};
 use self::generator::Blueprint;
 
 use crate::castle;
+use crate::organization::payout_multiplier;
 use crate::quest::{
     PENALTY_ZONE_DURATION_SECONDS, PENALTY_ZONE_WAVE_INTERVAL_SECONDS,
     PENALTY_ZONE_ZOMBIES_PER_WAVE,
@@ -62,6 +63,15 @@ pub const GATE_BREAK_WAVE_INTERVAL_TICKS: u64 = TICKS_PER_SECOND * 30;
 pub const GATE_BREAK_SPAWN_RADIUS: i32 = 8;
 /// Base Won paid to each nearby defender per cleared wave.
 pub const GATE_BREAK_WAVE_REWARD_BASE: u64 = 150;
+
+/// Won paid to each defender for one cleared wave of a gate break of `rank`.
+///
+/// Money uses the soft [`payout_multiplier`] curve instead of the combat
+/// multiplier that scales mob rewards, see [`crate::organization`].
+#[must_use]
+pub const fn gate_break_wave_reward(rank: HunterRank) -> u64 {
+    GATE_BREAK_WAVE_REWARD_BASE * payout_multiplier(rank) / 100
+}
 /// Horizontal distance from the gate that counts a hunter as a defender.
 pub const GATE_BREAK_PARTICIPATION_RADIUS: f64 = 48.0;
 /// How long a cleared dungeon stays open as a crystal mine.

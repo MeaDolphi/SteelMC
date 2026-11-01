@@ -16,7 +16,7 @@ use crate::castle;
 use crate::combat_reward::HunterReward;
 use crate::daily;
 use crate::item::chest::ChestKind;
-use crate::organization::{Event, rank_multiplier};
+use crate::organization::{Event, payout_multiplier};
 use crate::quest_book::{
     self, Achievement, Finished, Goal, Standing, errand_experience, errand_points, trial_won,
 };
@@ -69,7 +69,7 @@ fn shares(pool: u64, scores: &[u64]) -> Vec<u64> {
 impl SoloLevelingState {
     /// Pays the bounty and salaries of a cleared gate and counts it.
     pub fn on_gate_cleared(&self, clear: &GateClear) {
-        let mut pool = GATE_BOUNTY * rank_multiplier(clear.rank);
+        let mut pool = GATE_BOUNTY * payout_multiplier(clear.rank) / 100;
         if clear.red {
             pool = pool * 3 / 2;
         }
@@ -97,7 +97,7 @@ impl SoloLevelingState {
                         return None;
                     }
                     session.quests.salary_day = today;
-                    Some(SALARY * rank_multiplier(session.stats.rank()))
+                    Some(SALARY * payout_multiplier(session.stats.rank()) / 100)
                 })
                 .flatten();
             if let Some(salary) = salary {

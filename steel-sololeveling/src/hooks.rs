@@ -772,6 +772,25 @@ impl SoloLevelingHooks {
                     );
                     return;
                 }
+                let uuid = player.gameprofile.id();
+                let Some(rank) = self
+                    .state
+                    .with_session_mut(uuid, |session| session.stats.rank())
+                else {
+                    player.send_message(
+                        &TextComponent::plain("Сессия охотника не найдена.").color(Color::Red),
+                    );
+                    return;
+                };
+                let price = gate_menu::teleport_price(rank);
+                if let Err(message) = gate_menu::charge_teleport(&self.state, uuid, price) {
+                    player.send_message(&TextComponent::plain(message).color(Color::Red));
+                    return;
+                }
+                player.send_message(
+                    &TextComponent::plain(format!("Перенос к вратам. Списано {price} Won."))
+                        .color(Color::Gold),
+                );
                 let destination = glam::DVec3::new(
                     f64::from(gate.entrance.x()) + 0.5,
                     f64::from(gate.entrance.y()) + 1.0,

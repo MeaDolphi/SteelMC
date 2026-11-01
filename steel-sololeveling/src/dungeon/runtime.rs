@@ -48,13 +48,12 @@ use super::skills::{MobSkills, SkillAction, refresh_plates};
 use super::tower;
 use super::{
     DUNGEON_TIME_LIMIT_TICKS, DungeonLayout, DungeonWave, Footprint,
-    GATE_BREAK_PARTICIPATION_RADIUS, GATE_BREAK_WAVE_INTERVAL_TICKS, GATE_BREAK_WAVE_REWARD_BASE,
-    GATE_BREAK_WAVES, GATE_SPAWN_INTERVAL_TICKS, GATES_PER_SPAWN_CYCLE, Gate, GateBreak,
-    GateRegistry, GateRegistryChanges, GateRegistrySnapshot, GateRegistryWrite,
-    GateRetirementReason, INSTANCE_WORLD_PATH, InstanceRegion, InstanceRegionAllocator,
-    LegacyGateCleanup, MINE_DURATION_TICKS, PENALTY_ZONE_DURATION_TICKS,
-    PENALTY_ZONE_WAVE_INTERVAL_TICKS, TICKS_PER_SECOND, penalty_wave_size, wave_for_gate,
-    wave_for_rank,
+    GATE_BREAK_PARTICIPATION_RADIUS, GATE_BREAK_WAVE_INTERVAL_TICKS, GATE_BREAK_WAVES,
+    GATE_SPAWN_INTERVAL_TICKS, GATES_PER_SPAWN_CYCLE, Gate, GateBreak, GateRegistry,
+    GateRegistryChanges, GateRegistrySnapshot, GateRegistryWrite, GateRetirementReason,
+    INSTANCE_WORLD_PATH, InstanceRegion, InstanceRegionAllocator, LegacyGateCleanup,
+    MINE_DURATION_TICKS, PENALTY_ZONE_DURATION_TICKS, PENALTY_ZONE_WAVE_INTERVAL_TICKS,
+    TICKS_PER_SECOND, gate_break_wave_reward, penalty_wave_size, wave_for_gate, wave_for_rank,
 };
 use crate::castle;
 use crate::city;
@@ -3473,6 +3472,28 @@ impl DungeonRuntime {
             .collect()
     }
 
+    /// Builds the payout of a finished mine shift.
+    ///
+    /// The timer expiry and the exit walk both pay through this helper, so
+    /// they cannot drift apart: participants are read from the instance world
+    /// the party still stands in, never from the world it is about to return
+    /// to (where nobody has been teleported yet).
+    fn mine_credit_action(
+        server: &Arc<Server>,
+        instance_world: &Identifier,
+        region: InstanceRegion,
+        members: &[Uuid],
+        rank: HunterRank,
+        mined: u32,
+    ) -> Option<RunAction> {
+        let world = server.worlds.get(instance_world)?;
+        Some(RunAction::CreditMine {
+            participants: Self::mine_participants(world, region, members),
+            rank,
+            mined,
+        })
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "every per-tick run transition is easier to compare side by side"
@@ -3558,14 +3579,17 @@ impl DungeonRuntime {
                         }));
                     }
                     RunProgress::Mine(ref progress) => {
-                        let Some(world) = server.worlds.get(&run.instance_world) else {
+                        let Some(credit) = Self::mine_credit_action(
+                            server,
+                            &run.instance_world,
+                            run.region,
+                            &members,
+                            progress.rank,
+                            progress.mined,
+                        ) else {
                             continue;
                         };
-                        actions.push(RunAction::CreditMine {
-                            participants: Self::mine_participants(world, run.region, &members),
-                            rank: progress.rank,
-                            mined: progress.mined,
-                        });
+                        actions.push(credit);
                         actions.extend(members.iter().copied().map(|uuid| {
                             RunAction::ReturnPlayer {
                                 uuid,
@@ -3693,14 +3717,15 @@ impl DungeonRuntime {
                                 world: target_world,
                                 ..
                             } => {
-                                if let Some(world) = server.worlds.get(&target_world) {
-                                    actions.push(RunAction::CreditMine {
-                                        participants: Self::mine_participants(
-                                            world, run.region, &members,
-                                        ),
-                                        rank: progress.rank,
-                                        mined: progress.mined,
-                                    });
+                                if let Some(credit) = Self::mine_credit_action(
+                                    server,
+                                    &run.instance_world,
+                                    run.region,
+                                    &members,
+                                    progress.rank,
+                                    progress.mined,
+                                ) {
+                                    actions.push(credit);
                                 }
                                 actions.extend(members.into_iter().map(|uuid| {
                                     RunAction::ReturnPlayer {
@@ -3781,6 +3806,20 @@ impl DungeonRuntime {
     }
 }
 
+/// Converts a finished shift into each miner's Won share.
+///
+/// Every living participant inside the mine splits the sale value of the
+/// mined crystals equally; the division remainder is not paid out. Both ways
+/// of leaving a mine pay through the same [`RunAction::CreditMine`], so this
+/// conversion is the single payout formula for the timer expiry and the exit
+/// walk alike.
+pub fn mine_share(rank: HunterRank, mined: u32, participants: usize) -> u64 {
+    if participants == 0 {
+        return 0;
+    }
+    u64::from(mined) * crystal::sale_price(rank) / participants as u64
+}
+
 /// Applies one deferred run action after the runtime lock was released.
 pub fn apply_action(state: &SoloLevelingState, server: &Arc<Server>, action: &RunAction) {
     match action {
@@ -3820,7 +3859,7 @@ pub fn apply_action(state: &SoloLevelingState, server: &Arc<Server>, action: &Ru
         }
         RunAction::StartMine => {}
         RunAction::CityDefenseWave { participants, rank } => {
-            let reward = GATE_BREAK_WAVE_REWARD_BASE * rank_multiplier(*rank);
+            let reward = gate_break_wave_reward(*rank);
             for uuid in participants {
                 state.credit_won(*uuid, reward);
                 state.record_organization_event(vec![*uuid], Event::CityDefense(*rank));
@@ -3835,8 +3874,7 @@ pub fn apply_action(state: &SoloLevelingState, server: &Arc<Server>, action: &Ru
             if participants.is_empty() {
                 return;
             }
-            let total = u64::from(*mined) * crystal::sale_price(*rank);
-            let share = total / participants.len() as u64;
+            let share = mine_share(*rank, *mined, participants.len());
             for uuid in participants {
                 state.credit_won(*uuid, share);
                 state.notify(*uuid, &format!("Шахтная смена завершена: +{share} Won."));
@@ -4195,5 +4233,18 @@ mod tests {
         assert_eq!(mine.quota, HunterRank::D.crystal_vein_count() as u32);
         assert!(dungeon.boss_materials.is_empty());
         assert_eq!(mine.exit, exit);
+    }
+
+    #[test]
+    fn mine_shift_pays_the_same_share_on_exit_and_timer() {
+        // Both the exit walk and the timer expiry route through
+        // `mine_credit_action` and this conversion, so one formula defines
+        // the payout either way; the test pins the formula without depending
+        // on the crystal price itself.
+        let unit = crate::item::crystal::sale_price(HunterRank::D);
+        assert_eq!(super::mine_share(HunterRank::D, 6, 3), unit * 6 / 3);
+        assert_eq!(super::mine_share(HunterRank::D, 5, 3), unit * 5 / 3);
+        assert_eq!(super::mine_share(HunterRank::D, 6, 0), 0);
+        assert_eq!(super::mine_share(HunterRank::D, 0, 3), 0);
     }
 }
