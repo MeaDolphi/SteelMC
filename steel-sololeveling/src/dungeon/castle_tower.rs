@@ -705,6 +705,22 @@ pub fn floor_entry(region: InstanceRegion, floor: u32) -> DVec3 {
     )
 }
 
+/// Returns where a hunter entering the tower directly at `floor` stands: the
+/// middle of that floor's arena.
+///
+/// A climb only ever builds the floors it reaches, so the arrival aisle of a
+/// directly entered floor has an open stairwell under it, and the arena
+/// centre is the one position guaranteed to have a floor.
+#[must_use]
+pub fn hall_center(region: InstanceRegion, floor: u32) -> DVec3 {
+    let pos = at(region, (0, (floor as i32 - 1) * FLOOR_STEP, 0));
+    DVec3::new(
+        f64::from(pos.x()) + 0.5,
+        f64::from(pos.y()),
+        f64::from(pos.z()) + 0.5,
+    )
+}
+
 /// Returns the bottom of the exit frame of `floor`, standing in the middle
 /// of the hall.
 ///
@@ -810,6 +826,24 @@ mod tests {
     /// A stand the walker can rest at: cell plus feet height in half blocks
     /// above `floor`'s surface, so stairs split into their two half steps.
     type Stand = (i32, i32, i32);
+
+    #[test]
+    fn direct_entry_lands_on_solid_ground_at_any_floor() {
+        init_vanilla_registry();
+        for floor in 1_u32..=max_floors(320) {
+            let surface = floor_surface_y(floor);
+            let center = super::hall_center(InstanceRegion::from_slot(0), floor);
+            assert_eq!(center.y, f64::from(surface));
+            assert!(
+                floor_block(9, floor, 0, 0, surface - 1).is_some(),
+                "floor {floor}: the arena centre has no floor under it"
+            );
+            assert!(
+                floor_block(9, floor, 0, 0, surface).is_none(),
+                "floor {floor}: the arena centre is blocked"
+            );
+        }
+    }
 
     /// Reads the world column the way the incremental build leaves it: floor
     /// `n + 1` is written over floor `n`'s ceiling slab, except where its

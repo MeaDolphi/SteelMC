@@ -1030,9 +1030,16 @@ impl InstanceRun {
         self.members.is_empty()
     }
 
-    /// Teleports one member to the region spawn and announces the entry.
+    /// Teleports one member to the entry point of its run and announces it.
     fn place_member(&self, member: &Player) {
-        let _ = member.teleport(self.region.spawn, 0.0, 0.0);
+        // A castle run builds only the floor it entered: the region spawn is
+        // open air above that floor, so the member must land on the arena of
+        // the actual floor.
+        let target = match &self.progress {
+            RunProgress::Castle(progress) => castle_tower::hall_center(self.region, progress.floor),
+            _ => self.region.spawn,
+        };
+        let _ = member.teleport(target, 0.0, 0.0);
         member.send_message(&self.entry_announcement());
         if self.locked {
             member.send_message(
