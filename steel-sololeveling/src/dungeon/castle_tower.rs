@@ -9,6 +9,15 @@
 //! quarter turn, so the arrival hole of one floor never lands inside the
 //! staircase of the next.
 //!
+//! The hall around that skeleton is one of four archetypes, picked per floor
+//! from the run seed without ever repeating the previous floor: a colonnade
+//! with a glowing entablature and a red carpet, a lava arena ringed by a
+//! glass parapet with stone piers, a terraced garden of crimson and warped
+//! nylium, and a throne hall on every tenth floor. Every hall is lit by a
+//! shared plan — a shroomlight inlay ring, glowstone markers to the
+//! staircase, soul lanterns along the walls and a chained chandelier — so no
+//! hunter ever needs a torch of their own.
+//!
 //! Floors are generated one at a time, outside the game tick, by a server job
 //! modelled on `DungeonGenerationJob`; [`floor_block`] is the pure block
 //! function that function builds from and the tests walk.
@@ -17,8 +26,9 @@ use std::sync::Arc;
 
 use glam::DVec3;
 use steel_core::world::World;
+use steel_registry::blocks::BlockRef;
 use steel_registry::blocks::block_state_ext::BlockStateExt as _;
-use steel_registry::blocks::properties::{BlockStateProperties, Direction};
+use steel_registry::blocks::properties::{BlockStateProperties, Direction, SlabType};
 use steel_registry::vanilla_blocks;
 use steel_utils::{BlockPos, BlockStateId, ChunkPos};
 
@@ -140,46 +150,279 @@ fn stair_layer(x: i32) -> Option<i32> {
         .then_some(x - CLIMB_START)
 }
 
-/// Returns the four canonical pillar columns of one floor, jittered by the
-/// per-floor seed.
-const fn pillar_columns(seed: u64) -> [(i32, i32); 4] {
-    let mut columns = [(0, 0); 4];
-    let mut index = 0;
-    while index < 4 {
-        let (sx, sz) = (
-            if index % 2 == 0 { -1 } else { 1 },
-            if index < 2 { -1 } else { 1 },
-        );
-        let jx = (mix(seed, index as i32, 7) % 5) as i32 - 2;
-        let jz = (mix(seed, index as i32, 13) % 5) as i32 - 2;
-        columns[index] = (sx * 7 + jx, sz * 7 + jz);
-        index += 1;
-    }
-    columns
+/// Returns whether the canonical column is inside the staircase strip —
+/// the two columns along the south wall the staircase and landing occupy.
+fn in_strip(x: i32, z: i32) -> bool {
+    RAMP_DZ.contains(&z) && (RAMP_DX_MIN..=RAMP_DX_MAX).contains(&x)
 }
 
-/// Returns the two canonical ceiling light columns of one floor.
-fn light_columns(seed: u64) -> [(i32, i32); 2] {
-    let first = mix(seed, 3, 21) % 4;
-    let second = (first + 1 + mix(seed, 5, 33) % 3) % 4;
-    let corner = |quadrant: u64| {
-        let (sx, sz) = (
-            if quadrant % 2 == 0 { -1 } else { 1 },
-            if quadrant < 2 { -1 } else { 1 },
+/// Returns whether the canonical column must stay open at every walking
+/// layer because the climb or the arrival passes through it.
+///
+/// The staircase strip is one such corridor; the floor below's staircase
+/// stands one quarter turn back, so in this floor's plan its shaft is the
+/// strip rotated by three quarters: the two west columns. A hunter steps off
+/// that landing into the aisle east of it and walks into the climb's mouth
+/// along the strip's west extension, so those stay open as well. No
+/// decoration may intrude here, whatever the archetype.
+fn in_shaft_corridor(x: i32, z: i32) -> bool {
+    in_strip(x, z)
+        || (-13..=-12).contains(&x) && (-13..=12).contains(&z)
+        || x == -11 && (-12..=12).contains(&z)
+}
+
+/// Returns whether the canonical column is one the exit portal rotates
+/// across on the four quarter turns. The portal stands at a fixed world
+/// position on every floor, so its box sweeps this orbit through the plan;
+/// every cell of it must stay clear at walking height.
+fn in_exit_orbit(x: i32, z: i32) -> bool {
+    (-1..=2).contains(&x) && z == 6
+        || x == -6 && (-1..=2).contains(&z)
+        || (-2..=1).contains(&x) && z == -6
+        || x == 6 && (-2..=1).contains(&z)
+}
+
+/// Chebyshev radius of the glowing shroomlight inlay ring every hall's floor
+/// carries, centred on the exit portal.
+const INLAY_RADIUS: i32 = 5;
+/// Chebyshev radius of the colonnade ring: columns on a five-block grid with
+/// a half-slab architrave tying them together.
+const COLONNADE_RADIUS: i32 = 10;
+
+/// The plan one floor's hall is decorated with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Archetype {
+    /// A colonnade ring with glowing capitals and a red carpet to the centre.
+    Colonnade,
+    /// Lava channels along the hall edges, caged behind a glass parapet.
+    LavaArena,
+    /// Raised nylium terraces with a crimson garden along the walls.
+    Terraces,
+    /// A throne dais with wide steps and dense lighting, every tenth floor.
+    Throne,
+}
+
+impl Archetype {
+    /// Returns the plan of `floor`: the throne hall every tenth floor,
+    /// otherwise a seeded pick from the run seed that never repeats the
+    /// previous floor's plan.
+    fn of(seed: u64, floor: u32) -> Self {
+        const CYCLE: [Archetype; 3] = [
+            Archetype::Colonnade,
+            Archetype::LavaArena,
+            Archetype::Terraces,
+        ];
+        if floor.is_multiple_of(10) {
+            return Self::Throne;
+        }
+        let mut index = (mix(floor_seed(seed, floor), 11, 17) % CYCLE.len() as u64) as usize;
+        // Compare against the previous floor's effective plan, not its raw
+        // pick: the previous floor may itself have been shifted off its pick.
+        if floor > 1 && Self::of(seed, floor - 1) == CYCLE[index] {
+            index = (index + 1) % CYCLE.len();
+        }
+        CYCLE[index]
+    }
+
+    /// Returns the radius the soul lanterns hang at; the lava arena's glass
+    /// parapet stands where the wall lanterns would be.
+    const fn lantern_radius(self) -> i32 {
+        match self {
+            Self::LavaArena => 11,
+            Self::Colonnade | Self::Terraces | Self::Throne => 13,
+        }
+    }
+
+    /// Returns the block of the archetype's plan at the canonical column
+    /// `(x, z)` at `layer`, or `None` where the plan leaves the cell to the
+    /// shared lighting (or air).
+    fn block_at(self, salt: u64, x: i32, z: i32, layer: i32) -> Option<BlockStateId> {
+        match self {
+            Self::Colonnade => colonnade_block(x, z, layer),
+            Self::LavaArena => lava_arena_block(x, z, layer),
+            Self::Terraces => terraces_block(salt, x, z, layer),
+            Self::Throne => throne_block(x, z, layer),
+        }
+    }
+}
+
+/// Returns the colonnade plan: a ring of brick columns on a five-block grid
+/// with glowstone capitals, tied by a half-slab architrave, and a red carpet
+/// from the staircase mouth to the inlay ring.
+fn colonnade_block(x: i32, z: i32, layer: i32) -> Option<BlockStateId> {
+    if x == 1 && (-11..=5).contains(&z) && layer == 0 {
+        return Some(vanilla_blocks::RED_CARPET.default_state());
+    }
+    if x.abs().max(z.abs()) != COLONNADE_RADIUS {
+        return None;
+    }
+    let column = x.rem_euclid(5) == 0 && z.rem_euclid(5) == 0;
+    if column {
+        if (0..=4).contains(&layer) {
+            return Some(vanilla_blocks::POLISHED_BLACKSTONE_BRICKS.default_state());
+        }
+        if layer == 5 {
+            return Some(vanilla_blocks::GLOWSTONE.default_state());
+        }
+        return None;
+    }
+    if layer == 5 {
+        // The architrave hangs a continuous half-slab ring between the columns.
+        return Some(
+            vanilla_blocks::POLISHED_BLACKSTONE_BRICK_SLAB
+                .default_state()
+                .set_value(&BlockStateProperties::SLAB_TYPE, SlabType::Bottom),
         );
-        (sx * 4, sz * 4)
-    };
-    [corner(first), corner(second)]
+    }
+    None
+}
+
+/// Returns the lava arena plan: lava channels along the hall edges at walking
+/// level, caged behind a two-block glass parapet, with stone piers reaching
+/// over the lava at the side midpoints.
+fn lava_arena_block(x: i32, z: i32, layer: i32) -> Option<BlockStateId> {
+    let ring = x.abs().max(z.abs());
+    let pier = (x == 0 && z.abs() >= 11) || (z == 0 && x.abs() >= 11);
+    if pier && (11..=13).contains(&ring) {
+        return (layer == 0).then_some(vanilla_blocks::POLISHED_BLACKSTONE.default_state());
+    }
+    if (12..=13).contains(&ring) && layer == 0 {
+        return Some(vanilla_blocks::LAVA.default_state());
+    }
+    if ring == 11 && (0..=1).contains(&layer) {
+        return Some(vanilla_blocks::GLASS.default_state());
+    }
+    None
+}
+
+/// Returns the terraces plan: a full-block nylium terrace along the walls and
+/// a half-slab tier inside it, planted with a crimson and warped garden.
+fn terraces_block(salt: u64, x: i32, z: i32, layer: i32) -> Option<BlockStateId> {
+    let ring = x.abs().max(z.abs());
+    if (11..=13).contains(&ring) {
+        let soil = mix(salt, x, z) % 6;
+        if layer == 0 {
+            let terrace: BlockRef = match soil {
+                0 => &vanilla_blocks::WARPED_NYLIUM,
+                5 => &vanilla_blocks::POLISHED_BLACKSTONE,
+                _ => &vanilla_blocks::CRIMSON_NYLIUM,
+            };
+            return Some(terrace.default_state());
+        }
+        if layer == 1 && soil != 5 && mix(salt, x, z + 977).is_multiple_of(5) {
+            let plant: BlockRef = match mix(salt, x, z + 1999) % 3 {
+                0 => &vanilla_blocks::CRIMSON_FUNGUS,
+                1 => &vanilla_blocks::WARPED_FUNGUS,
+                _ => &vanilla_blocks::NETHER_SPROUTS,
+            };
+            return Some(plant.default_state());
+        }
+        return None;
+    }
+    if (8..=10).contains(&ring) && layer == 0 {
+        return Some(
+            vanilla_blocks::BLACKSTONE_SLAB
+                .default_state()
+                .set_value(&BlockStateProperties::SLAB_TYPE, SlabType::Bottom),
+        );
+    }
+    None
+}
+
+/// Returns the throne plan: a red nether brick dais with a second tier, a
+/// blackstone throne against the far wall, a half-slab step along its front
+/// and a red carpet from the staircase mouth to the steps.
+fn throne_block(x: i32, z: i32, layer: i32) -> Option<BlockStateId> {
+    // The carpet stops at the exit portal and resumes past it to the steps.
+    if x == 1 && ((-11..=5).contains(&z) || (7..=8).contains(&z)) && layer == 0 {
+        return Some(vanilla_blocks::RED_CARPET.default_state());
+    }
+    if (-4..=5).contains(&x) && (10..=13).contains(&z) {
+        if layer == 0 {
+            return Some(vanilla_blocks::RED_NETHER_BRICKS.default_state());
+        }
+        if layer == 1 {
+            if (x == -4 || x == 5) && (z == 10 || z == 13) {
+                return Some(vanilla_blocks::SHROOMLIGHT.default_state());
+            }
+            if (-2..=3).contains(&x) && z >= 12 {
+                return Some(vanilla_blocks::RED_NETHER_BRICKS.default_state());
+            }
+            return None;
+        }
+        if layer == 2 {
+            if (x == -2 || x == 3) && z == 12 {
+                return Some(vanilla_blocks::SHROOMLIGHT.default_state());
+            }
+            if (0..=1).contains(&x) && z == 12 {
+                return Some(vanilla_blocks::BLACKSTONE.default_state());
+            }
+            if (x == -1 || x == 2) && (12..=13).contains(&z) {
+                return Some(vanilla_blocks::BLACKSTONE.default_state());
+            }
+        }
+        if (2..=4).contains(&layer) && (0..=1).contains(&x) && z == 13 {
+            return Some(vanilla_blocks::BLACKSTONE.default_state());
+        }
+        return None;
+    }
+    // The wide step in front of the dais: a half slab, then a full block.
+    if (-4..=5).contains(&x) && z == 9 && layer == 0 {
+        return Some(
+            vanilla_blocks::BLACKSTONE_SLAB
+                .default_state()
+                .set_value(&BlockStateProperties::SLAB_TYPE, SlabType::Bottom),
+        );
+    }
+    None
+}
+
+/// Returns the shared lighting every hall carries, where the archetype plan
+/// leaves the cell alone: a shroomlight inlay ring around the centre,
+/// glowstone markers to the staircase mouth, soul lanterns along the walls at
+/// eye level and a chained chandelier over the centre.
+fn common_light(
+    salt: u64,
+    x: i32,
+    z: i32,
+    layer: i32,
+    lantern_radius: i32,
+) -> Option<BlockStateId> {
+    if layer == 0 {
+        if x.abs().max(z.abs()) == INLAY_RADIUS {
+            return Some(vanilla_blocks::SHROOMLIGHT.default_state());
+        }
+        if x == 0 && (-11..=-7).contains(&z) && z % 2 == 0 {
+            return Some(vanilla_blocks::GLOWSTONE.default_state());
+        }
+    }
+    if layer == 2 && x.abs().max(z.abs()) == lantern_radius && mix(salt, x, z).is_multiple_of(6) {
+        return Some(vanilla_blocks::SOUL_LANTERN.default_state());
+    }
+    if (0..=1).contains(&x) && (0..=1).contains(&z) {
+        if (5..=6).contains(&layer) {
+            return Some(vanilla_blocks::IRON_CHAIN.default_state());
+        }
+        if layer == 4 {
+            let cluster = if (x + z) % 2 == 0 {
+                &vanilla_blocks::SHROOMLIGHT
+            } else {
+                &vanilla_blocks::GLOWSTONE
+            };
+            return Some(cluster.default_state());
+        }
+    }
+    None
 }
 
 /// Returns the block of the canonical column `(x, z)` at `layer` above the
 /// floor surface, or `None` for air.
-fn canonical_block(seed: u64, x: i32, z: i32, layer: i32) -> Option<BlockStateId> {
+fn canonical_block(arch: Archetype, salt: u64, x: i32, z: i32, layer: i32) -> Option<BlockStateId> {
     let chebyshev = x.abs().max(z.abs());
     if chebyshev > WALL_OUTER {
         return None;
     }
-    if RAMP_DZ.contains(&z) && (RAMP_DX_MIN..=RAMP_DX_MAX).contains(&x) {
+    if in_strip(x, z) {
         // The staircase is a bare snake of stair blocks along the wall: one
         // column per half-block step, open air underneath, and a blackstone
         // landing at the next floor's level under the ceiling hole.
@@ -199,7 +442,7 @@ fn canonical_block(seed: u64, x: i32, z: i32, layer: i32) -> Option<BlockStateId
         }
     }
     if layer == -1 {
-        return Some(if mix(seed, x, z) % 5 == 0 {
+        return Some(if mix(salt, x, z) % 5 == 0 {
             vanilla_blocks::BLACKSTONE.default_state()
         } else {
             vanilla_blocks::POLISHED_BLACKSTONE.default_state()
@@ -217,19 +460,21 @@ fn canonical_block(seed: u64, x: i32, z: i32, layer: i32) -> Option<BlockStateId
         return Some(vanilla_blocks::POLISHED_BLACKSTONE_BRICKS.default_state());
     }
     if chebyshev >= WALL_RADIUS {
-        return Some(if mix(seed, x, layer * 31 + z) % 6 == 0 {
+        return Some(if mix(salt, x, layer * 31 + z) % 6 == 0 {
             vanilla_blocks::OBSIDIAN.default_state()
         } else {
             vanilla_blocks::POLISHED_BLACKSTONE_BRICKS.default_state()
         });
     }
-    if pillar_columns(seed).contains(&(x, z)) && layer <= 4 {
-        return Some(vanilla_blocks::OBSIDIAN.default_state());
+    if in_shaft_corridor(x, z) || in_exit_orbit(x, z) {
+        // The strip cells that are neither a stair nor the landing, the
+        // arrival shaft of the floor below, the aisle into the hall and the
+        // exit portal's orbit all stay open for the climb; no decoration may
+        // intrude here.
+        return None;
     }
-    if layer == CLEARANCE - 1 && light_columns(seed).contains(&(x, z)) {
-        return Some(vanilla_blocks::GLOWSTONE.default_state());
-    }
-    None
+    arch.block_at(salt, x, z, layer)
+        .or_else(|| common_light(salt, x, z, layer, arch.lantern_radius()))
 }
 
 /// Returns the block of the tower column `(dx, dz)` of `floor` at absolute
@@ -247,7 +492,13 @@ pub fn floor_block(seed: u64, floor: u32, dx: i32, dz: i32, y: i32) -> Option<Bl
         return None;
     }
     let (x, z) = canonical(floor, dx, dz);
-    canonical_block(floor_seed(seed, floor), x, z, layer)
+    canonical_block(
+        Archetype::of(seed, floor),
+        floor_seed(seed, floor),
+        x,
+        z,
+        layer,
+    )
 }
 
 /// Returns every chunk column the tower footprint touches, plus the chunks
@@ -377,20 +628,24 @@ pub fn exit_entrance(region: InstanceRegion, floor: u32) -> BlockPos {
 }
 
 /// Returns the seeded free columns of `floor` the wave spawns across.
+///
+/// A spot is usable only when the cell above the floor surface is open, which
+/// keeps every archetype's columns, lava channels, terraces and dais steps
+/// out of the spawn pool with one rule.
 #[must_use]
 pub fn spawn_spots(seed: u64, floor: u32) -> Vec<(i32, i32)> {
     let salt = floor_seed(seed, floor);
-    let pillars = pillar_columns(salt);
+    let surface = floor_surface_y(floor);
     let mut spots = Vec::new();
-    for index in 0..12 {
+    for index in 0..16 {
         let gx = (mix(salt, index as i32, 101) % 21) as i32 - 10;
         let gz = (mix(salt, index as i32, 202) % 15) as i32 - 3;
-        if pillars.contains(&(gx, gz)) {
-            continue;
-        }
         let (dx, dz) = rot(gx, gz, quarter(floor));
         // Never inside the exit frame standing in the middle of the hall.
         if (-1..=2).contains(&dx) && dz == 6 {
+            continue;
+        }
+        if floor_block(seed, floor, dx, dz, surface).is_some() {
             continue;
         }
         spots.push((dx, dz));
@@ -437,9 +692,10 @@ mod tests {
     use steel_registry::vanilla_blocks;
 
     use super::{
-        CLEARANCE, CLIMB_END, CLIMB_START, FLOOR_STEP, HOLE_START, LANDING_START, RAMP_DX_MAX,
-        RAMP_DX_MIN, RAMP_DZ, TOWER_HALF, WALL_OUTER, canonical, floor_block, floor_entry,
-        floor_surface_y, is_arrival_hole, max_floors, quarter, rot, spawn_spots, stair_layer,
+        Archetype, CLEARANCE, CLIMB_END, CLIMB_START, FLOOR_STEP, HOLE_START, LANDING_START,
+        RAMP_DX_MAX, RAMP_DX_MIN, RAMP_DZ, TOWER_HALF, WALL_OUTER, canonical, floor_block,
+        floor_entry, floor_surface_y, is_arrival_hole, max_floors, quarter, rot, spawn_spots,
+        stair_layer,
     };
     use crate::dungeon::InstanceRegion;
 
@@ -485,44 +741,201 @@ mod tests {
         visited
     }
 
+    /// Asserts the flood fill reached every spawn spot, the arrival, the
+    /// whole climb and the landing of `floor`.
+    fn assert_route_connected(seed: u64, floor: u32, reached: &[(i32, i32, i32)]) {
+        for spot in spawn_spots(seed, floor) {
+            assert!(
+                reached.contains(&(spot.0, spot.1, 0)),
+                "seed {seed} floor {floor}: spot {spot:?} is unreachable"
+            );
+        }
+        let (sx, sz) = rot(9, -12, quarter(floor.wrapping_sub(1)));
+        assert!(
+            reached.contains(&(sx, sz, 0)),
+            "seed {seed} floor {floor}: the arrival hole is buried"
+        );
+        // Every climbing column is walkable: the air cell above each
+        // stair, layer by layer up to the landing.
+        for gx in CLIMB_START..=CLIMB_END {
+            for gz in RAMP_DZ {
+                let (dx, dz) = rot(gx, gz, quarter(floor));
+                let layer = stair_layer(gx).unwrap() + 1;
+                assert!(
+                    reached.contains(&(dx, dz, layer)),
+                    "seed {seed} floor {floor}: climb column ({gx}, {gz}) is unreachable"
+                );
+            }
+        }
+        for gx in LANDING_START..=RAMP_DX_MAX {
+            for gz in RAMP_DZ {
+                let (dx, dz) = rot(gx, gz, quarter(floor));
+                assert!(
+                    reached.contains(&(dx, dz, 8)),
+                    "seed {seed} floor {floor}: landing ({gx}, {gz}) is unreachable"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_floor_connects_arrival_to_every_spot_and_the_landing() {
         init_vanilla_registry();
         for seed in [7_u64, 42, 1_337] {
             for floor in 1_u32..=6 {
                 let reached = flood_fill(seed, floor);
-                for spot in spawn_spots(seed, floor) {
-                    assert!(
-                        reached.contains(&(spot.0, spot.1, 0)),
-                        "seed {seed} floor {floor}: spot {spot:?} is unreachable"
+                assert_route_connected(seed, floor, &reached);
+            }
+        }
+    }
+
+    /// Returns one floor of `seed` for every archetype on every quarter turn
+    /// it can appear on, or panics when a hundred and twenty floors cannot
+    /// produce them all. The throne hall stands on every tenth floor, and a
+    /// multiple of ten is always an odd quarter turn, so the throne can only
+    /// ever be met on quarters one and three.
+    fn archetype_quarter_matrix(seed: u64) -> Vec<u32> {
+        let mut wanted: Vec<(Archetype, u32)> = Vec::new();
+        for quarter in 0..4 {
+            for arch in [
+                Archetype::Colonnade,
+                Archetype::LavaArena,
+                Archetype::Terraces,
+            ] {
+                wanted.push((arch, quarter));
+            }
+        }
+        for quarter in [1, 3] {
+            wanted.push((Archetype::Throne, quarter));
+        }
+        let mut matrix: Vec<((Archetype, u32), u32)> = Vec::new();
+        for floor in 1_u32..=120 {
+            let arch = Archetype::of(seed, floor);
+            let slot = (arch, quarter(floor));
+            if wanted.contains(&slot) && !matrix.iter().any(|(s, _)| *s == slot) {
+                matrix.push((slot, floor));
+            }
+        }
+        assert_eq!(
+            matrix.len(),
+            wanted.len(),
+            "seed {seed}: floors 1..=120 must cover every archetype on its quarter turns, missing {:?}",
+            wanted
+                .iter()
+                .filter(|slot| !matrix.iter().any(|(s, _)| s == *slot))
+                .collect::<Vec<_>>()
+        );
+        matrix.into_iter().map(|(_, floor)| floor).collect()
+    }
+
+    #[test]
+    fn every_archetype_connects_on_every_quarter_turn() {
+        init_vanilla_registry();
+        for seed in [7_u64, 42, 1_337] {
+            for floor in archetype_quarter_matrix(seed) {
+                let reached = flood_fill(seed, floor);
+                assert_route_connected(seed, floor, &reached);
+            }
+        }
+    }
+
+    #[test]
+    fn archetypes_rotate_without_immediate_repeats() {
+        for seed in [7_u64, 42, 1_337] {
+            let mut seen = Vec::new();
+            let mut previous = None;
+            for floor in 1_u32..=40 {
+                let arch = Archetype::of(seed, floor);
+                if floor % 10 == 0 {
+                    assert_eq!(
+                        arch,
+                        Archetype::Throne,
+                        "floor {floor} must be the throne hall"
                     );
                 }
-                let (sx, sz) = rot(9, -12, quarter(floor.wrapping_sub(1)));
-                assert!(
-                    reached.contains(&(sx, sz, 0)),
-                    "seed {seed} floor {floor}: the arrival hole is buried"
+                assert_ne!(
+                    Some(arch),
+                    previous,
+                    "seed {seed} floor {floor}: the archetype repeats the previous floor"
                 );
-                // Every climbing column is walkable: the air cell above each
-                // stair, layer by layer up to the landing.
-                for gx in CLIMB_START..=CLIMB_END {
-                    for gz in RAMP_DZ {
-                        let (dx, dz) = rot(gx, gz, quarter(floor));
-                        let layer = stair_layer(gx).unwrap() + 1;
+                if !seen.contains(&arch) {
+                    seen.push(arch);
+                }
+                previous = Some(arch);
+            }
+            assert_eq!(seen.len(), 4, "seed {seed}: every archetype must appear");
+        }
+    }
+
+    #[test]
+    fn the_exit_portal_stays_clear_on_every_archetype() {
+        init_vanilla_registry();
+        // The portal stands at a fixed world position on every floor, so
+        // floors 1..=4 walk the exit cell across all four quarter turns.
+        let mut covered = Vec::new();
+        for seed in [7_u64, 42, 1_337] {
+            for floor in 1_u32..=10 {
+                let arch = Archetype::of(seed, floor);
+                let surface = floor_surface_y(floor);
+                for y in surface..=surface + 4 {
+                    for x in -1..=2 {
                         assert!(
-                            reached.contains(&(dx, dz, layer)),
-                            "seed {seed} floor {floor}: climb column ({gx}, {gz}) is unreachable"
+                            floor_block(seed, floor, x, 6, y).is_none(),
+                            "seed {seed} floor {floor} ({arch:?}): exit cell {x} at layer {} is blocked",
+                            y - surface
                         );
                     }
                 }
-                for gx in LANDING_START..=RAMP_DX_MAX {
-                    for gz in RAMP_DZ {
-                        let (dx, dz) = rot(gx, gz, quarter(floor));
-                        assert!(
-                            reached.contains(&(dx, dz, 8)),
-                            "seed {seed} floor {floor}: landing ({gx}, {gz}) is unreachable"
-                        );
+                if !covered.contains(&arch) {
+                    covered.push(arch);
+                }
+            }
+        }
+        assert_eq!(covered.len(), 4, "the sweep must cover every archetype");
+    }
+
+    #[test]
+    fn light_reaches_every_quadrant_of_the_hall() {
+        init_vanilla_registry();
+        let sources = [
+            vanilla_blocks::GLOWSTONE.default_state(),
+            vanilla_blocks::SHROOMLIGHT.default_state(),
+            vanilla_blocks::SOUL_LANTERN.default_state(),
+            vanilla_blocks::LAVA.default_state(),
+        ];
+        for seed in [7_u64, 42, 1_337] {
+            for floor in 1_u32..=12 {
+                let surface = floor_surface_y(floor);
+                // Light sources counted per interior quadrant, floor to
+                // ceiling: the inlay ring, the wall lanterns, the
+                // chandelier and the archetype's own lights together must
+                // reach every corner of the hall.
+                let mut quadrants = [0_u32; 4];
+                for dx in -TOWER_HALF..=TOWER_HALF {
+                    for dz in -TOWER_HALF..=TOWER_HALF {
+                        for layer in 0..=CLEARANCE - 1 {
+                            let Some(block) = floor_block(seed, floor, dx, dz, surface + layer)
+                            else {
+                                continue;
+                            };
+                            if !sources.contains(&block) {
+                                continue;
+                            }
+                            let index = match (dx >= 0, dz >= 0) {
+                                (true, true) => 0,
+                                (false, true) => 1,
+                                (false, false) => 2,
+                                (true, false) => 3,
+                            };
+                            quadrants[index] += 1;
+                        }
                     }
                 }
+                assert!(
+                    quadrants.iter().all(|&count| count >= 3),
+                    "seed {seed} floor {floor} ({:?}): a quadrant has too few light sources: {quadrants:?}",
+                    Archetype::of(seed, floor)
+                );
             }
         }
     }
