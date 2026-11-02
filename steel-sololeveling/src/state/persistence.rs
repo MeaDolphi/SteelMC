@@ -2463,10 +2463,9 @@ impl SoloLevelingState {
     pub async fn flush_persistence(self: Arc<Self>, server: Arc<Server>) -> Result<(), String> {
         // Shutdown flushes twice (world save and the final drain): only the
         // first call queues the snapshots; later calls just drive the queue.
-        let first_flush = {
-            let mut persistence = self.persistence.lock();
-            !mem::replace(&mut persistence.quiescing, true)
-        };
+        // The store starts refusing new writes only once the snapshots are
+        // queued, since the snapshot queues refuse a quiescing store.
+        let first_flush = !self.persistence.lock().quiescing;
         if first_flush {
             for uuid in self.sessions.player_ids() {
                 self.save_session(uuid).map_err(|error| error.to_string())?;
@@ -2474,6 +2473,7 @@ impl SoloLevelingState {
             self.queue_island_save()
                 .map_err(|error| error.to_string())?;
             self.queue_party_save().map_err(|error| error.to_string())?;
+            self.persistence.lock().quiescing = true;
         }
         // A graceful shutdown must not hang on a stuck write: log progress
         // and give up with an error after the deadline, letting the world

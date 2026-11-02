@@ -24,7 +24,8 @@ pub mod theme;
 
 use glam::DVec3;
 use steel_core::world::World;
-use steel_utils::{BlockPos, ChunkPos};
+use steel_registry::vanilla_blocks;
+use steel_utils::{BlockPos, BlockStateId, ChunkPos};
 
 /// World name of the Demon Castle.
 pub const WORLD_NAME: &str = "sololeveling_demon_castle";
@@ -41,6 +42,34 @@ pub const HALL_HALF: i32 = GRID as i32 * DISTRICT_SIZE / 2;
 pub const GROUND_Y: i32 = 64;
 /// Highest floor whose hall still fits inside the world border.
 pub const MAX_FLOOR: u32 = (29_999_000 / FLOOR_STRIDE - 1) as u32;
+
+/// First and last world column of the antechamber on both axes.
+///
+/// The world spawn of the castle lies between the halls, where a player
+/// entering the world would find no ground: the spawn search would probe
+/// chunk after chunk of void before giving up. The antechamber gives it solid
+/// floor at once; the climb moves its hunters on to their floor the tick
+/// they arrive.
+const ANTECHAMBER: (i32, i32) = (-8, 24);
+
+/// Returns the block of the antechamber at world column `(x, z)` and
+/// `layer`, or `None` outside it.
+#[must_use]
+pub fn antechamber_block(x: i32, z: i32, layer: i32) -> Option<BlockStateId> {
+    let span = ANTECHAMBER.0..=ANTECHAMBER.1;
+    if !span.contains(&x) || !span.contains(&z) || layer != 0 {
+        return None;
+    }
+    let edge = x == ANTECHAMBER.0 || x == ANTECHAMBER.1 || z == ANTECHAMBER.0 || z == ANTECHAMBER.1;
+    let block = if edge {
+        &vanilla_blocks::CHISELED_POLISHED_BLACKSTONE
+    } else if x % 8 == 0 && z % 8 == 0 {
+        &vanilla_blocks::SHROOMLIGHT
+    } else {
+        &vanilla_blocks::POLISHED_BLACKSTONE_BRICKS
+    };
+    Some(block.default_state())
+}
 
 /// Returns whether `world` is the Demon Castle.
 #[must_use]
@@ -157,7 +186,7 @@ impl CastleSlots {
 
 #[cfg(test)]
 mod tests {
-    use super::{CastleSlot, FLOOR_STRIDE, HALL_HALF, MAX_FLOOR, locate};
+    use super::{CastleSlot, FLOOR_STRIDE, HALL_HALF, MAX_FLOOR, antechamber_block, locate};
     use glam::DVec3;
 
     #[test]
@@ -187,6 +216,9 @@ mod tests {
         assert_eq!(locate(HALL_HALF, FLOOR_STRIDE), None);
         assert_eq!(locate(0, 0), None);
         assert_eq!(locate(0, -FLOOR_STRIDE), None);
+        // The antechamber under the world spawn lies in the void between halls.
+        assert!(antechamber_block(8, 8, 0).is_some());
+        assert_eq!(locate(8, 8), None);
         let top = CastleSlot(0).center(MAX_FLOOR);
         assert!(
             top.z() + HALL_HALF < 29_999_984,

@@ -25,7 +25,7 @@ use steel_utils::{BlockPos, BlockStateId, ChunkPos, Identifier};
 use super::districts::{MAX_LAYER, MIN_LAYER};
 use super::plan::FloorPlan;
 use super::theme::CastleTheme;
-use super::{GROUND_Y, WORLD_NAME, locate};
+use super::{GROUND_Y, WORLD_NAME, antechamber_block, locate};
 
 /// Plans kept for the chunks of the floors being generated.
 const PLAN_CACHE: usize = 16;
@@ -97,6 +97,22 @@ impl CastleChunkGenerator {
         plan
     }
 
+    /// Writes the antechamber's share of a chunk between the halls.
+    fn build_antechamber(chunk: GenerationChunk<'_, TerrainPhase>) {
+        let pos = chunk.pos();
+        let Ok(relative_y) = usize::try_from(GROUND_Y - OVERWORLD.min_y) else {
+            return;
+        };
+        let blocks: Vec<(usize, usize, usize, BlockStateId)> = (0..16_usize)
+            .flat_map(|x| (0..16_usize).map(move |z| (x, z)))
+            .filter_map(|(x, z)| {
+                let block = antechamber_block(pos.0.x * 16 + x as i32, pos.0.y * 16 + z as i32, 0)?;
+                Some((x, relative_y, z, block))
+            })
+            .collect();
+        chunk.write_block_batch(&blocks);
+    }
+
     /// Returns the floor of a chunk; a chunk never spans two floors, since
     /// halls are far narrower than the stride between them.
     fn floor_of(pos: ChunkPos) -> Option<u32> {
@@ -158,6 +174,7 @@ impl ChunkGenerator for CastleChunkGenerator {
     ) {
         let pos = chunk.pos();
         let Some(floor) = Self::floor_of(pos) else {
+            Self::build_antechamber(chunk);
             return;
         };
         let plan = self.plan(floor);
