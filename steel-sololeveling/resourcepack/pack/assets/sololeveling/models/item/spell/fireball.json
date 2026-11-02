@@ -1,0 +1,40 @@
+{
+  "textures": {
+    "spell": "sololeveling:item/spell/fireball",
+    "particle": "sololeveling:item/spell/fireball"
+  },
+  "elements": [
+    {
+      "from": [
+        0,
+        0,
+        7.95
+      ],
+      "to": [
+        16,
+        16,
+        8.05
+      ],
+      "faces": {
+        "north": {
+          "uv": [
+            0,
+            0,
+            16,
+            16
+          ],
+          "texture": "#spell"
+        },
+        "south": {
+          "uv": [
+            0,
+            0,
+            16,
+            16
+          ],
+          "texture": "#spell"
+        }
+      }
+    }
+  ]
+}

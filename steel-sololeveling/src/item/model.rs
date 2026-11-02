@@ -10,6 +10,21 @@ use steel_registry::item_stack::ItemStack;
 
 use crate::identifier::from_sololeveling;
 
+/// Every animated rune and projectile model used by the spell renderer.
+pub const SPELL_MODELS: [&str; 11] = [
+    "spell/rune_arcane",
+    "spell/rune_fire",
+    "spell/rune_frost",
+    "spell/rune_holy",
+    "spell/rune_void",
+    "spell/rune_storm",
+    "spell/arcane_bolt",
+    "spell/fireball",
+    "spell/ice_spear",
+    "spell/void_lance",
+    "spell/shard",
+];
+
 /// Points `stack` at the pack model `path`, e.g. `crystal/s`.
 pub fn apply(stack: &mut ItemStack, path: &str) {
     stack.set(ITEM_MODEL, from_sololeveling(path.to_owned()));
@@ -82,6 +97,7 @@ mod tests {
         for (kind, _) in city::SIGNS {
             paths.push(kind.model().to_owned());
         }
+        paths.extend(super::SPELL_MODELS.map(str::to_owned));
         paths
     }
 

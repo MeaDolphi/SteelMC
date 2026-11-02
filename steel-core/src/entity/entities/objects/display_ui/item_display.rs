@@ -139,6 +139,17 @@ impl ItemDisplayEntity {
         data.display.left_rotation.set(rotation);
     }
 
+    /// Sets client-side position and transformation interpolation in ticks.
+    pub fn set_interpolation(&self, duration: i32) {
+        let mut data = self.entity_data.lock();
+        data.display
+            .pos_rot_interpolation_duration
+            .set(duration.max(0));
+        data.display
+            .transformation_interpolation_duration
+            .set(duration.max(0));
+    }
+
     /// Renders the item at fixed block and sky light levels, each 0 to 15,
     /// instead of the light at its position.
     pub fn set_brightness(&self, block: u8, sky: u8) {

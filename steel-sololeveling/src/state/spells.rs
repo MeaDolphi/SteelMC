@@ -13,7 +13,7 @@ use std::sync::Arc;
 use glam::DVec3;
 use rustc_hash::FxHashMap;
 use steel_core::entity::damage::DamageSource;
-use steel_core::entity::{Entity, LivingEntity, MobEffectInstance, SharedEntity};
+use steel_core::entity::{Entity, LivingEntity, MobEffectInstance, RemovalReason, SharedEntity};
 use steel_core::inventory::container::Container as _;
 use steel_core::inventory::equipment::EquipmentSlot;
 use steel_core::player::Player;
@@ -106,6 +106,23 @@ struct Meteor {
     due: u64,
 }
 
+const PROJECTILE_SPEED: f64 = 28.0;
+
+/// A visible bolt and the single impact it still owes.
+#[derive(Debug)]
+struct SpellProjectile {
+    owner: Uuid,
+    world: Identifier,
+    spell: SpellId,
+    position: DVec3,
+    direction: DVec3,
+    remaining: f64,
+    last_tick: u64,
+    damage: f32,
+    burn_ticks: i32,
+    entity: Option<i32>,
+}
+
 /// A Sanctuary circle.
 #[derive(Debug)]
 struct Sanctuary {
@@ -132,8 +149,10 @@ struct Regrowth {
 pub(super) struct SpellRuntime {
     casts: Vec<Uuid>,
     meteors: Vec<Meteor>,
+    projectiles: Vec<SpellProjectile>,
     sanctuaries: Vec<Sanctuary>,
     regrowths: Vec<Regrowth>,
+    visuals: fx::runtime::VisualRuntime,
     /// Weakened mobs by entity id, with the end of the effect.
     weakened: FxHashMap<i32, u64>,
 }
@@ -326,14 +345,6 @@ impl Caster<'_> {
     fn for_allies(&self, effect: impl Fn(&Arc<Player>)) {
         for ally in self.allies(PARTY_RADIUS) {
             effect(&ally);
-            fx::burst(
-                &self.world,
-                &vanilla_particle_types::HAPPY_VILLAGER,
-                ally.position() + DVec3::Y,
-                8,
-                0.4,
-                0.0,
-            );
         }
     }
 }
@@ -554,7 +565,7 @@ impl SoloLevelingState {
     /// Resolves queued casts and advances running spell effects.
     pub fn tick_spells(&self, server: &Server) {
         let now = now_millis();
-        let (casts, meteors) = {
+        let (casts, meteors, mut visuals, projectiles) = {
             let mut runtime = self.spell_runtime.lock();
             runtime.weakened.retain(|_, until| *until > now);
             let casts = mem::take(&mut runtime.casts);
@@ -562,8 +573,15 @@ impl SoloLevelingState {
                 .into_iter()
                 .partition(|meteor| meteor.due <= now);
             runtime.meteors = waiting;
-            (casts, due)
+            (
+                casts,
+                due,
+                mem::take(&mut runtime.visuals),
+                mem::take(&mut runtime.projectiles),
+            )
         };
+        visuals.tick(server, now);
+        self.spell_runtime.lock().visuals = visuals;
         for uuid in casts {
             if let Some(player) = find_player(server, uuid) {
                 self.cast(&player, now);
@@ -572,8 +590,228 @@ impl SoloLevelingState {
         for meteor in meteors {
             Self::land_meteor(server, &meteor);
         }
+        let mut flying = Vec::new();
+        for mut projectile in projectiles {
+            if self.tick_projectile(server, &mut projectile, now) {
+                flying.push(projectile);
+            }
+        }
+        self.spell_runtime.lock().projectiles.extend(flying);
         self.pulse_sanctuaries(server, now);
         self.pulse_regrowths(server, now);
+    }
+
+    fn cast_visual(&self, caster: &Caster<'_>, spell: SpellId) {
+        let feet = caster.player.position();
+        fx::cast(&caster.world, spell, feet);
+        let (model, _) = fx::school_assets(spell);
+        self.spell_runtime.lock().visuals.rune(
+            &caster.world,
+            caster.player.gameprofile.id(),
+            model,
+            feet + DVec3::new(0.0, 0.06, 0.0),
+            1.5,
+            700,
+            caster.now,
+            2.4,
+        );
+    }
+
+    fn timed_rune(
+        &self,
+        caster: &Caster<'_>,
+        model: fx::display::SpellModel,
+        center: DVec3,
+        radius: f32,
+        duration: u64,
+        spin: f32,
+    ) {
+        self.spell_runtime.lock().visuals.rune(
+            &caster.world,
+            caster.player.gameprofile.id(),
+            model,
+            center + DVec3::new(0.0, 0.06, 0.0),
+            radius,
+            duration,
+            caster.now,
+            spin,
+        );
+    }
+
+    fn following_rune(
+        &self,
+        caster: &Caster<'_>,
+        target: Uuid,
+        model: fx::display::SpellModel,
+        radius: f32,
+        duration: u64,
+        spin: f32,
+    ) {
+        self.spell_runtime.lock().visuals.spawn(
+            &caster.world,
+            caster.player.gameprofile.id(),
+            model,
+            fx::runtime::Motion::Follow {
+                target,
+                offset: DVec3::new(0.0, 0.06, 0.0),
+            },
+            radius * 2.0,
+            true,
+            spin,
+            caster.now,
+            caster.now.saturating_add(duration),
+        );
+    }
+
+    fn launch_projectile(&self, caster: &Caster<'_>, spell: SpellId) {
+        let (model, scale, damage, burn_ticks) = match spell {
+            SpellId::MagicArrow => (
+                fx::display::SpellModel::ArcaneBolt,
+                0.9,
+                MAGIC_ARROW_DAMAGE * caster.power,
+                0,
+            ),
+            SpellId::Fireball => (
+                fx::display::SpellModel::Fireball,
+                1.8,
+                FIREBALL_DAMAGE * caster.power,
+                80 * caster.burn,
+            ),
+            SpellId::IceSpear => (
+                fx::display::SpellModel::IceSpear,
+                1.4,
+                ICE_SPEAR_DAMAGE * caster.power,
+                0,
+            ),
+            _ => return,
+        };
+        let entity = fx::display::spawn(&caster.world, model, caster.eye, scale, false);
+        self.spell_runtime.lock().projectiles.push(SpellProjectile {
+            owner: caster.player.gameprofile.id(),
+            world: caster.world.key.clone(),
+            spell,
+            position: caster.eye,
+            direction: caster.look.normalize_or_zero(),
+            remaining: AIM_RANGE,
+            last_tick: caster.now,
+            damage,
+            burn_ticks,
+            entity,
+        });
+    }
+
+    /// Advances a projectile and returns whether it is still flying.
+    fn tick_projectile(&self, server: &Server, projectile: &mut SpellProjectile, now: u64) -> bool {
+        let Some(world) = server.worlds.get(&projectile.world) else {
+            return false;
+        };
+        let Some(owner) = find_player(server, projectile.owner) else {
+            Self::discard_projectile(world, projectile);
+            return false;
+        };
+        if owner.get_world().key != projectile.world {
+            Self::discard_projectile(world, projectile);
+            return false;
+        }
+        let elapsed = now.saturating_sub(projectile.last_tick).min(250);
+        projectile.last_tick = now;
+        let step = (PROJECTILE_SPEED * elapsed as f64 / 1_000.0).min(projectile.remaining);
+        if step <= 0.0 {
+            return true;
+        }
+        let from = projectile.position;
+        let shot = trace(world, from, projectile.direction, step, false, is_enemy);
+        projectile.position = shot.end;
+        projectile.remaining -= step;
+        if let Some(entity) = projectile.entity.and_then(|id| world.get_entity_by_id(id)) {
+            let _ = entity.try_set_position(projectile.position);
+        }
+        fx::trail(
+            world,
+            &fx::theme(projectile.spell),
+            from,
+            projectile.position,
+        );
+        let blocked = shot.end.distance(from) < step - 1e-6;
+        let target = shot.hits.first();
+        if target.is_none() && !blocked && projectile.remaining > 0.0 {
+            return true;
+        }
+        self.impact_projectile(world, &owner, projectile, target);
+        Self::discard_projectile(world, projectile);
+        false
+    }
+
+    fn impact_projectile(
+        &self,
+        world: &Arc<World>,
+        owner: &Arc<Player>,
+        projectile: &SpellProjectile,
+        target: Option<&SharedEntity>,
+    ) {
+        let cause: SharedEntity = Arc::<Player>::clone(owner);
+        let source =
+            DamageSource::environment(&vanilla_damage_types::MAGIC).with_causing_entity(cause);
+        match projectile.spell {
+            SpellId::MagicArrow => {
+                let at = target.map_or(projectile.position, |entity| entity.position() + DVec3::Y);
+                fx::impact(world, projectile.spell, at);
+                if let Some(target) = target.and_then(|entity| entity.as_living_entity()) {
+                    target.hurt(world, &source, projectile.damage);
+                }
+            }
+            SpellId::Fireball => {
+                let center = target.map_or(projectile.position, |entity| entity.position());
+                fx::explosion(world, center);
+                for enemy in enemies_near(world, center, 3.0) {
+                    if let Some(living) = enemy.as_living_entity() {
+                        living.hurt(world, &source, projectile.damage);
+                    }
+                    enemy.set_remaining_fire_ticks(projectile.burn_ticks);
+                }
+            }
+            SpellId::IceSpear => {
+                let at = target.map_or(projectile.position, |entity| entity.position() + DVec3::Y);
+                fx::impact(world, projectile.spell, at);
+                let mut visuals = self.spell_runtime.lock();
+                for offset in [
+                    DVec3::new(1.4, 0.8, 0.0),
+                    DVec3::new(-1.0, 1.1, 0.8),
+                    DVec3::new(0.2, 1.3, -1.2),
+                ] {
+                    visuals.visuals.spawn(
+                        world,
+                        projectile.owner,
+                        fx::display::SpellModel::Shard,
+                        fx::runtime::Motion::Linear {
+                            from: at,
+                            to: at + offset,
+                            started: projectile.last_tick,
+                            duration: 500,
+                        },
+                        0.7,
+                        false,
+                        0.0,
+                        projectile.last_tick,
+                        projectile.last_tick + 500,
+                    );
+                }
+                drop(visuals);
+                if let Some(target) = target {
+                    if let Some(living) = target.as_living_entity() {
+                        living.hurt(world, &source, projectile.damage);
+                    }
+                    afflict(target, vanilla_mob_effects::SLOWNESS, 60, 2);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn discard_projectile(world: &Arc<World>, projectile: &SpellProjectile) {
+        if let Some(entity) = projectile.entity.and_then(|id| world.get_entity_by_id(id)) {
+            entity.set_removed(RemovalReason::Discarded);
+        }
     }
 
     fn land_meteor(server: &Server, meteor: &Meteor) {
@@ -624,11 +862,27 @@ impl SoloLevelingState {
             let members = self
                 .party_of(owner)
                 .map_or_else(|| vec![owner], |party| party.members().to_vec());
-            fx::burst(
+            fx::ring_dust(
+                world,
+                fx::theme(SpellId::Sanctuary).tint,
+                center + DVec3::new(0.0, 0.12, 0.0),
+                6.0,
+                56,
+            );
+            fx::spiral(
                 world,
                 &vanilla_particle_types::END_ROD,
                 center,
-                16,
+                2.0,
+                4.0,
+                1.5,
+                36,
+            );
+            fx::burst(
+                world,
+                &vanilla_particle_types::HAPPY_VILLAGER,
+                center + DVec3::Y,
+                12,
                 3.0,
                 0.0,
             );
@@ -789,57 +1043,15 @@ impl SoloLevelingState {
         let now = caster.now;
         let scale = caster.scale;
         match spell {
-            SpellId::MagicArrow => {
-                fx::cast(world, spell, caster.player.position());
-                let shot = caster.aim(AIM_RANGE, false);
-                fx::beam(
-                    world,
-                    &vanilla_particle_types::END_ROD,
-                    caster.eye,
-                    shot.end,
-                );
-                if let Some(target) = shot.hits.first() {
-                    fx::impact(world, spell, target.position() + DVec3::Y);
-                    caster.hurt(target, MAGIC_ARROW_DAMAGE);
-                }
-            }
-            SpellId::Fireball => {
-                fx::cast(world, spell, caster.player.position());
-                let shot = caster.aim(AIM_RANGE, false);
-                let center = shot.hits.first().map_or(shot.end, |hit| hit.position());
-                fx::trail(world, &fx::theme(spell), caster.eye, center);
-                fx::explosion(world, center);
-                fx::burst(world, &vanilla_particle_types::LAVA, center, 10, 0.5, 0.1);
-                for target in enemies_near(world, center, 3.0) {
-                    caster.hurt(&target, FIREBALL_DAMAGE);
-                    target.set_remaining_fire_ticks(80 * caster.burn);
-                }
-            }
-            SpellId::IceSpear => {
-                fx::cast(world, spell, caster.player.position());
-                let shot = caster.aim(AIM_RANGE, false);
-                fx::beam(
-                    world,
-                    &vanilla_particle_types::SNOWFLAKE,
-                    caster.eye,
-                    shot.end,
-                );
-                if let Some(target) = shot.hits.first() {
-                    fx::impact(world, spell, target.position() + DVec3::Y);
-                    caster.hurt(target, ICE_SPEAR_DAMAGE);
-                    afflict(target, vanilla_mob_effects::SLOWNESS, 60, 2);
-                }
+            SpellId::MagicArrow | SpellId::Fireball | SpellId::IceSpear => {
+                self.cast_visual(caster, spell);
+                self.launch_projectile(caster, spell);
             }
             SpellId::ChainLightning => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
                 let shot = caster.aim(AIM_RANGE, false);
                 let Some(first) = shot.hits.first().cloned() else {
-                    fx::beam(
-                        world,
-                        &vanilla_particle_types::ELECTRIC_SPARK,
-                        caster.eye,
-                        shot.end,
-                    );
+                    fx::lightning(world, caster.eye, shot.end);
                     return Ok(());
                 };
                 let mut struck = vec![first.id()];
@@ -854,12 +1066,7 @@ impl SoloLevelingState {
                     1.0,
                 );
                 for _ in 0..4 {
-                    fx::beam(
-                        world,
-                        &vanilla_particle_types::ELECTRIC_SPARK,
-                        from,
-                        current.position() + DVec3::Y,
-                    );
+                    fx::lightning(world, from, current.position() + DVec3::Y);
                     fx::flash(world, current.position() + DVec3::Y);
                     caster.hurt(&current, damage);
                     damage *= 0.75;
@@ -881,7 +1088,24 @@ impl SoloLevelingState {
                 }
             }
             SpellId::ManaStorm => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
+                let center = caster.player.position();
+                self.timed_rune(
+                    caster,
+                    fx::display::SpellModel::RuneStorm,
+                    center,
+                    2.5,
+                    6_000,
+                    2.0,
+                );
+                self.timed_rune(
+                    caster,
+                    fx::display::SpellModel::RuneArcane,
+                    center,
+                    4.5,
+                    6_000,
+                    -1.4,
+                );
                 self.storms.lock().push(Storm::new(
                     caster.player.gameprofile.id(),
                     world.key.clone(),
@@ -892,7 +1116,7 @@ impl SoloLevelingState {
                 ));
             }
             SpellId::Meteor => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
                 let shot = caster.aim(LONG_RANGE, false);
                 let center = shot.hits.first().map_or(shot.end, |hit| hit.position());
                 // A burning marker column shows where the sky will fall.
@@ -906,6 +1130,30 @@ impl SoloLevelingState {
                     20,
                 );
                 fx::ring(world, &vanilla_particle_types::LAVA, center, 2.0, 18);
+                self.timed_rune(
+                    caster,
+                    fx::display::SpellModel::RuneFire,
+                    center,
+                    2.5,
+                    1_500,
+                    3.0,
+                );
+                self.spell_runtime.lock().visuals.spawn(
+                    world,
+                    caster.player.gameprofile.id(),
+                    fx::display::SpellModel::Fireball,
+                    fx::runtime::Motion::Linear {
+                        from: center + DVec3::new(0.0, 18.0, 0.0),
+                        to: center,
+                        started: now,
+                        duration: 1_500,
+                    },
+                    3.0,
+                    false,
+                    0.0,
+                    now,
+                    now + 1_600,
+                );
                 self.spell_runtime.lock().meteors.push(Meteor {
                     owner: caster.player.gameprofile.id(),
                     world: world.key.clone(),
@@ -916,16 +1164,27 @@ impl SoloLevelingState {
                 });
             }
             SpellId::VoidLance => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
                 let shot = caster.aim(LONG_RANGE, true);
                 fx::beam(world, &vanilla_particle_types::PORTAL, caster.eye, shot.end);
+                self.spell_runtime.lock().visuals.spawn(
+                    world,
+                    caster.player.gameprofile.id(),
+                    fx::display::SpellModel::VoidLance,
+                    fx::runtime::Motion::Static(caster.eye.lerp(shot.end, 0.5)),
+                    4.0,
+                    false,
+                    0.0,
+                    now,
+                    now + 500,
+                );
                 for target in &shot.hits {
                     fx::impact(world, spell, target.position() + DVec3::Y);
                     caster.hurt(target, VOID_LANCE_DAMAGE);
                 }
             }
             SpellId::MonarchsWrath => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
                 let feet = caster.player.position();
                 fx::spiral(
                     world,
@@ -936,23 +1195,39 @@ impl SoloLevelingState {
                     1.0,
                     30,
                 );
+                self.following_rune(
+                    caster,
+                    caster.player.gameprofile.id(),
+                    fx::display::SpellModel::RuneVoid,
+                    2.2,
+                    10_000,
+                    -2.0,
+                );
                 self.with_session_mut(caster.player.gameprofile.id(), |session| {
                     session.magic.wrath_until = now + 10_000;
                 });
             }
             SpellId::LesserHeal => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
                 let target = caster.ally_in_sight();
                 let healed = self.heal_hunter(&target, 6.0 * scale * caster.healing);
                 self.record_healing(caster.player.gameprofile.id(), healed);
                 fx::impact(world, spell, target.position() + DVec3::Y * 2.0);
+                self.timed_rune(
+                    caster,
+                    fx::display::SpellModel::RuneHoly,
+                    target.position(),
+                    1.2,
+                    900,
+                    2.0,
+                );
             }
             SpellId::Restoration => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
                 // World queries run before the spell lock is taken.
                 let allies = caster.allies(PARTY_RADIUS);
                 let mut runtime = self.spell_runtime.lock();
-                for ally in allies {
+                for ally in &allies {
                     runtime.regrowths.push(Regrowth {
                         caster: caster.player.gameprofile.id(),
                         target: ally.gameprofile.id(),
@@ -962,10 +1237,19 @@ impl SoloLevelingState {
                     });
                 }
                 drop(runtime);
-                caster.for_allies(|_| {});
+                for ally in allies {
+                    self.following_rune(
+                        caster,
+                        ally.gameprofile.id(),
+                        fx::display::SpellModel::RuneHoly,
+                        1.0,
+                        8_000,
+                        1.4,
+                    );
+                }
             }
             SpellId::Cleanse => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
                 caster.for_allies(|ally| {
                     for effect in [
                         vanilla_mob_effects::POISON,
@@ -981,7 +1265,7 @@ impl SoloLevelingState {
                 });
             }
             SpellId::Barrier => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
                 // Absorption gives 4 health per level.
                 let amplifier = (((8.0 * scale + caster.barrier) / 4.0).round() as i32 - 1).max(0);
                 caster.for_allies(|ally| {
@@ -990,10 +1274,18 @@ impl SoloLevelingState {
                         160,
                         amplifier,
                     ));
+                    self.following_rune(
+                        caster,
+                        ally.gameprofile.id(),
+                        fx::display::SpellModel::RuneHoly,
+                        1.2,
+                        8_000,
+                        2.0,
+                    );
                 });
             }
             SpellId::GreaterHeal => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
                 let target = caster.ally_in_sight();
                 let healed = self.heal_hunter(
                     &target,
@@ -1001,9 +1293,17 @@ impl SoloLevelingState {
                 );
                 self.record_healing(caster.player.gameprofile.id(), healed);
                 fx::impact(world, spell, target.position() + DVec3::Y * 2.0);
+                self.timed_rune(
+                    caster,
+                    fx::display::SpellModel::RuneHoly,
+                    target.position(),
+                    1.2,
+                    900,
+                    2.0,
+                );
             }
             SpellId::Sanctuary => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
                 let center = caster.player.position();
                 fx::ring(
                     world,
@@ -1011,6 +1311,14 @@ impl SoloLevelingState {
                     DVec3::new(center.x, center.y + 0.1, center.z),
                     6.0,
                     40,
+                );
+                self.timed_rune(
+                    caster,
+                    fx::display::SpellModel::RuneHoly,
+                    center,
+                    6.0,
+                    10_000,
+                    0.8,
                 );
                 self.spell_runtime.lock().sanctuaries.push(Sanctuary {
                     owner: caster.player.gameprofile.id(),
@@ -1022,7 +1330,15 @@ impl SoloLevelingState {
                 });
             }
             SpellId::LastStand => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
+                self.timed_rune(
+                    caster,
+                    fx::display::SpellModel::RuneHoly,
+                    caster.player.position(),
+                    3.0,
+                    6_000,
+                    1.5,
+                );
                 caster.for_allies(|ally| {
                     self.with_session_mut(ally.gameprofile.id(), |session| {
                         session.magic.last_stand_until = now + 6_000;
@@ -1030,8 +1346,16 @@ impl SoloLevelingState {
                 });
             }
             SpellId::Repulse => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
                 let center = caster.player.position();
+                self.timed_rune(
+                    caster,
+                    fx::display::SpellModel::RuneStorm,
+                    center,
+                    2.5,
+                    600,
+                    4.0,
+                );
                 let mut look = caster.look;
                 look.y = 0.0;
                 fx::cone(
@@ -1051,7 +1375,7 @@ impl SoloLevelingState {
                 }
             }
             SpellId::Haste => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
                 let feet = caster.player.position();
                 fx::spiral(
                     world,
@@ -1071,7 +1395,7 @@ impl SoloLevelingState {
                 });
             }
             SpellId::Shackles => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
                 let shot = caster.aim(AIM_RANGE, false);
                 let target = shot.hits.first().ok_or("Оковы: нет цели в прицеле.")?;
                 let boss = self.is_boss(world, target.id());
@@ -1088,9 +1412,17 @@ impl SoloLevelingState {
                     target.position() + DVec3::Y,
                 );
                 fx::impact(world, spell, target.position() + DVec3::Y);
+                self.timed_rune(
+                    caster,
+                    fx::display::SpellModel::RuneFrost,
+                    target.position(),
+                    1.2,
+                    if boss { 1_000 } else { 3_000 },
+                    3.0,
+                );
             }
             SpellId::BlessingOfStrength => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
                 fx::burst(
                     world,
                     &vanilla_particle_types::CRIT,
@@ -1106,8 +1438,16 @@ impl SoloLevelingState {
                 });
             }
             SpellId::Weaken => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
                 let center = caster.player.position();
+                self.timed_rune(
+                    caster,
+                    fx::display::SpellModel::RuneVoid,
+                    center,
+                    3.0,
+                    1_200,
+                    -2.5,
+                );
                 let targets = enemies_near(world, center, 6.0);
                 let mut runtime = self.spell_runtime.lock();
                 for target in targets {
@@ -1115,9 +1455,17 @@ impl SoloLevelingState {
                 }
             }
             SpellId::GravityWell => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
                 let shot = caster.aim(AIM_RANGE, false);
                 let center = shot.hits.first().map_or(shot.end, |hit| hit.position());
+                self.timed_rune(
+                    caster,
+                    fx::display::SpellModel::RuneVoid,
+                    center,
+                    4.0,
+                    1_600,
+                    4.0,
+                );
                 fx::spiral(
                     world,
                     &vanilla_particle_types::REVERSE_PORTAL,
@@ -1145,7 +1493,7 @@ impl SoloLevelingState {
                 }
             }
             SpellId::NightVision => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
                 let feet = caster.player.position();
                 fx::ring(
                     world,
@@ -1163,7 +1511,7 @@ impl SoloLevelingState {
                 });
             }
             SpellId::Blink => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
                 let player = caster.player;
                 let start = player.position();
                 let direction = caster.look.normalize_or_zero();
@@ -1179,6 +1527,22 @@ impl SoloLevelingState {
                 let destination = destination
                     .filter(|feet| feet.distance(start) >= 1.0)
                     .ok_or("Скачок: путь прегражден.")?;
+                self.timed_rune(
+                    caster,
+                    fx::display::SpellModel::RuneVoid,
+                    start,
+                    1.4,
+                    700,
+                    3.0,
+                );
+                self.timed_rune(
+                    caster,
+                    fx::display::SpellModel::RuneVoid,
+                    destination,
+                    1.4,
+                    700,
+                    -3.0,
+                );
                 let (yaw, pitch) = player.rotation();
                 player
                     .teleport(destination, yaw, pitch)
@@ -1202,7 +1566,7 @@ impl SoloLevelingState {
                 play_at(world, fx::theme(spell).impact_sound, destination, 1.0, 1.1);
             }
             SpellId::Detection => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
                 let center = caster.player.position();
                 // Two expanding sonar rings mark the sweep radius.
                 fx::ring(
@@ -1235,7 +1599,15 @@ impl SoloLevelingState {
                 tell(caster.player, &report, Color::Aqua);
             }
             SpellId::Meditation => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
+                self.timed_rune(
+                    caster,
+                    fx::display::SpellModel::RuneArcane,
+                    caster.player.position(),
+                    2.0,
+                    4_000,
+                    1.2,
+                );
                 self.with_session_mut(caster.player.gameprofile.id(), |session| {
                     session.magic.meditation = Some((now, caster.player.position()));
                 });
@@ -1246,9 +1618,17 @@ impl SoloLevelingState {
                 );
             }
             SpellId::ManaShield => {
-                fx::cast(world, spell, caster.player.position());
+                self.cast_visual(caster, spell);
                 let feet = caster.player.position();
                 fx::ring_dust(world, fx::theme(spell).tint, feet + DVec3::Y, 1.4, 24);
+                self.following_rune(
+                    caster,
+                    caster.player.gameprofile.id(),
+                    fx::display::SpellModel::RuneArcane,
+                    1.5,
+                    10_000,
+                    2.2,
+                );
                 self.with_session_mut(caster.player.gameprofile.id(), |session| {
                     session.magic.mana_shield_until = now + 10_000;
                 });

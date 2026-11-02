@@ -7,7 +7,10 @@
 //! around a hundred particles, so effects stay cheap next to vanilla fireworks.
 //! Damage, cooldowns and mana are untouched here; this module only draws.
 
-use std::f64::consts::TAU;
+pub mod display;
+pub mod runtime;
+
+use std::f64::consts::{PI, TAU};
 
 use glam::DVec3;
 use steel_core::world::World;
@@ -18,7 +21,7 @@ use steel_registry::sound_event::SoundEvent;
 use steel_registry::{sound_events, vanilla_particle_types as particle};
 use steel_utils::{ArgbColor, RgbColor};
 
-use crate::sound::play_at;
+use crate::sound::{SpellSound, play_at};
 use crate::spell::SpellId;
 
 /// How far the cast ring sits from the caster's feet.
@@ -205,6 +208,41 @@ pub fn beam(world: &World, kind: &'static ParticleType, from: DVec3, to: DVec3) 
         world,
         ParticleData::simple(kind),
         &line_points(from, to, BEAM_SPACING),
+    );
+}
+
+/// A deterministic jagged lightning path with exact endpoints.
+#[must_use]
+pub fn lightning_points(from: DVec3, to: DVec3) -> Vec<DVec3> {
+    let delta = to - from;
+    let length = delta.length();
+    let direction = delta.normalize_or_zero();
+    let side = direction.cross(DVec3::Y).normalize_or_zero();
+    let up = direction.cross(side).normalize_or_zero();
+    let segments = (length * 3.0).ceil().max(2.0) as usize;
+    (0..=segments)
+        .map(|index| {
+            let t = index as f64 / segments as f64;
+            let envelope = (t * PI).sin();
+            let jitter = (index as f64 * 2.17).sin() * 0.42 * envelope;
+            let lift = (index as f64 * 3.73).cos() * 0.24 * envelope;
+            from.lerp(to, t) + side * jitter + up * lift
+        })
+        .collect()
+}
+
+/// Draws a bright, jagged lightning bolt.
+pub fn lightning(world: &World, from: DVec3, to: DVec3) {
+    let points = lightning_points(from, to);
+    shape(
+        world,
+        ParticleData::simple(&particle::ELECTRIC_SPARK),
+        &points,
+    );
+    shape(
+        world,
+        ParticleData::simple(&particle::END_ROD),
+        &points.iter().step_by(3).copied().collect::<Vec<_>>(),
     );
 }
 
@@ -439,6 +477,37 @@ pub const fn theme(spell: SpellId) -> SpellTheme {
     }
 }
 
+/// The rune model and pack sound shared by a spell's cast and impact.
+#[must_use]
+pub(crate) const fn school_assets(spell: SpellId) -> (display::SpellModel, SpellSound) {
+    use display::SpellModel;
+    match spell {
+        SpellId::Fireball | SpellId::Meteor => (SpellModel::RuneFire, SpellSound::Fire),
+        SpellId::IceSpear | SpellId::Shackles => (SpellModel::RuneFrost, SpellSound::Frost),
+        SpellId::ChainLightning
+        | SpellId::ManaStorm
+        | SpellId::Repulse
+        | SpellId::Haste
+        | SpellId::Detection => (SpellModel::RuneStorm, SpellSound::Lightning),
+        SpellId::LesserHeal
+        | SpellId::Restoration
+        | SpellId::Cleanse
+        | SpellId::Barrier
+        | SpellId::GreaterHeal
+        | SpellId::Sanctuary
+        | SpellId::LastStand
+        | SpellId::BlessingOfStrength
+        | SpellId::NightVision => (SpellModel::RuneHoly, SpellSound::Holy),
+        SpellId::MonarchsWrath => (SpellModel::RuneVoid, SpellSound::Monarch),
+        SpellId::VoidLance | SpellId::Weaken | SpellId::GravityWell | SpellId::Blink => {
+            (SpellModel::RuneVoid, SpellSound::Void)
+        }
+        SpellId::MagicArrow | SpellId::Meditation | SpellId::ManaShield => {
+            (SpellModel::RuneArcane, SpellSound::Arcane)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Layers a cast is built from.
 // ---------------------------------------------------------------------------
@@ -450,39 +519,52 @@ pub fn cast(world: &World, spell: SpellId, feet: DVec3) {
     let base = DVec3::new(feet.x, feet.y + 0.1, feet.z);
     ring_dust(world, theme.tint, base, CAST_RING_RADIUS, 20);
     spiral(world, theme.secondary, base, 0.6, 2.0, 2.0, 24);
-    play_at(world, theme.cast_sound, feet, 1.0, 1.0);
+    school_assets(spell).1.play_at(world, feet, 0.9, 1.0);
 }
 
 /// The impact layer: a burst of the school's main particle, a ring of its
 /// secondary particle and the impact sound.
 pub fn impact(world: &World, spell: SpellId, at: DVec3) {
     let theme = theme(spell);
-    burst(world, theme.primary, at, 20, 0.35, 0.08);
-    ring(world, theme.secondary, at, 1.4, 16);
-    play_at(world, theme.impact_sound, at, 1.0, 1.0);
+    burst(world, theme.primary, at, 32, 0.45, 0.12);
+    ring(world, theme.secondary, at, 1.8, 24);
+    school_assets(spell).1.play_at(world, at, 1.0, 0.95);
 }
 
 /// The shared fire explosion of Fireball and Meteor: the emitter core, a
 /// firework flash, a flame burst and a smoke ring, with the explosion sound.
 pub fn explosion(world: &World, at: DVec3) {
-    burst(world, &particle::EXPLOSION_EMITTER, at, 1, 0.0, 0.0);
-    burst(world, &particle::FIREWORK, at, 14, 0.4, 0.15);
-    burst(world, &particle::FLAME, at, 22, 0.5, 0.1);
+    burst(world, &particle::EXPLOSION_EMITTER, at, 2, 0.2, 0.0);
+    burst(world, &particle::FIREWORK, at, 40, 0.8, 0.22);
+    burst(world, &particle::FLAME, at, 48, 0.9, 0.16);
+    burst(world, &particle::LAVA, at, 24, 1.0, 0.08);
     ring(
         world,
         &particle::LARGE_SMOKE,
         DVec3::new(at.x, at.y + 0.2, at.z),
-        1.8,
-        16,
+        2.4,
+        28,
     );
-    play_at(world, &sound_events::ENTITY_GENERIC_EXPLODE, at, 1.0, 0.9);
+    ring_dust(
+        world,
+        RgbColor::new(0xFF_B4_4A_u32 as i32),
+        DVec3::new(at.x, at.y + 0.15, at.z),
+        3.2,
+        40,
+    );
+    play_at(world, &sound_events::ENTITY_GENERIC_EXPLODE, at, 1.2, 0.85);
+    SpellSound::Fire.play_at(world, at, 1.0, 0.8);
 }
 
 #[cfg(test)]
 mod tests {
     use glam::DVec3;
 
-    use super::{cone_points, line_points, ring_points, spiral_points};
+    use super::{
+        cone_points, lightning_points, line_points, ring_points, school_assets, spiral_points,
+    };
+    use crate::item::model::SPELL_MODELS;
+    use crate::spell::ALL;
 
     #[test]
     fn a_ring_stays_at_radius_and_wraps_the_center() {
@@ -541,6 +623,31 @@ mod tests {
         assert!(points.last().expect("a line has points").distance(to) < 1e-9);
         for window in points.windows(2) {
             assert!((window[1].distance(window[0]) - 0.5).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn lightning_has_exact_endpoints_and_a_jagged_body() {
+        let from = DVec3::new(1.0, 2.0, 3.0);
+        let to = DVec3::new(8.0, 2.0, 3.0);
+        let points = lightning_points(from, to);
+        assert_eq!(points.first(), Some(&from));
+        assert_eq!(points.last(), Some(&to));
+        assert!(
+            points[1..points.len() - 1]
+                .iter()
+                .any(|point| (point.z - from.z).abs() > 0.01)
+        );
+    }
+
+    #[test]
+    fn every_spell_school_model_is_registered_for_the_pack_test() {
+        for spell in ALL {
+            let (model, _) = school_assets(spell);
+            assert!(
+                SPELL_MODELS.contains(&model.path()),
+                "{spell:?} uses an unregistered model"
+            );
         }
     }
 }

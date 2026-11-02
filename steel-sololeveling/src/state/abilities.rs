@@ -32,6 +32,8 @@ use crate::gear;
 use crate::identifier::from_sololeveling;
 use crate::item::artifact::{self, Ability, Category};
 use crate::item::enchantment::{self, Effect};
+use crate::spell::SpellId;
+use crate::spell_fx as fx;
 
 /// Milliseconds between two storm damage pulses.
 const STORM_PULSE_MILLIS: u64 = 1_000;
@@ -535,11 +537,27 @@ impl SoloLevelingState {
             let Some(world) = server.worlds.get(&world_key) else {
                 continue;
             };
-            world.send_particles(
-                ParticleData::simple(&vanilla_particle_types::SWEEP_ATTACK),
+            fx::ring_dust(
+                world,
+                fx::theme(SpellId::ManaStorm).tint,
+                center + DVec3::new(0.0, 0.15, 0.0),
+                radius,
+                48,
+            );
+            fx::spiral(
+                world,
+                &vanilla_particle_types::ENCHANT,
                 center,
-                12,
-                DVec3::new(radius, 0.5, radius),
+                radius * 0.65,
+                3.5,
+                2.0,
+                42,
+            );
+            world.send_particles(
+                ParticleData::simple(&vanilla_particle_types::END_ROD),
+                center + DVec3::Y,
+                16,
+                DVec3::new(radius, 0.8, radius),
                 0.0,
             );
             let area = WorldAabb::of_size(center, radius * 2.0, radius * 2.0, radius * 2.0);

@@ -1130,6 +1130,104 @@ def vortex_model(name):
     }
 
 
+# Spell displays: animated runes, a fire core and crystalline projectiles.
+SPELL_RUNES = {
+    "arcane": ("#32136e", "#9a63ff", "#bde8ff"),
+    "fire": ("#641407", "#ff6a1a", "#ffe28a"),
+    "frost": ("#103b65", "#67caff", "#e8fbff"),
+    "holy": ("#52621a", "#b8ef72", "#fff4b0"),
+    "void": ("#1d092e", "#843bd0", "#e1a4ff"),
+    "storm": ("#102b68", "#597dff", "#c4d5ff"),
+}
+SPELL_PROJECTILES = ("arcane_bolt", "fireball", "ice_spear", "void_lance", "shard")
+
+
+def rune_strip(name):
+    size, frames = 64, 8
+    dark, glow, core = SPELL_RUNES[name]
+    strip = Image.new("RGBA", (size, size * frames), (0, 0, 0, 0))
+    for frame in range(frames):
+        phase = frame / frames * 2 * math.pi
+        for y in range(size):
+            for x in range(size):
+                dx, dy = x - 31.5, y - 31.5
+                radius = math.hypot(dx, dy)
+                angle = math.atan2(dy, dx)
+                ring = min(abs(radius - 27), abs(radius - 21))
+                spokes = abs(math.sin(6 * angle + phase)) > 0.965 and 11 < radius < 26
+                inner = abs(radius - (10 + 1.5 * math.sin(phase))) < 0.8
+                diamond = abs(abs(dx) + abs(dy) - 15) < 0.9
+                if ring < 1.0 or spokes or inner or diamond:
+                    pulse = 0.65 + 0.35 * math.sin(phase + radius * 0.3)
+                    colour = mix(glow, core, max(0.0, pulse)) if ring < 0.7 or inner else rgb(glow)[:3]
+                    alpha = 245 if ring < 0.7 or inner else 205
+                    strip.putpixel((x, y + frame * size), (*colour, alpha))
+                elif 25 < radius < 29 and (x + y + frame) % 5 == 0:
+                    strip.putpixel((x, y + frame * size), (*rgb(dark)[:3], 130))
+    return strip
+
+
+def fireball_strip():
+    size, frames = 32, 8
+    strip = Image.new("RGBA", (size, size * frames), (0, 0, 0, 0))
+    for frame in range(frames):
+        phase = frame / frames * 2 * math.pi
+        for y in range(size):
+            for x in range(size):
+                dx, dy = (x - 15.5) / 15, (y - 15.5) / 15
+                radius = math.hypot(dx, dy)
+                angle = math.atan2(dy, dx)
+                edge = 0.88 + 0.12 * math.sin(7 * angle + phase) + 0.07 * math.sin(11 * angle - phase)
+                if radius > edge:
+                    continue
+                heat = max(0.0, 1.0 - radius / edge)
+                colour = mix("#ff5a0a", "#fff5b0", min(1.0, heat * 1.7))
+                alpha = round(150 + 105 * min(1.0, heat * 2.0))
+                strip.putpixel((x, y + frame * size), (*colour, alpha))
+    return strip
+
+
+def projectile_image(name):
+    image = Image.new("RGBA", (32, 32), (0, 0, 0, 0))
+    colours = {
+        "arcane_bolt": ("#482080", "#a875ff", "#e4f7ff"),
+        "ice_spear": ("#19548a", "#79d8ff", "#f2ffff"),
+        "void_lance": ("#1b082c", "#873bd0", "#f0b0ff"),
+        "shard": ("#1b5b85", "#8be2ff", "#ffffff"),
+    }
+    dark, body, core = colours[name]
+    for y in range(32):
+        for x in range(32):
+            dx, dy = abs(x - 15.5), abs(y - 15.5)
+            if name == "void_lance":
+                inside = dy <= max(1.0, 7.0 - dx * 0.35) and dx < 15
+            elif name == "shard":
+                inside = dx + dy * 1.8 < 10
+            else:
+                inside = dx * 0.75 + dy < 14 and dx < 10
+            if not inside:
+                continue
+            edge = dx * 0.75 + dy if name != "void_lance" else dy + dx * 0.2
+            colour = rgb(core) if edge < 4 else mix(body, core, max(0.0, 1.0 - edge / 12))
+            if edge > 11:
+                colour = rgb(dark)
+            image.putpixel((x, y), (*colour[:3], 245))
+    return image
+
+
+def spell_model(name):
+    texture = f"{NAMESPACE}:item/spell/{name}"
+    face = {"uv": [0, 0, 16, 16], "texture": "#spell"}
+    return {
+        "textures": {"spell": texture, "particle": texture},
+        "elements": [{
+            "from": [0, 0, 7.95],
+            "to": [16, 16, 8.05],
+            "faces": {"north": face, "south": face},
+        }],
+    }
+
+
 # Menu button icons, drawn from shapes and outlined automatically.
 def shaped(fill, main, light):
     """Fills the pixels `fill(x, y)` accepts, lights their top edge and outlines them."""
@@ -1264,6 +1362,27 @@ def arise_sound():
     start = int(SAMPLE_RATE * 0.35)
     body[start : start + len(chime)] += 0.5 * chime[: len(body) - start]
     return body
+
+
+def spell_noise(base, seconds, crackle=0.4):
+    import numpy as np
+
+    time = np.arange(int(SAMPLE_RATE * seconds)) / SAMPLE_RATE
+    rng = np.random.default_rng(int(base))
+    sweep = np.sin(2 * np.pi * (base * time + base * 0.35 * time * time))
+    noise = np.convolve(rng.standard_normal(len(time)), np.ones(12) / 12, mode="same")
+    return (sweep + crackle * noise) * np.minimum(time / 0.025, 1.0) * np.exp(-4.0 * time)
+
+
+SPELL_SOUNDS = {
+    "arcane": lambda: sequence([(440.0, 0.35), (880.0, 0.45), (1320.0, 0.35)], 0.045),
+    "fire": lambda: spell_noise(95, 0.8, 0.8),
+    "frost": lambda: sequence([(1568.0, 0.4), (2093.0, 0.45), (2637.0, 0.35)], 0.035),
+    "lightning": lambda: spell_noise(720, 0.45, 1.2),
+    "holy": lambda: sequence([(523.25, 0.5), (659.25, 0.55), (1046.5, 0.65)], 0.08),
+    "void": lambda: spell_noise(62, 0.9, 0.55),
+    "monarch": lambda: spell_noise(48, 1.2, 0.7),
+}
 
 
 SOUNDS = {
@@ -1401,6 +1520,37 @@ def build():
             assets / "items" / "gate" / f"vortex_{name}.json",
             {"model": {"type": "minecraft:model", "model": f"{NAMESPACE}:item/gate/vortex_{name}"}},
         )
+    for name in SPELL_RUNES:
+        texture = assets / "textures" / "item" / "spell" / f"rune_{name}.png"
+        texture.parent.mkdir(parents=True, exist_ok=True)
+        rune_strip(name).save(texture)
+        write_json(
+            texture.with_suffix(".png.mcmeta"),
+            {"animation": {"frametime": 2, "interpolate": True, "width": 64, "height": 64}},
+        )
+        model = f"spell/rune_{name}"
+        write_json(assets / "models" / "item" / f"{model}.json", spell_model(f"rune_{name}"))
+        write_json(
+            assets / "items" / f"{model}.json",
+            {"model": {"type": "minecraft:model", "model": f"{NAMESPACE}:item/{model}"}},
+        )
+    for name in SPELL_PROJECTILES:
+        texture = assets / "textures" / "item" / "spell" / f"{name}.png"
+        texture.parent.mkdir(parents=True, exist_ok=True)
+        if name == "fireball":
+            fireball_strip().save(texture)
+            write_json(
+                texture.with_suffix(".png.mcmeta"),
+                {"animation": {"frametime": 1, "interpolate": True, "width": 32, "height": 32}},
+            )
+        else:
+            projectile_image(name).save(texture)
+        model = f"spell/{name}"
+        write_json(assets / "models" / "item" / f"{model}.json", spell_model(name))
+        write_json(
+            assets / "items" / f"{model}.json",
+            {"model": {"type": "minecraft:model", "model": f"{NAMESPACE}:item/{model}"}},
+        )
     for item, draw_icon in UI_ICONS.items():
         texture = assets / "textures" / "item" / f"{item}.png"
         texture.parent.mkdir(parents=True, exist_ok=True)
@@ -1432,6 +1582,9 @@ def build():
     for name, synthesise in SOUNDS.items():
         write_sound(synthesise(), assets / "sounds" / "system" / f"{name}.ogg")
         sounds[f"system.{name}"] = {"sounds": [f"{NAMESPACE}:system/{name}"]}
+    for name, synthesise in SPELL_SOUNDS.items():
+        write_sound(synthesise(), assets / "sounds" / "spell" / f"{name}.ogg")
+        sounds[f"spell.{name}"] = {"sounds": [f"{NAMESPACE}:spell/{name}"]}
     write_json(assets / "sounds.json", sounds)
     write_json(
         PACK / "pack.mcmeta",

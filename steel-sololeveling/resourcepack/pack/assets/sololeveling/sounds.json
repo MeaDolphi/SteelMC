@@ -23,5 +23,40 @@
     "sounds": [
       "sololeveling:system/reward"
     ]
+  },
+  "spell.arcane": {
+    "sounds": [
+      "sololeveling:spell/arcane"
+    ]
+  },
+  "spell.fire": {
+    "sounds": [
+      "sololeveling:spell/fire"
+    ]
+  },
+  "spell.frost": {
+    "sounds": [
+      "sololeveling:spell/frost"
+    ]
+  },
+  "spell.lightning": {
+    "sounds": [
+      "sololeveling:spell/lightning"
+    ]
+  },
+  "spell.holy": {
+    "sounds": [
+      "sololeveling:spell/holy"
+    ]
+  },
+  "spell.void": {
+    "sounds": [
+      "sololeveling:spell/void"
+    ]
+  },
+  "spell.monarch": {
+    "sounds": [
+      "sololeveling:spell/monarch"
+    ]
   }
 }
