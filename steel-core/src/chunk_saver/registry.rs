@@ -48,6 +48,13 @@ impl WorldStorageRegistry {
                 create: create_ram_storage,
             },
         )?;
+        registry.register(
+            Identifier::from_steel("transient"),
+            WorldStorageFactory {
+                validate: validate_empty_config,
+                create: create_transient_storage,
+            },
+        )?;
         Ok(registry)
     }
 
@@ -183,6 +190,18 @@ fn create_ram_storage(
     })
 }
 
+fn create_transient_storage(
+    config: &toml::Value,
+    _save_root: &Path,
+    _default_world_path: &Path,
+) -> Result<WorldStorageOutput, String> {
+    validate_empty_config(config)?;
+    Ok(WorldStorageOutput {
+        storage: WorldStorageConfig::Transient,
+        level_data_path: None,
+    })
+}
+
 fn path_to_string(path: PathBuf) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -202,7 +221,12 @@ mod tests {
         init_vanilla_registry();
         let storage = WorldStorageRegistry::new_with_builtins().expect("storage registry");
         let generators = WorldGeneratorRegistry::new_with_builtins().expect("generators");
-        for (primary, derived) in [("disk", "disk"), ("disk", "ram"), ("ram", "ram")] {
+        for (primary, derived) in [
+            ("disk", "disk"),
+            ("disk", "ram"),
+            ("ram", "ram"),
+            ("disk", "transient"),
+        ] {
             let worlds = [("primary", primary, true), ("derived", derived, false)]
                 .into_iter()
                 .map(|(name, backend, default)| WorldEntryConfig {

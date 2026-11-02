@@ -143,7 +143,7 @@ pub(super) fn footprint_chunks(
         }
         Some(Footprint::Arena) => penalty_arena_chunks(region),
         Some(Footprint::Tower) => super::tower::tower_chunks(region),
-        Some(Footprint::Castle { .. }) => super::castle_tower::tower_chunks(region),
+        Some(Footprint::Castle { .. }) => Vec::new(),
         None => {
             let (min, max) = legacy_box(region);
             let mut chunks = chunks_covering(min, max);
@@ -420,7 +420,7 @@ pub fn erase_footprint(world: &Arc<World>, region: InstanceRegion, footprint: Op
         }
         Some(Footprint::Arena) => clear_box_of(world, arena_box(region), &mut failed),
         Some(Footprint::Tower) => super::tower::erase_tower(world, region, &mut failed),
-        Some(Footprint::Castle { .. }) => super::castle_tower::erase_castle(world, region),
+        Some(Footprint::Castle { .. }) => {}
         None => {
             clear_box_of(world, legacy_box(region), &mut failed);
             clear_box_of(world, arena_box(region), &mut failed);
@@ -559,7 +559,7 @@ pub fn spawn_room_mobs(
 
 /// Spawns one zombie-bodied mob of `class`, scaled by `wave` and geared for
 /// `rank`, with its nameplate.
-pub(super) fn spawn_class_mob(
+pub(crate) fn spawn_class_mob(
     world: &Arc<World>,
     theme: Theme,
     position: BlockPos,
@@ -657,8 +657,22 @@ pub fn spawn_dungeon_boss(
     } else {
         BossKind::from_seed(layout.seed)
     };
-    let boss = boss_for_gate(kind, rank, red);
-    let entity_type = if kind == BossKind::Archer {
+    spawn_boss_body(
+        world,
+        position,
+        boss_for_gate(kind, rank, red),
+        boss_label(kind, rank, red),
+    )
+}
+
+/// Spawns the body of `boss` at `position` under the nameplate `label`.
+pub(crate) fn spawn_boss_body(
+    world: &Arc<World>,
+    position: BlockPos,
+    boss: DungeonBoss,
+    label: MobLabel,
+) -> Option<SpawnedBoss> {
+    let entity_type = if boss.kind == BossKind::Archer {
         &vanilla_entities::SKELETON
     } else {
         &vanilla_entities::ZOMBIE
@@ -666,7 +680,6 @@ pub fn spawn_dungeon_boss(
     let entity = spawn_mob(world, entity_type, position).ok()?;
     let living = entity.as_living_entity()?;
     boss.apply_to(living);
-    let label = boss_label(kind, rank, red);
     label.show(world, living);
     // The boss was spawned at scale 1.0, so its hitbox has to follow the new
     // scale before the fight starts.
@@ -697,7 +710,7 @@ fn boss_label(kind: BossKind, rank: HunterRank, red: bool) -> MobLabel {
 }
 
 /// Spawns one mob and applies the rank multipliers to its vanilla attributes.
-fn spawn_scaled_mob(
+pub(crate) fn spawn_scaled_mob(
     world: &Arc<World>,
     entity_type: EntityTypeRef,
     position: BlockPos,
@@ -741,7 +754,7 @@ fn spawn_scaled_mob(
 ///
 /// [`World::set_block`] reports an out-of-bounds position or an unloaded chunk
 /// as a plain `false`; ignoring that would leave an invisible dungeon behind.
-pub(super) fn set_fixture(
+pub(crate) fn set_fixture(
     world: &Arc<World>,
     pos: BlockPos,
     state: BlockStateId,

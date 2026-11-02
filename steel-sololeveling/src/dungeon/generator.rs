@@ -23,6 +23,7 @@ use steel_registry::blocks::BlockRef;
 use steel_registry::vanilla_blocks;
 
 use crate::rank::HunterRank;
+use crate::seeded::{SplitMix, hash};
 
 /// Grid cells from the entrance cell to the grid edge.
 const GRID_RADIUS: i32 = 3;
@@ -39,40 +40,6 @@ const CORRIDOR_LIGHT_SPACING: i32 = 5;
 const ROOM_LIGHT_SPACING: i32 = 4;
 /// Most spawn spots remembered per room.
 const SPAWN_SPOTS: usize = 24;
-
-/// A small deterministic generator, so a seed keeps meaning the same dungeon
-/// regardless of the `rand` crate version.
-struct SplitMix(u64);
-
-impl SplitMix {
-    const fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut value = self.0;
-        value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        value ^ (value >> 31)
-    }
-
-    /// Returns a value in `low..=high`.
-    fn range(&mut self, low: i32, high: i32) -> i32 {
-        let span = u64::try_from(high - low + 1).unwrap_or(1).max(1);
-        low + i32::try_from(self.next() % span).unwrap_or(0)
-    }
-
-    const fn chance(&mut self, percent: u64) -> bool {
-        self.next() % 100 < percent
-    }
-}
-
-/// Hashes a position into a stable pseudo-random value.
-const fn hash(seed: u64, x: i32, y: i32, z: i32) -> u64 {
-    let mut value = seed
-        ^ (x as u64).wrapping_mul(73_856_093)
-        ^ (y as u64).wrapping_mul(83_492_791)
-        ^ (z as u64).wrapping_mul(2_654_435_761);
-    value = (value ^ (value >> 31)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    value ^ (value >> 29)
-}
 
 /// The look of a dungeon, named after the biome it imitates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,7 +329,7 @@ impl Blueprint {
     /// Generates the dungeon of `seed` with `combat_rooms` wave rooms.
     #[must_use]
     pub fn generate(seed: u64, combat_rooms: u8) -> Self {
-        let mut rng = SplitMix(seed);
+        let mut rng = SplitMix::new(seed);
         let theme = THEMES[usize::try_from(rng.next() % THEMES.len() as u64).unwrap_or(0)];
         Self::generate_with_theme(seed, combat_rooms, theme)
     }
@@ -370,7 +337,7 @@ impl Blueprint {
     /// Generates the dungeon of `seed` with a fixed `theme`.
     #[must_use]
     pub fn generate_with_theme(seed: u64, combat_rooms: u8, theme: Theme) -> Self {
-        let mut rng = SplitMix(seed);
+        let mut rng = SplitMix::new(seed);
         let path = main_path(&mut rng, usize::from(combat_rooms) + 2);
         let mut cells: Vec<((i32, i32), RoomRole)> = path
             .iter()
@@ -1495,7 +1462,7 @@ fn decorate(
     solid: &mut FxHashMap<(i32, i32, i32), Part>,
 ) -> FxHashSet<(i32, i32)> {
     let reachable = reachable_columns(air);
-    let mut rng = SplitMix(seed ^ 0xDEC0_F173_9B2A_7C15);
+    let mut rng = SplitMix::new(seed ^ 0xDEC0_F173_9B2A_7C15);
     let mut blocked_ground: FxHashSet<(i32, i32)> = FxHashSet::default();
     for (index, room) in rooms.iter().enumerate() {
         let doors: Vec<Doorway> = doorways

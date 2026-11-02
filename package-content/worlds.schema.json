@@ -61,11 +61,11 @@
       "properties": {
         "type": {
           "type": "string",
-          "enum": ["steel:disk", "steel:ram"]
+          "enum": ["steel:disk", "steel:ram", "steel:transient"]
         },
         "config": {
           "type": "object",
-          "description": "Storage-specific config. steel:disk supports optional relative path; steel:ram accepts no keys.",
+          "description": "Storage-specific config. steel:disk supports optional relative path; steel:ram and steel:transient accept no keys. steel:transient keeps no chunk once unloaded, so the generator rebuilds it.",
           "additionalProperties": true
         }
       },

@@ -1224,7 +1224,7 @@ impl SoloLevelingState {
                     afflict(target, vanilla_mob_effects::GLOWING, 300, 0);
                 }
                 let mut report = format!("Обнаружено мобов: {}.", found.len());
-                if let Some(boss) = self.boss_position(world) {
+                if let Some(boss) = self.boss_position(world, caster.player.gameprofile.id()) {
                     let _ = write!(
                         report,
                         " Босс: {} блоков, {}.",
@@ -1321,12 +1321,15 @@ impl SoloLevelingState {
 
     /// Returns whether `entity` is the boss of a run in `world`.
     pub(super) fn is_boss(&self, world: &World, entity: i32) -> bool {
-        self.dungeon_runtime.lock().boss_entity(world) == Some(entity)
+        self.dungeon_runtime
+            .lock()
+            .boss_rank(world, entity)
+            .is_some()
     }
 
-    /// Returns where the boss of a run in `world` stands.
-    fn boss_position(&self, world: &World) -> Option<DVec3> {
-        let boss = self.dungeon_runtime.lock().boss_entity(world)?;
+    /// Returns where the boss of `hunter`'s run stands.
+    fn boss_position(&self, world: &World, hunter: Uuid) -> Option<DVec3> {
+        let boss = self.dungeon_runtime.lock().boss_of(hunter)?;
         world.get_entity_by_id(boss).map(|entity| entity.position())
     }
 

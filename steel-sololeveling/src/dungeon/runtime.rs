@@ -35,7 +35,6 @@ use text_components::format::Color;
 use uuid::Uuid;
 
 use super::boss::{BossAbilityAction, BossFight};
-use super::castle_tower;
 use super::generator::{Room, RoomRole, Theme};
 use super::instance::{
     FrameStyle, SpawnedMob, build_dungeon, dungeon_chunks, erase_footprint, footprint_chunks,
@@ -58,6 +57,7 @@ use super::{
 use crate::castle;
 use crate::city;
 use crate::combat_reward::HunterReward;
+use crate::demon_castle::{self, CastleSlot, CastleSlots};
 use crate::item::chest::{self, ChestKind};
 use crate::item::crystal;
 use crate::item::{key, material, pouch};
@@ -65,6 +65,10 @@ use crate::organization::{Event, rank_multiplier};
 use crate::party::RaidContribution;
 use crate::rank::HunterRank;
 use crate::state::{GateClear, SoloLevelingState};
+
+mod castle_climb;
+
+use castle_climb::{CastleClimb, FLOOR_TIME_LIMIT_TICKS, FloorBoss, TreasureOpen};
 
 /// Horizontal distance kept between two gates. The four gate plazas are
 /// small, so the gap only has to keep two frames from touching; a wider gap
@@ -191,8 +195,8 @@ pub struct DungeonRuntime {
     generating_entries: FxHashMap<Uuid, GeneratingEntry>,
     /// Results produced by generation jobs, drained by [`finish_entries`].
     completed_generations: Arc<SyncMutex<Vec<GenerationResult>>>,
-    /// Results produced by castle floor jobs, drained by [`DungeonRuntime::tick_runs`].
-    completed_floors: Arc<SyncMutex<Vec<FloorResult>>>,
+    /// Copies of the Demon Castle handed to climbing parties.
+    castle_slots: CastleSlots,
     /// Live runs by their unique run id, never by a player id: a run outlives
     /// any single member (the party leaves one by one), so a leader who died
     /// and entered new gates must not replace the run his party still fights.
@@ -249,7 +253,7 @@ impl Debug for DungeonRuntime {
                 "completed_generations",
                 &self.completed_generations.lock().len(),
             )
-            .field("completed_floors", &self.completed_floors.lock().len())
+            .field("castle_slots", &self.castle_slots)
             .field("runs", &self.runs.len())
             .field("run_tickets", &self.run_tickets.len())
             .field("next_run_id", &self.next_run_id)
@@ -361,8 +365,6 @@ struct GateCycle {
 struct GeneratingEntry {
     /// Players waiting for this instance; their UUIDs are enough to detect busyness.
     players: Vec<Uuid>,
-    /// Region the entry prepares; floor results use it to detect a free slot.
-    region: InstanceRegion,
     /// Gate consumed by this entry, restored if generation is cancelled.
     gate_id: Option<u64>,
     /// Shared with the generation job so disconnects and persistence failures
@@ -380,7 +382,9 @@ struct GenerationResult {
     start: RunStart,
     /// Keeps the generated chunks loaded until the run is admitted or discarded.
     request: ChunkRequestHandle,
-    footprint: Footprint,
+    /// What the build left in the instance region; a castle floor leaves
+    /// nothing, its world regenerates it.
+    footprint: Option<Footprint>,
     cancelled: bool,
     #[expect(dead_code, reason = "kept for diagnostics and future expansion")]
     erase_micros: u64,
@@ -414,7 +418,7 @@ struct DungeonGenerationJob {
 impl DungeonGenerationJob {
     fn push_result(
         &mut self,
-        footprint: Footprint,
+        footprint: Option<Footprint>,
         erase_micros: u64,
         build_micros: u64,
         block_count: usize,
@@ -449,7 +453,7 @@ impl DungeonGenerationJob {
         if let Some(mut request) = self.request.take() {
             request.cancel();
         }
-        self.push_result(Footprint::Tower, 0, 0, 0, 0, true);
+        self.push_result(None, 0, 0, 0, 0, true);
     }
 }
 
@@ -482,15 +486,16 @@ impl ServerJob for DungeonGenerationJob {
                     .instance_world
                     .as_ref()
                     .expect("generation job missing instance world");
+                let start = self.start.as_ref().expect("generation job missing start");
                 let erase_start = Instant::now();
-                erase_footprint(instance_world, self.region, self.previous);
+                // A castle floor is built by its world's generator; the job
+                // only waited for the floor's chunks.
+                if !matches!(start, RunStart::Castle { .. }) {
+                    erase_footprint(instance_world, self.region, self.previous);
+                }
                 let erase_micros = erase_start.elapsed().as_micros() as u64;
 
-                let (footprint, block_count, build_micros) = match self
-                    .start
-                    .as_ref()
-                    .expect("generation job missing start")
-                {
+                let (footprint, block_count, build_micros) = match start {
                     RunStart::Gate { gate, layout } => {
                         let build_start = Instant::now();
                         build_dungeon(instance_world, self.region, layout, gate.rank);
@@ -511,7 +516,7 @@ impl ServerJob for DungeonGenerationJob {
                             chunk_count
                         );
                         (
-                            Footprint::Dungeon { seed: layout.seed },
+                            Some(Footprint::Dungeon { seed: layout.seed }),
                             layout.blueprint.blocks.len(),
                             build_micros,
                         )
@@ -532,34 +537,16 @@ impl ServerJob for DungeonGenerationJob {
                             self.region.slot,
                             chunk_count
                         );
-                        (Footprint::Tower, 0, build_micros)
+                        (Some(Footprint::Tower), 0, build_micros)
                     }
-                    RunStart::Castle { gate, seed } => {
-                        let floor = gate.floor.unwrap_or(1);
-                        let build_start = Instant::now();
-                        let blocks = castle_tower::build_floor(
-                            instance_world,
-                            self.region,
-                            *seed,
-                            floor,
-                            castle_tower::FloorBelow::Missing,
-                        );
-                        let build_micros = build_start.elapsed().as_micros() as u64;
+                    RunStart::Castle { gate, .. } => {
                         log::info!(
-                            "sololeveling: cleared previous instance footprint in {:.2} ms (region {}, {} chunks)",
-                            erase_micros as f64 / 1000.0,
+                            "sololeveling: castle floor {} is ready (slot {}, {} chunks)",
+                            gate.floor.unwrap_or(1),
                             self.region.slot,
                             chunk_count
                         );
-                        log::info!(
-                            "sololeveling: built castle floor {} in {:.2} ms (region {}, {} blocks, {} chunks)",
-                            floor,
-                            build_micros as f64 / 1000.0,
-                            self.region.slot,
-                            blocks,
-                            chunk_count
-                        );
-                        (Footprint::Castle { floors: 1 }, blocks, build_micros)
+                        (None, 0, 0)
                     }
                 };
                 self.push_result(
@@ -591,114 +578,23 @@ impl ServerJob for DungeonGenerationJob {
     }
 }
 
-/// Outcome of one [`CastleFloorJob`], drained by [`DungeonRuntime::tick_runs`].
-struct FloorResult {
-    region: InstanceRegion,
-    /// Floor that was built, as the absolute floor number.
-    floor: u32,
-}
-
-/// Server job that builds the next Demon Castle floor outside the game tick
-/// while the hunters climb the staircase of the floor below.
-///
-/// The region's chunks are already ticketed by the running climb; the request
-/// only mirrors [`DungeonGenerationJob`] so the build never happens before the
-/// columns are ready. Cancellation is cooperative via [`AtomicBool`].
-struct CastleFloorJob {
-    region: InstanceRegion,
-    instance_world: Arc<World>,
-    seed: u64,
-    floor: u32,
-    request: Option<ChunkRequestHandle>,
-    cancelled: Arc<AtomicBool>,
-    completed: Arc<SyncMutex<Vec<FloorResult>>>,
-}
-
-impl CastleFloorJob {
-    fn finish_cancelled(&mut self) {
-        if let Some(mut request) = self.request.take() {
-            request.cancel();
-        }
-    }
-}
-
-impl ServerJob for CastleFloorJob {
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the chunk-wait, cancel and build sequence mirrors DungeonGenerationJob"
-    )]
-    fn poll(&mut self, _context: &mut ServerJobContext) -> JobPoll {
-        if self.cancelled.load(Ordering::Relaxed) {
-            self.finish_cancelled();
-            return JobPoll::Finished;
-        }
-        let Some(request) = self.request.as_ref() else {
-            return JobPoll::Finished;
-        };
-        match request.poll() {
-            ChunkRequestState::Pending { .. } => JobPoll::Pending,
-            ChunkRequestState::Cancelled => {
-                self.finish_cancelled();
-                JobPoll::Finished
-            }
-            ChunkRequestState::Ready => {
-                if request.ready_chunks().is_none() {
-                    return JobPoll::Pending;
-                }
-                if self.cancelled.load(Ordering::Relaxed) {
-                    self.finish_cancelled();
-                    return JobPoll::Finished;
-                }
-                let build_start = Instant::now();
-                let blocks = castle_tower::build_floor(
-                    &self.instance_world,
-                    self.region,
-                    self.seed,
-                    self.floor,
-                    castle_tower::FloorBelow::Built,
-                );
-                log::info!(
-                    "sololeveling: built castle floor {} in {:.2} ms (region {}, {} blocks)",
-                    self.floor,
-                    build_start.elapsed().as_micros() as f64 / 1000.0,
-                    self.region.slot,
-                    blocks
-                );
-                self.request = None;
-                self.completed.lock().push(FloorResult {
-                    region: self.region,
-                    floor: self.floor,
-                });
-                JobPoll::Finished
-            }
-        }
-    }
-
-    fn cancel(&mut self) {
-        self.cancelled.store(true, Ordering::Relaxed);
-        self.finish_cancelled();
-    }
-
-    fn finish_shutdown(
-        mut self: Box<Self>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        self.cancelled.store(true, Ordering::Relaxed);
-        self.finish_cancelled();
-        Box::pin(async {})
-    }
-}
-
 /// Which kind of instance has to be prepared for a pending entry.
 enum RunStart {
     /// A dungeon reached through a discovered gate.
     Gate { gate: Gate, layout: DungeonLayout },
-    /// A Demon Castle climb starting at the floor the portal names.
-    Castle { gate: Gate, seed: u64 },
+    /// A Demon Castle climb starting at the floor the portal names, in the
+    /// castle world rather than the instance world.
+    Castle { gate: Gate },
     /// A penalty-zone challenge for an unfinished system quest.
     Penalty,
 }
 
 impl RunStart {
+    /// Returns whether the entry climbs the Demon Castle.
+    const fn is_castle(&self) -> bool {
+        matches!(self, Self::Castle { .. })
+    }
+
     /// Returns the gate the entry consumed, if any.
     const fn gate(&self) -> Option<&Gate> {
         match self {
@@ -740,43 +636,9 @@ struct InstanceRun {
 enum RunProgress {
     Dungeon(Box<DungeonProgress>),
     /// The Demon Castle climb: floor after floor until everyone falls or leaves.
-    Castle(TowerClimb),
+    Castle(Box<CastleClimb>),
     Penalty(PenaltyProgress),
     Mine(MineProgress),
-}
-
-/// One hunter's climb through the Demon Castle tower.
-struct TowerClimb {
-    /// Floor the hunters currently fight on.
-    floor: u32,
-    /// Run seed; rotates each floor's plan and rolls its cosmetics.
-    seed: u64,
-    /// Whether the wave of `floor` already appeared.
-    wave_spawned: bool,
-    /// Floor mobs still alive.
-    remaining_mobs: Vec<i32>,
-    /// Nameplates of the tower's mobs, by entity id.
-    labels: FxHashMap<i32, MobLabel>,
-    /// Abilities of the floor's shamans, bombers and broodmothers.
-    skills: MobSkills,
-    /// Abilities to apply once the runtime lock is released.
-    pending_skills: Vec<SkillAction>,
-    /// Exit frame opened in the hall once the floor's wave is cleared.
-    exit: Option<BlockPos>,
-    /// Generation of the next floor, queued when a hunter reaches the staircase.
-    ascent: Option<Ascent>,
-    /// Floor materials owed to the climbers, delivered floor by floor.
-    floor_loot: Vec<(Uuid, ItemStack)>,
-}
-
-/// The next tower floor being built while the hunters climb the staircase.
-struct Ascent {
-    /// Floor under construction.
-    floor: u32,
-    /// Shared with the floor job so the end of the run cancels the build.
-    cancelled: Arc<AtomicBool>,
-    /// Set by the runtime once the floor job finished building.
-    ready: bool,
 }
 
 struct MineProgress {
@@ -1025,6 +887,33 @@ struct PenaltyProgress {
     pending_skills: Vec<SkillAction>,
 }
 
+impl RunProgress {
+    /// Returns the rank the run is fought and rewarded at.
+    fn rank(&self) -> Option<HunterRank> {
+        match self {
+            Self::Dungeon(progress) => Some(progress.rank),
+            Self::Castle(progress) => Some(castle::rank_for_floor(progress.floor)),
+            Self::Mine(progress) => Some(progress.rank),
+            Self::Penalty(_) => None,
+        }
+    }
+
+    /// Returns the entity id of the run's living boss.
+    const fn live_boss(&self) -> Option<i32> {
+        match self {
+            Self::Dungeon(progress) => match progress.boss {
+                BossState::Alive(id) => Some(id),
+                _ => None,
+            },
+            Self::Castle(progress) => match progress.boss {
+                FloorBoss::Alive(id) => Some(id),
+                _ => None,
+            },
+            Self::Penalty(_) | Self::Mine(_) => None,
+        }
+    }
+}
+
 impl InstanceRun {
     /// Ends `member`'s participation in the run.
     ///
@@ -1038,11 +927,8 @@ impl InstanceRun {
 
     /// Teleports one member to the entry point of its run and announces it.
     fn place_member(&self, member: &Player) {
-        // A castle run builds only the floor it entered: the region spawn is
-        // open air above that floor, so the member must land on the arena of
-        // the actual floor.
         let target = match &self.progress {
-            RunProgress::Castle(progress) => castle_tower::hall_center(self.region, progress.floor),
+            RunProgress::Castle(progress) => progress.entry_position(),
             _ => self.region.spawn,
         };
         let _ = member.teleport(target, 0.0, 0.0);
@@ -1066,11 +952,7 @@ impl InstanceRun {
                 progress.layout.blueprint.theme.display_name()
             ))
             .color(Color::DarkPurple),
-            RunProgress::Castle(progress) => TextComponent::plain(match progress.floor {
-                1 => "Замок демонов: первый этаж башни".to_owned(),
-                floor => format!("Замок демонов: этаж {floor}"),
-            })
-            .color(Color::DarkPurple),
+            RunProgress::Castle(progress) => progress.announcement(),
             RunProgress::Penalty(_) => TextComponent::plain(
                 "Штрафная зона: поднимитесь на вершину башни или продержитесь до конца отсчёта.",
             )
@@ -1093,7 +975,7 @@ impl InstanceRun {
                 }
                 mobs
             }
-            RunProgress::Castle(progress) => mem::take(&mut progress.remaining_mobs),
+            RunProgress::Castle(progress) => progress.take_mobs(),
             RunProgress::Penalty(progress) => mem::take(&mut progress.remaining_mobs),
             RunProgress::Mine(_) => Vec::new(),
         }
@@ -1104,9 +986,12 @@ impl InstanceRun {
     /// The client keeps a boss bar until it is removed, even across the death
     /// screen, so it outlives the run otherwise.
     fn hide_boss_bar(&self, player: &Player) {
-        if let RunProgress::Dungeon(progress) = &self.progress
-            && let Some(fight) = &progress.fight
-        {
+        let fight = match &self.progress {
+            RunProgress::Dungeon(progress) => progress.fight.as_ref(),
+            RunProgress::Castle(progress) => progress.fight.as_ref(),
+            RunProgress::Penalty(_) | RunProgress::Mine(_) => None,
+        };
+        if let Some(fight) = fight {
             fight.abandon(player);
         }
     }
@@ -1308,17 +1193,9 @@ impl DungeonRuntime {
     /// is fought and rewarded at.
     #[must_use]
     pub fn instance_rank(&self, world: &World) -> Option<HunterRank> {
-        self.runs.values().find_map(|run| {
-            if run.instance_world != world.key {
-                return None;
-            }
-            match &run.progress {
-                RunProgress::Dungeon(progress) => Some(progress.rank),
-                RunProgress::Castle(progress) => Some(castle::rank_for_floor(progress.floor)),
-                RunProgress::Mine(progress) => Some(progress.rank),
-                RunProgress::Penalty(_) => None,
-            }
-        })
+        self.runs
+            .values()
+            .find_map(|run| (run.instance_world == world.key).then(|| run.progress.rank())?)
     }
 
     /// Records `amount` crystals mined in the mine run occupying `world` and `pos`.
@@ -1350,6 +1227,13 @@ impl DungeonRuntime {
             {
                 progress.boss = BossState::Defeated;
                 return;
+            }
+            if let RunProgress::Castle(progress) = &mut run.progress {
+                if progress.boss == FloorBoss::Alive(entity_id) {
+                    progress.boss = FloorBoss::Defeated;
+                    return;
+                }
+                progress.on_elite_death(entity_id, &run.members);
             }
             let remaining = match &mut run.progress {
                 RunProgress::Dungeon(progress) => &mut progress.remaining_mobs,
@@ -1522,9 +1406,7 @@ impl DungeonRuntime {
             // `remaining_mobs` once the kill is observed, which keeps a
             // duplicate death event from paying twice before the plates are
             // pruned.
-            if !progress.remaining_mobs.contains(&entity_id)
-                || !progress.labels.contains_key(&entity_id)
-            {
+            if !progress.tracks(entity_id) {
                 continue;
             }
             let mut reward = HunterReward::for_mob(castle::rank_for_floor(progress.floor));
@@ -1572,20 +1454,53 @@ impl DungeonRuntime {
         }
     }
 
-    /// Returns the entity id of the living boss of a run in `world`.
-    pub fn boss_entity(&self, world: &World) -> Option<i32> {
+    /// Returns the rank of the run whose living boss is `entity_id`, or
+    /// `None` when it is no run's boss.
+    ///
+    /// Several runs share one world (every castle climb does), so a boss is
+    /// matched by its id rather than by the world alone.
+    #[must_use]
+    pub fn boss_rank(&self, world: &World, entity_id: i32) -> Option<HunterRank> {
         self.runs.values().find_map(|run| {
-            if run.instance_world != world.key {
+            (run.instance_world == world.key && run.progress.live_boss() == Some(entity_id))
+                .then(|| run.progress.rank())?
+        })
+    }
+
+    /// Opens the castle treasure cache at `pos` for `hunter`; returns whether
+    /// they got loot, or `None` when no cache of their climb stands there.
+    pub fn open_castle_treasure(
+        &mut self,
+        world: &World,
+        pos: BlockPos,
+        hunter: Uuid,
+    ) -> Option<bool> {
+        let opened = self.runs.values_mut().find_map(|run| {
+            if run.instance_world != world.key || !run.members.contains(&hunter) {
                 return None;
             }
-            match &run.progress {
-                RunProgress::Dungeon(progress) => match progress.boss {
-                    BossState::Alive(id) => Some(id),
-                    _ => None,
-                },
-                RunProgress::Castle(_) | RunProgress::Penalty(_) | RunProgress::Mine(_) => None,
+            let RunProgress::Castle(progress) = &mut run.progress else {
+                return None;
+            };
+            progress.open_treasure(pos, hunter)
+        })?;
+        Some(match opened {
+            TreasureOpen::Looted(loot) => {
+                self.pending_loot
+                    .extend(loot.into_iter().map(|stack| (hunter, stack)));
+                true
             }
+            TreasureOpen::Empty => false,
         })
+    }
+
+    /// Returns the living boss of the run `hunter` fights in.
+    #[must_use]
+    pub fn boss_of(&self, hunter: Uuid) -> Option<i32> {
+        self.runs
+            .values()
+            .find(|run| run.members.contains(&hunter))
+            .and_then(|run| run.progress.live_boss())
     }
 
     /// Drains loot that must be delivered outside the runtime lock.
@@ -1616,8 +1531,7 @@ impl DungeonRuntime {
                 RunDeath::DungeonFailed
             }
             // A castle death ends the climb with the same fall back to the
-            // checkpoint the entry already moved the hunter to; `release_run`
-            // cancels the pending floor build.
+            // checkpoint the entry already moved the hunter to.
             RunProgress::Castle(_) => RunDeath::DungeonFailed,
             RunProgress::Penalty(_) => RunDeath::PenaltyFailed {
                 roll: rand::rng().random_range(0..5),
@@ -1705,15 +1619,19 @@ impl DungeonRuntime {
 
     /// Frees the region, gate, and mobs a finished run held.
     fn release_run(&mut self, mut run: InstanceRun) {
-        // A floor job outliving its run must not build into a released region.
-        if let RunProgress::Castle(progress) = &mut run.progress
-            && let Some(ascent) = &progress.ascent
-        {
-            ascent.cancelled.store(true, Ordering::Relaxed);
-        }
-        self.regions.release(run.region);
+        self.free_region(run.region, matches!(run.progress, RunProgress::Castle(_)));
         self.spend_gate(run.gate);
         self.spend_mobs(&mut run);
+    }
+
+    /// Gives a region back to the allocator it came from: castle climbs hold a
+    /// castle slot in the region's place.
+    fn free_region(&mut self, region: InstanceRegion, castle: bool) {
+        if castle {
+            self.castle_slots.release(CastleSlot(region.slot));
+        } else {
+            self.regions.release(region);
+        }
     }
 
     /// Admits a finished generation as a live run under a fresh id.
@@ -2712,14 +2630,21 @@ impl DungeonRuntime {
                 }
                 continue;
             }
-            let Some(instance_world) = instance_world_of(server, &world) else {
-                log::error!(
-                    "sololeveling: instance world is not loaded for {}",
-                    world.key
-                );
+            let Some(gate) = self.gates.enter_at(&world.key, rank, player.position()) else {
                 continue;
             };
-            let Some(gate) = self.gates.enter_at(&world.key, rank, player.position()) else {
+            let target_world = if gate.floor.is_some() {
+                castle_world_of(server, &world)
+            } else {
+                instance_world_of(server, &world)
+            };
+            let Some(instance_world) = target_world else {
+                log::error!(
+                    "sololeveling: the world behind gate {} is not loaded for {}",
+                    gate.id,
+                    world.key
+                );
+                self.gates.reopen(gate.id);
                 continue;
             };
             let start = if gate.floor.is_some() {
@@ -2729,10 +2654,7 @@ impl DungeonRuntime {
                     gate.id,
                     gate.floor.unwrap_or(1)
                 );
-                RunStart::Castle {
-                    gate: gate.clone(),
-                    seed: rand::rng().random(),
-                }
+                RunStart::Castle { gate: gate.clone() }
             } else {
                 log::info!(
                     "sololeveling: hunter {} entered {}-rank gate {}",
@@ -2826,13 +2748,31 @@ impl DungeonRuntime {
         instance_world: Arc<World>,
         start: RunStart,
     ) {
-        let region = self.regions.allocate();
+        let castle = matches!(start, RunStart::Castle { .. });
+        let region = if let RunStart::Castle { gate } = &start {
+            // A castle climb holds a slot of the castle world in the region's
+            // place; its spawn is never used, members land on the floor entry.
+            let slot = self.castle_slots.allocate();
+            InstanceRegion {
+                slot: slot.0,
+                spawn: slot.center(gate.floor.unwrap_or(1)).0.as_dvec3(),
+            }
+        } else {
+            self.regions.allocate()
+        };
         // The whole build, and the erasure of what the region held before, has
         // to be loaded before the first block is written.
-        let previous = self.regions.footprint(region);
+        let previous = if castle {
+            None
+        } else {
+            self.regions.footprint(region)
+        };
         let positions = match &start {
             RunStart::Gate { layout, .. } => dungeon_chunks(region, layout, previous),
-            RunStart::Castle { .. } => castle_tower::castle_chunks(region, previous),
+            RunStart::Castle { gate } => {
+                CastleClimb::entry_request(CastleSlot(region.slot), gate.floor.unwrap_or(1))
+                    .positions
+            }
             RunStart::Penalty => {
                 let mut chunks = tower::tower_chunks(region);
                 for chunk in footprint_chunks(region, previous) {
@@ -2849,7 +2789,7 @@ impl DungeonRuntime {
             ticket_kind: ChunkTicketKind::Portal,
         });
         let Some(leader) = players.first().map(|player| player.gameprofile.id()) else {
-            self.regions.release(region);
+            self.free_region(region, castle);
             return;
         };
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -2862,7 +2802,6 @@ impl DungeonRuntime {
             leader,
             GeneratingEntry {
                 players: player_uuids,
-                region,
                 gate_id,
                 cancelled: Arc::clone(&cancelled),
             },
@@ -2895,7 +2834,7 @@ impl DungeonRuntime {
             }
             let Some(entry) = self.generating_entries.get(&result.leader) else {
                 // The entry was already cleaned up; release the region defensively.
-                self.regions.release(result.region);
+                self.free_region(result.region, result.start.is_castle());
                 if let Some(gate) = result.start.gate() {
                     self.gates.reopen(gate.id);
                 }
@@ -2925,7 +2864,7 @@ impl DungeonRuntime {
 
     fn discard_generation_result(&mut self, result: &GenerationResult) {
         self.generating_entries.remove(&result.leader);
-        self.regions.release(result.region);
+        self.free_region(result.region, result.start.is_castle());
         if let Some(gate) = result.start.gate() {
             self.gates.reopen(gate.id);
         }
@@ -2949,9 +2888,11 @@ impl DungeonRuntime {
             footprint,
             ..
         } = result;
+        let castle = start.is_castle();
         let mut penalty_rank = HunterRank::E;
         let duration_ticks = match &start {
-            RunStart::Gate { .. } | RunStart::Castle { .. } => DUNGEON_TIME_LIMIT_TICKS,
+            RunStart::Gate { .. } => DUNGEON_TIME_LIMIT_TICKS,
+            RunStart::Castle { .. } => FLOOR_TIME_LIMIT_TICKS,
             RunStart::Penalty => {
                 let Some(rank) = state.claim_penalty(leader) else {
                     self.regions.release(region);
@@ -2961,7 +2902,9 @@ impl DungeonRuntime {
                 PENALTY_ZONE_DURATION_TICKS
             }
         };
-        self.regions.record(region, footprint);
+        if let Some(footprint) = footprint {
+            self.regions.record(region, footprint);
+        }
         let mut members = Vec::with_capacity(players.len());
         for player in players {
             let player_uuid = player.gameprofile.id();
@@ -2979,12 +2922,14 @@ impl DungeonRuntime {
             members.push(player_uuid);
         }
         if members.is_empty() {
-            self.regions.release(region);
+            self.free_region(region, castle);
             if let Some(gate) = start.gate() {
                 self.gates.restore_gate(gate.clone());
             }
             return;
         }
+        // A climb holds its floors' chunk tickets itself, floor by floor.
+        let mut request = Some(request);
         let (progress, gate, locked) = match start {
             RunStart::Gate { gate, layout } => {
                 let locked = gate.red;
@@ -3023,19 +2968,13 @@ impl DungeonRuntime {
                     locked,
                 )
             }
-            RunStart::Castle { gate, seed } => (
-                RunProgress::Castle(TowerClimb {
-                    floor: gate.floor.unwrap_or(1),
-                    seed,
-                    wave_spawned: false,
-                    remaining_mobs: Vec::new(),
-                    labels: FxHashMap::default(),
-                    skills: MobSkills::default(),
-                    pending_skills: Vec::new(),
-                    exit: None,
-                    ascent: None,
-                    floor_loot: Vec::new(),
-                }),
+            RunStart::Castle { gate } => (
+                RunProgress::Castle(Box::new(CastleClimb::new(
+                    CastleSlot(region.slot),
+                    gate.floor.unwrap_or(1),
+                    instance_world.seed() as u64,
+                    request.take(),
+                ))),
                 Some(gate.id),
                 false,
             ),
@@ -3069,7 +3008,9 @@ impl DungeonRuntime {
         // Keeps the region's chunks loaded for as long as the run is live:
         // waves spawn several rooms ahead of the hunter, past any ticket the
         // hunter's own loading distance keeps ready.
-        self.run_tickets.insert(run_id, request);
+        if let Some(request) = request {
+            self.run_tickets.insert(run_id, request);
+        }
     }
 
     /// Advances one dungeon run: waves, then the boss, then the exit.
@@ -3137,262 +3078,6 @@ impl DungeonRuntime {
             progress.skills.track(mob.id, mob.class, tick);
             progress.labels.insert(mob.id, mob.label);
         }
-    }
-
-    /// Advances one Demon Castle climb: a wave per floor, then the staircase
-    /// up into the next floor, until the hunters fall, leave, or run out of sky.
-    ///
-    /// Returns the action that ends the run, or `None` while the climb goes on.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a climb step needs the progress, its context, the tick and the job sink"
-    )]
-    fn tick_castle(
-        progress: &mut TowerClimb,
-        context: &RunContext<'_>,
-        tick: u64,
-        server: &Arc<Server>,
-        completed_floors: &Arc<SyncMutex<Vec<FloorResult>>>,
-    ) -> Option<RunAction> {
-        let RunContext {
-            state,
-            world,
-            uuid,
-            members,
-            region,
-            source_world,
-            ..
-        } = *context;
-        let hunters = members
-            .iter()
-            .filter_map(|member| world.players.get_by_uuid(member))
-            .filter(|hunter| !hunter.is_dead_or_dying())
-            .map(|hunter| hunter.position())
-            .collect::<Vec<_>>();
-
-        progress
-            .remaining_mobs
-            .retain(|id| world.get_entity_by_id(*id).is_some());
-        let wave = castle::wave(progress.floor);
-        let power = (5.0 + 5.0 * wave.damage_multiplier) as f32;
-        let out = progress
-            .skills
-            .tick(world, &hunters, &progress.remaining_mobs, power, tick);
-        progress.pending_skills.extend(out.actions);
-        for (id, label) in out.hatched {
-            progress.remaining_mobs.push(id);
-            progress.labels.insert(id, label);
-        }
-        if tick.is_multiple_of(10) {
-            progress
-                .labels
-                .retain(|id, _| world.get_entity_by_id(*id).is_some());
-            refresh_plates(world, &hunters, progress.labels.keys());
-        }
-
-        if !progress.wave_spawned {
-            // A wave waits in the hall until a hunter walks in.
-            if hunters
-                .iter()
-                .any(|hunter| castle_tower::floor_contains(region, progress.floor, *hunter))
-            {
-                let spawned = castle_tower::spawn_floor_wave(
-                    world,
-                    region,
-                    progress.seed,
-                    progress.floor,
-                    wave,
-                    castle::rank_for_floor(progress.floor),
-                );
-                progress.remaining_mobs = spawned.iter().map(|mob| mob.id).collect();
-                for mob in spawned {
-                    progress.skills.track(mob.id, mob.class, tick);
-                    progress.labels.insert(mob.id, mob.label);
-                }
-                progress.wave_spawned = true;
-            }
-            return None;
-        }
-        if progress.remaining_mobs.is_empty() && progress.exit.is_none() {
-            // The floor falls: pay the climbers and open the way out and up.
-            let survivors: Vec<(Uuid, String)> = members
-                .iter()
-                .filter_map(|member| {
-                    let hunter = world.players.get_by_uuid(member)?;
-                    (!hunter.is_dead_or_dying() && !hunter.connection.closed())
-                        .then_some((*member, hunter.gameprofile.name().to_owned()))
-                })
-                .collect();
-            for (survivor, _) in &survivors {
-                for stack in castle::floor_loot(progress.floor, || rand::random_range(0..100)) {
-                    progress.floor_loot.push((*survivor, stack));
-                }
-            }
-            state.record_castle_clear(&survivors, progress.floor);
-            for member in members {
-                if let Some(hunter) = world.players.get_by_uuid(member) {
-                    hunter.send_message(
-                        &TextComponent::plain(format!(
-                            "Замок демонов: этаж {} зачищен. Лестница вверх открыта; кварцевый портал ведёт домой.",
-                            progress.floor
-                        ))
-                        .color(Color::Gold),
-                    );
-                }
-            }
-            let entrance = castle_tower::exit_entrance(region, progress.floor);
-            place_gate_frame(world, entrance, FrameStyle::Normal);
-            progress.exit = Some(entrance);
-            if progress.floor + 1 > castle_tower::max_floors(world.get_max_y()) {
-                // The world runs out of sky; the climb ends in triumph.
-                for member in members {
-                    if let Some(hunter) = world.players.get_by_uuid(member) {
-                        hunter.send_message(
-                            &TextComponent::plain(
-                                "Замок демонов: вы достигли вершины, которую может вместить этот мир. Система возвращает вас.",
-                            )
-                            .color(Color::Gold),
-                        );
-                    }
-                }
-                return Some(RunAction::ReturnPlayer {
-                    uuid,
-                    world: source_world.clone(),
-                });
-            }
-            return None;
-        }
-        if let Some(ascent) = &progress.ascent {
-            if ascent.ready {
-                // The next floor is built: move the climb up.
-                let floor = ascent.floor;
-                progress.ascent = None;
-                progress.floor = floor;
-                progress.wave_spawned = false;
-                progress.exit = None;
-                let entry = castle_tower::floor_entry(region, floor);
-                for member in members {
-                    if let Some(hunter) = world.players.get_by_uuid(member) {
-                        let _ = hunter.teleport(entry, 0.0, 0.0);
-                        hunter.send_message(
-                            &TextComponent::plain(format!(
-                                "Замок демонов: этаж {floor}. Волна этажа приближается."
-                            ))
-                            .color(Color::DarkRed),
-                        );
-                    }
-                }
-            }
-            return None;
-        }
-        // Before the exit opens the staircase is a dead end; a hunter who
-        // climbs it early should learn why instead of staring into the void.
-        if progress.exit.is_none()
-            && tick.is_multiple_of(40)
-            && hunters
-                .iter()
-                .any(|hunter| castle_tower::at_ramp_top(region, progress.floor, *hunter))
-        {
-            for member in members {
-                if let Some(hunter) = world.players.get_by_uuid(member) {
-                    hunter.send_action_bar(
-                        TextComponent::plain("Лестница заперта: сначала зачистите этаж.")
-                            .color(Color::Yellow),
-                    );
-                }
-            }
-        }
-        if let Some(exit) = progress.exit {
-            // A hunter at the staircase top commits the climb: the next floor
-            // is generated outside the tick while they climb.
-            let next_floor = progress.floor + 1;
-            if hunters
-                .iter()
-                .any(|hunter| castle_tower::at_ramp_top(region, progress.floor, *hunter))
-            {
-                let cancelled = Arc::new(AtomicBool::new(false));
-                let request = world.chunk_map.request_chunks(ChunkRequest {
-                    status: ChunkStatus::Full,
-                    positions: castle_tower::tower_chunks(region),
-                    ticket_kind: ChunkTicketKind::Portal,
-                });
-                server.jobs.spawn(CastleFloorJob {
-                    region,
-                    instance_world: Arc::clone(world),
-                    seed: progress.seed,
-                    floor: next_floor,
-                    request: Some(request),
-                    cancelled: Arc::clone(&cancelled),
-                    completed: Arc::clone(completed_floors),
-                });
-                progress.ascent = Some(Ascent {
-                    floor: next_floor,
-                    cancelled,
-                    ready: false,
-                });
-                for member in members {
-                    if let Some(hunter) = world.players.get_by_uuid(member) {
-                        hunter.send_message(
-                            &TextComponent::plain(format!("Система готовит этаж {next_floor}…"))
-                                .color(Color::Aqua),
-                        );
-                    }
-                }
-            }
-            // Stepping into the quartz frame leaves the climb with the
-            // progress already banked at every cleared floor.
-            if hunters.iter().any(|hunter| opening_contains(exit, *hunter)) {
-                return Some(RunAction::ReturnPlayer {
-                    uuid,
-                    world: source_world.clone(),
-                });
-            }
-        }
-        None
-    }
-
-    /// Drains finished castle floor jobs into their climbs and footprints.
-    fn finish_floors(&mut self) {
-        let results = mem::take(&mut *self.completed_floors.lock());
-        for result in results {
-            // The job built into one region; the climb holding that region is
-            // its run no matter which member (if any) still belongs to it.
-            let applied = match self
-                .runs
-                .values_mut()
-                .find(|run| run.region.slot == result.region.slot)
-            {
-                Some(run) => {
-                    if let RunProgress::Castle(progress) = &mut run.progress
-                        && let Some(ascent) = &mut progress.ascent
-                        && ascent.floor == result.floor
-                    {
-                        ascent.ready = true;
-                    }
-                    true
-                }
-                None => false,
-            };
-            if applied || self.region_is_free(result.region) {
-                // Keep the footprint honest for the next run even when the
-                // climb ended while its floor job was in flight.
-                self.regions.record(
-                    result.region,
-                    Footprint::Castle {
-                        floors: result.floor,
-                    },
-                );
-            }
-        }
-    }
-
-    /// Returns whether no live run or pending entry holds `region`.
-    fn region_is_free(&self, region: InstanceRegion) -> bool {
-        !self.runs.values().any(|run| run.region.slot == region.slot)
-            && !self
-                .generating_entries
-                .values()
-                .any(|entry| entry.region.slot == region.slot)
     }
 
     #[expect(
@@ -3697,7 +3382,6 @@ impl DungeonRuntime {
         server: &Arc<Server>,
         tick: u64,
     ) -> Vec<RunAction> {
-        self.finish_floors();
         let players = server
             .get_players()
             .into_iter()
@@ -3779,23 +3463,20 @@ impl DungeonRuntime {
                         region,
                         source_world: &source_world,
                     };
-                    let action =
-                        Self::tick_castle(progress, &context, tick, server, &self.completed_floors);
+                    if let Some(action) = progress.tick(&context, tick) {
+                        actions.push(action);
+                    }
                     actions.extend(progress.pending_skills.drain(..).map(RunAction::MobSkill));
                     self.pending_loot.append(&mut progress.floor_loot);
-                    if let Some(action) = action {
-                        run.finishing = true;
-                        match action {
-                            RunAction::ReturnPlayer { world, .. } => {
-                                actions.extend(members.into_iter().map(|uuid| {
-                                    RunAction::ReturnPlayer {
-                                        uuid,
-                                        world: world.clone(),
-                                    }
-                                }));
-                            }
-                            action => actions.push(action),
+                    actions.extend(progress.leaving.drain(..).map(|uuid| {
+                        RunAction::ReturnPlayer {
+                            uuid,
+                            world: source_world.clone(),
                         }
+                    }));
+                    if mem::take(&mut progress.advanced) {
+                        // Every floor gets its own time limit.
+                        run.started_tick = tick;
                     }
                 }
                 RunProgress::Dungeon(progress) => {
@@ -3952,7 +3633,9 @@ impl DungeonRuntime {
                 continue;
             }
             let world = player.get_world();
-            if world.key.path.as_ref() != INSTANCE_WORLD_PATH {
+            if world.key.path.as_ref() != INSTANCE_WORLD_PATH
+                && !demon_castle::is_castle_world(&world)
+            {
                 continue;
             }
             let Some(default_world) = server.worlds.default_world(world.domain()) else {
@@ -4092,6 +3775,17 @@ fn instance_world_of(server: &Arc<Server>, world: &World) -> Option<Arc<World>> 
         .find(|candidate| {
             candidate.domain() == world.domain()
                 && candidate.key.path.as_ref() == INSTANCE_WORLD_PATH
+        })
+        .cloned()
+}
+
+/// Returns the Demon Castle world of `world`'s domain.
+fn castle_world_of(server: &Arc<Server>, world: &World) -> Option<Arc<World>> {
+    server
+        .worlds
+        .values()
+        .find(|candidate| {
+            candidate.domain() == world.domain() && demon_castle::is_castle_world(candidate)
         })
         .cloned()
 }
@@ -4253,7 +3947,7 @@ fn notify_near_gate(server: &Server, gate: &Gate, message: TextComponent) {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::Ordering;
 
     use uuid::Uuid;
 
@@ -4261,8 +3955,8 @@ mod tests {
     use steel_utils::BlockPos;
 
     use super::{
-        Ascent, BossState, CASTLE_MOB_REWARD_PERCENT, DungeonProgress, DungeonRuntime, FloorResult,
-        GateBreakTrack, GeneratingEntry, InstanceRun, MineProgress, RunProgress, TowerClimb,
+        BossState, CASTLE_MOB_REWARD_PERCENT, CastleClimb, CastleSlot, DungeonProgress,
+        DungeonRuntime, GateBreakTrack, GeneratingEntry, InstanceRun, MineProgress, RunProgress,
     };
     use crate::castle::rank_for_floor;
     use crate::combat_reward::HunterReward;
@@ -4314,7 +4008,6 @@ mod tests {
             leader,
             GeneratingEntry {
                 players: vec![leader, member],
-                region: InstanceRegion::from_slot(0),
                 gate_id: None,
                 cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
@@ -4334,7 +4027,6 @@ mod tests {
             leader,
             GeneratingEntry {
                 players: vec![leader],
-                region: InstanceRegion::from_slot(1),
                 gate_id: Some(7),
                 cancelled: Arc::clone(&cancelled),
             },
@@ -4517,19 +4209,8 @@ mod tests {
         }
     }
 
-    fn test_castle_progress(floor: u32) -> TowerClimb {
-        TowerClimb {
-            floor,
-            seed: 1,
-            wave_spawned: false,
-            remaining_mobs: Vec::new(),
-            labels: FxHashMap::default(),
-            skills: MobSkills::default(),
-            pending_skills: Vec::new(),
-            exit: None,
-            ascent: None,
-            floor_loot: Vec::new(),
-        }
+    fn test_castle_progress(floor: u32) -> Box<CastleClimb> {
+        Box::new(CastleClimb::new(CastleSlot(0), floor, 1, None))
     }
 
     #[test]
@@ -4562,37 +4243,10 @@ mod tests {
     }
 
     #[test]
-    fn castle_floor_result_reaches_its_climb_by_region() {
-        let mut runtime = DungeonRuntime::default();
-        let climber = Uuid::new_v4();
-        let mut climb = test_castle_progress(1);
-        climb.ascent = Some(Ascent {
-            floor: 2,
-            cancelled: Arc::new(AtomicBool::new(false)),
-            ready: false,
-        });
-        let run_id = runtime.adopt_run(test_run(vec![climber], RunProgress::Castle(climb)));
-        runtime.completed_floors.lock().push(FloorResult {
-            region: InstanceRegion::from_slot(0),
-            floor: 2,
-        });
-
-        runtime.finish_floors();
-
-        let run = runtime.runs.get(&run_id).expect("climb lives");
-        let RunProgress::Castle(progress) = &run.progress else {
-            panic!("climb stays a castle run");
-        };
-        assert!(
-            progress.ascent.as_ref().is_none_or(|ascent| ascent.ready),
-            "the finished floor is applied to the climb that ordered it"
-        );
-    }
-
-    #[test]
     fn castle_mob_kill_pays_half_an_ordinary_kill() {
         use steel_utils::Identifier;
 
+        steel_registry::init_vanilla_registry();
         let mut runtime = DungeonRuntime::default();
         let hunter = Uuid::new_v4();
         // Floor 11 ranks as a D gate, like the floor spawn table.

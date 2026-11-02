@@ -573,6 +573,16 @@ impl BossFight {
         }
     }
 
+    /// Marks `points` for impacts that land after the meteor delay, resolved
+    /// exactly like a meteor cast; arena hazards reuse it.
+    pub fn mark_impacts(&mut self, points: &[DVec3], tick: u64) {
+        self.meteors.extend(
+            points
+                .iter()
+                .map(|point| (*point, tick + METEOR_DELAY_TICKS)),
+        );
+    }
+
     /// Announces the boss: boss bar, title, and a spawn roar.
     pub fn announce(&mut self, boss: &SharedEntity, player: &Player, name: &TextComponent) {
         let progress = health_fraction(boss).unwrap_or(1.0);

@@ -380,6 +380,7 @@ impl World {
             WorldStorageConfig::RamOnly => {
                 Arc::new(ChunkStorage::RamOnly(RamOnlyStorage::empty_world()))
             }
+            WorldStorageConfig::Transient => Arc::new(ChunkStorage::Transient),
         };
 
         // Create or skip level data based on config

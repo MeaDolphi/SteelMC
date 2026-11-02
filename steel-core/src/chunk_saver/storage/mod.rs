@@ -450,6 +450,10 @@ pub enum ChunkStorage {
     Disk(RegionManager),
     /// In-memory storage for testing and minigames.
     RamOnly(RamOnlyStorage),
+    /// Keeps nothing: an unloaded chunk is generated again from scratch, so
+    /// a world built entirely by its generator resets itself once nobody
+    /// holds its chunks.
+    Transient,
 }
 
 /// Runtime chunk data loaded from persistence.
@@ -479,6 +483,7 @@ impl ChunkStorage {
         match self {
             Self::Disk(rm) => rm.load_chunk(pos, min_y, height, level, thread_pool).await,
             Self::RamOnly(ram) => ram.load_chunk(pos, min_y, height, level).await,
+            Self::Transient => Ok(None),
         }
     }
 
@@ -493,6 +498,9 @@ impl ChunkStorage {
         match self {
             Self::Disk(rm) => rm.save_chunk_data(prepared, thread_pool).await,
             Self::RamOnly(ram) => ram.save_chunk_data(prepared).await,
+            // Discarding is this backend's save: reporting it as a no-op
+            // would keep the chunk dirty and loaded forever.
+            Self::Transient => Ok(true),
         }
     }
 
@@ -501,6 +509,7 @@ impl ChunkStorage {
         match self {
             Self::Disk(rm) => rm.chunk_exists(pos).await,
             Self::RamOnly(ram) => ram.chunk_exists(pos).await,
+            Self::Transient => Ok(false),
         }
     }
 
@@ -512,6 +521,7 @@ impl ChunkStorage {
         match self {
             Self::Disk(rm) => rm.acquire_chunk(pos).await,
             Self::RamOnly(ram) => ram.chunk_exists(pos).await,
+            Self::Transient => Ok(false),
         }
     }
 
@@ -519,7 +529,7 @@ impl ChunkStorage {
     pub async fn release_chunk(&self, pos: ChunkPos) -> io::Result<()> {
         match self {
             Self::Disk(rm) => rm.release_chunk(pos).await,
-            Self::RamOnly(_) => Ok(()), // No-op for RAM storage
+            Self::RamOnly(_) | Self::Transient => Ok(()), // No-op for RAM storage
         }
     }
 
@@ -527,7 +537,7 @@ impl ChunkStorage {
     pub async fn flush_all(&self) -> io::Result<()> {
         match self {
             Self::Disk(rm) => rm.flush_all().await,
-            Self::RamOnly(_) => Ok(()), // No-op for RAM storage
+            Self::RamOnly(_) | Self::Transient => Ok(()), // No-op for RAM storage
         }
     }
 
@@ -535,7 +545,7 @@ impl ChunkStorage {
     pub async fn close_all(&self) -> io::Result<()> {
         match self {
             Self::Disk(rm) => rm.close_all().await,
-            Self::RamOnly(_) => Ok(()), // No-op for RAM storage
+            Self::RamOnly(_) | Self::Transient => Ok(()), // No-op for RAM storage
         }
     }
 

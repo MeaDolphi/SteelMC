@@ -185,6 +185,34 @@ async fn ram_only_storage_restores_the_status_bundled_with_the_prepared_save() {
     assert_eq!(loaded.status, ChunkStatus::Terrain);
 }
 
+#[tokio::test]
+async fn transient_storage_accepts_a_save_and_never_serves_it_back() {
+    init_vanilla_registry();
+
+    let pos = ChunkPos::new(3, -4);
+    let chunk = Chunk::new(single_empty_section(), pos, 0, 16, Weak::new());
+    let Some(prepared) = ChunkStorage::prepare_chunk_save(&chunk, ChunkStatus::Terrain, &[], false)
+    else {
+        panic!("dirty proto chunk should prepare for saving");
+    };
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("test pool should initialize");
+
+    let storage = ChunkStorage::Transient;
+    // A no-op report would keep the unloading chunk dirty and never let it go.
+    assert!(matches!(
+        storage.save_chunk_data(prepared, &pool).await,
+        Ok(true)
+    ));
+    assert!(matches!(storage.acquire_chunk(pos).await, Ok(false)));
+    assert!(matches!(
+        storage.load_chunk(pos, 0, 16, Weak::new(), &pool).await,
+        Ok(None)
+    ));
+}
+
 #[test]
 fn proto_postprocessing_roundtrips_through_persistent_chunk() {
     init_vanilla_registry();

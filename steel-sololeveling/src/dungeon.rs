@@ -1,7 +1,6 @@
 //! Dungeon-instance allocation and rank-scaled combat rules.
 
 pub mod boss;
-pub mod castle_tower;
 pub mod generator;
 pub mod instance;
 pub mod mobs;
@@ -27,6 +26,7 @@ use steel_utils::{BlockPos, Identifier};
 use self::generator::Blueprint;
 
 use crate::castle;
+use crate::demon_castle::is_castle_world;
 use crate::organization::payout_multiplier;
 use crate::quest::{
     PENALTY_ZONE_DURATION_SECONDS, PENALTY_ZONE_WAVE_INTERVAL_SECONDS,
@@ -167,13 +167,14 @@ impl Gate {
     }
 }
 
-/// Returns whether `world` is the dimension gates lead into.
+/// Returns whether `world` is one of the dimensions gates lead into: the
+/// dungeon instances or the Demon Castle.
 ///
-/// Dungeon rules (sealed walls, crystal ore) apply to this dimension alone, so
-/// the ordinary world keeps every vanilla building and mining rule.
+/// Dungeon rules (sealed walls, crystal ore) apply to these dimensions alone,
+/// so the ordinary world keeps every vanilla building and mining rule.
 #[must_use]
 pub fn is_instance_world(world: &World) -> bool {
-    world.key.path.as_ref() == INSTANCE_WORLD_PATH
+    world.key.path.as_ref() == INSTANCE_WORLD_PATH || is_castle_world(world)
 }
 
 /// Gate lifecycle bookkeeping independent of physical block placement.
@@ -910,10 +911,13 @@ pub enum Footprint {
     Arena,
     /// The spiral penalty tower.
     Tower,
-    /// The Demon Castle tower climbed during one run.
+    /// The retired Demon Castle tower that once stood in the instance world.
+    ///
+    /// The castle now has a world of its own; records of the old tower only
+    /// survive in region files of earlier processes, whose RAM-only instance
+    /// world kept none of its blocks, so there is nothing left to erase.
     Castle {
-        /// Highest floor built; erasure covers the whole buildable height, so
-        /// this is a diagnostic, not the source of truth for cleanup.
+        /// Highest floor the old tower built.
         floors: u32,
     },
 }

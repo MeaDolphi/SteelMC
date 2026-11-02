@@ -35,6 +35,7 @@ use crate::castle;
 use crate::city;
 use crate::combat_reward::HunterReward;
 use crate::daily;
+use crate::demon_castle;
 use crate::dungeon::Gate;
 use crate::dungeon::mobs::MobClass;
 use crate::dungeon::mobs::MobLabel;
@@ -438,16 +439,16 @@ impl SoloLevelingState {
 
     /// Returns whether `entity_id` in `world` is the living dungeon boss of its run.
     pub fn is_dungeon_boss(&self, world: &World, entity_id: i32) -> bool {
-        self.dungeon_runtime.lock().boss_entity(world) == Some(entity_id)
+        self.dungeon_runtime
+            .lock()
+            .boss_rank(world, entity_id)
+            .is_some()
     }
 
     /// Returns a dungeon boss source for `entity_id` when it is the run's boss.
     pub fn dungeon_boss_source(&self, world: &World, entity_id: i32) -> Option<BossSource> {
         let runtime = self.dungeon_runtime.lock();
-        if runtime.boss_entity(world) != Some(entity_id) {
-            return None;
-        }
-        let rank = runtime.instance_rank(world)?;
+        let rank = runtime.boss_rank(world, entity_id)?;
         let label = runtime.mob_label(world, entity_id)?;
         let archetype = label.name;
         let red = archetype.starts_with("Кровавый ");
@@ -703,20 +704,9 @@ impl SoloLevelingState {
         if !keyed && progress.free_entry_in(now) > 0 {
             return Err("Бесплатный вход ещё не восстановился: нужен ключ Замка демонов.");
         }
-        // The tower only fits so many floors below the world ceiling; a
-        // hunter who cleared them all re-enters the top one instead of a
-        // floor that would not fit.
-        let max_floor = self
-            .server()
-            .and_then(|server| {
-                server
-                    .worlds
-                    .values()
-                    .find(|world| crate::dungeon::is_instance_world(world))
-                    .map(|world| crate::dungeon::castle_tower::max_floors(world.get_max_y()))
-            })
-            .unwrap_or(u32::MAX);
-        let floor = progress.next_floor.max(1).min(max_floor);
+        // Floors end only at the world border; a hunter past the last one
+        // re-enters it.
+        let floor = progress.next_floor.clamp(1, demon_castle::MAX_FLOOR);
         // The runtime lock is never taken inside a session closure: the
         // runtime itself reads sessions while it holds its lock.
         if !self.dungeon_runtime.lock().request_key_gate(
@@ -756,6 +746,14 @@ impl SoloLevelingState {
                 log::warn!("sololeveling: could not save the castle ranking: {error}");
             }
         }
+    }
+
+    /// Opens the castle treasure cache at `pos` for `hunter`; see
+    /// [`DungeonRuntime::open_castle_treasure`].
+    pub fn open_castle_treasure(&self, world: &World, pos: BlockPos, hunter: Uuid) -> Option<bool> {
+        self.dungeon_runtime
+            .lock()
+            .open_castle_treasure(world, pos, hunter)
     }
 
     /// Returns a hunter's climb and this week's ranking.

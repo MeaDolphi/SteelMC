@@ -28,6 +28,7 @@ use uuid::Uuid;
 use crate::auction_menu;
 use crate::city;
 use crate::deferred_inventory_menu;
+use crate::demon_castle;
 use crate::dungeon::instance;
 use crate::dungeon::is_instance_world;
 use crate::dungeon::mobs;
@@ -99,6 +100,14 @@ impl GameplayHooks for SoloLevelingHooks {
                 ));
             }
             city_world.set_game_rule(&vanilla_game_rules::SPAWN_MOBS, false);
+            // Every castle mob belongs to a floor's packs.
+            if let Some(castle_world) = server
+                .worlds
+                .values()
+                .find(|world| demon_castle::is_castle_world(world))
+            {
+                castle_world.set_game_rule(&vanilla_game_rules::SPAWN_MOBS, false);
+            }
             state.start_resource_pack().await;
             Ok(())
         })
@@ -514,6 +523,23 @@ impl GameplayHooks for SoloLevelingHooks {
         let stack = player.inventory.lock().get_item_in_hand(hand).clone();
         if item::shadow::entity(&stack).is_some() {
             return item::consume::use_item(&self.state, player, &stack, hand);
+        }
+        if demon_castle::is_castle_world(world) {
+            // The client offers the off hand only when the main hand passed;
+            // the cache opens on the main hand alone.
+            if hand != InteractionHand::MainHand {
+                return None;
+            }
+            let looted = self
+                .state
+                .open_castle_treasure(world, pos, player.gameprofile.id())?;
+            let (line, color) = if looted {
+                ("Тайник вскрыт: Система выдаёт вам добычу.", Color::Gold)
+            } else {
+                ("Свою долю из этого тайника вы уже забрали.", Color::Gray)
+            };
+            player.send_message(&TextComponent::plain(line).color(color));
+            return Some(InteractionResult::Success);
         }
         if !self.state.is_organization_board(&world.key, pos) {
             return None;

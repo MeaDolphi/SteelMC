@@ -199,6 +199,8 @@ pub enum WorldStorageConfig {
     /// RAM-only storage with empty chunks created on demand.
     /// No data is persisted — useful for testing and minigames.
     RamOnly,
+    /// No chunk is kept once unloaded; the generator rebuilds it on demand.
+    Transient,
 }
 
 /// Parsed `worlds.toml` root.
