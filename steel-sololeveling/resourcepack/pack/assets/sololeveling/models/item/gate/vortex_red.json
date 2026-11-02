@@ -1,0 +1,40 @@
+{
+  "textures": {
+    "vortex": "sololeveling:item/gate/vortex_red",
+    "particle": "sololeveling:item/gate/vortex_red"
+  },
+  "elements": [
+    {
+      "from": [
+        0,
+        0,
+        7.95
+      ],
+      "to": [
+        16,
+        24,
+        8.05
+      ],
+      "faces": {
+        "north": {
+          "uv": [
+            0,
+            0,
+            16,
+            16
+          ],
+          "texture": "#vortex"
+        },
+        "south": {
+          "uv": [
+            0,
+            0,
+            16,
+            16
+          ],
+          "texture": "#vortex"
+        }
+      }
+    }
+  ]
+}

@@ -389,6 +389,7 @@ fn archetype_kind(archetype: &str) -> Option<BossKind> {
         BossKind::Archmage,
         BossKind::Assassin,
         BossKind::Archer,
+        BossKind::ElfChieftain,
     ]
     .into_iter()
     .find(|kind| kind.display_name().to_lowercase() == name.to_lowercase())

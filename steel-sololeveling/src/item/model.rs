@@ -40,6 +40,7 @@ mod tests {
     use std::path::Path;
 
     use crate::city;
+    use crate::dungeon::gate_vortex::VortexStyle;
     use crate::gear::GearKind;
     use crate::item::{artifact, chest, potion};
     use crate::rank::HunterRank;
@@ -75,6 +76,9 @@ mod tests {
         paths.push("grimoire".to_owned());
         paths.push("won_pouch".to_owned());
         paths.push("key/castle".to_owned());
+        for style in VortexStyle::ALL {
+            paths.push(style.model().to_owned());
+        }
         for (kind, _) in city::SIGNS {
             paths.push(kind.model().to_owned());
         }

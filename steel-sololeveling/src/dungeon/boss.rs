@@ -76,8 +76,12 @@ pub enum BossKind {
     Archmage,
     /// A fast killer that steps through shadows and poisons.
     Assassin,
-    /// A ranged elite that commands red gates (Baruka from the ice forest).
+    /// A ranged elite that once guarded red gates; kept for the shadows
+    /// already raised from it.
     Archer,
+    /// The chieftain of the snow elves, who rules the valley behind a red
+    /// gate: fast, cold and never alone for long.
+    ElfChieftain,
 }
 
 /// Every archetype, in roll order.
@@ -85,6 +89,8 @@ pub const BOSS_KINDS: [BossKind; 3] = [BossKind::Warlord, BossKind::Archmage, Bo
 
 /// Leather dye of the archer's winter garb.
 const ARCHER_GARB: i32 = 0xA3_1F1F;
+/// Leather dye of the elf chieftain's furs.
+const CHIEFTAIN_FURS: i32 = 0xD8_E6F2;
 
 impl BossKind {
     /// Returns the archetype a dungeon seed rolls.
@@ -101,13 +107,14 @@ impl BossKind {
             Self::Archmage => "Архимаг",
             Self::Assassin => "Теневой убийца",
             Self::Archer => "Лучник-элитка",
+            Self::ElfChieftain => "Хьярн, вождь снежных эльфов",
         }
     }
 
     /// Returns the archetype that guards every red gate.
     #[must_use]
     pub const fn for_red_gate() -> Self {
-        Self::Archer
+        Self::ElfChieftain
     }
 
     /// Returns the default resource-pack equipment skin of the archetype.
@@ -118,6 +125,7 @@ impl BossKind {
             Self::Archmage => "boss_shaman",
             Self::Assassin => "boss_berserker",
             Self::Archer => "boss_archer",
+            Self::ElfChieftain => "boss_elf_chieftain",
         }
     }
 
@@ -128,8 +136,8 @@ impl BossKind {
     #[must_use]
     pub const fn abilities(self, rank: HunterRank) -> &'static [BossAbility] {
         use BossAbility::{
-            ArcaneBolt, Blink, DreadRoar, FrostNova, Meteor, ShadowStep, Slam, SmokeBomb,
-            VenomBlades, WarCry,
+            ArcaneBolt, Blink, Blizzard, DreadRoar, FrostNova, IceLeap, Meteor, ShadowStep, Slam,
+            SmokeBomb, VenomBlades, WarCry,
         };
         let tier = match rank {
             HunterRank::E | HunterRank::D => 0,
@@ -146,6 +154,8 @@ impl BossKind {
             (Self::Assassin, _) => &[VenomBlades, SmokeBomb, ShadowStep],
             // The archer relies on its skeleton bow AI; the fight only tracks the boss bar.
             (Self::Archer, _) => &[],
+            (Self::ElfChieftain, 0) => &[FrostNova, IceLeap],
+            (Self::ElfChieftain, _) => &[Blizzard, FrostNova, IceLeap],
         }
     }
 
@@ -159,6 +169,8 @@ impl BossKind {
             Self::Assassin => (0.6, 1.1, 1.35, 0.75),
             // The archer is fragile and slow but keeps its distance.
             Self::Archer => (0.6, 0.8, 0.5, 0.9),
+            // The chieftain outlasts and outruns a warlord of its rank.
+            Self::ElfChieftain => (1.15, 1.1, 1.25, 1.05),
         }
     }
 }
@@ -186,6 +198,10 @@ pub enum BossAbility {
     VenomBlades,
     /// A smoke cloud that blinds hunters and hides the boss.
     SmokeBomb,
+    /// A leap onto the farthest hunter that strikes and chills.
+    IceLeap,
+    /// A howling storm that cuts and freezes every hunter around the boss.
+    Blizzard,
 }
 
 impl BossAbility {
@@ -196,13 +212,14 @@ impl BossAbility {
             Self::ArcaneBolt => 50,
             Self::VenomBlades => 80,
             Self::Slam => 100,
-            Self::Blink => 120,
+            Self::Blink | Self::IceLeap => 120,
             Self::ShadowStep => 140,
             Self::FrostNova => 160,
             Self::DreadRoar => 200,
             Self::Meteor => 220,
             Self::SmokeBomb => 260,
             Self::WarCry => 300,
+            Self::Blizzard => 240,
         }
     }
 
@@ -214,11 +231,12 @@ impl BossAbility {
             Self::VenomBlades => (0.0, 3.5),
             Self::Blink => (0.0, 4.0),
             Self::FrostNova => (0.0, 6.0),
-            Self::SmokeBomb => (0.0, 8.0),
+            Self::SmokeBomb | Self::Blizzard => (0.0, 8.0),
             Self::ShadowStep => (4.0, 16.0),
             Self::DreadRoar | Self::WarCry => (0.0, 16.0),
             Self::Meteor => (0.0, 20.0),
             Self::ArcaneBolt => (0.0, 24.0),
+            Self::IceLeap => (5.0, 20.0),
         }
     }
 
@@ -232,6 +250,8 @@ impl BossAbility {
             Self::Meteor => 1.2,
             Self::ShadowStep => 1.0,
             Self::VenomBlades => 0.4,
+            Self::IceLeap => 0.9,
+            Self::Blizzard => 0.45,
             Self::DreadRoar | Self::WarCry | Self::Blink | Self::SmokeBomb => 0.0,
         }
     }
@@ -249,6 +269,8 @@ impl BossAbility {
             Self::ShadowStep => ("Шаг тени!", Color::DarkGray),
             Self::VenomBlades => ("Отравленные клинки!", Color::DarkGreen),
             Self::SmokeBomb => ("Дымовая завеса!", Color::Gray),
+            Self::IceLeap => ("Ледяной рывок!", Color::Aqua),
+            Self::Blizzard => ("Буран! Холод режет и сковывает", Color::White),
         }
     }
 }
@@ -425,6 +447,10 @@ impl DungeonBoss {
             BossKind::Archer => (
                 ItemStack::new(&vanilla_items::BOW),
                 dyed_leather(ARCHER_GARB),
+            ),
+            BossKind::ElfChieftain => (
+                ItemStack::new(self.gear.sword()),
+                dyed_leather(CHIEFTAIN_FURS),
             ),
         };
         let mut equipment = vec![(EquipmentSlot::MainHand, weapon)];
@@ -799,8 +825,10 @@ impl Cast<'_> {
     fn run(&self, ability: BossAbility, points: &[DVec3]) {
         // Single-target abilities fizzle silently when every hunter hid
         // between the choice and the cast.
-        if matches!(ability, BossAbility::ArcaneBolt | BossAbility::ShadowStep)
-            && self.nearest().is_none()
+        if matches!(
+            ability,
+            BossAbility::ArcaneBolt | BossAbility::ShadowStep | BossAbility::IceLeap
+        ) && self.nearest().is_none()
         {
             return;
         }
@@ -818,6 +846,8 @@ impl Cast<'_> {
             BossAbility::ShadowStep => self.shadow_step(),
             BossAbility::VenomBlades => self.venom_blades(),
             BossAbility::SmokeBomb => self.smoke_bomb(),
+            BossAbility::IceLeap => self.ice_leap(),
+            BossAbility::Blizzard => self.blizzard(),
         }
     }
 
@@ -1016,6 +1046,49 @@ impl Cast<'_> {
         }
     }
 
+    fn ice_leap(&self) {
+        let origin = self.boss.position();
+        let (near, far) = BossAbility::IceLeap.range();
+        let Some(target) = self
+            .within(origin, far)
+            .filter(|target| target.position().distance(origin) >= near)
+            .max_by(|a, b| {
+                a.position()
+                    .distance(origin)
+                    .total_cmp(&b.position().distance(origin))
+            })
+        else {
+            return;
+        };
+        // Lands a step short of the target, on its side of the boss.
+        let back = origin - target.position();
+        let back = DVec3::new(back.x, 0.0, back.z).normalize_or_zero();
+        let landing = target.position() + back * 1.5;
+        if !standable(self.world, landing) {
+            return;
+        }
+        self.particles(&vanilla_particle_types::SNOWFLAKE, origin, 30, 0.6);
+        if self.boss.teleport_to(landing).is_ok() {
+            self.particles(&vanilla_particle_types::SNOWFLAKE, landing, 40, 0.8);
+            self.sound(&sound_events::BLOCK_POWDER_SNOW_BREAK, 0.6);
+            self.strike(target, BossAbility::IceLeap);
+            Self::afflict(target, vanilla_mob_effects::SLOWNESS, 40, 1);
+        }
+    }
+
+    fn blizzard(&self) {
+        let ground = self.boss.position();
+        self.particles(&vanilla_particle_types::SNOWFLAKE, ground, 160, 6.0);
+        self.particles(&vanilla_particle_types::CLOUD, ground, 40, 5.0);
+        self.sound(&sound_events::ENTITY_PLAYER_HURT_FREEZE, 0.5);
+        let (_, range) = BossAbility::Blizzard.range();
+        for target in self.within(ground, range) {
+            self.spell(target, BossAbility::Blizzard);
+            Self::afflict(target, vanilla_mob_effects::SLOWNESS, 120, 2);
+            Self::afflict(target, vanilla_mob_effects::MINING_FATIGUE, 120, 0);
+        }
+    }
+
     fn venom_blades(&self) {
         let ground = self.boss.position();
         self.particles(&vanilla_particle_types::SWEEP_ATTACK, ground, 6, 1.5);
@@ -1042,9 +1115,6 @@ impl Cast<'_> {
 
 #[cfg(test)]
 mod tests {
-    use steel_core::inventory::equipment::EquipmentSlot;
-    use steel_registry::vanilla_items;
-
     use super::{BOSS_KINDS, BossAbility, BossFight, BossGear, BossKind, boss_for_gate};
     use crate::rank::HunterRank;
 
@@ -1153,17 +1223,20 @@ mod tests {
     }
 
     #[test]
-    fn red_gate_boss_is_the_archer_with_a_bow_and_no_melee_abilities() {
-        let boss = boss_for_gate(BossKind::for_red_gate(), HunterRank::C, true);
-        assert_eq!(boss.kind, BossKind::Archer);
-        assert!(boss.abilities.is_empty());
-        assert!(boss.speed_multiplier < 1.0);
-        assert!(boss.scale >= 1.0);
-        let equipment = boss.equipment();
+    fn the_red_gate_chieftain_leaps_from_afar_and_storms_up_close() {
+        let boss = boss_for_gate(BossKind::for_red_gate(), HunterRank::B, true);
+        assert_eq!(boss.kind, BossKind::ElfChieftain);
         assert!(
-            equipment.iter().any(
-                |(slot, item)| *slot == EquipmentSlot::MainHand && item.is(&vanilla_items::BOW)
-            )
+            boss.speed_multiplier > 1.0,
+            "the chieftain outruns its hunters"
         );
+        let mut fight = BossFight::new(&boss, 7, 0);
+        assert_eq!(fight.choose_ability(40, 12.0), Some(BossAbility::IceLeap));
+        // Up close the storm comes first, then the nova.
+        assert_eq!(fight.choose_ability(41, 3.0), Some(BossAbility::Blizzard));
+        assert_eq!(fight.choose_ability(42, 3.0), Some(BossAbility::FrostNova));
+        // The leap never fires on a hunter already within reach.
+        assert_eq!(fight.choose_ability(400, 2.0), Some(BossAbility::Blizzard));
+        assert_ne!(fight.choose_ability(401, 2.0), Some(BossAbility::IceLeap));
     }
 }

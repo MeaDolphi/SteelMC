@@ -20,7 +20,10 @@ use std::collections::VecDeque;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use steel_registry::blocks::BlockRef;
+use steel_registry::blocks::block_state_ext::BlockStateExt as _;
+use steel_registry::blocks::properties::{BlockStateProperties, SlabType};
 use steel_registry::vanilla_blocks;
+use steel_utils::BlockStateId;
 
 use crate::rank::HunterRank;
 use crate::seeded::{SplitMix, hash};
@@ -58,6 +61,9 @@ pub enum Theme {
     DeepDark,
     /// End city ruins.
     End,
+    /// The snow valley of the elves behind a red gate; never rolled, a red
+    /// gate always leads there.
+    SnowElves,
 }
 
 /// Every theme, in roll order.
@@ -99,6 +105,7 @@ impl Theme {
             Self::Jungle => "Руины джунглей",
             Self::DeepDark => "Глубокая тьма",
             Self::End => "Руины Края",
+            Self::SnowElves => "Снежная долина",
         }
     }
 
@@ -172,6 +179,17 @@ impl Theme {
                 slab: &vanilla_blocks::DEEPSLATE_BRICK_SLAB,
                 accent: &vanilla_blocks::SCULK,
             },
+            Self::SnowElves => Palette {
+                floor: &vanilla_blocks::SNOW_BLOCK,
+                floor_alt: &vanilla_blocks::PODZOL,
+                wall: &vanilla_blocks::PACKED_ICE,
+                wall_alt: &vanilla_blocks::BLUE_ICE,
+                pillar: &vanilla_blocks::SPRUCE_LOG,
+                ceiling: &vanilla_blocks::SNOW_BLOCK,
+                light: &vanilla_blocks::LANTERN,
+                slab: &vanilla_blocks::SPRUCE_SLAB,
+                accent: &vanilla_blocks::BLUE_ICE,
+            },
             Self::End => Palette {
                 floor: &vanilla_blocks::END_STONE_BRICKS,
                 floor_alt: &vanilla_blocks::PURPUR_BLOCK,
@@ -216,12 +234,15 @@ pub enum Part {
     Chain,
     /// Still lava inside a rimmed basin; never exposed.
     Lava,
+    /// A block the layout picks itself instead of the theme: the trees, huts
+    /// and furnishings of an open valley need more kinds than a palette has.
+    Block(BlockStateId),
 }
 
 impl Palette {
     /// Returns the block a `part` is built from; ore is not themed.
     #[must_use]
-    pub const fn block(&self, part: Part, ore: BlockRef) -> BlockRef {
+    pub fn block(&self, part: Part, ore: BlockRef) -> BlockRef {
         match part {
             Part::Floor => self.floor,
             Part::FloorAlt => self.floor_alt,
@@ -235,6 +256,23 @@ impl Palette {
             Part::Decor => self.accent,
             Part::Chain => &vanilla_blocks::IRON_CHAIN,
             Part::Lava => &vanilla_blocks::LAVA,
+            Part::Block(state) => state.get_block(),
+        }
+    }
+
+    /// Returns the block state a `part` is built as.
+    ///
+    /// Platforms are half-height terraces: their slab sits in the bottom state
+    /// so they stay walkable without jumping.
+    #[must_use]
+    pub fn state(&self, part: Part, ore: BlockRef) -> BlockStateId {
+        match part {
+            Part::Block(state) => state,
+            Part::Platform => self
+                .slab
+                .default_state()
+                .set_value(&BlockStateProperties::SLAB_TYPE, SlabType::Bottom),
+            _ => self.block(part, ore).default_state(),
         }
     }
 }
@@ -1386,7 +1424,9 @@ fn feature_cells(
                 }
             }
         }
-        Theme::Ice => {
+        // The snow valley is built by its own generator; were a cave ever
+        // dressed in it, it would take the ice cave's icicles.
+        Theme::Ice | Theme::SnowElves => {
             // Icicles under the ceiling: a three-long tip row and a centre
             // spike hanging lower.
             for du in -1..=1 {
@@ -1572,6 +1612,7 @@ mod tests {
     use super::{
         Blueprint, CELL, GRID_RADIUS, MAX_ROOM_HALF, Part, Placement, RoomRole, THEMES, Theme,
     };
+    use crate::dungeon::DungeonLayout;
     use crate::rank::HunterRank;
 
     fn air_columns(blueprint: &Blueprint) -> FxHashSet<(i32, i32)> {
@@ -1894,10 +1935,13 @@ mod tests {
     }
 
     #[test]
-    fn red_gates_always_generate_an_ice_theme() {
-        for seed in 0..50 {
-            let layout = crate::dungeon::DungeonLayout::for_gate(seed, true);
-            assert_eq!(layout.blueprint.theme, Theme::Ice);
+    fn only_red_gates_lead_into_the_snow_valley() {
+        steel_registry::init_vanilla_registry();
+        for seed in 0..8 {
+            let red = DungeonLayout::for_gate(seed, true);
+            assert_eq!(red.blueprint.theme, Theme::SnowElves);
+            let blue = DungeonLayout::for_gate(seed, false);
+            assert_ne!(blue.blueprint.theme, Theme::SnowElves);
         }
     }
 

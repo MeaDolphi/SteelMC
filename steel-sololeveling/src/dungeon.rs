@@ -1,10 +1,13 @@
 //! Dungeon-instance allocation and rank-scaled combat rules.
 
 pub mod boss;
+pub mod gate_site;
+pub mod gate_vortex;
 pub mod generator;
 pub mod instance;
 pub mod map;
 pub mod mobs;
+pub mod red_gate;
 pub mod runtime;
 pub mod skills;
 pub mod tower;
@@ -49,7 +52,8 @@ pub const INSTANCE_WORLD_PATH: &str = "sololeveling_instances";
 pub const GATES_PER_SPAWN_CYCLE: u8 = 3;
 /// Delay between automatic gate-spawn cycles.
 pub const GATE_SPAWN_INTERVAL_TICKS: u64 = TICKS_PER_SECOND * 60 * 10;
-/// Chance out of one hundred that a newly discovered gate is a red gate.
+/// Chance out of one hundred that a gate turns red as its first hunter
+/// steps in.
 pub const RED_GATE_CHANCE_PERCENT: u8 = 10;
 /// Multiplier red gates apply on top of their bumped rank: mob count, health,
 /// attack damage, and the reward.
@@ -98,18 +102,38 @@ pub struct Gate {
     pub world: Identifier,
     /// Bottom-center of the entrance frame.
     pub entrance: BlockPos,
-    /// Chosen dungeon rank; a red gate already has its rank bump applied.
+    /// Rank the gate shows and admits hunters by; the run of a red gate
+    /// fights one rank higher ([`Gate::run_rank`]).
     pub rank: HunterRank,
-    /// Whether this is a red gate: one rank higher and noticeably deadlier.
+    /// Whether the gate turned red as its first hunter stepped in: one rank
+    /// higher, noticeably deadlier, and closed to everyone else.
     pub red: bool,
     /// Server tick when this gate appeared.
     pub created_tick: u64,
     /// Unix timestamp used to expire gates across server restarts.
     pub created_at_unix_seconds: u64,
-    /// Whether a hunter has already entered this gate.
-    pub entered: bool,
+    /// What the gate admits right now; runtime only, never persisted.
+    pub phase: GatePhase,
     /// Demon Castle floor this gate opens; `None` for an ordinary gate.
     pub floor: Option<u32>,
+}
+
+/// What a gate admits right now.
+///
+/// Runs do not survive a restart, so the phase is never persisted: a restored
+/// gate is open and blue again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GatePhase {
+    /// Nobody entered yet; the next hunter opens the gate.
+    #[default]
+    Open,
+    /// The first hunter's dungeon is being prepared; nobody else enters yet.
+    Opening,
+    /// A run is underway behind the gate. A blue gate admits any hunter of its
+    /// rank into that run; a red gate admits nobody.
+    Active,
+    /// The run cleared its boss; the gate admits nobody and closes with the run.
+    Closing,
 }
 
 /// One-time cleanup request for a legacy gate frame left without a registry record.
@@ -135,13 +159,24 @@ impl LegacyGateCleanup {
             red: self.red,
             created_tick: 0,
             created_at_unix_seconds: 0,
-            entered: false,
+            phase: GatePhase::Open,
             floor: None,
         }
     }
 }
 
 impl Gate {
+    /// Returns the rank the run behind the gate fights at: one above the
+    /// gate's own rank once it turned red.
+    #[must_use]
+    pub const fn run_rank(&self) -> HunterRank {
+        if self.red {
+            self.rank.promoted()
+        } else {
+            self.rank
+        }
+    }
+
     /// Returns the lowest hunter rank allowed to enter this gate.
     ///
     /// A hunter may enter one rank below the gate itself; E gates therefore
@@ -213,7 +248,6 @@ struct PersistedGate {
     world: Identifier,
     entrance: [i32; 3],
     rank: String,
-    red: bool,
     created_tick: u64,
     #[serde(default)]
     created_at_unix_seconds: u64,
@@ -234,7 +268,6 @@ impl PersistedGate {
             world: gate.world.clone(),
             entrance: [gate.entrance.x(), gate.entrance.y(), gate.entrance.z()],
             rank: gate.rank.name().to_owned(),
-            red: gate.red,
             created_tick: gate.created_tick,
             created_at_unix_seconds: gate.created_at_unix_seconds,
             floor: gate.floor,
@@ -249,10 +282,10 @@ impl PersistedGate {
             world: self.world,
             entrance: BlockPos::new(self.entrance[0], self.entrance[1], self.entrance[2]),
             rank,
-            red: self.red,
+            red: false,
             created_tick: self.created_tick,
             created_at_unix_seconds: self.created_at_unix_seconds,
-            entered: false,
+            phase: GatePhase::Open,
             floor: self.floor,
         })
     }
@@ -408,10 +441,21 @@ impl GateRegistry {
         Ok(())
     }
 
-    /// Returns the currently committed gates, for menus and navigation.
+    /// Returns the currently committed gates, for menus and navigation, with
+    /// the colour and phase they have right now.
     #[must_use]
     pub fn committed_gates(&self) -> Vec<Gate> {
-        self.committed_gates.values().cloned().collect()
+        self.committed_gates
+            .values()
+            .map(|committed| {
+                let mut gate = committed.clone();
+                if let Some(live) = self.gates.get(&gate.id) {
+                    gate.red = live.red;
+                    gate.phase = live.phase;
+                }
+                gate
+            })
+            .collect()
     }
 
     /// Returns whether a write is pending or the gate document has failed.
@@ -448,7 +492,8 @@ impl GateRegistry {
             .iter()
             .map(|(id, gate)| {
                 let mut gate = gate.clone();
-                gate.entered = false;
+                gate.red = false;
+                gate.phase = GatePhase::Open;
                 (*id, gate)
             })
             .collect();
@@ -494,6 +539,12 @@ impl GateRegistry {
             .collect();
         self.persistence_failed = true;
         created
+    }
+
+    /// Returns the live gate with `id`, committed or not.
+    #[must_use]
+    pub fn gate(&self, id: u64) -> Option<&Gate> {
+        self.gates.get(&id)
     }
 
     /// Returns the last committed gate id lookup, if present.
@@ -569,40 +620,28 @@ impl GateRegistry {
         self.revision = self.revision.saturating_add(1);
     }
 
-    /// Creates a gate from a deterministic rank roll and red-gate roll.
-    ///
-    /// A red gate is rolled first, then promoted one rank, so the roll
-    /// distribution of ordinary gates is unaffected.
+    /// Creates a blue gate from a deterministic rank roll; a gate only turns
+    /// red when its first hunter steps in ([`GateRegistry::enter_at`]).
     pub fn create(
         &mut self,
         world: Identifier,
         entrance: BlockPos,
         tick: u64,
         rank_roll: u8,
-        red_roll: u8,
     ) -> Gate {
-        let red = red_roll < RED_GATE_CHANCE_PERCENT;
-        let rank = gate_rank_for_roll(rank_roll);
-        self.create_ranked(
-            world,
-            entrance,
-            tick,
-            if red { rank.promoted() } else { rank },
-            red,
-        )
+        self.create_ranked(world, entrance, tick, gate_rank_for_roll(rank_roll))
     }
 
-    /// Creates a gate with an explicit rank, skipping the rank and red rolls.
+    /// Creates a blue gate with an explicit rank, skipping the rank roll.
     ///
-    /// Used where the rank is decided elsewhere, such as the prototype gate
-    /// placed next to a hunter for testing.
+    /// Used where the rank is decided elsewhere, such as a gate opened by a
+    /// dungeon key.
     pub fn create_ranked(
         &mut self,
         world: Identifier,
         entrance: BlockPos,
         tick: u64,
         rank: HunterRank,
-        red: bool,
     ) -> Gate {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
@@ -611,12 +650,12 @@ impl GateRegistry {
             world,
             entrance,
             rank,
-            red,
+            red: false,
             created_tick: tick,
             created_at_unix_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_secs()),
-            entered: false,
+            phase: GatePhase::Open,
             floor: None,
         };
         self.gates.insert(id, gate.clone());
@@ -633,8 +672,7 @@ impl GateRegistry {
         tick: u64,
         floor: u32,
     ) -> Gate {
-        let mut gate =
-            self.create_ranked(world, entrance, tick, castle::rank_for_floor(floor), false);
+        let mut gate = self.create_ranked(world, entrance, tick, castle::rank_for_floor(floor));
         gate.floor = Some(floor);
         if let Some(stored) = self.gates.get_mut(&gate.id) {
             stored.floor = Some(floor);
@@ -654,7 +692,7 @@ impl GateRegistry {
         self.gates
             .values()
             .filter(|gate| {
-                !gate.entered
+                gate.phase == GatePhase::Open
                     && tick.saturating_sub(gate.created_tick) >= UNUSED_GATE_LIFETIME_TICKS
             })
             .map(|gate| gate.id)
@@ -666,7 +704,7 @@ impl GateRegistry {
         self.gates
             .values()
             .filter(|gate| {
-                !gate.entered
+                gate.phase == GatePhase::Open
                     && now_unix_seconds.saturating_sub(gate.created_at_unix_seconds)
                         >= UNUSED_GATE_LIFETIME_TICKS / TICKS_PER_SECOND
             })
@@ -690,44 +728,57 @@ impl GateRegistry {
             .collect()
     }
 
-    /// Finds an enterable gate in a world and marks it used.
+    /// Opens the open gate whose opening holds a hunter of `hunter_rank` at
+    /// `position`: it turns red when `red`, and admits nobody else until its
+    /// run starts ([`GateRegistry::activate`]) or the entry fails
+    /// ([`GateRegistry::reopen`]).
     pub fn enter_at(
         &mut self,
         world: &Identifier,
         hunter_rank: HunterRank,
         position: DVec3,
+        red: bool,
     ) -> Option<Gate> {
         let gate = self.gates.values_mut().find(|gate| {
-            gate.world == *world && !gate.entered && gate.accepts_hunter(hunter_rank, position)
+            gate.world == *world
+                && gate.phase == GatePhase::Open
+                && gate.accepts_hunter(hunter_rank, position)
         })?;
-        gate.entered = true;
+        gate.phase = GatePhase::Opening;
+        // A castle portal is a personal climb and never turns red.
+        gate.red = red && gate.floor.is_none();
         Some(gate.clone())
     }
 
-    /// Makes a gate usable again when an attempted entry could not be completed.
-    pub fn reopen(&mut self, id: u64) {
+    /// Marks the gate's run as started.
+    pub fn activate(&mut self, id: u64) {
         if let Some(gate) = self.gates.get_mut(&id) {
-            gate.entered = false;
+            gate.phase = GatePhase::Active;
         }
     }
 
-    /// Restores a consumed gate when no hunter could be moved into its instance.
-    pub fn restore_gate(&mut self, mut gate: Gate) {
-        gate.entered = false;
-        self.next_id = self.next_id.max(gate.id.saturating_add(1));
-        self.gates.insert(gate.id, gate.clone());
-        self.pending_created.push(gate);
-        self.changed();
+    /// Stops a gate from admitting anyone once its run cleared the boss.
+    pub fn close(&mut self, id: u64) {
+        if let Some(gate) = self.gates.get_mut(&id) {
+            gate.phase = GatePhase::Closing;
+        }
     }
 
-    /// Returns the unentered gate whose opening contains `position`, whatever
-    /// the hunter's rank.
+    /// Makes a gate open and blue again when an attempted entry could not be
+    /// completed.
+    pub fn reopen(&mut self, id: u64) {
+        if let Some(gate) = self.gates.get_mut(&id) {
+            gate.phase = GatePhase::Open;
+            gate.red = false;
+        }
+    }
+
+    /// Returns the gate whose opening contains `position`, whatever its phase
+    /// and the hunter's rank.
     #[must_use]
     pub fn at_opening(&self, world: &Identifier, position: DVec3) -> Option<&Gate> {
         self.gates.values().find(|gate| {
-            gate.world == *world
-                && !gate.entered
-                && instance::opening_contains(gate.entrance, position)
+            gate.world == *world && instance::opening_contains(gate.entrance, position)
         })
     }
 
@@ -793,6 +844,20 @@ impl GateRegistry {
         Some(break_state.gate)
     }
 
+    /// Returns the entrance of every frame that stands, or is about to stand,
+    /// in `world`: live gates, active breaks, and retired gates whose frame is
+    /// not removed yet.
+    #[must_use]
+    pub fn frame_entrances(&self, world: &Identifier) -> Vec<BlockPos> {
+        self.gates
+            .values()
+            .chain(self.breaks.values().map(|break_state| &break_state.gate))
+            .chain(self.retired_gates.values().map(|(gate, _)| gate))
+            .filter(|gate| gate.world == *world)
+            .map(|gate| gate.entrance)
+            .collect()
+    }
+
     /// Returns whether a break is active at the given frame.
     #[must_use]
     pub fn has_break_at(&self, world: &Identifier, entrance: BlockPos) -> bool {
@@ -853,6 +918,8 @@ impl InstanceRegion {
 pub struct DungeonLayout {
     /// Seed the whole dungeon is generated from.
     pub seed: u64,
+    /// Whether a red gate leads into it.
+    pub red: bool,
     /// Number of combat rooms between the entrance and the reserved boss room.
     pub combat_room_count: u8,
     /// Rooms, corridors and blocks of the dungeon.
@@ -866,23 +933,30 @@ impl DungeonLayout {
         Self::for_gate(seed, false)
     }
 
-    /// Generates the dungeon of `seed`. Red gates always roll the ice theme.
+    /// Generates the dungeon of `seed`: a red gate always opens onto the snow
+    /// valley of the elves ([`red_gate`]).
     #[must_use]
     pub fn for_gate(seed: u64, red: bool) -> Self {
         let combat_room_count = 2 + u8::try_from((seed >> 56) % 4).unwrap_or(0);
         let blueprint = if red {
-            Blueprint::generate_with_theme(
-                seed,
-                combat_room_count,
-                crate::dungeon::generator::Theme::Ice,
-            )
+            red_gate::generate(seed, combat_room_count)
         } else {
             Blueprint::generate(seed, combat_room_count)
         };
         Self {
             seed,
+            red,
             combat_room_count,
             blueprint: Arc::new(blueprint),
+        }
+    }
+
+    /// Returns the footprint that erases this dungeon from its region.
+    #[must_use]
+    pub const fn footprint(&self) -> Footprint {
+        Footprint::Dungeon {
+            seed: self.seed,
+            red: self.red,
         }
     }
 
@@ -903,10 +977,14 @@ impl DungeonLayout {
 /// What the last run built in a region, so the next one can erase it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Footprint {
-    /// A generated dungeon; the seed rebuilds the exact blocks to erase.
+    /// A generated dungeon; the seed and gate colour rebuild the exact blocks
+    /// to erase.
     Dungeon {
         /// Seed of the dungeon.
         seed: u64,
+        /// Whether a red gate built it, which picks a different layout.
+        #[serde(default)]
+        red: bool,
     },
     /// The flat penalty arena used before the tower.
     Arena,
@@ -1118,7 +1196,6 @@ mod tests {
             BlockPos::new(20, 70, 20),
             0,
             70,
-            100,
         );
         assert_eq!(gate.rank, HunterRank::C);
         assert_eq!(gate.minimum_hunter_rank(), HunterRank::D);
@@ -1135,7 +1212,6 @@ mod tests {
             BlockPos::new(20, 70, 20),
             0,
             0,
-            100,
         );
         assert!(
             gates
@@ -1143,10 +1219,78 @@ mod tests {
                     &Identifier::from_steel("overworld"),
                     HunterRank::E,
                     DVec3::new(20.5, 71.0, 20.5),
+                    false,
                 )
                 .is_some()
         );
         assert_eq!(gates.expire_unused(UNUSED_GATE_LIFETIME_TICKS).len(), 0);
+    }
+
+    #[test]
+    fn a_gate_turns_red_only_as_its_first_hunter_steps_in() {
+        let mut gates = GateRegistry::default();
+        let world = Identifier::from_steel("overworld");
+        let position = DVec3::new(20.5, 71.0, 20.5);
+        let gate = gates.create_ranked(world.clone(), BlockPos::new(20, 70, 20), 0, HunterRank::C);
+        assert!(!gate.red, "a gate is always born blue");
+
+        let entered = gates
+            .enter_at(&world, HunterRank::C, position, true)
+            .expect("the open gate admits its first hunter");
+        assert!(entered.red);
+        assert_eq!(
+            entered.rank,
+            HunterRank::C,
+            "the gate keeps the rank it showed"
+        );
+        assert_eq!(
+            entered.run_rank(),
+            HunterRank::B,
+            "its run fights one rank higher"
+        );
+
+        // A failed entry leaves the gate blue for the next hunter.
+        gates.reopen(gate.id);
+        let reopened = gates.gate(gate.id).expect("the gate still stands");
+        assert!(!reopened.red);
+        assert_eq!(reopened.phase, GatePhase::Open);
+
+        // A castle portal is a personal climb and never turns red.
+        let portal = gates.create_castle(world.clone(), BlockPos::new(60, 70, 20), 0, 3);
+        let climbed = gates
+            .enter_at(&world, HunterRank::E, DVec3::new(60.5, 71.0, 20.5), true)
+            .expect("the portal admits its climber");
+        assert_eq!(climbed.id, portal.id);
+        assert!(!climbed.red);
+    }
+
+    #[test]
+    fn a_running_gate_admits_nobody_else_until_its_run_starts() {
+        let mut gates = GateRegistry::default();
+        let world = Identifier::from_steel("overworld");
+        let position = DVec3::new(20.5, 71.0, 20.5);
+        let gate = gates.create_ranked(world.clone(), BlockPos::new(20, 70, 20), 0, HunterRank::E);
+        assert!(
+            gates
+                .enter_at(&world, HunterRank::E, position, false)
+                .is_some()
+        );
+        // While the first dungeon is prepared, a second hunter opens nothing.
+        assert!(
+            gates
+                .enter_at(&world, HunterRank::E, position, false)
+                .is_none()
+        );
+        gates.activate(gate.id);
+        let standing = gates
+            .at_opening(&world, position)
+            .expect("the gate stays open");
+        assert_eq!(standing.phase, GatePhase::Active);
+        gates.close(gate.id);
+        assert_eq!(
+            gates.at_opening(&world, position).map(|gate| gate.phase),
+            Some(GatePhase::Closing)
+        );
     }
 
     #[test]
@@ -1157,7 +1301,6 @@ mod tests {
             BlockPos::new(22, 4, 2),
             5,
             HunterRank::D,
-            false,
         );
         let write = gates.begin_persistence().expect("new gate is dirty");
         let bytes = serde_json::to_vec(&write.snapshot).expect("snapshot should serialize");
@@ -1171,8 +1314,9 @@ mod tests {
             .expect("snapshot should restore");
         let saved = restored.committed_gates();
         assert_eq!(saved.len(), 1);
-        assert!(
-            !saved[0].entered,
+        assert_eq!(
+            saved[0].phase,
+            GatePhase::Open,
             "a pending entry is reopened after restart"
         );
         assert!(
@@ -1198,7 +1342,6 @@ mod tests {
             BlockPos::new(22, 4, 2),
             5,
             HunterRank::D,
-            false,
         );
         let created = gates.begin_persistence().expect("new gate is dirty");
         gates.commit_persistence(created.revision);
@@ -1240,7 +1383,6 @@ mod tests {
             BlockPos::new(22, 4, 2),
             5,
             HunterRank::D,
-            false,
         );
         let write = gates.begin_persistence().expect("new gate is dirty");
 
@@ -1260,18 +1402,17 @@ mod tests {
             BlockPos::new(20, 70, 20),
             0,
             HunterRank::E,
-            false,
         );
         let position = DVec3::new(20.5, 71.0, 20.5);
         assert!(
             gates
-                .enter_at(&gate.world, HunterRank::E, position)
+                .enter_at(&gate.world, HunterRank::E, position, false)
                 .is_some()
         );
         gates.reopen(gate.id);
         assert!(
             gates
-                .enter_at(&gate.world, HunterRank::E, position)
+                .enter_at(&gate.world, HunterRank::E, position, false)
                 .is_some()
         );
     }
@@ -1285,37 +1426,15 @@ mod tests {
     }
 
     #[test]
-    fn red_gates_are_promoted_and_scaled() {
+    fn a_red_s_gate_cannot_be_promoted_any_further() {
         let mut gates = GateRegistry::default();
-        let normal = gates.create(
-            Identifier::from_steel("overworld"),
-            BlockPos::new(20, 70, 20),
-            0,
-            70,
-            RED_GATE_CHANCE_PERCENT,
-        );
-        assert_eq!(normal.rank, HunterRank::C);
-        assert!(!normal.red);
-
-        let red = gates.create(
-            Identifier::from_steel("overworld"),
-            BlockPos::new(60, 70, 20),
-            0,
-            70,
-            RED_GATE_CHANCE_PERCENT - 1,
-        );
-        assert!(red.red);
-        assert_eq!(red.rank, HunterRank::B);
-
-        // A red S gate cannot be promoted any further.
-        let top = gates.create(
-            Identifier::from_steel("overworld"),
-            BlockPos::new(100, 70, 20),
-            0,
-            99,
-            0,
-        );
-        assert_eq!(top.rank, HunterRank::S);
+        let world = Identifier::from_steel("overworld");
+        gates.create(world.clone(), BlockPos::new(100, 70, 20), 0, 99);
+        let red = gates
+            .enter_at(&world, HunterRank::S, DVec3::new(100.5, 71.0, 20.5), true)
+            .expect("the S gate admits an S hunter");
+        assert_eq!(red.rank, HunterRank::S);
+        assert_eq!(red.run_rank(), HunterRank::S);
     }
 
     #[test]
@@ -1350,7 +1469,6 @@ mod tests {
             BlockPos::new(20, 70, 20),
             0,
             HunterRank::D,
-            false,
         );
         let break_state = gates.start_break(gate.id).expect("gate should break");
         assert_eq!(break_state.gate.id, gate.id);
@@ -1366,7 +1484,6 @@ mod tests {
             BlockPos::new(20, 70, 20),
             0,
             HunterRank::E,
-            false,
         );
         let mut break_state = gates.start_break(gate.id).expect("gate should break");
         break_state.wave = 1;
@@ -1388,7 +1505,6 @@ mod tests {
             BlockPos::new(20, 70, 20),
             0,
             HunterRank::E,
-            false,
         );
         let mut break_state = gates.start_break(gate.id).expect("gate should break");
         break_state.wave = 3;
@@ -1421,7 +1537,6 @@ mod tests {
             BlockPos::new(20, 70, 20),
             0,
             HunterRank::C,
-            false,
         );
         let mut break_state = gates.start_break(gate.id).expect("gate should break");
         break_state.wave = 1;
@@ -1443,7 +1558,6 @@ mod tests {
             BlockPos::new(20, 70, 20),
             100,
             HunterRank::C,
-            false,
         );
         let mut break_state = gates.start_break(gate.id).unwrap();
         break_state.wave = 2;
@@ -1472,7 +1586,6 @@ mod tests {
             BlockPos::new(20, 70, 20),
             0,
             HunterRank::B,
-            false,
         );
         gates.start_break(gate.id);
         let retired = gates.clear_break(gate.id).expect("break should clear");

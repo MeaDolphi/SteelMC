@@ -227,6 +227,7 @@ pub const fn theme_skin(theme: Theme) -> &'static str {
         Theme::Jungle => "mob_jungle",
         Theme::DeepDark => "mob_deep_dark",
         Theme::End => "mob_end",
+        Theme::SnowElves => "mob_snow_elf",
     }
 }
 
@@ -283,6 +284,18 @@ pub const fn creature_name(theme: Theme) -> &'static str {
         Theme::Jungle => "Болотник",
         Theme::DeepDark => "Порождение тьмы",
         Theme::End => "Странник Края",
+        Theme::SnowElves => "Снежный эльф",
+    }
+}
+
+/// Returns what a mob of `class` is called in a dungeon of `theme`: the snow
+/// elves name their fighters after their craft.
+const fn class_title(theme: Theme, class: MobClass) -> &'static str {
+    match (theme, class) {
+        (Theme::SnowElves, MobClass::Warrior) => "Мечник",
+        (Theme::SnowElves, MobClass::Guard) => "Щитоносец",
+        (Theme::SnowElves, MobClass::Shaman) => "Колдунья",
+        _ => class.display_name(),
     }
 }
 
@@ -332,7 +345,7 @@ impl MobLabel {
     pub fn mob(theme: Theme, class: MobClass) -> Self {
         Self {
             name: creature_name(theme).to_owned(),
-            title: class.display_name().to_owned(),
+            title: class_title(theme, class).to_owned(),
             color: class.color(),
             is_tank: class == MobClass::Guard,
             is_broodmother: class == MobClass::Broodmother,

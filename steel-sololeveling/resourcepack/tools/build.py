@@ -17,6 +17,7 @@ wear no equipment.
 
 import hashlib
 import json
+import math
 import shutil
 import sys
 import zipfile
@@ -722,7 +723,40 @@ MOB_THEMES = {
     "jungle": ("#3f6b2a", "#6a9a48", "#1f3a14", "#b6ff3f", "vines"),
     "deep_dark": ("#0f2a33", "#1f4a55", "#061418", "#3fe0e0", "sculk"),
     "end": ("#241a3a", "#3e2c60", "#120c20", "#ff4fd8", "specks"),
+    # The snow elves of the red gate: pale faces, silver hair, white furs.
+    "snow_elf": ("#e6eef7", "#ffffff", "#7a93b0", "#5fd8ff", "fur"),
 }
+
+# Elf faces: pale skin under silver hair, with the tip of a pointed ear on
+# each side of the head.
+ELF_SKIN = "#f2e2d0"
+ELF_HAIR = "#c8d4e8"
+ELF_SASH = "#2f6be0"
+
+
+def elf_head(eyes, crown=None):
+    def pick(face, x, y, width, height):
+        if face == "top":
+            return rgb(ELF_HAIR)
+        if face == "front":
+            if y <= 1:
+                if crown and y == 0 and x % 2 == 0:
+                    return rgb(crown)
+                return rgb(crown if crown and y == 1 else ELF_HAIR)
+            if y == 3 and x in (1, 2, 5, 6):
+                return rgb(eyes)
+            if y == 6 and x in (3, 4):
+                return rgb("#9a6a5a")
+            return rgb(ELF_SKIN)
+        if face in ("left", "right"):
+            # The ear tip sticks out at eye height, near the face.
+            near_face = x == (width - 1 if face == "right" else 0)
+            if near_face and y in (2, 3):
+                return rgb(ELF_SKIN)
+            return rgb(ELF_HAIR)
+        return rgb(ELF_HAIR)
+
+    return pick
 
 
 def noise(x, y, seed):
@@ -748,6 +782,11 @@ def mob_pattern(kind, base, light, dark, accent, seed):
             return rgb(accent if n < 10 else dark)
         if kind == "specks" and n < 20:
             return rgb(accent if n < 6 else light)
+        if kind == "fur":
+            if face in ("front", "back") and width == 8 and 6 <= y <= 7:
+                return rgb(ELF_SASH)
+            if n < 30:
+                return rgb(dark if n < 10 else light)
         if face == "top" or y == 0:
             return rgb(light)
         return rgb(base)
@@ -756,6 +795,8 @@ def mob_pattern(kind, base, light, dark, accent, seed):
 
 
 def mob_face(kind, base, light, dark, eyes):
+    if kind == "fur":
+        return elf_head(eyes)
     pattern = mob_pattern(kind, base, light, dark, eyes, 3)
 
     def pick(face, x, y, width, height):
@@ -801,6 +842,9 @@ BOSS_THEMES = {
     "smiling_god": ("#4a4a66", "#8a8ab0", "#22223a", "#b06bff", "#3fd6ff", "carved"),
     # Igris, the blood-red commander of the castle.
     "igris": ("#6e1020", "#c03040", "#2a0810", "#ff2d3d", "#ffcf3f", "plates"),
+    # Hjarn, chieftain of the snow elves: white furs with frost runes and a
+    # golden circlet.
+    "elf_chieftain": ("#dfe8f2", "#ffffff", "#6a7f9a", "#3fe8ff", "#7cc8ff", "furs"),
 }
 
 
@@ -824,6 +868,11 @@ def boss_pattern(kind, base, light, dark, rune, seed):
             return rgb("#ffffff" if n < 8 else light)
         if kind == "carved" and face == "front" and width == 8 and 4 <= y <= 5 and 1 <= x <= 6:
             return rgb("#3a3a55")
+        if kind == "furs":
+            if face in ("front", "back") and width == 8 and 6 <= y <= 7:
+                return rgb(rune if x % 3 == 1 else ELF_SASH)
+            if n < 26:
+                return rgb(dark if n < 9 else light)
         if face == "top" or y == 0:
             return rgb(light)
         return rgb(base)
@@ -832,6 +881,8 @@ def boss_pattern(kind, base, light, dark, rune, seed):
 
 
 def boss_face(kind, base, light, dark, eyes, rune):
+    if kind == "furs":
+        return elf_head(eyes, crown="#ffcf3f")
     pattern = boss_pattern(kind, base, light, dark, rune, 3)
 
     def pick(face, x, y, width, height):
@@ -1012,6 +1063,70 @@ def sign_model(name):
             "fixed": {"rotation": [0, 180, 0], "scale": [2.75, 2.75, 2.75]},
             "gui": {"scale": [0.33, 0.33, 0.33]},
         },
+    }
+
+
+# Gate vortices: the swirl that fills an open gate frame. An item display
+# renders the model across the two-by-three opening; the texture spins
+# through its frames, brightest at the core.
+VORTEX_SIZE = (32, 48)
+VORTEX_FRAMES = 16
+GATE_VORTICES = {
+    # name: (rim, body, glow, core)
+    "blue": ("#07103a", "#1f5fd8", "#5fd8ff", "#e8fbff"),
+    "red": ("#2a0408", "#b01428", "#ff5a3a", "#ffe0c8"),
+    "castle": ("#12041f", "#5a1a9a", "#b06bff", "#f2e0ff"),
+}
+
+
+def mix(first, second, amount):
+    a, b = rgb(first), rgb(second)
+    return tuple(round(a[i] + (b[i] - a[i]) * amount) for i in range(3))
+
+
+def vortex_strip(name):
+    """Every frame of one vortex stacked top to bottom, as Minecraft animates it."""
+    rim, body, glow, core = GATE_VORTICES[name]
+    width, height = VORTEX_SIZE
+    strip = Image.new("RGBA", (width, height * VORTEX_FRAMES), (0, 0, 0, 0))
+    centre = ((width - 1) / 2, (height - 1) / 2)
+    for frame in range(VORTEX_FRAMES):
+        phase = frame / VORTEX_FRAMES * 2 * math.pi
+        for y in range(height):
+            for x in range(width):
+                dx = (x - centre[0]) / (width / 2)
+                dy = (y - centre[1]) / (height / 2)
+                radius = math.hypot(dx, dy)
+                angle = math.atan2(dy, dx)
+                # Three arms wound tighter towards the centre.
+                arms = 0.5 + 0.5 * math.sin(3 * angle + 4.5 * math.log(radius + 0.08) - phase)
+                if radius < 0.22:
+                    colour = mix(glow, core, 1 - radius / 0.22)
+                elif arms > 0.6:
+                    colour = mix(body, glow, (arms - 0.6) / 0.4)
+                else:
+                    colour = mix(rim, body, arms / 0.6 * max(0.0, 1.2 - radius))
+                sparkle = noise(x, y + frame * height, 41) < 6
+                if sparkle and radius > 0.3:
+                    colour = rgb(core)[:3]
+                strip.putpixel((x, y + frame * height), (*colour, 225))
+    return strip
+
+
+def vortex_model(name):
+    """A thin double-sided plane, one block by one and a half; the display
+    entity scales it over the whole opening."""
+    texture = f"{NAMESPACE}:item/gate/vortex_{name}"
+    face = {"uv": [0, 0, 16, 16], "texture": "#vortex"}
+    return {
+        "textures": {"vortex": texture, "particle": texture},
+        "elements": [
+            {
+                "from": [0, 0, 7.95],
+                "to": [16, 24, 8.05],
+                "faces": {"north": face, "south": face},
+            }
+        ],
     }
 
 
@@ -1272,6 +1387,20 @@ def build():
             assets / "items" / "sign" / f"{name}.json",
             {"model": {"type": "minecraft:model", "model": f"{NAMESPACE}:item/sign/{name}"}},
         )
+    for name in GATE_VORTICES:
+        texture = assets / "textures" / "item" / "gate" / f"vortex_{name}.png"
+        texture.parent.mkdir(parents=True, exist_ok=True)
+        vortex_strip(name).save(texture)
+        width, height = VORTEX_SIZE
+        write_json(
+            texture.with_suffix(".png.mcmeta"),
+            {"animation": {"frametime": 2, "interpolate": True, "width": width, "height": height}},
+        )
+        write_json(assets / "models" / "item" / "gate" / f"vortex_{name}.json", vortex_model(name))
+        write_json(
+            assets / "items" / "gate" / f"vortex_{name}.json",
+            {"model": {"type": "minecraft:model", "model": f"{NAMESPACE}:item/gate/vortex_{name}"}},
+        )
     for item, draw_icon in UI_ICONS.items():
         texture = assets / "textures" / "item" / f"{item}.png"
         texture.parent.mkdir(parents=True, exist_ok=True)
@@ -1330,7 +1459,7 @@ def build():
         f"{len(ITEMS)} items, {len(UI_ICONS)} menu icons, "
         f"{len(EQUIPMENT) + len(LEGGINGS_LAYERS)} armor layers, {len(MOB_THEMES)} mob skins, "
         f"{len(BOSS_THEMES)} boss skins, "
-        f"{len(SIGNS)} signs, "
+        f"{len(SIGNS)} signs, {len(GATE_VORTICES)} gate vortices, "
         f"{len(RANK_GLYPHS)} rank badges, {len(SOUNDS)} sounds -> {ZIP} (sha1 {digest})"
     )
 

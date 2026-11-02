@@ -8,11 +8,9 @@
 use std::iter;
 use std::sync::Arc;
 
-use steel_core::inventory::equipment::EquipmentSlot;
 use steel_core::world::World;
 use steel_registry::blocks::block_state_ext::BlockStateExt as _;
-use steel_registry::item_stack::ItemStack;
-use steel_registry::{vanilla_attributes, vanilla_entities, vanilla_items};
+use steel_registry::{vanilla_attributes, vanilla_entities};
 use steel_utils::BlockStateId;
 use steel_utils::axis::Axis;
 use text_components::format::Color;
@@ -24,8 +22,8 @@ use super::theme::CastleTheme;
 use super::{CastleSlot, DISTRICT_SIZE, GROUND_Y};
 use crate::dungeon::DungeonWave;
 use crate::dungeon::generator::Theme;
-use crate::dungeon::instance::{SpawnedMob, spawn_class_mob, spawn_scaled_mob};
-use crate::dungeon::mobs::{MobClass, MobLabel, MobRarity, wear_theme_skin};
+use crate::dungeon::instance::{SpawnedMob, spawn_archer, spawn_class_mob, spawn_scaled_mob};
+use crate::dungeon::mobs::{MobClass, MobLabel, MobRarity};
 use crate::rank::HunterRank;
 use crate::seeded::{SplitMix, hash};
 
@@ -391,40 +389,7 @@ fn spawn_beast(
     foe: Foe,
     wave: DungeonWave,
 ) -> Option<SpawnedMob> {
-    let (entity_type, health, damage, name, title, color) = match foe {
-        Foe::Archer => (
-            &vanilla_entities::SKELETON,
-            0.8,
-            1.0,
-            "Демон-лучник",
-            "Лучник",
-            Color::Yellow,
-        ),
-        Foe::Hound => (
-            &vanilla_entities::SPIDER,
-            0.9,
-            1.1,
-            "Адская гончая",
-            "Гончая",
-            Color::DarkRed,
-        ),
-        Foe::Class(_) | Foe::Elite(_) => return None,
-    };
-    let entity = spawn_scaled_mob(
-        world,
-        entity_type,
-        position,
-        wave.health_multiplier * health,
-        wave.damage_multiplier * damage,
-    )?;
-    let living = entity.as_living_entity()?;
-    if foe == Foe::Archer {
-        living.with_equipment_slot_mut(EquipmentSlot::MainHand, &mut |stack| {
-            *stack = ItemStack::new(&vanilla_items::BOW);
-        });
-        wear_theme_skin(living, theme);
-    }
-    let label = MobLabel {
+    let common = |name: &str, title: &str, color| MobLabel {
         name: name.to_owned(),
         title: title.to_owned(),
         color,
@@ -432,6 +397,22 @@ fn spawn_beast(
         is_broodmother: false,
         rarity: MobRarity::Common,
     };
+    if foe == Foe::Archer {
+        let label = common("Демон-лучник", "Лучник", Color::Yellow);
+        return spawn_archer(world, theme, position, wave, label);
+    }
+    if foe != Foe::Hound {
+        return None;
+    }
+    let entity = spawn_scaled_mob(
+        world,
+        &vanilla_entities::SPIDER,
+        position,
+        wave.health_multiplier * 0.9,
+        wave.damage_multiplier * 1.1,
+    )?;
+    let living = entity.as_living_entity()?;
+    let label = common("Адская гончая", "Гончая", Color::DarkRed);
     label.show(world, living);
     Some(SpawnedMob {
         id: entity.id(),

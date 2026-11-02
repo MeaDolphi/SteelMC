@@ -10,8 +10,8 @@ use text_components::format::Color;
 use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
-use crate::dungeon::Gate;
 use crate::dungeon::is_instance_world;
+use crate::dungeon::{Gate, GatePhase};
 use crate::item::{named, with_lore};
 use crate::organization::payout_multiplier;
 use crate::rank::HunterRank;
@@ -200,7 +200,12 @@ fn gate_item(
             TextComponent::plain(format!(
                 "{}-ранговые врата{}",
                 gate.rank.name(),
-                if gate.red { " · красные" } else { "" }
+                match (gate.phase, gate.red) {
+                    (GatePhase::Open, _) => "",
+                    (_, true) => " · красные, заперты",
+                    (GatePhase::Active, false) => " · рейд внутри",
+                    (GatePhase::Opening | GatePhase::Closing, false) => " · закрыты",
+                }
             ))
             .color(color),
         ),

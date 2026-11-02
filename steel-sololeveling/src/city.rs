@@ -390,9 +390,7 @@ impl CityChunkGenerator {
         let local_z = (z + HALF_LOT).rem_euclid(LOT_SIZE);
         let district = district(tile_x, tile_z);
         let height = building_height(district);
-        let in_building = height > GROUND_Y
-            && (LOT_MIN..=LOT_MAX).contains(&local_x)
-            && (LOT_MIN..=LOT_MAX).contains(&local_z);
+        let in_building = in_building(district, local_x, local_z);
         let ground = if district == District::Plaza {
             Some(self.plaza_state(x, z))
         } else if district == District::GateSquare {
@@ -428,9 +426,7 @@ impl CityChunkGenerator {
             }
         }
 
-        let lamp = district != District::Plaza
-            && (is_street_lamp(local_x, local_z)
-                || (district == District::GateSquare && is_gate_square_lamp(local_x, local_z)));
+        let lamp = is_lamp(district, local_x, local_z);
         if !in_building && !lamp && is_ground_light(district, x, z) {
             chunk.set_block_state(
                 BlockPos::new(x, GROUND_Y + 1, z),
@@ -490,6 +486,39 @@ pub(crate) const fn district(tile_x: i32, tile_z: i32) -> District {
         (x, z) if x.abs() <= 2 && z.abs() <= 2 => District::Civic,
         _ => District::Residential,
     }
+}
+
+/// Returns whether the column `(x, z)` is open street-level ground a gate
+/// frame may stand on: no building, lamp post or hidden light takes it.
+#[must_use]
+pub const fn is_gate_ground(x: i32, z: i32) -> bool {
+    let tile_x = (x + HALF_LOT).div_euclid(LOT_SIZE);
+    let tile_z = (z + HALF_LOT).div_euclid(LOT_SIZE);
+    if tile_x.abs() > CITY_TILES || tile_z.abs() > CITY_TILES {
+        return true;
+    }
+    let local_x = (x + HALF_LOT).rem_euclid(LOT_SIZE);
+    let local_z = (z + HALF_LOT).rem_euclid(LOT_SIZE);
+    let district = district(tile_x, tile_z);
+    !in_building(district, local_x, local_z)
+        && !is_lamp(district, local_x, local_z)
+        && !is_ground_light(district, x, z)
+}
+
+/// Returns whether lot-local `(local_x, local_z)` lies inside a building.
+const fn in_building(district: District, local_x: i32, local_z: i32) -> bool {
+    building_height(district) > GROUND_Y
+        && local_x >= LOT_MIN
+        && local_x <= LOT_MAX
+        && local_z >= LOT_MIN
+        && local_z <= LOT_MAX
+}
+
+/// Returns whether a lamp post stands on lot-local `(local_x, local_z)`.
+const fn is_lamp(district: District, local_x: i32, local_z: i32) -> bool {
+    !matches!(district, District::Plaza)
+        && (is_street_lamp(local_x, local_z)
+            || (matches!(district, District::GateSquare) && is_gate_square_lamp(local_x, local_z)))
 }
 
 /// Returns the height of the buildings of `district`.
@@ -631,9 +660,10 @@ mod tests {
         ASSOCIATION_CLERK_POS, ASSOCIATION_LOT, AXIS, CityPalette, District, ENTRANCE_FRAME,
         ENTRANCE_TOP, GATE_SITE_OFFSETS, GROUND_Y, HALF_LOT, LOT_MAX, LOT_MIN, LOT_SIZE,
         MARKET_LOT, MERCHANT_POS, ORGANIZATION_AGENT_POS, SIGNS, WORLD_NAME, building_state,
-        city_layers, district, gate_candidate, is_ground_light, register_world_generator,
-        sign_block,
+        city_layers, district, gate_candidate, is_gate_ground, is_ground_light,
+        register_world_generator, sign_block,
     };
+    use crate::dungeon::instance::gate_footprint;
 
     #[test]
     fn the_entrance_frame_keeps_glass_away_from_the_doorway() {
@@ -710,12 +740,11 @@ mod tests {
         }
         for _ in 0..100 {
             let candidate = gate_candidate(BlockPos::new(0, 0, 0));
-            // The whole four-block frame stays on the plaza.
-            for dx in -1..=2 {
-                assert_eq!(
-                    district(lot(candidate.x() + dx), lot(candidate.z())),
-                    District::GateSquare
-                );
+            // The whole footprint stays on open plaza ground, which the site
+            // check demands of every gate.
+            for (x, z) in gate_footprint(candidate) {
+                assert_eq!(district(lot(x), lot(z)), District::GateSquare);
+                assert!(is_gate_ground(x, z), "({x}, {z})");
             }
         }
     }

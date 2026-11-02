@@ -7,12 +7,13 @@ use rand::RngExt as _;
 use steel_core::entity::entities::{DisplayBillboard, TextDisplayEntity};
 use steel_core::entity::{Entity as _, SharedEntity, next_entity_id, spawn_mob};
 use steel_core::gameplay_hooks::BlockMutationCause;
+use steel_core::inventory::equipment::EquipmentSlot;
 use steel_core::world::World;
 use steel_registry::blocks::BlockRef;
 use steel_registry::blocks::block_state_ext::BlockStateExt;
-use steel_registry::blocks::properties::{BlockStateProperties, SlabType};
 use steel_registry::entity_type::EntityTypeRef;
-use steel_registry::{vanilla_attributes, vanilla_blocks, vanilla_entities};
+use steel_registry::item_stack::ItemStack;
+use steel_registry::{vanilla_attributes, vanilla_blocks, vanilla_entities, vanilla_items};
 use steel_utils::BlockPos;
 use steel_utils::ChunkPos;
 use steel_utils::types::{BlockStateId, UpdateFlags};
@@ -22,7 +23,7 @@ use text_components::format::Color;
 
 use super::boss::{BossKind, DungeonBoss};
 use super::generator::{Blueprint, Part, Room, Theme};
-use super::mobs::{MobClass, MobLabel, MobRarity};
+use super::mobs::{MobClass, MobLabel, MobRarity, wear_theme_skin};
 use super::{
     DungeonLayout, DungeonWave, Footprint, Gate, INSTANCE_FLOOR_Y, InstanceRegion, boss_for_gate,
 };
@@ -139,8 +140,8 @@ pub(super) fn footprint_chunks(
     footprint: Option<Footprint>,
 ) -> Vec<ChunkPos> {
     match footprint {
-        Some(Footprint::Dungeon { seed }) => {
-            blueprint_chunks(region, &DungeonLayout::from_seed(seed).blueprint)
+        Some(Footprint::Dungeon { seed, red }) => {
+            blueprint_chunks(region, &DungeonLayout::for_gate(seed, red).blueprint)
         }
         Some(Footprint::Arena) => penalty_arena_chunks(region),
         Some(Footprint::Tower) => super::tower::tower_chunks(region),
@@ -213,35 +214,54 @@ pub fn gate_space_is_clear(world: &World, entrance: BlockPos) -> bool {
         .all(|pos| world.get_block_state(pos) == vanilla_blocks::AIR.default_state())
 }
 
-/// Returns whether a gate can stand at `entrance` without hanging over water.
+/// Returns the columns a gate based at `entrance` needs on level ground: the
+/// four frame columns, and the opening's columns one step before and behind
+/// it, so the gate can be walked into from either side.
+#[must_use]
+pub const fn gate_footprint(entrance: BlockPos) -> [(i32, i32); 8] {
+    let (x, z) = (entrance.x(), entrance.z());
+    [
+        (x - 1, z),
+        (x, z),
+        (x + 1, z),
+        (x + 2, z),
+        (x, z - 1),
+        (x + 1, z - 1),
+        (x, z + 1),
+        (x + 1, z + 1),
+    ]
+}
+
+/// Returns whether a gate can stand at `entrance` on level, dry ground.
 ///
-/// The centre column is already known to be dry, because the entrance was
-/// found through [`World::safe_surface_position`], which skips water columns.
-/// A frame is four blocks wide though, so on a shoreline the outer columns
-/// would still reach out over the water surface. Every frame column therefore
-/// needs dry land of its own, and the opening has to be free of fluid.
-pub fn gate_ground_is_dry(world: &World, entrance: BlockPos) -> bool {
-    gate_is_dry_at(
+/// [`World::safe_surface_position`] returns the highest standing surface of a
+/// column and skips water, so every footprint column must report exactly the
+/// entrance height: a column that reaches higher is a roof, a lamp or another
+/// frame above the site, and one that is lower or wet leaves the frame
+/// hanging over a drop or a shore.
+pub fn gate_ground_is_level(world: &World, entrance: BlockPos) -> bool {
+    gate_is_level_at(
         entrance,
-        |x, z| world.safe_surface_position(x, z).is_some(),
+        |x, z| world.safe_surface_position(x, z).map(|surface| surface.y()),
         |pos| world.get_block_state(pos),
     )
 }
 
-fn gate_is_dry_at(
+fn gate_is_level_at(
     entrance: BlockPos,
-    column_has_land: impl Fn(i32, i32) -> bool,
+    surface_y: impl Fn(i32, i32) -> Option<i32>,
     state_at: impl Fn(BlockPos) -> BlockStateId,
 ) -> bool {
-    let frames_stand_on_land =
-        (-1..=2).all(|offset| column_has_land(entrance.x() + offset, entrance.z()));
+    let level = gate_footprint(entrance)
+        .into_iter()
+        .all(|(x, z)| surface_y(x, z) == Some(entrance.y()));
     let opening_is_dry = (1..4).all(|height| {
         (0..2).all(|offset| {
             let pos = BlockPos::new(entrance.x() + offset, entrance.y() + height, entrance.z());
             !state_at(pos).has_fluid()
         })
     });
-    frames_stand_on_land && opening_is_dry
+    level && opening_is_dry
 }
 
 /// The look of one gate entrance frame.
@@ -292,11 +312,15 @@ fn frame_block(style: FrameStyle, entrance: BlockPos, pos: BlockPos) -> BlockSta
 }
 
 /// Places a gate frame without replacing blocks built after its site was chosen.
+///
+/// A frame of another style already standing at the site is restyled, so a
+/// gate that turns red, or a red frame left by a run that did not survive a
+/// restart, takes the colour the gate has now.
 pub fn place_gate_frame(world: &Arc<World>, entrance: BlockPos, style: FrameStyle) -> bool {
     let positions = gate_frame_positions(entrance);
     if positions.iter().any(|pos| {
         let state = world.get_block_state(*pos);
-        !state.is_air() && state != frame_block(style, entrance, *pos)
+        !state.is_air() && !is_frame_block(entrance, *pos, state)
     }) || !(1..4).all(|height| {
         (0..2).all(|offset| {
             world
@@ -342,6 +366,28 @@ pub fn spawn_gate_label(
     world.try_add_entity(entity).ok().map(|()| id)
 }
 
+/// Returns the style of the complete frame standing at `entrance`, or `None`
+/// when no whole frame stands there (or its chunk is not loaded).
+#[must_use]
+pub fn standing_frame_style(world: &World, entrance: BlockPos) -> Option<FrameStyle> {
+    let positions = gate_frame_positions(entrance);
+    [FrameStyle::Normal, FrameStyle::Red, FrameStyle::Castle]
+        .into_iter()
+        .find(|style| {
+            positions
+                .iter()
+                .all(|pos| world.get_block_state(*pos) == frame_block(*style, entrance, *pos))
+        })
+}
+
+/// Returns whether `state` at `pos` is a block of any frame style of the gate
+/// at `entrance`.
+fn is_frame_block(entrance: BlockPos, pos: BlockPos, state: BlockStateId) -> bool {
+    [FrameStyle::Normal, FrameStyle::Red, FrameStyle::Castle]
+        .into_iter()
+        .any(|style| state == frame_block(style, entrance, pos))
+}
+
 /// Restores a gate entrance to air, leaving any other block untouched.
 ///
 /// Removal accepts every known frame style, not only the style the registry
@@ -349,11 +395,7 @@ pub fn spawn_gate_label(
 /// no longer match the expected style exactly.
 pub fn remove_gate_frame(world: &Arc<World>, gate: &Gate) {
     for pos in gate_frame_positions(gate.entrance) {
-        let state = world.get_block_state(pos);
-        let is_frame_block = [FrameStyle::Normal, FrameStyle::Red, FrameStyle::Castle]
-            .into_iter()
-            .any(|style| state == frame_block(style, gate.entrance, pos));
-        if is_frame_block {
+        if is_frame_block(gate.entrance, pos, world.get_block_state(pos)) {
             let _ = world.set_block_with_cause(
                 pos,
                 vanilla_blocks::AIR.default_state(),
@@ -409,16 +451,7 @@ pub fn build_dungeon(
         } else {
             placement.part
         };
-        let block = palette.block(part, CRYSTAL_ORE);
-        // Platforms are half-height terraces: their slab must sit in the
-        // bottom state so they stay walkable without jumping.
-        let state = if part == Part::Platform {
-            block
-                .default_state()
-                .set_value(&BlockStateProperties::SLAB_TYPE, SlabType::Bottom)
-        } else {
-            block.default_state()
-        };
+        let state = palette.state(part, CRYSTAL_ORE);
         set_fixture(world, at(region, placement.offset), state, &mut failed);
     }
     warn_unwritten("dungeon", at(region, (0, -1, 0)), failed);
@@ -434,8 +467,8 @@ pub fn erase_footprint(world: &Arc<World>, region: InstanceRegion, footprint: Op
     let air = vanilla_blocks::AIR.default_state();
     let mut failed = 0;
     match footprint {
-        Some(Footprint::Dungeon { seed }) => {
-            let layout = DungeonLayout::from_seed(seed);
+        Some(Footprint::Dungeon { seed, red }) => {
+            let layout = DungeonLayout::for_gate(seed, red);
             for placement in &layout.blueprint.blocks {
                 set_fixture(world, at(region, placement.offset), air, &mut failed);
             }
@@ -567,8 +600,20 @@ pub fn spawn_room_mobs(
     for index in 0..count {
         let position = spawn_position(region, plan, usize::from(index));
         let roll = salt.wrapping_add(u64::from(index).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let class = MobClass::from_roll(roll ^ (roll >> 29));
-        if let Some(mob) = spawn_class_mob(world, theme, position, class, wave, rank) {
+        let roll = roll ^ (roll >> 29);
+        let mob = if theme == Theme::SnowElves {
+            spawn_elf(world, position, roll, wave, rank)
+        } else {
+            spawn_class_mob(
+                world,
+                theme,
+                position,
+                MobClass::from_roll(roll),
+                wave,
+                rank,
+            )
+        };
+        if let Some(mob) = mob {
             spawned.push(mob);
         }
     }
@@ -580,6 +625,77 @@ pub fn spawn_room_mobs(
         );
     }
     spawned
+}
+
+/// Movement speed a snow elf has over the dead of other gates.
+const ELF_SPEED: f64 = 1.15;
+
+/// Spawns one snow elf of a roll out of sixteen: five swordsmen, three
+/// berserkers, two shield bearers, four archers and two frost witches. Elves
+/// keep no bombers or broodmothers.
+fn spawn_elf(
+    world: &Arc<World>,
+    position: BlockPos,
+    roll: u64,
+    wave: DungeonWave,
+    rank: HunterRank,
+) -> Option<SpawnedMob> {
+    let class = match roll % 16 {
+        0..=4 => MobClass::Warrior,
+        5..=7 => MobClass::Berserker,
+        8 | 9 => MobClass::Guard,
+        10..=13 => {
+            let label = MobLabel {
+                title: "Лучник".to_owned(),
+                color: Color::Aqua,
+                ..MobLabel::mob(Theme::SnowElves, MobClass::Warrior)
+            };
+            return spawn_archer(world, Theme::SnowElves, position, wave, label);
+        }
+        _ => MobClass::Shaman,
+    };
+    let mob = spawn_class_mob(world, Theme::SnowElves, position, class, wave, rank)?;
+    if let Some(living) = world
+        .get_entity_by_id(mob.id)
+        .as_ref()
+        .and_then(|entity| entity.as_living_entity())
+    {
+        let speed = living
+            .attributes()
+            .lock()
+            .required_value(vanilla_attributes::MOVEMENT_SPEED);
+        living.set_base_attribute_value(vanilla_attributes::MOVEMENT_SPEED, speed * ELF_SPEED);
+    }
+    Some(mob)
+}
+
+/// Spawns a skeleton archer with a bow, dressed in the skin of `theme`, under
+/// `label`.
+pub(crate) fn spawn_archer(
+    world: &Arc<World>,
+    theme: Theme,
+    position: BlockPos,
+    wave: DungeonWave,
+    label: MobLabel,
+) -> Option<SpawnedMob> {
+    let entity = spawn_scaled_mob(
+        world,
+        &vanilla_entities::SKELETON,
+        position,
+        wave.health_multiplier * 0.8,
+        wave.damage_multiplier,
+    )?;
+    let living = entity.as_living_entity()?;
+    living.with_equipment_slot_mut(EquipmentSlot::MainHand, &mut |stack| {
+        *stack = ItemStack::new(&vanilla_items::BOW);
+    });
+    wear_theme_skin(living, theme);
+    label.show(world, living);
+    Some(SpawnedMob {
+        id: entity.id(),
+        class: MobClass::Warrior,
+        label,
+    })
 }
 
 /// Spawns one zombie-bodied mob of `class`, scaled by `wave` and geared for
@@ -719,7 +835,8 @@ pub(crate) fn spawn_boss_body(
 
 /// Returns the nameplate of a dungeon boss.
 fn boss_label(kind: BossKind, rank: HunterRank, red: bool) -> MobLabel {
-    let name = if red {
+    // The chieftain has a name of its own and needs no red-gate prefix.
+    let name = if red && kind != BossKind::ElfChieftain {
         format!("Кровавый {}", kind.display_name().to_lowercase())
     } else {
         kind.display_name().to_owned()
@@ -819,11 +936,11 @@ mod tests {
     use steel_utils::{BlockPos, ChunkPos};
 
     use super::{
-        CRYSTAL_ORE, FrameStyle, INSTANCE_FLOOR_Y, at, dungeon_chunks, frame_block,
-        gate_frame_chunks, gate_is_dry_at, opening_contains, penalty_arena_chunks,
+        CRYSTAL_ORE, FrameStyle, INSTANCE_FLOOR_Y, at, dungeon_chunks, frame_block, gate_footprint,
+        gate_frame_chunks, gate_is_level_at, opening_contains, penalty_arena_chunks,
     };
     use crate::dungeon::generator::{Part, THEMES};
-    use crate::dungeon::{DungeonLayout, Footprint, InstanceRegion};
+    use crate::dungeon::{DungeonLayout, InstanceRegion};
 
     #[test]
     fn every_theme_builds_platforms_from_a_real_slab() {
@@ -854,19 +971,29 @@ mod tests {
     }
 
     #[test]
-    fn a_gate_needs_land_under_every_frame_column() {
+    fn a_gate_needs_level_ground_under_its_whole_footprint() {
         init_vanilla_registry();
         let entrance = BlockPos::new(10, 64, 0);
-        assert!(gate_is_dry_at(entrance, |_, _| true, dry_shore(entrance)));
+        let flat = |_: i32, _: i32| Some(entrance.y());
+        assert!(gate_is_level_at(entrance, flat, dry_shore(entrance)));
 
-        // The frame hangs one column over the water surface: that column has no
-        // dry surface of its own, which a centre-only check would not notice.
-        for shore_edge in [-1, 2] {
-            assert!(!gate_is_dry_at(
-                entrance,
-                |x, _| x != entrance.x() + shore_edge,
-                dry_shore(entrance)
-            ));
+        for (x, z) in gate_footprint(entrance) {
+            // A roof or lamp above one column, a drop or water under it: the
+            // frame would stand on top of something or hang over the edge.
+            for surface in [Some(entrance.y() + 1), Some(entrance.y() - 1), None] {
+                assert!(
+                    !gate_is_level_at(
+                        entrance,
+                        |cx, cz| if (cx, cz) == (x, z) {
+                            surface
+                        } else {
+                            flat(cx, cz)
+                        },
+                        dry_shore(entrance)
+                    ),
+                    "column ({x}, {z}) at {surface:?}"
+                );
+            }
         }
     }
 
@@ -875,9 +1002,9 @@ mod tests {
         init_vanilla_registry();
         let entrance = BlockPos::new(10, 64, 0);
         let flooded = BlockPos::new(entrance.x() + 1, entrance.y() + 2, 0);
-        assert!(!gate_is_dry_at(
+        assert!(!gate_is_level_at(
             entrance,
-            |_, _| true,
+            |_, _| Some(entrance.y()),
             |pos| {
                 if pos == flooded {
                     vanilla_blocks::WATER.default_state()
@@ -944,17 +1071,12 @@ mod tests {
     }
     #[test]
     fn dungeon_chunks_cover_every_block_and_the_previous_footprint() {
+        init_vanilla_registry();
         let region = InstanceRegion::from_slot(3);
         for seed in [0, 7, 3 << 56, u64::MAX] {
             let layout = DungeonLayout::from_seed(seed);
-            let previous = DungeonLayout::from_seed(seed ^ 0xABCD);
-            let chunks = dungeon_chunks(
-                region,
-                &layout,
-                Some(Footprint::Dungeon {
-                    seed: previous.seed,
-                }),
-            );
+            let previous = DungeonLayout::for_gate(seed ^ 0xABCD, true);
+            let chunks = dungeon_chunks(region, &layout, Some(previous.footprint()));
             // Every block the build writes, and every block the erasure of the
             // previous dungeon writes, has to be loaded first.
             for placement in layout
