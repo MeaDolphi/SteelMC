@@ -1,24 +1,19 @@
 //! The city merchant: serial hunter gear for Won.
 //!
-//! Two showcases sell transferable, ordinary-wear copies:
+//! Three showcases sell transferable serial gear for Won:
 //!
 //! - the **shared** showcase is the same for every hunter and changes once an
-//!   hour. It always carries replacements of the starter kit, the starter-line
-//!   weapons (swords, axes, bows and crossbows) and the Mage staff, adds four
-//!   rotating specialization pieces, and closes with three arrow packs;
-//! - the **personal** showcase changes every twenty minutes, offers three
-//!   specialization pieces for the hunter's class at a discount, and each of
-//!   its offers can be bought once per period.
+//!   hour, offering twelve distinct improved pieces;
+//! - the **personal** showcase changes every twenty minutes, offering eight
+//!   ordinary and improved armor pieces for the hunter's class at a discount;
+//! - **Essentials** permanently offers starter replacements and arrow packs.
 //!
-//! The arrow packs are always the same: ordinary arrows for everyone,
-//! spectral arrows from rank C and poison-tipped arrows from rank A.
-//!
-//! Both are derived from the wall-clock period (and the hunter for the
-//! personal one), so reconnecting or restarting can never reroll them; only
-//! the personal purchase marks are saved. A request names the period it was
+//! The rolling showcases are derived from the wall-clock period (and the hunter
+//! for the personal one), so reconnecting or restarting cannot reroll them;
+//! only personal purchase marks are saved. A request names the period it was
 //! made in and is refused without a debit once that period has passed.
 //!
-//! The System shop is a separate store and stays unchanged.
+//! The System shop has its own currency and separate random/permanent tabs.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,10 +34,10 @@ use crate::rank::HunterRank;
 pub const SHARED_PERIOD_SECONDS: u64 = 60 * 60;
 /// Seconds one personal showcase stays up.
 pub const PERSONAL_PERIOD_SECONDS: u64 = 20 * 60;
-/// Rotating specialization pieces of the shared showcase.
-pub const SHARED_ROTATING: usize = 4;
+/// Improved pieces of the shared showcase.
+pub const SHARED_ROTATING: usize = 12;
 /// Offers of the personal showcase.
-pub const PERSONAL_OFFERS: usize = 3;
+pub const PERSONAL_OFFERS: usize = 8;
 /// Discount of the personal showcase, in percent.
 pub const PERSONAL_DISCOUNT_PERCENT: u64 = 15;
 /// Lowest rank that may buy specialization armor: classes open there.
@@ -55,6 +50,8 @@ pub enum Showcase {
     Shared,
     /// The hunter's own twenty-minute showcase.
     Personal,
+    /// Permanent starter replacements and ammunition.
+    Essentials,
 }
 
 /// A pack of arrows sold by the shared showcase.
@@ -199,7 +196,7 @@ pub struct MerchantRecord {
     #[serde(default)]
     pub period: u64,
     /// Personal offers already bought in that period.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bought")]
     pub bought: [bool; PERSONAL_OFFERS],
 }
 
@@ -222,6 +219,16 @@ impl MerchantRecord {
             *bought = true;
         }
     }
+}
+
+fn deserialize_bought<'de, D>(deserializer: D) -> Result<[bool; PERSONAL_OFFERS], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let saved = Vec::<bool>::deserialize(deserializer)?;
+    Ok(std::array::from_fn(|index| {
+        saved.get(index).copied().unwrap_or(false)
+    }))
 }
 
 /// Returns the base price of `item` in Won, or `None` if it is not sold.
@@ -260,6 +267,35 @@ pub const fn base_price(item: SerialId) -> Option<u64> {
     Some(price)
 }
 
+/// Returns the price of a serial item, including a finished improved piece.
+#[must_use]
+pub fn sale_price(item: SerialId) -> Option<u64> {
+    if let Some(price) = base_price(item) {
+        return Some(price);
+    }
+    let base = base_price(crate::crafting::base_of(item)?)?;
+    let recipe = crate::crafting::recipe(item)?;
+    let materials = recipe
+        .materials
+        .into_iter()
+        .map(|(material, count)| u64::from(count) * material_price(material, recipe.quality))
+        .sum::<u64>();
+    Some(base + materials + recipe.work)
+}
+
+fn material_price(material: Material, quality: Quality) -> u64 {
+    let unit = match quality {
+        Quality::Common => 10,
+        Quality::Reinforced => 30,
+        Quality::Superior => 90,
+    };
+    if material == Material::StableEssence {
+        unit * 3
+    } else {
+        unit
+    }
+}
+
 /// Returns the Won the merchant pays for `stack`, or `None` when he does not
 /// buy it: personal items, crystals (the Organization buys those) and
 /// anything that is neither a material nor an artifact.
@@ -270,17 +306,7 @@ pub fn buyback_price(stack: &ItemStack) -> Option<u64> {
     }
     let count = u64::try_from(stack.count).ok()?;
     if let Some((material, quality)) = material::of(stack) {
-        let unit = match quality {
-            Quality::Common => 10,
-            Quality::Reinforced => 30,
-            Quality::Superior => 90,
-        };
-        let unit = if material == Material::StableEssence {
-            unit * 3
-        } else {
-            unit
-        };
-        return Some(unit * count);
+        return Some(material_price(material, quality) * count);
     }
     if let Some(id) = serial::of(stack) {
         let each = base_price(id).map_or(30, |price| price * 30 / 100);
@@ -322,17 +348,35 @@ pub const fn seconds_left(unix_seconds: u64, length: u64) -> u64 {
     length - unix_seconds % length
 }
 
-/// Returns the shared showcase of `period`: the starter replacements first,
-/// then the always-on-sale weapons and the rotating specialization pieces,
-/// then the arrow packs.
+/// Returns twelve distinct improved items of the hourly shared showcase.
 #[must_use]
 pub fn shared_showcase(period: u64) -> Vec<MerchantOffer> {
-    let rotating = pick_distinct(&SPECIALIZATION, SHARED_ROTATING, period ^ 0x5348_4152_4544);
+    pick_distinct(
+        &serial::IMPROVED,
+        SHARED_ROTATING,
+        period ^ 0x5348_4152_4544,
+    )
+    .into_iter()
+    .enumerate()
+    .filter_map(|(index, item)| {
+        Some(MerchantOffer {
+            showcase: Showcase::Shared,
+            period,
+            index,
+            item: Goods::Serial(item),
+            price: sale_price(item)?,
+        })
+    })
+    .collect()
+}
+
+/// Returns the permanent starter replacements and arrow packs.
+#[must_use]
+pub fn essentials_showcase() -> Vec<MerchantOffer> {
     STARTER
         .into_iter()
         .chain(MAGE_SHOP)
         .chain(WEAPON_SHOP)
-        .chain(rotating)
         .map(Goods::Serial)
         .chain(ARROW_PACKS.into_iter().map(Goods::Arrows))
         .enumerate()
@@ -342,8 +386,8 @@ pub fn shared_showcase(period: u64) -> Vec<MerchantOffer> {
                 Goods::Arrows(pack) => pack.price(),
             };
             Some(MerchantOffer {
-                showcase: Showcase::Shared,
-                period,
+                showcase: Showcase::Essentials,
+                period: 0,
                 index,
                 item,
                 price,
@@ -364,6 +408,7 @@ pub fn personal_showcase(
 ) -> Vec<MerchantOffer> {
     let pool: Vec<SerialId> = SPECIALIZATION
         .into_iter()
+        .chain(serial::IMPROVED)
         .filter(|item| class.is_none_or(|class| item.line().is_some_and(|line| fits(line, class))))
         .collect();
     let (high, low) = hunter.as_u64_pair();
@@ -372,7 +417,7 @@ pub fn personal_showcase(
         .into_iter()
         .enumerate()
         .filter_map(|(index, item)| {
-            let price = base_price(item)? * (100 - PERSONAL_DISCOUNT_PERCENT) / 100;
+            let price = sale_price(item)? * (100 - PERSONAL_DISCOUNT_PERCENT) / 100;
             Some(MerchantOffer {
                 showcase: Showcase::Personal,
                 period,
@@ -392,7 +437,10 @@ fn fits(line: ArmorLine, class: HunterClass) -> bool {
 #[must_use]
 pub fn may_buy(item: Goods, rank: HunterRank) -> bool {
     match item {
-        Goods::Serial(id) => id.line().is_none() || rank >= SPECIALIZATION_RANK,
+        Goods::Serial(id) => id.crafted_tier().map_or_else(
+            || id.line().is_none() || rank >= SPECIALIZATION_RANK,
+            |tier| rank >= tier.rank(),
+        ),
         Goods::Arrows(pack) => rank >= pack.rank(),
     }
 }
@@ -423,7 +471,7 @@ mod tests {
 
     use super::{
         ARROW_PACKS, Goods, MerchantRecord, PERSONAL_OFFERS, SHARED_ROTATING, Showcase, base_price,
-        may_buy, personal_showcase, shared_showcase,
+        essentials_showcase, may_buy, personal_showcase, sale_price, shared_showcase,
     };
     use crate::class::HunterClass;
     use crate::item::serial::{MAGE_SHOP, SPECIALIZATION, STARTER, SerialId, WEAPON_SHOP};
@@ -434,40 +482,59 @@ mod tests {
         for item in STARTER.into_iter().chain(SPECIALIZATION).chain(WEAPON_SHOP) {
             assert!(base_price(item).is_some(), "{item:?}");
         }
+        for item in crate::item::serial::IMPROVED {
+            assert!(sale_price(item).is_some(), "{item:?}");
+        }
         assert_eq!(base_price(SerialId::ImprovedHunterSword), None);
         assert_eq!(base_price(SerialId::HunterBow), Some(300));
         assert_eq!(base_price(SerialId::HunterCrossbow), Some(350));
     }
 
     #[test]
-    fn the_shared_showcase_always_has_the_starter_replacements() {
+    fn the_shared_showcase_has_distinct_improved_items_per_period() {
         for period in 0..50 {
             let offers = shared_showcase(period);
-            assert_eq!(
-                offers.len(),
-                STARTER.len()
-                    + MAGE_SHOP.len()
-                    + WEAPON_SHOP.len()
-                    + SHARED_ROTATING
-                    + ARROW_PACKS.len()
-            );
-            for item in STARTER.into_iter().chain(WEAPON_SHOP) {
-                assert!(offers.iter().any(|offer| offer.item == Goods::Serial(item)));
+            assert_eq!(offers.len(), SHARED_ROTATING);
+            let mut seen = std::collections::BTreeSet::new();
+            for offer in &offers {
+                let Goods::Serial(id) = offer.item else {
+                    panic!("shared improved offers are serials");
+                };
+                assert!(id.is_improved(), "{id:?}");
+                assert!(seen.insert(id), "{id:?} shown twice");
             }
             assert_eq!(shared_showcase(period), offers, "a period never rerolls");
         }
+        assert_ne!(shared_showcase(0), shared_showcase(1));
+    }
+
+    #[test]
+    fn essentials_keep_the_starter_replacements() {
+        let offers = essentials_showcase();
+        assert_eq!(
+            offers.len(),
+            STARTER.len() + MAGE_SHOP.len() + WEAPON_SHOP.len() + ARROW_PACKS.len()
+        );
+        for item in STARTER.into_iter().chain(WEAPON_SHOP) {
+            assert!(offers.iter().any(|offer| offer.item == Goods::Serial(item)));
+        }
+        assert!(
+            offers
+                .iter()
+                .all(|offer| offer.showcase == Showcase::Essentials)
+        );
     }
 
     #[test]
     fn arrow_packs_are_always_on_sale_and_rank_gated() {
-        let offers = shared_showcase(7);
+        let offers = essentials_showcase();
         for pack in ARROW_PACKS {
             let offer = offers
                 .iter()
                 .find(|offer| offer.item == Goods::Arrows(pack))
                 .unwrap_or_else(|| panic!("{pack:?} must be on sale"));
             assert_eq!(offer.price, pack.price());
-            assert_eq!(offer.showcase, Showcase::Shared);
+            assert_eq!(offer.showcase, Showcase::Essentials);
             let stack = offer.item.stack();
             assert_eq!(stack.count, pack.count(), "{pack:?}");
         }
@@ -508,7 +575,7 @@ mod tests {
                     id.allowed_classes()
                         .is_some_and(|classes| { classes.contains(&HunterClass::Mage) })
                 );
-                assert!(offer.price < base_price(id).unwrap_or(0));
+                assert!(offer.price < sale_price(id).unwrap_or(0));
             }
             assert_eq!(
                 personal_showcase(hunter, Some(HunterClass::Mage), period),
@@ -540,5 +607,21 @@ mod tests {
         record.mark(8, 0);
         assert!(record.bought(8, 0));
         assert!(!record.bought(8, 1));
+    }
+
+    #[test]
+    fn old_three_slot_marks_expand_without_losing_purchases() {
+        let record: MerchantRecord =
+            serde_json::from_str(r#"{"period":7,"bought":[true,false,true]}"#)
+                .expect("legacy merchant record");
+        assert!(record.bought(7, 0));
+        assert!(!record.bought(7, 1));
+        assert!(record.bought(7, 2));
+        assert!(!record.bought(7, 3));
+        assert_eq!(record.bought.len(), PERSONAL_OFFERS);
+        let encoded = serde_json::to_string(&record).expect("encode expanded record");
+        let restored: MerchantRecord =
+            serde_json::from_str(&encoded).expect("decode expanded record");
+        assert_eq!(restored, record);
     }
 }

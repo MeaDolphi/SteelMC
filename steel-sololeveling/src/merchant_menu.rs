@@ -1,10 +1,9 @@
 //! The city merchant as a chest menu.
 //!
-//! The top row shows the hunter's Won and when each showcase changes. Rows
-//! two and three hold the shared showcase: the starter replacements, then
-//! the rotating specialization pieces. Row five holds the personal showcase.
-//! Clicking an offer buys it; the menu redraws whenever a showcase, the
-//! balance or a purchase mark changes.
+//! The main page holds twelve shared improved offers and eight personal armor
+//! offers. A separate page keeps starter replacements and arrows permanently
+//! available. Clicking an offer buys it; the menu redraws whenever a showcase,
+//! the balance or a purchase mark changes.
 
 use std::sync::Arc;
 
@@ -30,24 +29,36 @@ use crate::ui::{self, After};
 const MENU_SLOTS: usize = 54;
 const INFO_SLOT: usize = 4;
 const SHARED_LABEL_SLOT: usize = 9;
-/// Menu slots of the shared showcase, in showcase order: sixteen serial
-/// offers in three rows, then three arrow packs.
-const SHARED_SLOTS: [usize; 19] = [
+/// Twelve improved offers of the shared showcase.
+const SHARED_SLOTS: [usize; 12] = [10, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22, 23];
+const PERSONAL_LABEL_SLOT: usize = 36;
+/// Eight ordinary and improved armor offers for the hunter's class.
+const PERSONAL_SLOTS: [usize; 8] = [37, 38, 39, 40, 41, 42, 43, 44];
+/// Permanent starter replacements and arrow packs.
+const ESSENTIAL_SLOTS: [usize; 19] = [
     10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 28, 29, 30, 31, 32,
 ];
-const PERSONAL_LABEL_SLOT: usize = 36;
-/// Menu slots of the personal showcase, in showcase order.
-const PERSONAL_SLOTS: [usize; 3] = [38, 40, 42];
+/// Button that opens the permanent starter showcase.
+const ESSENTIALS_SLOT: usize = 46;
 /// Button that opens the crafting orders.
 const ORDERS_SLOT: usize = 49;
 /// Button that opens the buyback of materials and spare artifacts.
 const BUYBACK_SLOT: usize = 47;
+/// Button that returns from the permanent starter showcase.
+const BACK_SLOT: usize = 49;
 
 /// Opens the merchant for a hunter at the board.
 pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
     player.open_menu(
         TextComponent::plain("Городской торговец").color(Color::Gold),
-        move |context| build(context.container_id, context.player, state),
+        move |context| build(context.container_id, context.player, state, false),
+    );
+}
+
+fn open_essentials(player: &Player, state: Arc<SoloLevelingState>) {
+    player.open_menu(
+        TextComponent::plain("Постоянные товары").color(Color::Gold),
+        move |context| build(context.container_id, context.player, state, true),
     );
 }
 
@@ -56,6 +67,7 @@ pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
 struct View {
     shared: Vec<MerchantOffer>,
     personal: Vec<MerchantOffer>,
+    essentials: Vec<MerchantOffer>,
     won: u64,
     rank: HunterRank,
     record: MerchantRecord,
@@ -72,6 +84,7 @@ fn view(state: &SoloLevelingState, uuid: Uuid) -> Option<View> {
     Some(View {
         shared,
         personal,
+        essentials: merchant::essentials_showcase(),
         won,
         rank,
         record,
@@ -80,9 +93,19 @@ fn view(state: &SoloLevelingState, uuid: Uuid) -> Option<View> {
     })
 }
 
-fn build(container_id: u8, player: &Player, state: Arc<SoloLevelingState>) -> Menu {
+fn build(
+    container_id: u8,
+    player: &Player,
+    state: Arc<SoloLevelingState>,
+    essentials: bool,
+) -> Menu {
     let view = view(&state, player.gameprofile.id());
-    let container = SimpleContainer::from_items(menu_items(view.as_ref())).into_shared();
+    let items = if essentials {
+        essentials_items(view.as_ref())
+    } else {
+        menu_items(view.as_ref())
+    };
+    let container = SimpleContainer::from_items(items).into_shared();
     let mut builder = MenuBuilder::new(&vanilla_menu_types::GENERIC_9X6, container_id);
     let buttons = builder.section_all(Arc::clone(&container));
     builder.player_inventory(&player.inventory);
@@ -91,6 +114,7 @@ fn build(container_id: u8, player: &Player, state: Arc<SoloLevelingState>) -> Me
         buttons,
         container,
         view,
+        essentials,
     })
 }
 
@@ -100,6 +124,46 @@ fn offer_at(view: &View, slot: usize) -> Option<MerchantOffer> {
     }
     let index = PERSONAL_SLOTS.iter().position(|shown| *shown == slot)?;
     view.personal.get(index).copied()
+}
+
+fn essentials_offer_at(view: &View, slot: usize) -> Option<MerchantOffer> {
+    let index = ESSENTIAL_SLOTS.iter().position(|shown| *shown == slot)?;
+    view.essentials.get(index).copied()
+}
+
+fn essentials_items(view: Option<&View>) -> Vec<ItemStack> {
+    let mut items = vec![ItemStack::empty(); MENU_SLOTS];
+    let Some(view) = view else {
+        return items;
+    };
+    items[INFO_SLOT] = with_lore(
+        named(
+            ItemStack::new(&vanilla_items::GOLD_INGOT),
+            TextComponent::plain(format!("Ваши Won: {}", view.won)).color(Color::Gold),
+        ),
+        vec![
+            TextComponent::plain("Постоянная вкладка не меняется со временем.").color(Color::Gray),
+            TextComponent::plain("Покупки можно передавать и продавать.").color(Color::Gray),
+        ],
+    );
+    items[SHARED_LABEL_SLOT] = with_lore(
+        named(
+            ItemStack::new(&vanilla_items::CHEST),
+            TextComponent::plain("Стартовые товары и боеприпасы").color(Color::Yellow),
+        ),
+        vec![TextComponent::plain("Можно покупать повторно.").color(Color::Gray)],
+    );
+    items[BACK_SLOT] = with_lore(
+        named(
+            ItemStack::new(&vanilla_items::ARROW),
+            TextComponent::plain("Назад к витринам").color(Color::Yellow),
+        ),
+        vec![TextComponent::plain("Клик — вернуться.").color(Color::Aqua)],
+    );
+    for (slot, offer) in ESSENTIAL_SLOTS.into_iter().zip(&view.essentials) {
+        items[slot] = offer_item(view, *offer);
+    }
+    items
 }
 
 fn menu_items(view: Option<&View>) -> Vec<ItemStack> {
@@ -114,7 +178,7 @@ fn menu_items(view: Option<&View>) -> Vec<ItemStack> {
         ),
         vec![
             TextComponent::plain("Покупки можно передавать и продавать.").color(Color::Gray),
-            TextComponent::plain("Купленные вещи изнашиваются как обычные.").color(Color::Gray),
+            TextComponent::plain("Серийное снаряжение не ломается.").color(Color::Gray),
             TextComponent::plain("Броню надевают в снаряжении Системы.").color(Color::Gray),
         ],
     );
@@ -124,8 +188,9 @@ fn menu_items(view: Option<&View>) -> Vec<ItemStack> {
             TextComponent::plain("Общая витрина").color(Color::Yellow),
         ),
         vec![
-            TextComponent::plain("Одна для всех охотников, меняется раз в час.").color(Color::Gray),
-            TextComponent::plain("Внизу — пачки стрел для луков и арбалетов.").color(Color::Gray),
+            TextComponent::plain("12 случайных улучшенных вещей; одна для всех.")
+                .color(Color::Gray),
+            TextComponent::plain("Ассортимент меняется раз в час.").color(Color::Gray),
             TextComponent::plain(format!("До обновления: {} мин.", view.shared_minutes))
                 .color(Color::Aqua),
         ],
@@ -136,7 +201,7 @@ fn menu_items(view: Option<&View>) -> Vec<ItemStack> {
             TextComponent::plain("Персональная витрина").color(Color::LightPurple),
         ),
         vec![
-            TextComponent::plain("Броня вашего класса, меняется каждые 20 минут.")
+            TextComponent::plain("8 деталей брони вашего класса: обычные и улучшенные.")
                 .color(Color::Gray),
             TextComponent::plain(format!(
                 "Скидка {PERSONAL_DISCOUNT_PERCENT}%, каждое предложение — один раз."
@@ -144,6 +209,16 @@ fn menu_items(view: Option<&View>) -> Vec<ItemStack> {
             .color(Color::Gray),
             TextComponent::plain(format!("До обновления: {} мин.", view.personal_minutes))
                 .color(Color::Aqua),
+        ],
+    );
+    items[ESSENTIALS_SLOT] = with_lore(
+        named(
+            ItemStack::new(&vanilla_items::CHEST),
+            TextComponent::plain("Постоянные товары").color(Color::Yellow),
+        ),
+        vec![
+            TextComponent::plain("Стартовые предметы и стрелы.").color(Color::Gray),
+            TextComponent::plain("Клик — открыть постоянную вкладку.").color(Color::Aqua),
         ],
     );
     items[ORDERS_SLOT] = with_lore(
@@ -217,6 +292,7 @@ pub(crate) struct MerchantMenuKind {
     buttons: Section,
     container: Shared<SimpleContainer>,
     view: Option<View>,
+    essentials: bool,
 }
 
 // SAFETY: This Solo Leveling-owned key uniquely identifies the concrete menu kind.
@@ -240,7 +316,12 @@ impl MenuKind for MerchantMenuKind {
         }
         let container_id = ContainerId::from_arc(&self.container);
         if let Some(container) = guard.get_typed_mut::<SimpleContainer>(container_id) {
-            for (index, item) in menu_items(view.as_ref()).into_iter().enumerate() {
+            let items = if self.essentials {
+                essentials_items(view.as_ref())
+            } else {
+                menu_items(view.as_ref())
+            };
+            for (index, item) in items.into_iter().enumerate() {
                 container.set_item(index, item);
             }
             self.view = view;
@@ -264,20 +345,31 @@ impl MenuKind for MerchantMenuKind {
         if !self.buttons.contains(slot) {
             return ClickOutcome::Fallthrough;
         }
-        if slot - self.buttons.start() == ORDERS_SLOT {
+        let slot = slot - self.buttons.start();
+        if self.essentials && slot == BACK_SLOT {
+            open(player, Arc::clone(&self.state));
+            return ClickOutcome::Consume;
+        }
+        if !self.essentials && slot == ESSENTIALS_SLOT {
+            open_essentials(player, Arc::clone(&self.state));
+            return ClickOutcome::Consume;
+        }
+        if !self.essentials && slot == ORDERS_SLOT {
             crafting_menu::open(player, Arc::clone(&self.state));
             return ClickOutcome::Consume;
         }
         // The picker reads the inventory, which this click has locked.
-        if slot - self.buttons.start() == BUYBACK_SLOT {
+        if !self.essentials && slot == BUYBACK_SLOT {
             self.state.defer_buyback_menu(player.gameprofile.id());
             return ClickOutcome::Consume;
         }
-        let Some(offer) = self
-            .view
-            .as_ref()
-            .and_then(|view| offer_at(view, slot - self.buttons.start()))
-        else {
+        let Some(offer) = self.view.as_ref().and_then(|view| {
+            if self.essentials {
+                essentials_offer_at(view, slot)
+            } else {
+                offer_at(view, slot)
+            }
+        }) else {
             return ClickOutcome::Consume;
         };
         match self.state.request_merchant_purchase(player, offer) {
@@ -364,7 +456,10 @@ mod tests {
     use steel_registry::init_vanilla_registry;
     use uuid::Uuid;
 
-    use super::{PERSONAL_SLOTS, SHARED_SLOTS, View, menu_items, offer_at};
+    use super::{
+        ESSENTIAL_SLOTS, PERSONAL_SLOTS, SHARED_SLOTS, View, essentials_items, essentials_offer_at,
+        menu_items, offer_at,
+    };
     use crate::class::HunterClass;
     use crate::item::serial;
     use crate::merchant::{self, MerchantRecord};
@@ -374,6 +469,7 @@ mod tests {
         View {
             shared: merchant::shared_showcase(3),
             personal: merchant::personal_showcase(Uuid::new_v4(), Some(HunterClass::Tanker), 9),
+            essentials: merchant::essentials_showcase(),
             won: 1_000,
             rank: HunterRank::D,
             record: MerchantRecord::default(),
@@ -418,15 +514,19 @@ mod tests {
     fn arrow_packs_render_with_price_and_gate() {
         init_vanilla_registry();
         let view = sample();
-        let items = menu_items(Some(&view));
+        let items = essentials_items(Some(&view));
         let offers: Vec<_> = view
-            .shared
+            .essentials
             .iter()
             .filter(|offer| matches!(offer.item, crate::merchant::Goods::Arrows(_)))
             .collect();
         assert_eq!(offers.len(), crate::merchant::ARROW_PACKS.len());
         for offer in offers {
-            let stack = &items[SHARED_SLOTS[offer.index]];
+            let stack = &items[ESSENTIAL_SLOTS[offer.index]];
+            assert_eq!(
+                essentials_offer_at(&view, ESSENTIAL_SLOTS[offer.index]),
+                Some(*offer)
+            );
             assert!(!stack.is_empty(), "arrow pack must render");
             let lore = format!("{:?}", stack.get(LORE));
             assert!(lore.contains("Цена:"), "{lore}");

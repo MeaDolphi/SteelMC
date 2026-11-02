@@ -30,6 +30,7 @@ use super::{RunAction, RunContext};
 use crate::castle;
 use crate::demon_castle::districts;
 use crate::demon_castle::districts::prison::bars;
+use crate::demon_castle::elites::{EliteAction, EliteSkills};
 use crate::demon_castle::encounter::{self, LIVE_CAP, Pack, Spot};
 use crate::demon_castle::giga::{self, Phase};
 use crate::demon_castle::plan::{Archetype, FloorPlan, Side};
@@ -98,8 +99,10 @@ pub(super) struct CastleClimb {
     /// Nameplates of the climb's mobs and boss, by entity id.
     pub(super) labels: FxHashMap<i32, MobLabel>,
     skills: MobSkills,
+    elite_skills: EliteSkills,
     /// Abilities to apply once the runtime lock is released.
     pub(super) pending_skills: Vec<SkillAction>,
+    pub(super) pending_elite_skills: Vec<EliteAction>,
     /// The floor boss.
     pub(super) boss: FloorBoss,
     /// Ability cooldowns and boss-bar state of a boss that appeared.
@@ -162,7 +165,9 @@ impl CastleClimb {
             mob_district: FxHashMap::default(),
             labels: FxHashMap::default(),
             skills: MobSkills::default(),
+            elite_skills: EliteSkills::default(),
             pending_skills: Vec::new(),
+            pending_elite_skills: Vec::new(),
             boss: FloorBoss::Waiting,
             fight: None,
             sealed: false,
@@ -395,7 +400,7 @@ impl CastleClimb {
             })
             .collect();
         let positions: Vec<DVec3> = hunters.iter().map(|hunter| hunter.position()).collect();
-        self.tick_mobs(world, &positions, tick);
+        self.tick_mobs(world, &positions, context.members, tick);
         self.wake_packs(world, &positions, tick);
         self.release_lower_floor(world, &positions);
         let action = self.tick_boss(context, &hunters, tick);
@@ -403,7 +408,7 @@ impl CastleClimb {
         action
     }
 
-    fn tick_mobs(&mut self, world: &Arc<World>, hunters: &[DVec3], tick: u64) {
+    fn tick_mobs(&mut self, world: &Arc<World>, hunters: &[DVec3], members: &[Uuid], tick: u64) {
         self.remaining_mobs
             .retain(|id| world.get_entity_by_id(*id).is_some());
         let power = (5.0 + 5.0 * castle::wave(self.floor).damage_multiplier) as f32;
@@ -411,6 +416,8 @@ impl CastleClimb {
             .skills
             .tick(world, hunters, &self.remaining_mobs, power, tick);
         self.pending_skills.extend(out.actions);
+        self.pending_elite_skills
+            .extend(self.elite_skills.tick(world, members, power, tick));
         for (id, label) in out.hatched {
             self.remaining_mobs.push(id);
             if let Some(entity) = world.get_entity_by_id(id)
@@ -457,6 +464,7 @@ impl CastleClimb {
             {
                 if elite {
                     self.elites.push(mob.id);
+                    self.elite_skills.track(mob.id, mob.class, tick);
                 }
                 self.remaining_mobs.push(mob.id);
                 self.mob_district.insert(mob.id, pack.district);
@@ -915,6 +923,8 @@ impl CastleClimb {
         self.giga = None;
         self.locate_treasures();
         self.skills = MobSkills::default();
+        self.elite_skills = EliteSkills::default();
+        self.pending_elite_skills.clear();
         self.boss = FloorBoss::Waiting;
         self.fight = None;
         self.sealed = false;

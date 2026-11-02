@@ -1,8 +1,8 @@
-//! The personal System shop: ten slots rolled per hunter every 20 minutes.
+//! The personal System shop: random artifacts and permanent consumables.
 //!
-//! Each slot independently rolls a category from the shop table, then a
-//! uniform item from that category's catalog. The roll is saved with the
-//! hunter, so reconnecting or restarting cannot reroll the current slots.
+//! Ten artifact slots are rolled per hunter every 20 minutes and saved, so
+//! reconnecting or restarting cannot reroll them. The six consumables stay
+//! available in every window and can be bought repeatedly.
 //!
 //! Prices are paid in system points, which only personal mob kills, boss pools,
 //! and dungeon rewards produce, so trading cannot fund the shop. Every purchase,
@@ -106,29 +106,41 @@ impl Offer {
     }
 }
 
-/// One row of the shop table.
+/// One row of the random artifact table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Category {
-    Food(Food),
-    Buff,
     Weapon(Rarity),
     Armor(Rarity),
 }
 
-/// The shop table: chance in per mille, category, and price in system points.
-///
-/// The chances add up to exactly 1000.
-const TABLE: [(u32, Category, u64); 9] = [
-    (200, Category::Food(Food::BakedPotato), 10),
-    (200, Category::Food(Food::CookedBeef), 15),
-    (350, Category::Buff, 40),
-    (100, Category::Weapon(Rarity::Rare), 120),
-    (100, Category::Armor(Rarity::Rare), 100),
-    (20, Category::Weapon(Rarity::Epic), 600),
-    (20, Category::Armor(Rarity::Epic), 500),
-    (5, Category::Weapon(Rarity::Legendary), 3_000),
-    (5, Category::Armor(Rarity::Legendary), 2_500),
+/// The random table: 80% Rare, 16% Epic and 4% Legendary artifacts.
+const TABLE: [(u32, Category, u64); 6] = [
+    (400, Category::Weapon(Rarity::Rare), 120),
+    (400, Category::Armor(Rarity::Rare), 100),
+    (80, Category::Weapon(Rarity::Epic), 600),
+    (80, Category::Armor(Rarity::Epic), 500),
+    (20, Category::Weapon(Rarity::Legendary), 3_000),
+    (20, Category::Armor(Rarity::Legendary), 2_500),
 ];
+
+/// Every consumable available at any time, independent of the random window.
+#[must_use]
+pub fn permanent_offers() -> [Offer; 6] {
+    array::from_fn(|index| match index {
+        0 => Offer {
+            price: 10,
+            item: OfferItem::Food(Food::BakedPotato),
+        },
+        1 => Offer {
+            price: 15,
+            item: OfferItem::Food(Food::CookedBeef),
+        },
+        _ => Offer {
+            price: 40,
+            item: OfferItem::Buff(potion::ALL[index - 2]),
+        },
+    })
+}
 
 /// Rolls one slot from a per-mille `chance` roll and an item `pick` roll.
 ///
@@ -147,10 +159,8 @@ pub fn roll_offer(chance: u32, pick: usize) -> Offer {
                 None
             }
         })
-        .unwrap_or((Category::Buff, 40));
+        .unwrap_or((Category::Armor(Rarity::Rare), 100));
     let item = match category {
-        Category::Food(food) => OfferItem::Food(food),
-        Category::Buff => OfferItem::Buff(potion::ALL[pick % potion::ALL.len()]),
         Category::Weapon(rarity) => pick_artifact(&artifact::weapons_of(rarity), pick),
         Category::Armor(rarity) => pick_artifact(&artifact::armors_of(rarity), pick),
     };
@@ -262,6 +272,20 @@ impl ShopDay {
     }
 }
 
+/// Which stock a purchase belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShopPurchase {
+    /// One slot of the hunter's current random window.
+    Random {
+        /// Slot in the saved random window.
+        slot: usize,
+        /// Window shown by the menu, or `None` for a command purchase.
+        displayed: Option<ShopDay>,
+    },
+    /// A repeatable offer from the permanent consumable catalog.
+    Permanent,
+}
+
 /// Why a purchase was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShopError {
@@ -319,29 +343,56 @@ mod tests {
 
     #[test]
     fn chance_rolls_land_in_the_table_rows() {
-        assert_eq!(roll_offer(0, 0).item, OfferItem::Food(Food::BakedPotato));
-        assert_eq!(roll_offer(199, 0).price, 10);
-        assert_eq!(roll_offer(200, 0).item, OfferItem::Food(Food::CookedBeef));
-        assert_eq!(roll_offer(400, 0).price, 40);
-        assert!(matches!(roll_offer(749, 3).item, OfferItem::Buff(_)));
-        assert_eq!(roll_offer(750, 0).price, 120);
-        assert_eq!(roll_offer(850, 0).price, 100);
-        assert_eq!(roll_offer(950, 0).price, 600);
-        assert_eq!(roll_offer(970, 0).price, 500);
-        assert_eq!(roll_offer(990, 0).price, 3_000);
-        assert_eq!(roll_offer(999, 0).price, 2_500);
+        for (chance, price) in [
+            (0, 120),
+            (399, 120),
+            (400, 100),
+            (799, 100),
+            (800, 600),
+            (879, 600),
+            (880, 500),
+            (959, 500),
+            (960, 3_000),
+            (979, 3_000),
+            (980, 2_500),
+            (999, 2_500),
+        ] {
+            let offer = roll_offer(chance, 0);
+            assert_eq!(offer.price, price, "chance {chance}");
+            assert!(matches!(offer.item, OfferItem::Artifact(_)));
+        }
+    }
+
+    #[test]
+    fn permanent_catalog_has_every_existing_consumable() {
+        let offers = permanent_offers();
+        assert_eq!(offers.len(), 6);
+        assert!(offers.contains(&Offer {
+            price: 10,
+            item: OfferItem::Food(Food::BakedPotato),
+        }));
+        assert!(offers.contains(&Offer {
+            price: 15,
+            item: OfferItem::Food(Food::CookedBeef),
+        }));
+        for buff in potion::ALL {
+            assert!(offers.contains(&Offer {
+                price: 40,
+                item: OfferItem::Buff(buff),
+            }));
+        }
     }
 
     #[test]
     fn artifact_rolls_match_their_rarity_and_category() {
         for pick in 0..16 {
             for (chance, rarity, weapon) in [
-                (750, Rarity::Rare, true),
-                (850, Rarity::Rare, false),
-                (950, Rarity::Epic, true),
-                (970, Rarity::Epic, false),
-                (990, Rarity::Legendary, true),
-                (995, Rarity::Legendary, false),
+                (0, Rarity::Rare, true),
+                (400, Rarity::Rare, false),
+                (800, Rarity::Epic, true),
+                (880, Rarity::Epic, false),
+                (960, Rarity::Legendary, true),
+                (980, Rarity::Legendary, false),
             ] {
                 let OfferItem::Artifact(id) = roll_offer(chance, pick).item else {
                     panic!("chance {chance} must roll an artifact");

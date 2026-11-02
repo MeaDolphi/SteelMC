@@ -70,6 +70,7 @@ impl SoloLevelingState {
         let showcase = match offer.showcase {
             Showcase::Shared => shared,
             Showcase::Personal => personal,
+            Showcase::Essentials => merchant::essentials_showcase(),
         };
         if showcase.get(offer.index) == Some(&offer) {
             Ok(())

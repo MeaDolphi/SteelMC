@@ -63,6 +63,7 @@ use super::{
 use crate::castle;
 use crate::city;
 use crate::combat_reward::HunterReward;
+use crate::demon_castle::elites::EliteAction;
 use crate::demon_castle::{self, CastleSlot, CastleSlots};
 use crate::item::chest::{self, ChestKind};
 use crate::item::crystal;
@@ -136,6 +137,13 @@ pub enum RunAction {
     BossAbility(BossAbilityAction),
     /// Executes a mob ability outside the runtime lock for the same reason.
     MobSkill(SkillAction),
+    /// Executes a cache guard's class kit with its current targets.
+    EliteSkill {
+        /// Ability prepared by the cache guard.
+        action: EliteAction,
+        /// Hunters whose bodies and allied shadows may be hit.
+        members: Vec<Uuid>,
+    },
     /// Deal lethal instance damage so the hunter dies inside the dungeon.
     KillPlayer(Uuid),
     /// Send a hunter back to the ordinary world.
@@ -3796,6 +3804,12 @@ impl DungeonRuntime {
                         actions.push(action);
                     }
                     actions.extend(progress.pending_skills.drain(..).map(RunAction::MobSkill));
+                    actions.extend(progress.pending_elite_skills.drain(..).map(|action| {
+                        RunAction::EliteSkill {
+                            action,
+                            members: context.members.to_vec(),
+                        }
+                    }));
                     self.pending_loot.append(&mut progress.floor_loot);
                     actions.extend(progress.leaving.drain(..).map(|uuid| {
                         RunAction::ReturnPlayer {
@@ -4056,6 +4070,7 @@ pub fn apply_action(state: &SoloLevelingState, server: &Arc<Server>, action: &Ru
     match action {
         RunAction::BossAbility(action) => action.apply(server),
         RunAction::MobSkill(action) => action.apply(server),
+        RunAction::EliteSkill { action, members } => action.apply(server, members),
         RunAction::KillPlayer(uuid) => {
             let Some(player) = find_player(server, *uuid) else {
                 state.complete_offline_run(*uuid);

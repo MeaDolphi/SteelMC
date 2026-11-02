@@ -16,6 +16,7 @@
 //! its party has left.
 
 pub mod districts;
+pub mod elites;
 pub mod encounter;
 pub mod generator;
 pub mod giga;

@@ -56,7 +56,7 @@ use crate::{
     player_data::SoloLevelingPlayerData,
     quest_book::Goal,
     rank::HunterRank,
-    shop::{Offer, ShopError},
+    shop::{Offer, ShopError, ShopPurchase},
     shop_menu::ShopMenuKind,
     sound::SystemSound,
 };
@@ -191,9 +191,8 @@ enum Request {
     },
     ShopPurchase {
         uuid: Uuid,
-        slot: usize,
+        purchase: ShopPurchase,
         offer: Offer,
-        shop: crate::shop::ShopDay,
         from_menu: bool,
     },
     ShopRefresh {
@@ -676,9 +675,8 @@ impl SoloLevelingState {
         server: &Arc<Server>,
         player: Arc<Player>,
         uuid: Uuid,
-        slot: usize,
+        purchase: ShopPurchase,
         offer: Offer,
-        shop: crate::shop::ShopDay,
         from_menu: bool,
     ) -> bool {
         if player.connection.closed() {
@@ -699,16 +697,23 @@ impl SoloLevelingState {
         };
         let snapshot = self.sessions.with_mut(uuid, |session| {
             let mut snapshot = session.saved_data(uuid);
-            if !snapshot
-                .shop
-                .permits_purchase(shop, crate::shop::current_window(), slot, offer)
-            {
-                return Err("Этот слот магазина уже недоступен.");
+            if let ShopPurchase::Random { slot, displayed } = purchase {
+                let expected = displayed.unwrap_or(snapshot.shop);
+                if !snapshot.shop.permits_purchase(
+                    expected,
+                    crate::shop::current_window(),
+                    slot,
+                    offer,
+                ) {
+                    return Err("Этот слот магазина уже недоступен.");
+                }
             }
             if !snapshot.system_points.debit(offer.price) {
                 return Err("Недостаточно очков Системы.");
             }
-            if !snapshot.shop.mark(slot) {
+            if let ShopPurchase::Random { slot, .. } = purchase
+                && !snapshot.shop.mark(slot)
+            {
                 return Err("Этот слот магазина уже куплен.");
             }
             Ok(snapshot)
@@ -1161,28 +1166,63 @@ impl SoloLevelingState {
         from_menu: bool,
         displayed: Option<crate::shop::ShopDay>,
     ) -> Result<Offer, ShopError> {
+        let offer = self
+            .shop_day(player.gameprofile.id())
+            .ok_or(ShopError::NoSession)?
+            .offer(slot)
+            .ok_or(ShopError::UnknownSlot)?;
+        self.request_shop_offer(
+            player,
+            ShopPurchase::Random { slot, displayed },
+            offer,
+            from_menu,
+        )
+    }
+
+    /// Queues a repeatable purchase from the permanent consumable catalog.
+    pub fn request_permanent_purchase(
+        &self,
+        player: &Player,
+        offer: Offer,
+        from_menu: bool,
+    ) -> Result<Offer, ShopError> {
+        if !crate::shop::permanent_offers().contains(&offer) {
+            return Err(ShopError::UnknownSlot);
+        }
+        self.request_shop_offer(player, ShopPurchase::Permanent, offer, from_menu)
+    }
+
+    fn request_shop_offer(
+        &self,
+        player: &Player,
+        purchase: ShopPurchase,
+        offer: Offer,
+        from_menu: bool,
+    ) -> Result<Offer, ShopError> {
         let uuid = player.gameprofile.id();
-        self.shop_day(uuid).ok_or(ShopError::NoSession)?;
-        let (offer, shop) = self
-            .sessions
+        self.sessions
             .with_mut(uuid, |session| {
                 if session.economic_busy {
                     return Err(ShopError::Busy);
                 }
-                if session.shop.day != crate::shop::current_window()
-                    || displayed.is_some_and(|view| view != session.shop)
-                {
-                    return Err(ShopError::Stale);
-                }
-                let offer = session.shop.offer(slot).ok_or(ShopError::UnknownSlot)?;
-                if session.shop.bought(slot) {
-                    return Err(ShopError::AlreadyBought);
+                if let ShopPurchase::Random { slot, displayed } = purchase {
+                    if session.shop.day != crate::shop::current_window()
+                        || displayed.is_some_and(|view| view != session.shop)
+                    {
+                        return Err(ShopError::Stale);
+                    }
+                    if session.shop.offer(slot) != Some(offer) {
+                        return Err(ShopError::UnknownSlot);
+                    }
+                    if session.shop.bought(slot) {
+                        return Err(ShopError::AlreadyBought);
+                    }
                 }
                 if session.system_points.amount() < offer.price {
                     return Err(ShopError::InsufficientPoints);
                 }
                 session.economic_busy = true;
-                Ok((offer, session.shop))
+                Ok(())
             })
             .ok_or(ShopError::NoSession)??;
 
@@ -1195,9 +1235,8 @@ impl SoloLevelingState {
         }
         persistence.requests.push_back(Request::ShopPurchase {
             uuid,
-            slot,
+            purchase,
             offer,
-            shop,
             from_menu,
         });
         Ok(offer)
@@ -1673,9 +1712,8 @@ impl SoloLevelingState {
             }
             Request::ShopPurchase {
                 uuid,
-                slot,
+                purchase,
                 offer,
-                shop,
                 from_menu,
             } => {
                 let Some(player) = server
@@ -1686,7 +1724,7 @@ impl SoloLevelingState {
                     self.release_shop_purchase(uuid);
                     return;
                 };
-                if !self.begin_shop_purchase(server, player, uuid, slot, offer, shop, from_menu) {
+                if !self.begin_shop_purchase(server, player, uuid, purchase, offer, from_menu) {
                     self.persistence.lock().busy = false;
                 }
             }
@@ -2604,6 +2642,59 @@ mod tests {
     use crate::player_data::SoloLevelingPlayerData;
     use crate::rank::HunterRank;
     use crate::state::SoloLevelingState;
+
+    #[test]
+    fn permanent_purchases_do_not_consume_random_slots() {
+        init_vanilla_registry();
+        let directory = env::temp_dir().join(format!("sololeveling-shop-{}", Uuid::new_v4()));
+        let state = SoloLevelingState::new(directory.clone()).expect("shop state");
+        let world = crate::test_support::world(std::sync::Arc::new(
+            steel_core::gameplay_hooks::NoopGameplayHooks,
+        ));
+        let player = crate::test_support::player(&world.world, "Buyer", 1);
+        let uuid = player.gameprofile.id();
+        state.begin_session(uuid, SoloLevelingPlayerData::new(uuid));
+        let before = state
+            .with_session_mut(uuid, |session| {
+                assert!(session.system_points.credit(100));
+                session.shop.roll_over(crate::shop::current_window());
+                session.shop
+            })
+            .expect("buyer session");
+        let offer = crate::shop::permanent_offers()[0];
+        state
+            .request_permanent_purchase(&player, offer, false)
+            .expect("first permanent purchase");
+        state.with_session_mut(uuid, |session| {
+            // Completion of the preceding transaction releases the account.
+            session.economic_busy = false;
+        });
+        state
+            .request_permanent_purchase(&player, offer, false)
+            .expect("repeat permanent purchase");
+        assert_eq!(
+            state.with_session_mut(uuid, |session| session.shop),
+            Some(before),
+            "permanent purchases leave the random window and marks untouched"
+        );
+        let permanent = state
+            .persistence
+            .lock()
+            .requests
+            .iter()
+            .filter(|request| {
+                matches!(
+                    request,
+                    super::Request::ShopPurchase {
+                        purchase: crate::shop::ShopPurchase::Permanent,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(permanent, 2);
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
 
     #[test]
     fn stale_prepared_accounts_are_dropped_without_a_join() {
