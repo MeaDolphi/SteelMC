@@ -26,7 +26,7 @@ const SENSE_SLOT: usize = 4;
 /// Opens the hunter-stat allocation menu for an online player.
 pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
     player.open_menu(
-        TextComponent::plain("Hunter Stats").color(Color::Gold),
+        TextComponent::plain("Характеристики охотника").color(Color::Gold),
         move |context| build(context.container_id, context.player, Arc::clone(&state)),
     );
 }
@@ -52,38 +52,38 @@ fn menu_items(stats: &HunterStats) -> Vec<ItemStack> {
     vec![
         stat_item(
             &vanilla_items::IRON_SWORD,
-            "Strength",
+            "Сила",
             stats.strength,
-            "Attack damage: +1% per point",
+            "Урон атаки: +1% за очко",
         ),
         stat_item(
             &vanilla_items::GOLDEN_APPLE,
-            "Vitality",
+            "Выносливость",
             stats.vitality,
-            "Maximum health: +1% per point",
+            "Максимальное здоровье: +1% за очко",
         ),
         stat_item(
             &vanilla_items::FEATHER,
-            "Agility",
+            "Ловкость",
             stats.agility,
-            "Movement and attack speed: +0.5% per point",
+            "Скорость движения и атаки: +0,5% за очко",
         ),
         stat_item(
             &vanilla_items::ENCHANTED_BOOK,
-            "Intelligence",
+            "Интеллект",
             stats.intelligence,
-            "Reserved for future skills",
+            "Мана: +5 за очко · восстановление: +0,1/с",
         ),
         stat_item(
             &vanilla_items::SPYGLASS,
-            "Sense",
+            "Чутьё",
             stats.sense,
-            "Reserved for future gate sensing",
+            "Пока не даёт боевого бонуса",
         ),
         ItemStack::empty(),
         points_item(stats.unspent_points),
-        ItemStack::empty(),
-        ItemStack::empty(),
+        level_item(stats),
+        experience_item(stats),
     ]
 }
 
@@ -96,9 +96,49 @@ fn stat_item(item: ItemRef, name: &str, value: u32, effect: &str) -> ItemStack {
     set_lore(
         &mut stack,
         vec![
-            TextComponent::plain(format!("Current value: {value}")).color(Color::Aqua),
+            TextComponent::plain(format!("Текущее значение: {value}")).color(Color::Aqua),
             TextComponent::plain(effect.to_owned()),
-            TextComponent::plain("Left-click: allocate 1 point").color(Color::Yellow),
+            TextComponent::plain("ЛКМ: добавить 1 очко").color(Color::Yellow),
+        ],
+    );
+    stack
+}
+
+fn level_item(stats: &HunterStats) -> ItemStack {
+    let mut stack = ItemStack::new(&vanilla_items::BOOK);
+    stack.set(
+        CUSTOM_NAME,
+        TextComponent::plain("Уровень и ранг").color(Color::Gold),
+    );
+    set_lore(
+        &mut stack,
+        vec![
+            TextComponent::plain(format!(
+                "Уровень {} · ранг {}",
+                stats.level,
+                stats.rank().name()
+            ))
+            .color(Color::Aqua),
+        ],
+    );
+    stack
+}
+
+fn experience_item(stats: &HunterStats) -> ItemStack {
+    let mut stack = ItemStack::new(&vanilla_items::EXPERIENCE_BOTTLE);
+    stack.set(
+        CUSTOM_NAME,
+        TextComponent::plain("Опыт").color(Color::Green),
+    );
+    set_lore(
+        &mut stack,
+        vec![
+            TextComponent::plain(format!(
+                "{} / {} XP до следующего уровня",
+                stats.experience,
+                stats.experience_to_next_level()
+            ))
+            .color(Color::Aqua),
         ],
     );
     stack
@@ -108,11 +148,11 @@ fn points_item(points: u32) -> ItemStack {
     let mut stack = ItemStack::new(&vanilla_items::NETHER_STAR);
     stack.set(
         CUSTOM_NAME,
-        TextComponent::plain("Unspent points").color(Color::Yellow),
+        TextComponent::plain("Свободные очки характеристик").color(Color::Yellow),
     );
     set_lore(
         &mut stack,
-        vec![TextComponent::plain(format!("Available: {points}")).color(Color::Aqua)],
+        vec![TextComponent::plain(format!("Доступно: {points}")).color(Color::Aqua)],
     );
     stack
 }
@@ -187,5 +227,71 @@ const fn stat_for_slot(slot: usize) -> Option<HunterStat> {
         INTELLIGENCE_SLOT => Some(HunterStat::Intelligence),
         SENSE_SLOT => Some(HunterStat::Sense),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use steel_registry::data_components::vanilla_components::{CUSTOM_NAME, LORE};
+    use steel_registry::item_stack::ItemStack;
+    use text_components::resolving::NoResolutor;
+
+    use super::{HunterStat, HunterStats, menu_items, stat_for_slot};
+
+    fn item_text(stack: &ItemStack) -> String {
+        let mut text = stack
+            .get(CUSTOM_NAME)
+            .map(|name| name.to_plain(&NoResolutor))
+            .unwrap_or_default();
+        if let Some(lore) = stack.get(LORE) {
+            for line in lore.lines() {
+                text.push_str(&line.to_plain(&NoResolutor));
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn menu_is_russian_and_shows_current_progress() {
+        let stats = HunterStats {
+            level: 12,
+            experience: 50,
+            unspent_points: 6,
+            strength: 3,
+            intelligence: 4,
+            ..HunterStats::new()
+        };
+        let items = menu_items(&stats);
+        assert_eq!(items.len(), 9);
+        let text = items.iter().map(item_text).collect::<Vec<_>>().join("\n");
+        for expected in [
+            "Сила",
+            "Выносливость",
+            "Ловкость",
+            "Интеллект",
+            "Чутьё",
+            "Текущее значение: 3",
+            "Мана: +5 за очко · восстановление: +0,1/с",
+            "Пока не даёт боевого бонуса",
+            "Доступно: 6",
+            "Уровень 12 · ранг D",
+            &format!("50 / {} XP", stats.experience_to_next_level()),
+            "ЛКМ: добавить 1 очко",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in {text}");
+        }
+        for outdated in ["Strength", "Intelligence", "Reserved", "Current value"] {
+            assert!(!text.contains(outdated), "outdated {outdated:?} in {text}");
+        }
+    }
+
+    #[test]
+    fn allocation_slots_are_unchanged() {
+        assert_eq!(stat_for_slot(0), Some(HunterStat::Strength));
+        assert_eq!(stat_for_slot(1), Some(HunterStat::Vitality));
+        assert_eq!(stat_for_slot(2), Some(HunterStat::Agility));
+        assert_eq!(stat_for_slot(3), Some(HunterStat::Intelligence));
+        assert_eq!(stat_for_slot(4), Some(HunterStat::Sense));
+        assert_eq!(stat_for_slot(5), None);
     }
 }
