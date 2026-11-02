@@ -575,9 +575,14 @@ impl SoloLevelingState {
             let source =
                 DamageSource::environment(&vanilla_damage_types::MAGIC).with_causing_entity(cause);
             for target in targets {
-                if let Some(living) = target.as_living_entity() {
-                    living.hurt(world, &source, damage);
-                }
+                super::spells::spell_hit(
+                    world,
+                    &player,
+                    SpellId::ManaStorm,
+                    &target,
+                    damage,
+                    &source,
+                );
             }
         }
     }

@@ -134,6 +134,21 @@ enum ProjectileStep {
     Impact(Option<SharedEntity>),
 }
 
+/// One delayed jump of Chain Lightning.
+#[derive(Debug)]
+struct ChainLink {
+    owner: Uuid,
+    world: Identifier,
+    from: DVec3,
+    target: i32,
+    damage: f32,
+    due: u64,
+}
+
+fn split_due_chain_links(links: Vec<ChainLink>, now: u64) -> (Vec<ChainLink>, Vec<ChainLink>) {
+    links.into_iter().partition(|link| link.due <= now)
+}
+
 /// A Sanctuary circle.
 #[derive(Debug)]
 struct Sanctuary {
@@ -161,6 +176,7 @@ pub(super) struct SpellRuntime {
     casts: Vec<Uuid>,
     meteors: Vec<Meteor>,
     projectiles: Vec<SpellProjectile>,
+    chain_links: Vec<ChainLink>,
     sanctuaries: Vec<Sanctuary>,
     regrowths: Vec<Regrowth>,
     visuals: fx::runtime::VisualRuntime,
@@ -184,12 +200,10 @@ fn passable(world: &World, pos: DVec3) -> bool {
     !world.get_block_state(BlockPos::from(pos)).blocks_motion()
 }
 
-/// Returns whether `point` lies inside `entity`'s rough body.
+/// Returns whether `point` lies inside the entity's actual hitbox, with a
+/// small readability margin rather than one guessed silhouette for every mob.
 fn touches(entity: &dyn Entity, point: DVec3) -> bool {
-    let feet = entity.position();
-    let dx = feet.x - point.x;
-    let dz = feet.z - point.z;
-    dx * dx + dz * dz <= 0.8 * 0.8 && point.y >= feet.y - 0.3 && point.y <= feet.y + 2.2
+    entity.bounding_box().inflate(0.15).contains(point)
 }
 
 /// A line of sight: where it ended and what it passed through, nearest first.
@@ -253,6 +267,34 @@ fn afflict(entity: &SharedEntity, effect: MobEffectRef, ticks: i32, amplifier: i
     }
 }
 
+/// Applies one spell hit and reports the health actually lost by the target.
+pub(super) fn spell_hit(
+    world: &Arc<World>,
+    owner: &Arc<Player>,
+    spell: SpellId,
+    target: &SharedEntity,
+    damage: f32,
+    source: &DamageSource,
+) -> bool {
+    let Some(living) = target.as_living_entity() else {
+        return false;
+    };
+    let before = living.get_health();
+    if !living.hurt(world, source, damage) {
+        return false;
+    }
+    let lost = (before - living.get_health()).max(0.0);
+    if lost <= 0.0 {
+        return true;
+    }
+    fx::impact(world, spell, target.position() + DVec3::Y);
+    owner.send_action_bar(
+        TextComponent::plain(format!("{} · −{lost:.1} HP", spell.info().name))
+            .color(Color::LightPurple),
+    );
+    true
+}
+
 fn tell(player: &Player, text: &str, color: Color) {
     player.send_message(&TextComponent::plain(text.to_owned()).color(color));
 }
@@ -302,10 +344,15 @@ impl Caster<'_> {
         DamageSource::environment(&vanilla_damage_types::MAGIC).with_causing_entity(cause)
     }
 
-    fn hurt(&self, target: &SharedEntity, damage: f32) {
-        if let Some(living) = target.as_living_entity() {
-            living.hurt(&self.world, &self.source(), damage * self.power);
-        }
+    fn hurt(&self, spell: SpellId, target: &SharedEntity, damage: f32) -> bool {
+        spell_hit(
+            &self.world,
+            self.player,
+            spell,
+            target,
+            damage * self.power,
+            &self.source(),
+        )
     }
 
     fn aim(&self, range: f64, pierce: bool) -> Trace {
@@ -582,7 +629,7 @@ impl SoloLevelingState {
     /// Resolves queued casts and advances running spell effects.
     pub fn tick_spells(&self, server: &Server) {
         let now = now_millis();
-        let (casts, meteors, mut visuals, projectiles) = {
+        let (casts, meteors, mut visuals, projectiles, chain_links) = {
             let mut runtime = self.spell_runtime.lock();
             runtime.weakened.retain(|_, until| *until > now);
             let casts = mem::take(&mut runtime.casts);
@@ -590,11 +637,15 @@ impl SoloLevelingState {
                 .into_iter()
                 .partition(|meteor| meteor.due <= now);
             runtime.meteors = waiting;
+            let (chain_due, chain_waiting) =
+                split_due_chain_links(mem::take(&mut runtime.chain_links), now);
+            runtime.chain_links = chain_waiting;
             (
                 casts,
                 due,
                 mem::take(&mut runtime.visuals),
                 mem::take(&mut runtime.projectiles),
+                chain_due,
             )
         };
         visuals.tick(server, now);
@@ -614,8 +665,46 @@ impl SoloLevelingState {
             }
         }
         self.spell_runtime.lock().projectiles.extend(flying);
+        for link in chain_links {
+            Self::tick_chain_link(server, &link);
+        }
         self.pulse_sanctuaries(server, now);
         self.pulse_regrowths(server, now);
+    }
+
+    fn tick_chain_link(server: &Server, link: &ChainLink) {
+        let Some(world) = server.worlds.get(&link.world) else {
+            return;
+        };
+        let Some(owner) = find_player(server, link.owner) else {
+            return;
+        };
+        let Some(target) = world.get_entity_by_id(link.target) else {
+            return;
+        };
+        if target
+            .as_living_entity()
+            .is_none_or(LivingEntity::is_dead_or_dying)
+        {
+            return;
+        }
+        let at = target.position() + DVec3::Y;
+        fx::lightning(world, link.from, at);
+        fx::flash(world, at);
+        fx::school_assets(SpellId::ChainLightning)
+            .1
+            .play_at(world, at, 0.8, 1.0);
+        let cause: SharedEntity = Arc::<Player>::clone(&owner);
+        let source =
+            DamageSource::environment(&vanilla_damage_types::MAGIC).with_causing_entity(cause);
+        spell_hit(
+            world,
+            &owner,
+            SpellId::ChainLightning,
+            &target,
+            link.damage,
+            &source,
+        );
     }
 
     fn cast_visual(&self, caster: &Caster<'_>, spell: SpellId) {
@@ -895,19 +984,31 @@ impl SoloLevelingState {
             DamageSource::environment(&vanilla_damage_types::MAGIC).with_causing_entity(cause);
         match projectile.spell {
             SpellId::MagicArrow => {
-                let at = target.map_or(projectile.position, |entity| entity.position() + DVec3::Y);
-                fx::impact(world, projectile.spell, at);
-                if let Some(target) = target.and_then(|entity| entity.as_living_entity()) {
-                    target.hurt(world, &source, projectile.damage);
+                if let Some(target) = target {
+                    spell_hit(
+                        world,
+                        owner,
+                        projectile.spell,
+                        target,
+                        projectile.damage,
+                        &source,
+                    );
+                } else {
+                    fx::impact(world, projectile.spell, projectile.position);
                 }
             }
             SpellId::Fireball => {
                 let center = target.map_or(projectile.position, |entity| entity.position());
                 fx::explosion(world, center);
                 for enemy in enemies_near(world, center, 3.0) {
-                    if let Some(living) = enemy.as_living_entity() {
-                        living.hurt(world, &source, projectile.damage);
-                    }
+                    spell_hit(
+                        world,
+                        owner,
+                        projectile.spell,
+                        &enemy,
+                        projectile.damage,
+                        &source,
+                    );
                     enemy.set_remaining_fire_ticks(projectile.burn_ticks);
                 }
             }
@@ -941,9 +1042,14 @@ impl SoloLevelingState {
                 }
                 drop(visuals);
                 if let Some(target) = target {
-                    if let Some(living) = target.as_living_entity() {
-                        living.hurt(world, &source, projectile.damage);
-                    }
+                    spell_hit(
+                        world,
+                        owner,
+                        projectile.spell,
+                        target,
+                        projectile.damage,
+                        &source,
+                    );
                     afflict(target, vanilla_mob_effects::SLOWNESS, 60, 2);
                 }
             }
@@ -977,9 +1083,14 @@ impl SoloLevelingState {
         let source =
             DamageSource::environment(&vanilla_damage_types::MAGIC).with_causing_entity(cause);
         for target in enemies_near(world, meteor.center, 5.0) {
-            if let Some(living) = target.as_living_entity() {
-                living.hurt(world, &source, meteor.damage);
-            }
+            spell_hit(
+                world,
+                &owner,
+                SpellId::Meteor,
+                &target,
+                meteor.damage,
+                &source,
+            );
             target.set_remaining_fire_ticks(meteor.burn_ticks);
         }
     }
@@ -1200,18 +1311,17 @@ impl SoloLevelingState {
                 let mut struck = vec![first.id()];
                 let mut from = caster.eye;
                 let mut current = first;
-                let mut damage = CHAIN_LIGHTNING_DAMAGE;
-                play_at(
-                    world,
-                    fx::theme(spell).impact_sound,
-                    current.position(),
-                    0.6,
-                    1.0,
-                );
-                for _ in 0..4 {
-                    fx::lightning(world, from, current.position() + DVec3::Y);
-                    fx::flash(world, current.position() + DVec3::Y);
-                    caster.hurt(&current, damage);
+                let mut damage = CHAIN_LIGHTNING_DAMAGE * caster.power;
+                let mut links = Vec::new();
+                for index in 0..4 {
+                    links.push(ChainLink {
+                        owner: caster.player.gameprofile.id(),
+                        world: world.key.clone(),
+                        from,
+                        target: current.id(),
+                        damage,
+                        due: now + index * 300,
+                    });
                     damage *= 0.75;
                     from = current.position() + DVec3::Y;
                     let Some(next) = enemies_near(world, current.position(), 6.0)
@@ -1229,6 +1339,7 @@ impl SoloLevelingState {
                     struck.push(next.id());
                     current = next;
                 }
+                self.spell_runtime.lock().chain_links.extend(links);
             }
             SpellId::ManaStorm => {
                 self.cast_visual(caster, spell);
@@ -1322,8 +1433,7 @@ impl SoloLevelingState {
                     now + 500,
                 );
                 for target in &shot.hits {
-                    fx::impact(world, spell, target.position() + DVec3::Y);
-                    caster.hurt(target, VOID_LANCE_DAMAGE);
+                    caster.hurt(spell, target, VOID_LANCE_DAMAGE);
                 }
             }
             SpellId::MonarchsWrath => {
@@ -1974,9 +2084,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        CHAIN_LIGHTNING_DAMAGE, FIREBALL_DAMAGE, ICE_SPEAR_DAMAGE, MAGIC_ARROW_DAMAGE,
+        CHAIN_LIGHTNING_DAMAGE, ChainLink, FIREBALL_DAMAGE, ICE_SPEAR_DAMAGE, MAGIC_ARROW_DAMAGE,
         MANA_STORM_DAMAGE_PER_SECOND, METEOR_DAMAGE, ProjectileStep, SpellProjectile,
-        VOID_LANCE_DAMAGE, cast_cost, compass,
+        VOID_LANCE_DAMAGE, cast_cost, compass, split_due_chain_links,
     };
     use crate::spell::{SpellGear, SpellId};
     use crate::state::SoloLevelingState;
@@ -1988,6 +2098,29 @@ mod tests {
     use steel_registry::{init_vanilla_registry, vanilla_dimension_types};
     use steel_utils::Identifier;
     use steel_utils::types::{Difficulty, GameType};
+
+    #[test]
+    fn chain_links_fire_in_order_and_never_repeat() {
+        let make_links = || {
+            (0..4)
+                .map(|index| ChainLink {
+                    owner: Uuid::new_v4(),
+                    world: Identifier::vanilla_static("test"),
+                    from: DVec3::ZERO,
+                    target: index,
+                    damage: 8.0 * 0.75_f32.powi(index),
+                    due: 1_000 + index as u64 * 300,
+                })
+                .collect::<Vec<_>>()
+        };
+        let (first, waiting) = split_due_chain_links(make_links(), 1_299);
+        assert_eq!(first.len(), 1);
+        assert_eq!(waiting.len(), 3);
+        assert_eq!(split_due_chain_links(waiting, 1_299).0.len(), 0);
+        let (all, waiting) = split_due_chain_links(make_links(), 1_900);
+        assert_eq!(all.len(), 4);
+        assert!(waiting.is_empty());
+    }
 
     fn projectile_world() -> (Arc<World>, Arc<DamageHistory>, Arc<Runtime>) {
         init_vanilla_registry();
