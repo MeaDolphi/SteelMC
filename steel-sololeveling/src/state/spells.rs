@@ -6,6 +6,8 @@
 //! Mage bonus, robes and magic artifacts raise it through the ordinary
 //! damage hook.
 
+mod casting;
+
 use std::f64::consts::TAU;
 use std::fmt::Write as _;
 use std::mem;
@@ -48,7 +50,7 @@ use crate::item::serial;
 use crate::quest_book::Goal;
 use crate::rank::HunterRank;
 use crate::sound::play_at;
-use crate::spell::{self, School, SpellError, SpellGear, SpellId};
+use crate::spell::{self, CastProgress, School, SpellError, SpellGear, SpellId};
 use crate::spell_fx as fx;
 
 /// Reach of aimed spells, in blocks.
@@ -78,12 +80,10 @@ const MEDITATION_SHARE: f32 = 0.5;
 
 // Destruction damage, one constant per spell.
 //
-// Balance (маг-нерф): the upper-bound sustained damage of the spammable
-// rotation (damage per cast divided by the base cooldown, mana and bonuses
-// aside) is cut from ~11.3 to ~6.8 per second, about −40%, so a Mage wins
-// by kiting and burst windows instead of out-damaging melee classes while
-// never being reached. Long-cooldown spells keep most of their per-cast
-// punch. The band is pinned by
+// Balance: spell reading gives enemies a window to punish a cast, while
+// longer base cooldowns and slightly higher mana costs limit the basic
+// rotation without removing the damage bonuses of high-rank equipment.
+// The full rotation is pinned by
 // `destruction_rotation_sustained_damage_fits_the_nerf_band`.
 /// Damage of one Magic Arrow.
 const MAGIC_ARROW_DAMAGE: f32 = 5.0;
@@ -174,6 +174,7 @@ struct Regrowth {
 #[derive(Debug, Default)]
 pub(super) struct SpellRuntime {
     casts: Vec<Uuid>,
+    casting_visuals: casting::CastingVisuals,
     meteors: Vec<Meteor>,
     projectiles: Vec<SpellProjectile>,
     chain_links: Vec<ChainLink>,
@@ -540,6 +541,7 @@ impl SoloLevelingState {
                 let refresh = repaint || magic.shown_mana != Some(shown);
                 magic.shown_mana = Some(shown);
                 let grimoire = mem::take(&mut magic.grimoire_due);
+                let reading = magic.casting.is_some();
                 let hint = session.spells.selected_spell().map(|spell| {
                     let ready = magic
                         .cooldowns
@@ -557,6 +559,7 @@ impl SoloLevelingState {
                     learned,
                     note,
                     hint,
+                    reading,
                 })
             })
             .flatten()
@@ -577,6 +580,7 @@ impl SoloLevelingState {
                 learned,
                 note,
                 hint,
+                reading,
             } => {
                 if refresh {
                     player.send_packet(CSetExperience {
@@ -602,7 +606,7 @@ impl SoloLevelingState {
                         tell(player, "Гримуар Системы получен.", Color::LightPurple);
                     }
                 }
-                if holds_grimoire(player) && player.tick_count() % 10 == 0 {
+                if !reading && holds_grimoire(player) && player.tick_count() % 10 == 0 {
                     let line = hint.map_or_else(
                         || "Нет подготовленных заклинаний: Shift + ПКМ".to_owned(),
                         |(spell, ready, cost)| {
@@ -629,10 +633,9 @@ impl SoloLevelingState {
     /// Resolves queued casts and advances running spell effects.
     pub fn tick_spells(&self, server: &Server) {
         let now = now_millis();
-        let (casts, meteors, mut visuals, projectiles, chain_links) = {
+        let (meteors, mut visuals, projectiles, chain_links) = {
             let mut runtime = self.spell_runtime.lock();
             runtime.weakened.retain(|_, until| *until > now);
-            let casts = mem::take(&mut runtime.casts);
             let (due, waiting): (Vec<_>, Vec<_>) = mem::take(&mut runtime.meteors)
                 .into_iter()
                 .partition(|meteor| meteor.due <= now);
@@ -641,7 +644,6 @@ impl SoloLevelingState {
                 split_due_chain_links(mem::take(&mut runtime.chain_links), now);
             runtime.chain_links = chain_waiting;
             (
-                casts,
                 due,
                 mem::take(&mut runtime.visuals),
                 mem::take(&mut runtime.projectiles),
@@ -650,11 +652,7 @@ impl SoloLevelingState {
         };
         visuals.tick(server, now);
         self.spell_runtime.lock().visuals = visuals;
-        for uuid in casts {
-            if let Some(player) = find_player(server, uuid) {
-                self.cast(&player, now);
-            }
-        }
+        casting::tick(self, server, now);
         for meteor in meteors {
             Self::land_meteor(server, &meteor);
         }
@@ -709,7 +707,6 @@ impl SoloLevelingState {
 
     fn cast_visual(&self, caster: &Caster<'_>, spell: SpellId) {
         let feet = caster.player.position();
-        fx::cast(&caster.world, spell, feet);
         let (model, _) = fx::school_assets(spell);
         self.spell_runtime.lock().visuals.rune(
             &caster.world,
@@ -1185,101 +1182,6 @@ impl SoloLevelingState {
                 self.record_healing(caster, healed);
             }
         }
-    }
-
-    /// Casts the caster's selected spell if it is ready and affordable.
-    fn cast(&self, player: &Arc<Player>, now: u64) {
-        let uuid = player.gameprofile.id();
-        if !holds_grimoire(player) {
-            return;
-        }
-        let gear = self.spell_gear(player);
-        let Some(check) = self.with_session_mut(uuid, |session| {
-            if session.class.class != Some(HunterClass::Mage) {
-                return Err(SpellError::NotAMage.message().to_owned());
-            }
-            let spell = session
-                .spells
-                .selected_spell()
-                .ok_or_else(|| "Нет подготовленных заклинаний.".to_owned())?;
-            let magic = &session.magic;
-            if let Some(deadline) = magic.cooldowns.get(&spell)
-                && *deadline > now
-            {
-                return Err(format!(
-                    "{}: перезарядка {:.1} с.",
-                    spell.info().name,
-                    (*deadline - now) as f64 / 1_000.0
-                ));
-            }
-            let wrath = magic.wrath_until > now;
-            let free = gear.free_every > 0 && (magic.casts + 1) % gear.free_every == 0;
-            let cost = if free {
-                0.0
-            } else {
-                cast_cost(
-                    gear,
-                    spell,
-                    wrath && spell.info().school == School::Destruction,
-                )
-            };
-            let maximum = spell::max_mana(session.stats.intelligence) + gear.mana;
-            if magic.mana.unwrap_or(maximum) < cost {
-                return Err(format!("Не хватает маны: нужно {}.", cost.round()));
-            }
-            Ok((spell, cost, wrath, session.stats.rank()))
-        }) else {
-            return;
-        };
-        let (spell, cost, wrath, rank) = match check {
-            Ok(check) => check,
-            Err(message) => {
-                player.send_action_bar(TextComponent::plain(message).color(Color::Red));
-                return;
-            }
-        };
-        let world = player.get_world();
-        let caster = Caster {
-            state: self,
-            player,
-            eye: DVec3::new(player.position().x, player.get_eye_y(), player.position().z),
-            look: player.look_angle(),
-            world,
-            scale: class::rank_scale(rank),
-            healing: 1.0 + gear.healing,
-            barrier: gear.barrier,
-            burn: if gear.burning { 2 } else { 1 },
-            power: if wrath && spell.info().school == School::Destruction {
-                WRATH_DAMAGE
-            } else {
-                1.0
-            },
-            now,
-        };
-        if let Err(message) = self.perform(&caster, spell, rank) {
-            player.send_action_bar(TextComponent::plain(message).color(Color::Red));
-            return;
-        }
-        // A destruction echo strikes again for free; Monarch's Wrath does not
-        // stack with itself.
-        let echo = spell.info().school == School::Destruction
-            && spell != SpellId::MonarchsWrath
-            && rand::random_range(0..100) < gear.echo_percent;
-        if echo {
-            let _ = self.perform(&caster, spell, rank);
-        }
-        self.with_session_mut(uuid, |session| {
-            let maximum = spell::max_mana(session.stats.intelligence) + gear.mana;
-            let magic = &mut session.magic;
-            magic.mana = Some((magic.mana.unwrap_or(maximum) - cost).max(0.0));
-            magic.casts = magic.casts.wrapping_add(1);
-            magic.cooldowns.insert(spell, now + gear.cooldown_of(spell));
-            magic.cooldowns.retain(|_, deadline| *deadline > now);
-        });
-        player.send_action_bar(
-            TextComponent::plain(spell.info().name.to_owned()).color(Color::LightPurple),
-        );
-        self.record_goal(uuid, Goal::SpellCast, 1);
     }
 
     /// Applies one spell; an error leaves mana and the cooldown untouched.
@@ -2008,6 +1910,9 @@ impl SoloLevelingState {
                     let magic = &mut session.magic;
                     magic.last_hurt = now;
                     magic.meditation = None;
+                    if let Some(reading) = magic.casting.as_mut() {
+                        reading.interrupted = true;
+                    }
                     // A single layer answers a hit: the Mana Shield, while
                     // it holds, converts damage and the Sanctuary ward
                     // yields; see `spell::protected_damage`.
@@ -2057,6 +1962,7 @@ enum ManaTick {
         learned: bool,
         note: Option<(&'static str, Color)>,
         hint: Option<(SpellId, u64, f32)>,
+        reading: bool,
     },
 }
 
@@ -2172,8 +2078,8 @@ mod tests {
     #[test]
     fn wrath_halves_the_cost_and_compass_points_the_right_way() {
         let gear = SpellGear::default();
-        assert!((cast_cost(gear, SpellId::Fireball, true) - 12.5).abs() < f32::EPSILON);
-        assert!((cast_cost(gear, SpellId::Fireball, false) - 25.0).abs() < f32::EPSILON);
+        assert!((cast_cost(gear, SpellId::Fireball, true) - 15.0).abs() < f32::EPSILON);
+        assert!((cast_cost(gear, SpellId::Fireball, false) - 30.0).abs() < f32::EPSILON);
         assert_eq!(compass(DVec3::ZERO, DVec3::new(0.0, 0.0, -10.0)), "север");
         assert_eq!(compass(DVec3::ZERO, DVec3::new(10.0, 0.0, 0.0)), "восток");
         assert_eq!(compass(DVec3::ZERO, DVec3::new(0.0, 0.0, 10.0)), "юг");
@@ -2181,10 +2087,8 @@ mod tests {
 
     #[test]
     fn destruction_rotation_sustained_damage_fits_the_nerf_band() {
-        // Upper-bound sustained damage of the four spammable destruction
-        // spells: damage per cast divided by the base cooldown, mana and
-        // bonuses aside. The balance target is ~6.8 per second, about −40%
-        // of the pre-nerf ~11.3; see the constants above the cast code.
+        // The mild rebalance includes the time before a spell can deal
+        // damage, not only the cooldown shown on its grimoire icon.
         let rotation = [
             (MAGIC_ARROW_DAMAGE, SpellId::MagicArrow),
             (FIREBALL_DAMAGE, SpellId::Fireball),
@@ -2193,11 +2097,14 @@ mod tests {
         ];
         let per_second: f32 = rotation
             .iter()
-            .map(|(damage, spell)| damage / (spell.info().cooldown_millis as f32 / 1_000.0))
+            .map(|(damage, spell)| {
+                let cycle = spell.info().cooldown_millis + spell.cast_millis();
+                damage / (cycle as f32 / 1_000.0)
+            })
             .sum();
         assert!(
-            (5.8..=7.8).contains(&per_second),
-            "sustained rotation damage {per_second} outside the nerf band"
+            (4.0..=5.2).contains(&per_second),
+            "sustained rotation damage {per_second} outside the mild rebalance band"
         );
     }
 
@@ -2262,5 +2169,100 @@ mod tests {
             projectile.position
         );
         assert!(projectile.remaining.abs() < 1e-6);
+    }
+
+    #[derive(Default)]
+    struct DeathProbe {
+        hunters: steel_utils::locks::SyncMutex<Vec<Option<Uuid>>>,
+    }
+
+    impl steel_core::gameplay_hooks::GameplayHooks for DeathProbe {
+        fn on_living_entity_death(
+            &self,
+            _world: &World,
+            entity: &dyn steel_core::entity::LivingEntity,
+            source: &steel_core::entity::damage::DamageSource,
+        ) {
+            self.hunters
+                .lock()
+                .push(crate::hooks::death_hunter(entity, source));
+        }
+    }
+
+    #[test]
+    fn spell_and_burn_kills_reach_the_death_hook_with_their_hunter() {
+        use steel_core::entity::SharedEntity;
+        use steel_core::entity::damage::DamageSource;
+        use steel_core::entity::entities::ZombieEntity;
+        use steel_core::player::Player;
+        use steel_registry::vanilla_damage_types;
+
+        use super::spell_hit;
+
+        let probe = Arc::new(DeathProbe::default());
+        let fixture = crate::test_support::world(probe.clone());
+        let world = &fixture.world;
+        let player = crate::test_support::player(world, "Mage", 1);
+        let hunter = player.gameprofile.id();
+        let cause: SharedEntity = Arc::<Player>::clone(&player);
+        let source =
+            DamageSource::environment(&vanilla_damage_types::MAGIC).with_causing_entity(cause);
+        let target = |id| -> SharedEntity {
+            Arc::new(ZombieEntity::new(
+                &steel_registry::vanilla_entities::ZOMBIE,
+                id,
+                DVec3::ZERO,
+                Arc::downgrade(world),
+            ))
+        };
+
+        let direct = target(2);
+        assert!(spell_hit(
+            world,
+            &player,
+            SpellId::MagicArrow,
+            &direct,
+            100.0,
+            &source
+        ));
+        assert!(!spell_hit(
+            world,
+            &player,
+            SpellId::MagicArrow,
+            &direct,
+            100.0,
+            &source
+        ));
+        assert_eq!(probe.hunters.lock().as_slice(), [Some(hunter)]);
+
+        let burning = target(3);
+        assert!(spell_hit(
+            world,
+            &player,
+            SpellId::Fireball,
+            &burning,
+            1.0,
+            &source
+        ));
+        assert!(burning.hurt(
+            world,
+            &DamageSource::environment(&vanilla_damage_types::ON_FIRE),
+            100.0,
+        ));
+        assert_eq!(
+            probe.hunters.lock().as_slice(),
+            [Some(hunter), Some(hunter)]
+        );
+
+        let environmental = target(4);
+        assert!(environmental.hurt(
+            world,
+            &DamageSource::environment(&vanilla_damage_types::ON_FIRE),
+            100.0,
+        ));
+        assert_eq!(
+            probe.hunters.lock().as_slice(),
+            [Some(hunter), Some(hunter), None]
+        );
     }
 }

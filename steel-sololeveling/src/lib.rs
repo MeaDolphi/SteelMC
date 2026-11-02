@@ -79,3 +79,6 @@ pub mod state;
 pub mod stats;
 pub mod temple;
 pub mod ui;
+
+#[cfg(test)]
+mod test_support;

@@ -682,7 +682,7 @@ impl GameplayHooks for SoloLevelingHooks {
         mobs::clear_health_line(world, entity);
         scenario::on_boss_death(world, entity.id());
         self.state.observe_shadow_death(entity.uuid());
-        let Some(killer) = source.causing_entity() else {
+        let Some(killer) = death_killer(world, entity, source) else {
             if self
                 .state
                 .observe_island_death(world, entity.id(), None)
@@ -694,7 +694,7 @@ impl GameplayHooks for SoloLevelingHooks {
             }
             return;
         };
-        let hunter = credited_hunter(killer);
+        let hunter = credited_hunter(&killer);
         // Players and summoned shadows are not mobs the Organization pays for.
         if let Some(hunter) = hunter
             && entity.as_player().is_none()
@@ -948,6 +948,30 @@ fn credited_hunter(entity: &SharedEntity) -> Option<Uuid> {
     entity.as_mob()?.allied_owner()
 }
 
+pub(crate) fn death_hunter(entity: &dyn LivingEntity, source: &DamageSource) -> Option<Uuid> {
+    if let Some(killer) = source.causing_entity() {
+        return credited_hunter(killer);
+    }
+    (entity.last_hurt_by_player_memory_time() > 0)
+        .then(|| entity.last_hurt_by_player_uuid())
+        .flatten()
+}
+
+fn death_killer(
+    world: &World,
+    entity: &dyn LivingEntity,
+    source: &DamageSource,
+) -> Option<SharedEntity> {
+    if let Some(killer) = source.causing_entity() {
+        return Some(Arc::clone(killer));
+    }
+    let hunter = death_hunter(entity, source)?;
+    world.players.get_by_uuid(&hunter).map(|player| {
+        let entity: SharedEntity = player;
+        entity
+    })
+}
+
 fn allows_instance_block_mutation(
     old_state: BlockStateId,
     new_state: BlockStateId,
@@ -1031,13 +1055,15 @@ fn announce_quest(state: &SoloLevelingState, player: &Player, update: QuestUpdat
 mod tests {
     use super::{
         DropDecision, allows_city_mutation, allows_instance_mutation, allows_player_damage,
-        drop_decision, give_or_drop, is_shadow_tank, keeps_item_on_death, keeps_projectile_ammo,
+        death_hunter, drop_decision, give_or_drop, is_shadow_tank, keeps_item_on_death,
+        keeps_projectile_ammo,
     };
     use crate::item::{artifact, grimoire, menu_book, serial};
     use glam::DVec3;
-    use std::sync::Weak;
-    use steel_core::entity::Entity as _;
+    use std::sync::{Arc, Weak};
+    use steel_core::entity::damage::DamageSource;
     use steel_core::entity::entities::ZombieEntity;
+    use steel_core::entity::{Entity as _, LivingEntity as _, SharedEntity};
     use steel_core::gameplay_hooks::BlockMutationCause;
     use steel_core::inventory::container::Container as _;
     use steel_core::player::player_inventory::PlayerInventory;
@@ -1164,6 +1190,41 @@ mod tests {
         assert!(is_shadow_tank(&zombie));
         mob.set_allied_tank(false);
         assert!(!is_shadow_tank(&zombie));
+    }
+
+    #[test]
+    fn delayed_damage_keeps_only_the_remembered_hunter() {
+        init_vanilla_registry();
+        let victim = ZombieEntity::new(&vanilla_entities::ZOMBIE, 1, DVec3::ZERO, Weak::new());
+        let hunter = Uuid::new_v4();
+        let fire = DamageSource::environment(&steel_registry::vanilla_damage_types::ON_FIRE);
+        assert_eq!(death_hunter(&victim, &fire), None);
+
+        victim.set_last_hurt_by_player(hunter, 100);
+        assert_eq!(death_hunter(&victim, &fire), Some(hunter));
+        victim.set_last_hurt_by_player_memory_time(0);
+        assert_eq!(death_hunter(&victim, &fire), None);
+    }
+
+    #[test]
+    fn an_explicit_death_cause_takes_priority_over_recent_damage() {
+        init_vanilla_registry();
+        let victim = ZombieEntity::new(&vanilla_entities::ZOMBIE, 1, DVec3::ZERO, Weak::new());
+        victim.set_last_hurt_by_player(Uuid::new_v4(), 100);
+        let owner = Uuid::new_v4();
+        let shadow: SharedEntity = Arc::new(ZombieEntity::new(
+            &vanilla_entities::ZOMBIE,
+            2,
+            DVec3::ZERO,
+            Weak::new(),
+        ));
+        shadow
+            .as_mob()
+            .expect("shadow body is a mob")
+            .set_allied_owner(Some(owner));
+        let source =
+            DamageSource::direct(&steel_registry::vanilla_damage_types::PLAYER_ATTACK, shadow);
+        assert_eq!(death_hunter(&victim, &source), Some(owner));
     }
 
     #[test]

@@ -231,8 +231,8 @@ impl SpellId {
                 "Магическая стрела",
                 Destruction,
                 "Снаряд до 48 блоков: 5 магического урона",
-                10.0,
-                2,
+                12.0,
+                3,
                 0,
                 D,
             ),
@@ -240,8 +240,8 @@ impl SpellId {
                 "Огненный шар",
                 Destruction,
                 "Взрыв радиусом 3 в точке взгляда: 7 урона и поджог",
-                25.0,
-                5,
+                30.0,
+                6,
                 100,
                 D,
             ),
@@ -249,8 +249,8 @@ impl SpellId {
                 "Ледяное копьё",
                 Destruction,
                 "9 урона и замедление 60% на 3 с",
-                25.0,
-                5,
+                30.0,
+                6,
                 200,
                 C,
             ),
@@ -258,8 +258,8 @@ impl SpellId {
                 "Цепная молния",
                 Destruction,
                 "8 урона цели и до 3 соседям, каждому следующему −25%",
-                35.0,
-                7,
+                40.0,
+                8,
                 300,
                 C,
             ),
@@ -461,6 +461,25 @@ impl SpellId {
                 800,
                 B,
             ),
+        }
+    }
+
+    /// Milliseconds spent reading the spell before its release.
+    #[must_use]
+    pub const fn cast_millis(self) -> u64 {
+        match self {
+            Self::MagicArrow | Self::LesserHeal | Self::Repulse => 600,
+            Self::NightVision | Self::ManaShield => 400,
+            Self::Fireball | Self::Barrier | Self::Shackles | Self::BlessingOfStrength => 1_000,
+            Self::LastStand => 1_000,
+            Self::IceSpear | Self::Restoration | Self::Weaken => 1_200,
+            Self::Cleanse | Self::Haste | Self::Detection => 800,
+            Self::ChainLightning => 1_400,
+            Self::MonarchsWrath | Self::GreaterHeal => 1_500,
+            Self::GravityWell | Self::ManaStorm => 1_600,
+            Self::Sanctuary | Self::VoidLance => 2_000,
+            Self::Meteor => 2_500,
+            Self::Blink | Self::Meditation => 0,
         }
     }
 }
@@ -803,12 +822,46 @@ impl SpellGear {
     }
 }
 
+/// One non-persistent reading of a spell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CastProgress {
+    /// Spell selected when the reading started.
+    pub spell: SpellId,
+    /// Wall-clock millisecond when the reading started.
+    pub started: u64,
+    /// Wall-clock millisecond when the spell may be released.
+    pub ready_at: u64,
+    /// An accepted hit interrupted this reading.
+    pub interrupted: bool,
+}
+
+impl CastProgress {
+    /// Starts reading `spell` at `now`.
+    #[must_use]
+    pub const fn new(spell: SpellId, now: u64) -> Self {
+        Self {
+            spell,
+            started: now,
+            ready_at: now.saturating_add(spell.cast_millis()),
+            interrupted: false,
+        }
+    }
+
+    /// Milliseconds left before release.
+    #[must_use]
+    pub const fn remaining_millis(self, now: u64) -> u64 {
+        self.ready_at.saturating_sub(now)
+    }
+}
+
 /// Live magic state of one hunter; never persisted.
 ///
 /// Party buffs land on every member, so the deadlines live here for any
 /// class, while mana and cooldowns only matter to a Mage.
 #[derive(Debug, Clone, Default)]
 pub struct MagicState {
+    /// The spell currently being read, if any.
+    pub casting: Option<CastProgress>,
     /// Current mana; `None` until the first tick fills it.
     pub mana: Option<f32>,
     /// Millisecond the hunter last took damage.
@@ -840,6 +893,7 @@ impl MagicState {
     #[must_use]
     pub const fn new() -> Self {
         Self {
+            casting: None,
             mana: None,
             last_hurt: 0,
             cooldowns: BTreeMap::new(),
@@ -957,14 +1011,14 @@ mod tests {
             ..SpellGear::default()
         });
         assert_eq!(both.free_every, 5);
-        assert!((both.cost_of(SpellId::Fireball) - 27.5).abs() < 1e-4);
+        assert!((both.cost_of(SpellId::Fireball) - 33.0).abs() < 1e-4);
         assert!((both.cost_of(SpellId::LesserHeal) - 24.0).abs() < 1e-4);
-        assert_eq!(both.cooldown_of(SpellId::Fireball), 2_500);
+        assert_eq!(both.cooldown_of(SpellId::Fireball), 3_000);
         let cheap = SpellGear {
             cost: -5.0,
             ..SpellGear::default()
         };
-        assert!((cheap.cost_of(SpellId::Fireball) - 5.0).abs() < 1e-4);
+        assert!((cheap.cost_of(SpellId::Fireball) - 6.0).abs() < 1e-4);
         let calm = SpellGear {
             free_meditation: true,
             ..SpellGear::default()

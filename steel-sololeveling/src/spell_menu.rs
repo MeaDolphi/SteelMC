@@ -193,6 +193,14 @@ fn spell_item(view: &View, spell: SpellId) -> ItemStack {
             ),
             Color::Aqua,
         ),
+        line(
+            if spell.cast_millis() == 0 {
+                "Выпуск: мгновенно".to_owned()
+            } else {
+                format!("Чтение: {:.1} с", spell.cast_millis() as f64 / 1_000.0)
+            },
+            Color::LightPurple,
+        ),
     ];
     let (status, color) = if prepared {
         ("Подготовлено. Клик — убрать.".to_owned(), Color::Green)
