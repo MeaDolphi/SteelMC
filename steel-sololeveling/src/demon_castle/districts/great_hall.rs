@@ -64,6 +64,9 @@ pub(super) fn fill(ctx: &Ctx<'_>, u: i32, v: i32, layer: i32) -> Fill {
     let ring = wall_ring(u, v);
     if (WALL..=GALLERY_INNER).contains(&ring) {
         if layer == GALLERY_LAYER {
+            if (u - 3).rem_euclid(4) == 0 && (v - 3).rem_euclid(4) == 0 {
+                return Fill::of(palette.floor_light);
+            }
             return Fill::of(palette.floor_trim);
         }
         if layer == GALLERY_LAYER + 1 && ring == GALLERY_INNER && !on_landing(u, v) {

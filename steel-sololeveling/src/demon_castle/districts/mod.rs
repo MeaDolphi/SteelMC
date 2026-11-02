@@ -97,6 +97,18 @@ pub fn block(ctx: &Ctx<'_>, u: i32, v: i32, layer: i32) -> Option<BlockStateId> 
     if is_wall(u, v) {
         return wall_block(ctx, u, v, layer);
     }
+    let lantern_layer = (height - 3).min(5);
+    if height >= 7 && (u - 3).rem_euclid(4) == 0 && (v - 3).rem_euclid(4) == 0 {
+        if layer == lantern_layer {
+            return Some(ctx.palette.floor_light.default_state());
+        }
+        if (lantern_layer + 1..=height).contains(&layer)
+            && !(ctx.district.archetype == Archetype::GreatHall
+                && layer == great_hall::GALLERY_LAYER)
+        {
+            return Some(chain());
+        }
+    }
     if let Some(fill) = treasure(ctx, u, v, layer) {
         return match fill {
             Fill::Block(block) => Some(block),
@@ -152,6 +164,9 @@ fn wall_block(ctx: &Ctx<'_>, u: i32, v: i32, layer: i32) -> Option<BlockStateId>
                 return None;
             }
             if layer == 0 {
+                if along.rem_euclid(2) == 1 {
+                    return Some(palette.floor_light.default_state());
+                }
                 return Some(palette.floor_trim.default_state());
             }
             if layer == DOOR_HEIGHT + 1 {
@@ -170,6 +185,9 @@ fn wall_block(ctx: &Ctx<'_>, u: i32, v: i32, layer: i32) -> Option<BlockStateId>
             return Some(palette.wall_light.default_state());
         }
         if depth == WALL - 1 && layer == 1 {
+            if along.rem_euclid(4) == 3 {
+                return Some(palette.wall_light.default_state());
+            }
             return Some(palette.floor_trim.default_state());
         }
     }
@@ -205,7 +223,7 @@ pub fn default_floor(ctx: &Ctx<'_>, u: i32, v: i32) -> BlockStateId {
     if u == WALL || v == WALL || u == INNER_MAX || v == INNER_MAX {
         return palette.floor_trim.default_state();
     }
-    if u % 10 == 5 && v % 10 == 5 && !in_aisle(ctx.district, u, v) {
+    if (u - 2).rem_euclid(6) == 0 && (v - 2).rem_euclid(6) == 0 {
         return palette.floor_light.default_state();
     }
     if u % 10 == 0 || v % 10 == 0 {

@@ -208,6 +208,7 @@ impl GameplayHooks for SoloLevelingHooks {
         self.state.tick_artifacts(player);
         self.state.tick_class(player);
         item::menu_book::keep_in_place(player);
+        item::dungeon_map::keep_in_place(player, self.state.dungeon_map_id(player));
         if player.tick_count() % 20 == 0 {
             if is_instance_world(&player.get_world()) {
                 // The free starter-weapon swap ends with the first run.
@@ -867,6 +868,7 @@ fn keeps_projectile_ammo(ammo: &ItemStack) -> bool {
 fn keeps_item_on_death(stack: &ItemStack, instance_world: bool) -> bool {
     item::grimoire::is_grimoire(stack)
         || item::menu_book::is_menu_book(stack)
+        || item::dungeon_map::is_dungeon_map(stack)
         || item::serial::of(stack).is_some()
         || item::artifact::of(stack).is_some()
         || !item::binding::may_drop(stack)
@@ -893,7 +895,10 @@ fn drop_decision(stack: &ItemStack, off_hand: &ItemStack) -> DropDecision {
     if item::grimoire::is_grimoire(stack) || (spell_gear && item::grimoire::is_grimoire(off_hand)) {
         return DropDecision::CycleSpell;
     }
-    if item::menu_book::is_menu_book(stack) || !item::binding::may_drop(stack) {
+    if item::menu_book::is_menu_book(stack)
+        || item::dungeon_map::is_dungeon_map(stack)
+        || !item::binding::may_drop(stack)
+    {
         return DropDecision::Destroy;
     }
     DropDecision::Allow
@@ -1070,6 +1075,19 @@ mod tests {
         let mut loot = material_stack();
         crate::item::loot::mark(&mut loot);
         assert!(!keeps_item_on_death(&loot, true));
+    }
+
+    #[test]
+    fn dungeon_map_stays_on_death_and_is_destroyed_instead_of_dropped() {
+        init_vanilla_registry();
+        let map = crate::item::dungeon_map::stack(
+            steel_registry::data_components::components::MapId::new(7),
+        );
+        assert!(keeps_item_on_death(&map, false));
+        assert_eq!(
+            drop_decision(&map, &ItemStack::empty()),
+            DropDecision::Destroy
+        );
     }
 
     fn material_stack() -> ItemStack {

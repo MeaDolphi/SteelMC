@@ -20,7 +20,7 @@ const ISLAND_EDGE: i32 = PLAZA_HI - PLAZA_LO;
 /// Centres of the four piers.
 const PIERS: [(i32, i32); 4] = [(16, 16), (16, 63), (63, 16), (63, 63)];
 /// Columns of the lanterns hanging over the chasm.
-const LANTERNS: [(i32, i32); 4] = [(24, 40), (55, 40), (40, 24), (40, 55)];
+const LANTERNS: [(i32, i32); 4] = [(24, 32), (55, 47), (32, 24), (47, 55)];
 
 /// Returns the wall ring of `(u, v)`: 0 at the outer face of the walls.
 const fn wall_ring(u: i32, v: i32) -> i32 {
@@ -115,9 +115,6 @@ fn ground(
         }
         return Fill::Block(default_floor(ctx, u, v));
     }
-    if layer != 1 {
-        return Fill::Default;
-    }
     let on_bridge_deck = bridge.is_some_and(|across| (DOOR_LO..=DOOR_HI).contains(&across));
     let railing = if island {
         ring(u, v) == ISLAND_EDGE && !on_bridge_deck
@@ -126,6 +123,12 @@ fn ground(
     } else {
         bridge.is_some_and(|across| across == DOOR_LO - 1 || across == DOOR_HI + 1)
     };
+    if layer == 2 && railing && (u + v).rem_euclid(8) == 0 {
+        return Fill::of(palette.lantern);
+    }
+    if layer != 1 {
+        return Fill::Default;
+    }
     if railing {
         Fill::of(palette.rail)
     } else {

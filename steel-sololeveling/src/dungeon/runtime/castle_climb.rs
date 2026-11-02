@@ -36,11 +36,13 @@ use crate::demon_castle::plan::{Archetype, FloorPlan, Side};
 use crate::demon_castle::{CastleSlot, GROUND_Y, MAX_FLOOR};
 use crate::dungeon::boss::{BossFight, BossKind, boss_for_gate};
 use crate::dungeon::instance::{
-    FrameStyle, opening_contains, place_gate_frame, set_fixture, spawn_boss_body,
+    FrameStyle, opening_contains, place_gate_frame, set_fixture, spawn_boss_body, spawn_gate_label,
 };
+use crate::dungeon::map::{self, ZoneStatus};
 use crate::dungeon::mobs::{MobLabel, MobRarity};
 use crate::dungeon::skills::{MobSkills, SkillAction, refresh_plates};
 use crate::item::key;
+use steel_protocol::packets::game::MapDecoration;
 
 /// Ticks one castle floor may take before the hunters are overwhelmed.
 pub(super) const FLOOR_TIME_LIMIT_TICKS: u64 = 20 * 60 * 30;
@@ -75,6 +77,7 @@ struct LowerFloor {
     floor: u32,
     exit: BlockPos,
     home: BlockPos,
+    labels: Vec<i32>,
     _ticket: Option<ChunkRequestHandle>,
 }
 
@@ -90,6 +93,8 @@ pub(super) struct CastleClimb {
     packs: Vec<Pack>,
     /// Live castle mobs.
     pub(super) remaining_mobs: Vec<i32>,
+    /// District each live mob belongs to, for the map's clear states.
+    mob_district: FxHashMap<i32, usize>,
     /// Nameplates of the climb's mobs and boss, by entity id.
     pub(super) labels: FxHashMap<i32, MobLabel>,
     skills: MobSkills,
@@ -105,6 +110,7 @@ pub(super) struct CastleClimb {
     exit: Option<BlockPos>,
     /// The gate home, open beside the gate up.
     home: Option<BlockPos>,
+    gate_labels: Vec<i32>,
     lower: Option<LowerFloor>,
     /// Keeps the current floor generated and its mobs simulated; the entry
     /// request of the first floor.
@@ -153,6 +159,7 @@ impl CastleClimb {
             packs: encounter::floor_packs(&plan, world_seed),
             plan,
             remaining_mobs: Vec::new(),
+            mob_district: FxHashMap::default(),
             labels: FxHashMap::default(),
             skills: MobSkills::default(),
             pending_skills: Vec::new(),
@@ -161,6 +168,7 @@ impl CastleClimb {
             sealed: false,
             exit: None,
             home: None,
+            gate_labels: Vec::new(),
             lower: None,
             ticket,
             next_ticket: None,
@@ -250,18 +258,122 @@ impl CastleClimb {
             ""
         };
         TextComponent::plain(format!(
-            "Замок демонов, этаж {}: {}.{giga}",
+            "Замок демонов, этаж {}: {}.{giga} Пробейтесь к тронному залу и убейте стража этажа.",
             self.floor,
             self.plan.theme.display_name()
         ))
         .color(Color::DarkPurple)
     }
 
-    /// Removes every live mob id, so their entities can be discarded.
+    pub(super) fn map_canvas(&self) -> [u8; map::SIZE * map::SIZE] {
+        let mut statuses = [ZoneStatus::Cleared; 16];
+        for (cell, _) in self.plan.districts() {
+            let index = cell.1 * 4 + cell.0;
+            statuses[index] = if cell == self.plan.arrival {
+                ZoneStatus::Arrival
+            } else if cell == self.plan.throne {
+                if self.boss == FloorBoss::Cleared {
+                    ZoneStatus::ThroneCleared
+                } else {
+                    ZoneStatus::Throne
+                }
+            } else {
+                let alive = self
+                    .remaining_mobs
+                    .iter()
+                    .any(|id| self.mob_district.get(id) == Some(&index));
+                let waiting = self.packs.iter().any(|pack| pack.district == index);
+                if alive {
+                    ZoneStatus::Combat
+                } else if waiting {
+                    ZoneStatus::Unexplored
+                } else {
+                    ZoneStatus::Cleared
+                }
+            };
+        }
+        map::castle::canvas(&self.plan, &statuses)
+    }
+
+    pub(super) fn map_decorations(
+        &self,
+        world: &Arc<World>,
+        viewer: &Player,
+        members: &[Uuid],
+    ) -> Vec<MapDecoration> {
+        let viewer_id = viewer.gameprofile.id();
+        let mut decorations = Vec::new();
+        for member in members {
+            let Some(hunter) = world.players.get_by_uuid(member) else {
+                continue;
+            };
+            let Some((lx, lz)) = self.slot.local(self.floor, hunter.position()) else {
+                continue;
+            };
+            let (x, y) = map::castle::point(lx, lz);
+            let kind = if *member == viewer_id {
+                map::PLAYER
+            } else {
+                map::FRAME
+            };
+            decorations.push(map::decoration(
+                kind,
+                x,
+                y,
+                map::player_rotation(hunter.rotation().0),
+                None,
+            ));
+        }
+        if let FloorBoss::Alive(id) = self.boss
+            && let Some(boss) = world.get_entity_by_id(id)
+            && let Some((lx, lz)) = self.slot.local(self.floor, boss.position())
+        {
+            let (x, y) = map::castle::point(lx, lz);
+            decorations.push(map::decoration(map::RED_MARKER, x, y, 0, Some("Страж")));
+        }
+        for (gate, kind, name) in [
+            (self.home, map::BANNER_LIGHT_BLUE, "Домой"),
+            (self.exit, map::BANNER_PURPLE, "Наверх"),
+        ] {
+            let Some(gate) = gate else {
+                continue;
+            };
+            let position = DVec3::new(
+                f64::from(gate.x()) + 0.5,
+                f64::from(gate.y()),
+                f64::from(gate.z()) + 0.5,
+            );
+            if let Some((lx, lz)) = self.slot.local(self.floor, position) {
+                let (x, y) = map::castle::point(lx, lz);
+                decorations.push(map::decoration(kind, x, y, 0, Some(name)));
+            }
+        }
+        for treasure in &self.treasures {
+            if self.opened.contains(&(*treasure, viewer_id)) {
+                continue;
+            }
+            let position = DVec3::new(
+                f64::from(treasure.x()) + 0.5,
+                f64::from(treasure.y()),
+                f64::from(treasure.z()) + 0.5,
+            );
+            if let Some((lx, lz)) = self.slot.local(self.floor, position) {
+                let (x, y) = map::castle::point(lx, lz);
+                decorations.push(map::decoration(map::RED_X, x, y, 0, Some("Тайник")));
+            }
+        }
+        decorations
+    }
+
+    /// Removes every live mob and gate label id, so their entities can be discarded.
     pub(super) fn take_mobs(&mut self) -> Vec<i32> {
         let mut mobs = mem::take(&mut self.remaining_mobs);
         if let FloorBoss::Alive(id) = self.boss {
             mobs.push(id);
+        }
+        mobs.append(&mut self.gate_labels);
+        if let Some(lower) = &mut self.lower {
+            mobs.append(&mut lower.labels);
         }
         mobs
     }
@@ -285,7 +397,7 @@ impl CastleClimb {
         let positions: Vec<DVec3> = hunters.iter().map(|hunter| hunter.position()).collect();
         self.tick_mobs(world, &positions, tick);
         self.wake_packs(world, &positions, tick);
-        self.release_lower_floor(&positions);
+        self.release_lower_floor(world, &positions);
         let action = self.tick_boss(context, &hunters, tick);
         self.walk_gates(context.world, &hunters, tick);
         action
@@ -301,6 +413,12 @@ impl CastleClimb {
         self.pending_skills.extend(out.actions);
         for (id, label) in out.hatched {
             self.remaining_mobs.push(id);
+            if let Some(entity) = world.get_entity_by_id(id)
+                && let Some((lx, lz)) = self.slot.local(self.floor, entity.position())
+                && let Some((cell, _, _)) = FloorPlan::district_at(lx, lz)
+            {
+                self.mob_district.insert(id, cell.1 * 4 + cell.0);
+            }
             self.labels.insert(id, label);
         }
         if tick.is_multiple_of(10) {
@@ -341,6 +459,7 @@ impl CastleClimb {
                     self.elites.push(mob.id);
                 }
                 self.remaining_mobs.push(mob.id);
+                self.mob_district.insert(mob.id, pack.district);
                 self.skills.track(mob.id, mob.class, tick);
                 self.labels.insert(mob.id, mob.label);
             }
@@ -348,7 +467,7 @@ impl CastleClimb {
     }
 
     /// Lets go of the floor below once no hunter is left on it.
-    fn release_lower_floor(&mut self, hunters: &[DVec3]) {
+    fn release_lower_floor(&mut self, world: &Arc<World>, hunters: &[DVec3]) {
         let Some(lower) = &self.lower else {
             return;
         };
@@ -356,7 +475,14 @@ impl CastleClimb {
             .iter()
             .all(|hunter| self.slot.local(lower.floor, *hunter).is_none())
         {
-            self.lower = None;
+            let Some(lower) = self.lower.take() else {
+                return;
+            };
+            for id in lower.labels {
+                if let Some(entity) = world.get_entity_by_id(id) {
+                    entity.set_removed(RemovalReason::Discarded);
+                }
+            }
         }
     }
 
@@ -582,6 +708,8 @@ impl CastleClimb {
             encounter::spawn_adds(world, self.slot, &self.plan, &spots, near, adds, wave, rank)
         {
             self.remaining_mobs.push(mob.id);
+            self.mob_district
+                .insert(mob.id, self.plan.throne.1 * 4 + self.plan.throne.0);
             self.skills.track(mob.id, mob.class, tick);
             self.labels.insert(mob.id, mob.label);
         }
@@ -651,11 +779,37 @@ impl CastleClimb {
         context.state.record_castle_clear(&survivors, self.floor);
         let gate = |(lx, lz): (i32, i32)| self.slot.block(self.floor, lx, lz, GROUND_Y + 1);
         let home = gate(self.plan.home_gate());
-        place_gate_frame(world, home, FrameStyle::Normal);
+        if place_gate_frame(world, home, FrameStyle::Normal) {
+            self.gate_labels.extend(spawn_gate_label(
+                world,
+                home,
+                TextComponent::plain("Врата домой").color(Color::Aqua),
+            ));
+        } else {
+            log::warn!(
+                "sololeveling: home gate of castle floor {} is blocked at {home:?}",
+                self.floor
+            );
+        }
         self.home = Some(home);
         if !top {
             let exit = gate(self.plan.exit_gate());
-            place_gate_frame(world, exit, FrameStyle::Castle);
+            if place_gate_frame(world, exit, FrameStyle::Castle) {
+                self.gate_labels.extend(spawn_gate_label(
+                    world,
+                    exit,
+                    TextComponent::plain(format!(
+                        "Врата наверх — нужен ключ {}-го этажа",
+                        self.floor
+                    ))
+                    .color(Color::Gold),
+                ));
+            } else {
+                log::warn!(
+                    "sololeveling: exit gate of castle floor {} is blocked at {exit:?}",
+                    self.floor
+                );
+            }
             self.exit = Some(exit);
         }
         let line = if top {
@@ -669,6 +823,12 @@ impl CastleClimb {
         };
         for member in context.members {
             if let Some(hunter) = world.players.get_by_uuid(member) {
+                hunter.send_title(TextComponent::plain("Страж повержен").color(Color::Gold));
+                hunter.send_subtitle(
+                    TextComponent::plain("У трона открылись врата: домой и наверх")
+                        .color(Color::Aqua),
+                );
+                hunter.send_title_times(10, 70, 20);
                 hunter.send_message(&TextComponent::plain(line.clone()).color(Color::Gold));
             }
         }
@@ -727,6 +887,7 @@ impl CastleClimb {
         let (Some(exit), Some(home)) = (self.exit.take(), self.home.take()) else {
             return;
         };
+        let gate_labels = mem::take(&mut self.gate_labels);
         for id in self.take_mobs() {
             if let Some(entity) = world.get_entity_by_id(id) {
                 entity.set_removed(RemovalReason::Discarded);
@@ -742,11 +903,13 @@ impl CastleClimb {
             floor: self.floor,
             exit,
             home,
+            labels: gate_labels,
             _ticket: ticket,
         });
         self.floor += 1;
         self.plan = Arc::new(FloorPlan::generate(self.world_seed, self.floor));
         self.packs = encounter::floor_packs(&self.plan, self.world_seed);
+        self.mob_district.clear();
         self.labels.clear();
         self.elites.clear();
         self.giga = None;

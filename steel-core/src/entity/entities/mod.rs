@@ -9,7 +9,8 @@ pub use mobs::hostile::{
 };
 pub use mobs::passive::{ChickenEntity, CowEntity, MushroomCowEntity, PigEntity, SheepEntity};
 pub use objects::display_ui::{
-    BlockDisplayEntity, ItemFrameEntity, LeashFenceKnotEntity, MannequinEntity,
+    BlockDisplayEntity, DisplayBillboard, ItemFrameEntity, LeashFenceKnotEntity, MannequinEntity,
+    TextDisplayEntity,
 };
 pub use objects::explosives::EndCrystalEntity;
 pub use objects::items::{ExperienceOrbEntity, FallingBlockEntity, ItemEntity};

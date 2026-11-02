@@ -24,6 +24,8 @@ use steel_core::player::connection::NetworkConnection as _;
 use steel_core::server::Server;
 use steel_core::server::jobs::{JobPoll, ServerJob, ServerJobContext};
 use steel_core::world::World;
+use steel_protocol::packets::game::MapDecoration;
+use steel_registry::data_components::components::MapId;
 use steel_registry::item_stack::ItemStack;
 use steel_registry::vanilla_damage_types;
 use steel_utils::locks::SyncMutex;
@@ -40,8 +42,10 @@ use super::instance::{
     FrameStyle, SpawnedMob, build_dungeon, dungeon_chunks, erase_footprint, footprint_chunks,
     gate_frame_chunks, gate_frame_is_clear, gate_frame_matches, gate_ground_is_dry,
     gate_space_is_clear, open_dungeon_exit, opening_contains, place_gate_frame, remove_gate_frame,
-    spawn_city_break_mob, spawn_dungeon_boss, spawn_dungeon_wave, spawn_room_mobs,
+    spawn_city_break_mob, spawn_dungeon_boss, spawn_dungeon_wave, spawn_gate_label,
+    spawn_room_mobs,
 };
+use super::map::{self, DungeonMap, ZoneStatus};
 use super::mobs::{MobClass, MobLabel};
 use super::skills::{MobSkills, SkillAction, refresh_plates};
 use super::tower;
@@ -621,6 +625,8 @@ struct InstanceRun {
     started_tick: u64,
     duration_ticks: u64,
     progress: RunProgress,
+    /// Live map for castle and ordinary-dungeon runs.
+    map: Option<DungeonMap>,
     /// Gate consumed by this run, removed from the world when the run ends.
     gate: Option<u64>,
     /// Members already teleported to the region spawn. A member is placed at
@@ -713,6 +719,8 @@ struct DungeonProgress {
     fight: Option<BossFight>,
     /// Exit opened in the boss room once the boss is defeated.
     exit: Option<BlockPos>,
+    /// Label above the exit, removed with the run.
+    visuals: Vec<i32>,
     /// Damage and mob-clear credit used to divide the cleared-gate Won reward.
     contributions: FxHashMap<Uuid, RaidContribution>,
     /// Chest type rolled once for the squad when the boss died, handed to every
@@ -730,6 +738,8 @@ struct DungeonProgress {
     /// Chamber guards and hatched larvae: fought and rewarded like wave mobs,
     /// but not needed to open the next room.
     extra_mobs: Vec<i32>,
+    /// Room each chamber guard or hatched larva belongs to.
+    extra_mob_rooms: FxHashMap<i32, usize>,
     /// Abilities of the run's shamans, bombers and broodmothers.
     skills: MobSkills,
     /// Abilities to apply once the runtime lock is released.
@@ -781,7 +791,10 @@ impl DungeonProgress {
             self.rank,
             salt,
         );
-        self.extra_mobs.extend(spawned.iter().map(|mob| mob.id));
+        for mob in &spawned {
+            self.extra_mobs.push(mob.id);
+            self.extra_mob_rooms.insert(mob.id, index);
+        }
         self.adopt(spawned, tick);
     }
 
@@ -813,6 +826,8 @@ impl DungeonProgress {
         self.pending_skills.extend(out.actions);
         for (id, label) in out.hatched {
             self.extra_mobs.push(id);
+            self.extra_mob_rooms
+                .insert(id, usize::from(self.combat_room));
             self.labels.insert(id, label);
         }
         if tick.is_multiple_of(10) {
@@ -820,6 +835,105 @@ impl DungeonProgress {
                 .retain(|id, _| world.get_entity_by_id(*id).is_some());
             refresh_plates(world, hunters, self.labels.keys());
         }
+    }
+
+    fn map_canvas(&self) -> [u8; map::SIZE * map::SIZE] {
+        let statuses = self
+            .layout
+            .blueprint
+            .rooms
+            .iter()
+            .enumerate()
+            .map(|(index, room)| match room.role {
+                RoomRole::Entrance => ZoneStatus::Cleared,
+                RoomRole::Combat => {
+                    let current = usize::from(self.combat_room);
+                    if index < current
+                        || (index == current && self.wave_spawned && self.remaining_mobs.is_empty())
+                    {
+                        ZoneStatus::Cleared
+                    } else if index == current {
+                        ZoneStatus::Combat
+                    } else {
+                        ZoneStatus::Unexplored
+                    }
+                }
+                RoomRole::Chamber => {
+                    let alive = self
+                        .extra_mobs
+                        .iter()
+                        .any(|id| self.extra_mob_rooms.get(id) == Some(&index));
+                    if alive {
+                        ZoneStatus::Combat
+                    } else if self.guarded_chambers.contains(&index) {
+                        ZoneStatus::Cleared
+                    } else {
+                        ZoneStatus::Unexplored
+                    }
+                }
+                RoomRole::Boss => match self.boss {
+                    BossState::Defeated => ZoneStatus::ThroneCleared,
+                    BossState::Waiting | BossState::Alive(_) => ZoneStatus::Throne,
+                },
+            })
+            .collect::<Vec<_>>();
+        map::gate::canvas(&self.layout.blueprint, &statuses)
+    }
+
+    fn map_decorations(
+        &self,
+        world: &Arc<World>,
+        region: InstanceRegion,
+        viewer: &Player,
+        members: &[Uuid],
+    ) -> Vec<MapDecoration> {
+        let projection = map::gate::GateProjection::new(&self.layout.blueprint);
+        let viewer_id = viewer.gameprofile.id();
+        let point = |position: DVec3| {
+            projection.point(
+                (position.x - region.spawn.x.floor()).floor() as i32,
+                (position.z - region.spawn.z.floor()).floor() as i32,
+            )
+        };
+        let mut decorations = Vec::new();
+        for member in members {
+            let Some(hunter) = world.players.get_by_uuid(member) else {
+                continue;
+            };
+            let (x, y) = point(hunter.position());
+            decorations.push(map::decoration(
+                if *member == viewer_id {
+                    map::PLAYER
+                } else {
+                    map::FRAME
+                },
+                x,
+                y,
+                map::player_rotation(hunter.rotation().0),
+                None,
+            ));
+        }
+        if let BossState::Alive(id) = self.boss
+            && let Some(boss) = world.get_entity_by_id(id)
+        {
+            let (x, y) = point(boss.position());
+            decorations.push(map::decoration(map::RED_MARKER, x, y, 0, Some("Босс")));
+        }
+        if let Some(exit) = self.exit {
+            let (x, y) = point(DVec3::new(
+                f64::from(exit.x()) + 0.5,
+                f64::from(exit.y()),
+                f64::from(exit.z()) + 0.5,
+            ));
+            decorations.push(map::decoration(
+                map::BANNER_LIGHT_BLUE,
+                x,
+                y,
+                0,
+                Some("Выход"),
+            ));
+        }
+        decorations
     }
 }
 
@@ -970,6 +1084,7 @@ impl InstanceRun {
             RunProgress::Dungeon(progress) => {
                 let mut mobs = mem::take(&mut progress.remaining_mobs);
                 mobs.append(&mut progress.extra_mobs);
+                mobs.append(&mut progress.visuals);
                 if let BossState::Alive(id) = progress.boss {
                     mobs.push(id);
                 }
@@ -1187,6 +1302,17 @@ impl DungeonRuntime {
         actions
     }
 
+    /// Returns the map id of the mapped run `player` is currently inside.
+    #[must_use]
+    pub fn map_id_for(&self, player: &Player) -> Option<MapId> {
+        let uuid = player.gameprofile.id();
+        let world = player.get_world();
+        self.runs
+            .values()
+            .find(|run| run.instance_world == world.key && run.members.contains(&uuid))
+            .and_then(|run| run.map.as_ref().map(DungeonMap::id))
+    }
+
     /// Returns the effective rank of the dungeon run inside `world`.
     ///
     /// Red gates store their already promoted rank, so this is the rank the run
@@ -1233,7 +1359,18 @@ impl DungeonRuntime {
                     progress.boss = FloorBoss::Defeated;
                     return;
                 }
-                progress.on_elite_death(entity_id, &run.members);
+                if progress.on_elite_death(entity_id, &run.members) {
+                    for member in &run.members {
+                        if let Some(hunter) = world.players.get_by_uuid(member) {
+                            hunter.send_action_bar(
+                                TextComponent::plain(
+                                    "Элита повержена. Страж этажа ждёт в тронном зале — он отмечен на карте",
+                                )
+                                .color(Color::Gold),
+                            );
+                        }
+                    }
+                }
             }
             let remaining = match &mut run.progress {
                 RunProgress::Dungeon(progress) => &mut progress.remaining_mobs,
@@ -1639,9 +1776,15 @@ impl DungeonRuntime {
     /// The id identifies the run, never the entering leader: his next entry
     /// after a death starts a second run next to the one his party still
     /// fights in, and two live runs must not collide on one key.
-    fn adopt_run(&mut self, run: InstanceRun) -> RunId {
+    fn adopt_run(&mut self, mut run: InstanceRun) -> RunId {
         let id = self.next_run_id;
         self.next_run_id.0 += 1;
+        if matches!(
+            run.progress,
+            RunProgress::Dungeon(_) | RunProgress::Castle(_)
+        ) {
+            run.map = Some(DungeonMap::new(id.0));
+        }
         self.runs.insert(id, run);
         id
     }
@@ -2947,6 +3090,7 @@ impl DungeonRuntime {
                         boss: BossState::Waiting,
                         fight: None,
                         exit: None,
+                        visuals: Vec::new(),
                         contributions: members
                             .iter()
                             .copied()
@@ -2958,6 +3102,7 @@ impl DungeonRuntime {
                         wave_spawned: false,
                         guarded_chambers: Vec::new(),
                         extra_mobs: Vec::new(),
+                        extra_mob_rooms: FxHashMap::default(),
                         skills: MobSkills::default(),
                         pending_skills: Vec::new(),
                         classes: FxHashMap::default(),
@@ -3000,6 +3145,7 @@ impl DungeonRuntime {
             started_tick: tick,
             duration_ticks,
             progress,
+            map: None,
             gate,
             placed: FxHashSet::default(),
             finishing: false,
@@ -3217,7 +3363,13 @@ impl DungeonRuntime {
             }
         }
         if progress.exit.is_none() {
-            progress.exit = Some(open_dungeon_exit(world, region, &progress.layout));
+            let exit = open_dungeon_exit(world, region, &progress.layout);
+            progress.visuals.extend(spawn_gate_label(
+                world,
+                exit,
+                TextComponent::plain("Выход").color(Color::Aqua),
+            ));
+            progress.exit = Some(exit);
             log::info!(
                 "sololeveling: hunter {uuid} defeated the boss of a {}-rank dungeon; the exit is open",
                 progress.rank.name()
@@ -3616,6 +3768,35 @@ impl DungeonRuntime {
                     }
                     Self::tick_tower(progress, &world, region, &hunters, tick);
                     actions.extend(progress.pending_skills.drain(..).map(RunAction::MobSkill));
+                }
+            }
+            if tick.is_multiple_of(10) && !run.finishing {
+                let Some(dungeon_map) = &mut run.map else {
+                    continue;
+                };
+                let canvas = match &run.progress {
+                    RunProgress::Dungeon(progress) => progress.map_canvas(),
+                    RunProgress::Castle(progress) => progress.map_canvas(),
+                    RunProgress::Penalty(_) | RunProgress::Mine(_) => continue,
+                };
+                dungeon_map.replace_canvas(&canvas);
+                for member in &run.members {
+                    let Some(hunter) = players.get(member) else {
+                        continue;
+                    };
+                    if hunter.get_world().key != run.instance_world {
+                        continue;
+                    }
+                    let decorations = match &run.progress {
+                        RunProgress::Dungeon(progress) => {
+                            progress.map_decorations(&world, region, hunter, &run.members)
+                        }
+                        RunProgress::Castle(progress) => {
+                            progress.map_decorations(&world, hunter, &run.members)
+                        }
+                        RunProgress::Penalty(_) | RunProgress::Mine(_) => Vec::new(),
+                    };
+                    dungeon_map.sync(hunter, decorations);
                 }
             }
         }
@@ -4129,6 +4310,7 @@ mod tests {
             boss: BossState::Waiting,
             fight: None,
             exit: Some(BlockPos::new(10, 64, 10)),
+            visuals: Vec::new(),
             contributions: FxHashMap::default(),
             boss_chest: None,
             survivors: Vec::new(),
@@ -4136,6 +4318,7 @@ mod tests {
             wave_spawned: false,
             guarded_chambers: Vec::new(),
             extra_mobs: Vec::new(),
+            extra_mob_rooms: FxHashMap::default(),
             skills: MobSkills::default(),
             pending_skills: Vec::new(),
             classes: FxHashMap::default(),
@@ -4175,6 +4358,7 @@ mod tests {
             started_tick: 0,
             duration_ticks: 100,
             progress,
+            map: None,
             gate: None,
             placed: FxHashSet::default(),
             finishing: false,
@@ -4195,6 +4379,7 @@ mod tests {
             boss: BossState::Waiting,
             fight: None,
             exit: None,
+            visuals: Vec::new(),
             contributions: FxHashMap::default(),
             boss_chest: None,
             survivors: Vec::new(),
@@ -4202,6 +4387,7 @@ mod tests {
             wave_spawned: false,
             guarded_chambers: Vec::new(),
             extra_mobs: Vec::new(),
+            extra_mob_rooms: FxHashMap::default(),
             skills: MobSkills::default(),
             pending_skills: Vec::new(),
             classes: FxHashMap::default(),

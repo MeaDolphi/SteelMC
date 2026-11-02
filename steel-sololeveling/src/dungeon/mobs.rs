@@ -230,6 +230,15 @@ pub const fn theme_skin(theme: Theme) -> &'static str {
     }
 }
 
+/// Dresses `living` in the skin of `theme` on every armor slot; for mobs
+/// without a class kit, such as castle archers.
+pub fn wear_theme_skin(living: &dyn LivingEntity, theme: Theme) {
+    for (slot, plain) in SKIN_SLOTS {
+        let piece = skin_piece(plain, theme);
+        living.with_equipment_slot_mut(slot, &mut |stack| *stack = piece.clone());
+    }
+}
+
 /// Builds one skin piece: it only changes the look, so it grants no armor.
 fn skin_piece(holder: &'static LazyLock<Item>, theme: Theme) -> ItemStack {
     let mut stack = ItemStack::new(holder);

@@ -87,6 +87,47 @@ impl ArrowEntity {
         power: f32,
         spread: f32,
     ) -> Option<SharedEntity> {
+        Self::spawn_launched(
+            world,
+            owner,
+            weapon,
+            ammo,
+            Launch::FromRotation { power, spread },
+        )
+    }
+
+    /// Spawns an arrow shot by `owner` along `direction` rather than along
+    /// its facing: vanilla `Projectile.spawnProjectileUsingShoot`, which a
+    /// mob uses to aim at its target.
+    pub fn spawn_toward(
+        world: &Arc<World>,
+        owner: &dyn Entity,
+        weapon: Option<&ItemStack>,
+        ammo: &ItemStack,
+        direction: DVec3,
+        power: f32,
+        uncertainty: f32,
+    ) -> Option<SharedEntity> {
+        Self::spawn_launched(
+            world,
+            owner,
+            weapon,
+            ammo,
+            Launch::Toward {
+                direction,
+                power,
+                uncertainty,
+            },
+        )
+    }
+
+    fn spawn_launched(
+        world: &Arc<World>,
+        owner: &dyn Entity,
+        weapon: Option<&ItemStack>,
+        ammo: &ItemStack,
+        launch: Launch,
+    ) -> Option<SharedEntity> {
         let position = owner.position();
         let spawn_pos = DVec3::new(position.x, owner.get_eye_y() - 0.1, position.z);
 
@@ -97,7 +138,7 @@ impl ArrowEntity {
                 spawn_pos,
                 Arc::downgrade(world),
             );
-            init_shot_arrow(&arrow, owner, weapon, power, spread);
+            init_shot_arrow(&arrow, owner, weapon, launch);
             arrow.set_pickup_item(ammo.copy_with_count(1));
             Arc::new(arrow)
         } else {
@@ -107,7 +148,7 @@ impl ArrowEntity {
                 spawn_pos,
                 Arc::downgrade(world),
             );
-            init_shot_arrow(&arrow, owner, weapon, power, spread);
+            init_shot_arrow(&arrow, owner, weapon, launch);
             arrow.set_pickup_item(ammo.copy_with_count(1));
             arrow.update_potion_color();
             Arc::new(arrow)
@@ -132,6 +173,19 @@ impl ArrowEntity {
     }
 }
 
+/// How a freshly spawned arrow leaves its shooter.
+#[derive(Clone, Copy)]
+enum Launch {
+    /// Along the shooter's facing, adding its own movement: a held bow.
+    FromRotation { power: f32, spread: f32 },
+    /// Along an aimed direction: a mob shooting at its target.
+    Toward {
+        direction: DVec3,
+        power: f32,
+        uncertainty: f32,
+    },
+}
+
 /// Applies the shared vanilla setup for a freshly shot arrow: owner (which
 /// also enables pickup for player-shot arrows), fired weapon, and launch
 /// direction/speed.
@@ -139,8 +193,7 @@ fn init_shot_arrow<A: AbstractArrow + ?Sized>(
     arrow: &A,
     owner: &dyn Entity,
     weapon: Option<&ItemStack>,
-    power: f32,
-    spread: f32,
+    launch: Launch,
 ) {
     arrow.set_owner_uuid(Some(owner.uuid()));
     // Vanilla `AbstractArrow.setOwner`: player-shot arrows become pickup-allowed.
@@ -151,8 +204,17 @@ fn init_shot_arrow<A: AbstractArrow + ?Sized>(
         arrow.set_weapon_item(Some(weapon.clone()));
     }
 
-    let (yaw, pitch) = owner.rotation();
-    arrow.shoot_from_rotation(owner, pitch, yaw, 0.0, power, spread);
+    match launch {
+        Launch::FromRotation { power, spread } => {
+            let (yaw, pitch) = owner.rotation();
+            arrow.shoot_from_rotation(owner, pitch, yaw, 0.0, power, spread);
+        }
+        Launch::Toward {
+            direction,
+            power,
+            uncertainty,
+        } => arrow.shoot(direction, power, uncertainty),
+    }
 }
 
 impl Entity for ArrowEntity {

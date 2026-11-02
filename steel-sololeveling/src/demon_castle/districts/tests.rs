@@ -1,9 +1,11 @@
 use std::collections::VecDeque;
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use steel_core::chunk::light::{get_light_block_into, get_light_opacity};
 use steel_registry::blocks::block_state_ext::BlockStateExt as _;
 use steel_registry::blocks::properties::BlockStateProperties;
-use steel_registry::init_vanilla_registry;
+use steel_registry::{init_vanilla_registry, vanilla_blocks};
+use steel_utils::Direction;
 use steel_utils::axis::Axis;
 
 use super::great_hall::GALLERY_LAYER;
@@ -133,6 +135,77 @@ fn stands_between(column: &Column, to: f64, from: f64) -> bool {
 
 fn reached(set: &FxHashSet<(i32, i32, i32)>, lx: i32, lz: i32, feet: f64) -> bool {
     set.contains(&(lx, lz, (feet * 16.0).round() as i32))
+}
+
+/// Propagates block light through the generated blocks with vanilla opacity
+/// and face-occlusion rules, independently of chunk loading.
+fn block_light(plan: &FloorPlan) -> FxHashMap<(i32, i32, i32), u8> {
+    let air = vanilla_blocks::AIR.default_state();
+    let state = |lx, lz, layer| plan.block(lx, lz, layer).unwrap_or(air);
+    let mut levels = FxHashMap::default();
+    let mut queue = VecDeque::new();
+    for lx in -HALL_HALF..HALL_HALF {
+        for lz in -HALL_HALF..HALL_HALF {
+            for layer in MIN_LAYER..=MAX_LAYER {
+                let emission = state(lx, lz, layer).get_light_emission();
+                if emission > 0 {
+                    levels.insert((lx, lz, layer), emission);
+                    queue.push_back((lx, lz, layer, emission));
+                }
+            }
+        }
+    }
+    while let Some((lx, lz, layer, level)) = queue.pop_front() {
+        for (dx, dz, dy, direction) in [
+            (1, 0, 0, Direction::East),
+            (-1, 0, 0, Direction::West),
+            (0, 1, 0, Direction::South),
+            (0, -1, 0, Direction::North),
+            (0, 0, 1, Direction::Up),
+            (0, 0, -1, Direction::Down),
+        ] {
+            let (nx, nz, ny) = (lx + dx, lz + dz, layer + dy);
+            if !(-HALL_HALF..HALL_HALF).contains(&nx)
+                || !(-HALL_HALF..HALL_HALF).contains(&nz)
+                || !(MIN_LAYER..=MAX_LAYER).contains(&ny)
+            {
+                continue;
+            }
+            let from = state(lx, lz, layer);
+            let to = state(nx, nz, ny);
+            let cost = get_light_block_into(from, to, direction, get_light_opacity(to));
+            let Some(next) = level.checked_sub(cost).filter(|next| *next > 0) else {
+                continue;
+            };
+            if levels.get(&(nx, nz, ny)).is_some_and(|old| *old >= next) {
+                continue;
+            }
+            levels.insert((nx, nz, ny), next);
+            queue.push_back((nx, nz, ny, next));
+        }
+    }
+    levels
+}
+
+#[test]
+fn every_reachable_stand_is_lit() {
+    init_vanilla_registry();
+    for (seed, floor) in [(7_u64, 1_u32), (42, 3), (1_337, 24), (99, 37), (7, 10)] {
+        let plan = FloorPlan::generate(seed, floor);
+        let (ex, ez) = plan.entry();
+        let stands = Walk::new(&plan).reachable((ex, ez, 1.0));
+        let light = block_light(&plan);
+        for &(lx, lz, feet) in &stands {
+            let layer = feet.div_euclid(16);
+            let level = light.get(&(lx, lz, layer)).copied().unwrap_or(0);
+            let district = FloorPlan::district_at(lx, lz)
+                .map(|(cell, u, v)| (plan.district(cell).archetype, u, v));
+            assert!(
+                level >= 7,
+                "seed {seed} floor {floor}: stand ({lx}, {lz}, {layer}) in {district:?} has light {level}"
+            );
+        }
+    }
 }
 
 #[test]

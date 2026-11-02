@@ -274,7 +274,7 @@ impl RangedAttackMob for SkeletonEntity {
     fn perform_ranged_attack(
         &self,
         entity: &SharedEntity,
-        _target: &SharedEntity,
+        target: &SharedEntity,
         _distance_sq: f64,
     ) {
         let Some(world) = self.level() else {
@@ -290,7 +290,27 @@ impl RangedAttackMob for SkeletonEntity {
             bow
         };
 
-        let Some(arrow) = ArrowEntity::spawn(&world, self, Some(&weapon), &ammo, 1.6, 10.0) else {
+        // Vanilla `AbstractSkeleton.performRangedAttack`: aim at a third of the
+        // target's height, lifted with distance against the arrow's drop.
+        let origin = self.position();
+        let target_pos = target.position();
+        let target_box = target.bounding_box();
+        let target_y = target_pos.y + (target_box.max_y() - target_box.min_y()) / 3.0;
+        let dx = target_pos.x - origin.x;
+        let dz = target_pos.z - origin.z;
+        let horizontal = dx.hypot(dz);
+        let dy = target_y - (self.get_eye_y() - 0.1);
+        let direction = DVec3::new(dx, dy + horizontal * 0.2, dz);
+        let uncertainty = f32::from(14 - 4 * world.difficulty() as u8);
+        let Some(arrow) = ArrowEntity::spawn_toward(
+            &world,
+            self,
+            Some(&weapon),
+            &ammo,
+            direction,
+            1.6,
+            uncertainty,
+        ) else {
             return;
         };
 
@@ -319,6 +339,7 @@ mod tests {
     use steel_utils::{BlockPos, ChunkPos, Downcast as _};
 
     use super::SkeletonEntity;
+    use crate::behavior::init_behaviors;
     use crate::entity::monster::DEFAULT_XP_REWARD;
     use crate::entity::registry::init_entities;
     use crate::entity::{Entity, LivingEntity, Mob, SharedEntity, spawn_mob};
@@ -375,5 +396,82 @@ mod tests {
             main_hand = Some(stack.clone());
         });
         assert!(main_hand.is_some_and(|stack| stack.is(&vanilla_items::BOW)));
+    }
+
+    #[test]
+    fn a_drawn_bow_advances_every_tick_and_drops_when_the_bow_is_gone() {
+        use steel_registry::item_stack::ItemStack;
+        use steel_utils::types::InteractionHand;
+
+        init_vanilla_registry();
+        init_entities();
+        init_behaviors();
+        let world_fixture = fresh_test_world("skeleton_bow_draw");
+        let world = &world_fixture.world;
+        insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+        let spawned: SharedEntity =
+            spawn_mob(world, &vanilla_entities::SKELETON, BlockPos::new(8, 64, 8))
+                .expect("the skeleton factory should be registered");
+        let skeleton = spawned
+            .downcast_ref::<SkeletonEntity>()
+            .expect("skeleton is concrete");
+
+        let bow = ItemStack::new(&vanilla_items::BOW);
+        assert!(
+            skeleton
+                .living_base()
+                .start_using_item(InteractionHand::MainHand, &bow, 72_000)
+        );
+        // The ranged goal shoots once the draw reaches 20 ticks; a draw that
+        // never advances keeps the skeleton from ever firing.
+        for _ in 0..20 {
+            skeleton.tick_equipment_item_use(&spawned);
+        }
+        assert_eq!(skeleton.get_ticks_using_item(), 20);
+
+        skeleton.with_equipment_slot_mut(EquipmentSlot::MainHand, &mut |stack| {
+            *stack = ItemStack::empty();
+        });
+        skeleton.tick_equipment_item_use(&spawned);
+        assert!(!skeleton.living_base().is_using_item());
+    }
+
+    #[test]
+    fn an_arrow_flies_at_the_target_whatever_way_the_body_faces() {
+        use crate::entity::RangedAttackMob as _;
+
+        init_vanilla_registry();
+        init_entities();
+        init_behaviors();
+        let world_fixture = fresh_test_world("skeleton_aim");
+        let world = &world_fixture.world;
+        insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+        insert_ready_full_chunk(world, ChunkPos::new(1, 0));
+        let shooter: SharedEntity =
+            spawn_mob(world, &vanilla_entities::SKELETON, BlockPos::new(4, 64, 8))
+                .expect("the skeleton factory should be registered");
+        // The body faces south while the target stands due east: a body
+        // lagging behind the head must not steer the arrow.
+        shooter.set_rotation((0.0, 0.0));
+        let target: SharedEntity =
+            spawn_mob(world, &vanilla_entities::SKELETON, BlockPos::new(16, 64, 8))
+                .expect("the skeleton factory should be registered");
+        let skeleton = shooter
+            .downcast_ref::<SkeletonEntity>()
+            .expect("skeleton is concrete");
+
+        skeleton.perform_ranged_attack(&shooter, &target, 144.0);
+
+        let arrows = world
+            .get_entities_in_aabb_matching(&shooter.bounding_box().inflate(3.0), |entity| {
+                entity.entity_type().key == vanilla_entities::ARROW.key
+            });
+        let arrow = arrows.first().expect("the skeleton shot an arrow");
+        let velocity = arrow.velocity();
+        let horizontal = glam::DVec2::new(velocity.x, velocity.z).normalize();
+        assert!(
+            horizontal.x > 0.95,
+            "the arrow flies {horizontal:?} instead of east at the target"
+        );
     }
 }

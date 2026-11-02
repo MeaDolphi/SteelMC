@@ -459,6 +459,15 @@ impl SoloLevelingState {
         })
     }
 
+    /// Returns the live map id of the player's current dungeon run.
+    #[must_use]
+    pub fn dungeon_map_id(
+        &self,
+        player: &Player,
+    ) -> Option<steel_registry::data_components::components::MapId> {
+        self.dungeon_runtime.lock().map_id_for(player)
+    }
+
     /// Advances live gate and dungeon orchestration at the server tick boundary.
     ///
     /// The runtime lock is released before any deferred run action runs, so

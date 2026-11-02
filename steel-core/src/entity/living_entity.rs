@@ -5,7 +5,9 @@ use steel_registry::stat::vanilla_stat_types;
 use steel_registry::{DyeColor, vanilla_custom_stats};
 
 use super::*;
-use crate::behavior::{BLOCK_BEHAVIORS, InventoryTickContext, MOB_EFFECT_BEHAVIORS};
+use crate::behavior::{
+    BLOCK_BEHAVIORS, ITEM_BEHAVIORS, InventoryTickContext, MOB_EFFECT_BEHAVIORS,
+};
 use crate::entity::consume_effect::apply_consume_effect;
 use crate::entity::damage::RecentDamageSource;
 
@@ -2055,6 +2057,7 @@ pub trait LivingEntity: Entity {
     /// The default `Entity::tick` dispatches living entities here.
     fn tick_living_entity(&self, entity: &SharedEntity) {
         self.default_tick();
+        self.tick_equipment_item_use(entity);
         self.living_base().decrement_invulnerable_time();
         self.tick_mob_effects();
         self.detect_equipment_updates();
@@ -2068,6 +2071,44 @@ pub trait LivingEntity: Entity {
         }
 
         self.tick_living_state();
+    }
+
+    /// Runs vanilla `LivingEntity.updatingUsingItem` for an entity whose hands
+    /// are its equipment slots; a player ticks its inventory hands instead.
+    ///
+    /// Without it a mob that starts using an item never advances the use: a
+    /// skeleton would draw its bow forever and never shoot.
+    fn tick_equipment_item_use(&self, entity: &SharedEntity) {
+        let Some(active) = self.living_base().active_item_use() else {
+            return;
+        };
+        let slot = match active.hand() {
+            InteractionHand::MainHand => EquipmentSlot::MainHand,
+            InteractionHand::OffHand => EquipmentSlot::OffHand,
+        };
+        let mut held = ItemStack::empty();
+        self.with_equipment_slot(slot, &mut |stack| held = stack.clone());
+        if held.is_empty() || held.item() != active.item() {
+            self.living_base().stop_using_item();
+            return;
+        }
+        let (Some(world), Some(user)) = (self.level(), LivingEntityRef::new(entity)) else {
+            return;
+        };
+        let behavior = ITEM_BEHAVIORS.get_behavior(active.item());
+        let mut item = held.clone();
+        behavior.on_use_tick(&world, user, &mut item, active.remaining_ticks());
+        if let Some(active) = self.living_base().decrement_active_item_use()
+            && active.remaining_ticks() == 0
+            && !behavior.use_on_release(&item)
+            && !item.is_empty()
+        {
+            item = behavior.finish_using(&mut item, &world, user);
+            self.living_base().stop_using_item();
+        }
+        if item != held {
+            self.with_equipment_slot_mut(slot, &mut |stack| *stack = item.clone());
+        }
     }
 
     /// Ticks living-entity counters after movement.

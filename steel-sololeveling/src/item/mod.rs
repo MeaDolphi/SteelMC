@@ -17,6 +17,7 @@ pub mod chest;
 pub mod choice_menu;
 pub mod consume;
 pub mod crystal;
+pub mod dungeon_map;
 pub mod enchantment;
 pub mod grimoire;
 pub mod key;

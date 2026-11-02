@@ -25,14 +25,14 @@ use super::{CastleSlot, DISTRICT_SIZE, GROUND_Y};
 use crate::dungeon::DungeonWave;
 use crate::dungeon::generator::Theme;
 use crate::dungeon::instance::{SpawnedMob, spawn_class_mob, spawn_scaled_mob};
-use crate::dungeon::mobs::{MobClass, MobLabel, MobRarity};
+use crate::dungeon::mobs::{MobClass, MobLabel, MobRarity, wear_theme_skin};
 use crate::rank::HunterRank;
 use crate::seeded::{SplitMix, hash};
 
 /// Horizontal distance from a pack at which a hunter wakes it.
 pub const ACTIVATION_RADIUS: f64 = 40.0;
 /// Live castle mobs one climb keeps before further packs wait.
-pub const LIVE_CAP: usize = 60;
+pub const LIVE_CAP: usize = 72;
 /// Health an elite has over an ordinary mob of its class.
 const ELITE_HEALTH: f64 = 4.0;
 /// Damage an elite deals over an ordinary mob of its class.
@@ -67,6 +67,8 @@ pub enum Foe {
 /// A group of mobs waiting at one spot of a floor.
 #[derive(Debug, Clone)]
 pub struct Pack {
+    /// Index of the district in the 4×4 floor grid.
+    pub district: usize,
     /// Hall column of the pack's centre.
     pub center: (i32, i32),
     /// Where each mob appears.
@@ -88,7 +90,7 @@ impl Pack {
 /// Returns how many mobs one pack of `floor` holds.
 #[must_use]
 pub fn pack_size(floor: u32) -> usize {
-    4 + usize::try_from(floor / 12).unwrap_or(usize::MAX).min(3)
+    ((4 + usize::try_from(floor / 12).unwrap_or(usize::MAX).min(3)) * 6).div_ceil(5)
 }
 
 /// Plans every pack of a floor.
@@ -99,6 +101,7 @@ pub fn floor_packs(plan: &FloorPlan, world_seed: u64) -> Vec<Pack> {
     let size = pack_size(plan.floor);
     let mut packs = Vec::new();
     for (cell, district) in plan.districts() {
+        let district_index = cell.1 * 4 + cell.0;
         let (ground, gallery) = match district.archetype {
             Archetype::Courtyard | Archetype::Barracks | Archetype::Prison => (3, 0),
             Archetype::Bridge => (2, 0),
@@ -111,18 +114,26 @@ pub fn floor_packs(plan: &FloorPlan, world_seed: u64) -> Vec<Pack> {
         let (floor_spots, gallery_spots) = district_spots(plan, cell);
         let mut centres: Vec<Spot> = Vec::new();
         for _ in 0..ground {
-            if let Some(pack) = pack_at(&mut rng, &floor_spots, &mut centres, size, |rng| {
-                ground_foe(rng, district.archetype)
-            }) {
+            if let Some(pack) = pack_at(
+                &mut rng,
+                &floor_spots,
+                &mut centres,
+                size,
+                district_index,
+                |rng| ground_foe(rng, district.archetype),
+            ) {
                 packs.push(pack);
             }
         }
         for _ in 0..gallery {
-            if let Some(pack) =
-                pack_at(&mut rng, &gallery_spots, &mut centres, size / 2 + 2, |_| {
-                    Foe::Archer
-                })
-            {
+            if let Some(pack) = pack_at(
+                &mut rng,
+                &gallery_spots,
+                &mut centres,
+                size / 2 + 2,
+                district_index,
+                |_| Foe::Archer,
+            ) {
                 packs.push(pack);
             }
         }
@@ -133,6 +144,7 @@ pub fn floor_packs(plan: &FloorPlan, world_seed: u64) -> Vec<Pack> {
                 &floor_spots,
                 (lx, lz),
                 district.archetype,
+                district_index,
             ));
         }
     }
@@ -145,6 +157,7 @@ fn guard_pack(
     spots: &[Spot],
     (lx, lz): (i32, i32),
     archetype: Archetype,
+    district: usize,
 ) -> Pack {
     let mut near = spots.to_vec();
     near.sort_by_key(|spot| (spot.0 - lx).pow(2) + (spot.1 - lz).pow(2));
@@ -154,6 +167,7 @@ fn guard_pack(
         .chain((1..near.len()).map(|_| ground_foe(rng, archetype)))
         .collect();
     Pack {
+        district,
         center: (lx, lz),
         spots: near,
         foes,
@@ -167,6 +181,7 @@ fn pack_at(
     spots: &[Spot],
     centres: &mut Vec<Spot>,
     size: usize,
+    district: usize,
     mut foe: impl FnMut(&mut SplitMix) -> Foe,
 ) -> Option<Pack> {
     if spots.len() < size {
@@ -194,6 +209,7 @@ fn pack_at(
     around.truncate(size);
     let foes = (0..size).map(|_| foe(rng)).collect();
     Some(Pack {
+        district,
         center: (centre.0, centre.1),
         spots: around,
         foes,
@@ -328,7 +344,7 @@ pub fn spawn_pack(
             let mob = match foe {
                 Foe::Class(class) => spawn_class_mob(world, theme, position, class, wave, rank),
                 Foe::Elite(class) => spawn_elite(world, theme, position, class, wave, rank),
-                Foe::Archer | Foe::Hound => spawn_beast(world, position, foe, wave),
+                Foe::Archer | Foe::Hound => spawn_beast(world, theme, position, foe, wave),
             };
             mob.map(|mob| (mob, elite))
         })
@@ -356,7 +372,7 @@ fn spawn_elite(
     living.set_base_attribute_value(vanilla_attributes::SCALE, ELITE_SCALE);
     entity.refresh_dimensions();
     mob.label = MobLabel {
-        name: format!("Элитный {}", class.display_name().to_lowercase()),
+        name: format!("Элита · {}", class.display_name().to_lowercase()),
         title: "Хранитель тайника".to_owned(),
         color: Color::Gold,
         is_tank: mob.label.is_tank,
@@ -370,6 +386,7 @@ fn spawn_elite(
 /// Spawns an archer or a hound with its nameplate.
 fn spawn_beast(
     world: &Arc<World>,
+    theme: Theme,
     position: steel_utils::BlockPos,
     foe: Foe,
     wave: DungeonWave,
@@ -405,6 +422,7 @@ fn spawn_beast(
         living.with_equipment_slot_mut(EquipmentSlot::MainHand, &mut |stack| {
             *stack = ItemStack::new(&vanilla_items::BOW);
         });
+        wear_theme_skin(living, theme);
     }
     let label = MobLabel {
         name: name.to_owned(),
@@ -437,7 +455,7 @@ mod tests {
             let packs = floor_packs(&plan, seed);
             let mobs: usize = packs.iter().map(|pack| pack.foes.len()).sum();
             assert!(
-                (120..=300).contains(&mobs),
+                (145..=360).contains(&mobs),
                 "seed {seed} floor {floor}: {mobs} mobs on the floor"
             );
             for pack in &packs {

@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use glam::DVec3;
 use rand::RngExt as _;
-use steel_core::entity::{SharedEntity, spawn_mob};
+use steel_core::entity::entities::{DisplayBillboard, TextDisplayEntity};
+use steel_core::entity::{Entity as _, SharedEntity, next_entity_id, spawn_mob};
 use steel_core::gameplay_hooks::BlockMutationCause;
 use steel_core::world::World;
 use steel_registry::blocks::BlockRef;
@@ -315,6 +316,30 @@ pub fn place_gate_frame(world: &Arc<World>, entrance: BlockPos, style: FrameStyl
     }
     warn_unwritten("gate frame", entrance, failed);
     failed == 0
+}
+
+/// Places a player-facing label above a gate and returns its entity id.
+pub fn spawn_gate_label(
+    world: &Arc<World>,
+    entrance: BlockPos,
+    text: TextComponent,
+) -> Option<i32> {
+    let position = DVec3::new(
+        f64::from(entrance.x()) + 0.5,
+        f64::from(entrance.y()) + 5.5,
+        f64::from(entrance.z()) + 0.5,
+    );
+    let display = TextDisplayEntity::new(
+        &vanilla_entities::TEXT_DISPLAY,
+        next_entity_id(),
+        position,
+        Arc::downgrade(world),
+    );
+    display.set_text(text);
+    display.set_billboard(DisplayBillboard::Center);
+    let id = display.base().id();
+    let entity: SharedEntity = Arc::new(display);
+    world.try_add_entity(entity).ok().map(|()| id)
 }
 
 /// Restores a gate entrance to air, leaving any other block untouched.

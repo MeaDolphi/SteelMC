@@ -3,6 +3,7 @@
 pub mod boss;
 pub mod generator;
 pub mod instance;
+pub mod map;
 pub mod mobs;
 pub mod runtime;
 pub mod skills;
