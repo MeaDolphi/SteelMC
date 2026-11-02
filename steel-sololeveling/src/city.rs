@@ -118,15 +118,19 @@ pub fn is_city_world(world: &World) -> bool {
     world.key.path.as_ref() == WORLD_NAME
 }
 
+/// Farthest a gate lands from the centre of its plaza along either axis: the
+/// whole footprint stays clear of the street lamps that reach into the plaza.
+const GATE_SITE_SPREAD: i32 = 9;
+
 /// Picks a gate position inside one of the generated perimeter gate plazas.
 #[must_use]
 pub fn gate_candidate(center: BlockPos) -> BlockPos {
     let mut rng = rand::rng();
     let (site_x, site_z) = GATE_SITE_OFFSETS[rng.random_range(0..GATE_SITE_OFFSETS.len())];
     BlockPos::new(
-        center.x() + site_x + rng.random_range(-10..=10),
+        center.x() + site_x + rng.random_range(-GATE_SITE_SPREAD..=GATE_SITE_SPREAD),
         0,
-        center.z() + site_z + rng.random_range(-10..=10),
+        center.z() + site_z + rng.random_range(-GATE_SITE_SPREAD..=GATE_SITE_SPREAD),
     )
 }
 
@@ -658,9 +662,9 @@ mod tests {
 
     use super::{
         ASSOCIATION_CLERK_POS, ASSOCIATION_LOT, AXIS, CityPalette, District, ENTRANCE_FRAME,
-        ENTRANCE_TOP, GATE_SITE_OFFSETS, GROUND_Y, HALF_LOT, LOT_MAX, LOT_MIN, LOT_SIZE,
-        MARKET_LOT, MERCHANT_POS, ORGANIZATION_AGENT_POS, SIGNS, WORLD_NAME, building_state,
-        city_layers, district, gate_candidate, is_gate_ground, is_ground_light,
+        ENTRANCE_TOP, GATE_SITE_OFFSETS, GATE_SITE_SPREAD, GROUND_Y, HALF_LOT, LOT_MAX, LOT_MIN,
+        LOT_SIZE, MARKET_LOT, MERCHANT_POS, ORGANIZATION_AGENT_POS, SIGNS, WORLD_NAME,
+        building_state, city_layers, district, is_gate_ground, is_ground_light,
         register_world_generator, sign_block,
     };
     use crate::dungeon::instance::gate_footprint;
@@ -738,13 +742,18 @@ mod tests {
         for (x, z) in GATE_SITE_OFFSETS {
             assert_eq!(district(lot(x), lot(z)), District::GateSquare);
         }
-        for _ in 0..100 {
-            let candidate = gate_candidate(BlockPos::new(0, 0, 0));
-            // The whole footprint stays on open plaza ground, which the site
-            // check demands of every gate.
-            for (x, z) in gate_footprint(candidate) {
-                assert_eq!(district(lot(x), lot(z)), District::GateSquare);
-                assert!(is_gate_ground(x, z), "({x}, {z})");
+        // Every site the roll can pick keeps its whole footprint on open
+        // plaza ground, which the site check demands of every gate.
+        let spread = -GATE_SITE_SPREAD..=GATE_SITE_SPREAD;
+        for (site_x, site_z) in GATE_SITE_OFFSETS {
+            for dx in spread.clone() {
+                for dz in spread.clone() {
+                    let candidate = BlockPos::new(site_x + dx, 0, site_z + dz);
+                    for (x, z) in gate_footprint(candidate) {
+                        assert_eq!(district(lot(x), lot(z)), District::GateSquare);
+                        assert!(is_gate_ground(x, z), "({x}, {z})");
+                    }
+                }
             }
         }
     }

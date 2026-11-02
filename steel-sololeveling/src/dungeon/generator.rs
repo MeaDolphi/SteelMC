@@ -37,10 +37,6 @@ const CELL: i32 = 24;
 const MAX_ROOM_HALF: i32 = 11;
 /// Air height of a corridor.
 const CORRIDOR_HEIGHT: u8 = 3;
-/// Blocks between two corridor ceiling lights.
-const CORRIDOR_LIGHT_SPACING: i32 = 5;
-/// Blocks between two room ceiling lights.
-const ROOM_LIGHT_SPACING: i32 = 4;
 /// Most spawn spots remembered per room.
 const SPAWN_SPOTS: usize = 24;
 
@@ -106,6 +102,19 @@ impl Theme {
             Self::DeepDark => "Глубокая тьма",
             Self::End => "Руины Края",
             Self::SnowElves => "Снежная долина",
+        }
+    }
+
+    /// Returns the blocks between two ceiling lights in a room and in a
+    /// corridor.
+    ///
+    /// The nether fortress is built from bricks so dark that the usual grid
+    /// leaves it gloomy, so its lights hang closer together.
+    #[must_use]
+    pub const fn light_spacing(self) -> (i32, i32) {
+        match self {
+            Self::Nether => (3, 3),
+            _ => (4, 5),
         }
     }
 
@@ -406,11 +415,13 @@ impl Blueprint {
         }
         let mut lights: FxHashSet<(i32, i32)> = FxHashSet::default();
         let mut doorways: Vec<Doorway> = Vec::new();
+        let (room_spacing, corridor_spacing) = theme.light_spacing();
         for (from, to) in &links {
             carve_corridor(
                 &mut rng,
                 &mut air,
                 &mut lights,
+                corridor_spacing,
                 &rooms[*from],
                 *from,
                 &rooms[*to],
@@ -419,7 +430,7 @@ impl Blueprint {
             );
         }
         for room in &rooms {
-            light_room(&air, &mut lights, room);
+            light_room(&air, &mut lights, room, room_spacing);
         }
 
         let mut solid = shell(seed, &air, &lights);
@@ -726,12 +737,13 @@ struct Doorway {
 /// pillar can never seal a doorway.
 #[expect(
     clippy::too_many_arguments,
-    reason = "a corridor is fully described by its rng, the maps it carves, both linked rooms and the doorway list"
+    reason = "a corridor is fully described by its rng, the maps it carves and lights, both linked rooms and the doorway list"
 )]
 fn carve_corridor(
     rng: &mut SplitMix,
     air: &mut FxHashMap<(i32, i32), Column>,
     lights: &mut FxHashSet<(i32, i32)>,
+    light_spacing: i32,
     from: &Room,
     from_index: usize,
     to: &Room,
@@ -810,7 +822,7 @@ fn carve_corridor(
         }
         let center = if along_x { (*a, *b) } else { (*b, *a) };
         let index = i32::try_from(index).unwrap_or(0);
-        if index % CORRIDOR_LIGHT_SPACING == CORRIDOR_LIGHT_SPACING / 2
+        if index % light_spacing == light_spacing / 2
             && air.get(&center).is_some_and(|column| column.room.is_none())
         {
             lights.insert(center);
@@ -818,20 +830,19 @@ fn carve_corridor(
     }
 }
 
-/// Puts a grid of ceiling lights over a room.
+/// Puts a grid of ceiling lights `spacing` blocks apart over a room.
 fn light_room(
     air: &FxHashMap<(i32, i32), Column>,
     lights: &mut FxHashSet<(i32, i32)>,
     room: &Room,
+    spacing: i32,
 ) {
     let (hx, hz) = room.half;
     let (cx, cz) = room.center;
     for u in -hx..=hx {
         for v in -hz..=hz {
             let column = (cx + u, cz + v);
-            if u.rem_euclid(ROOM_LIGHT_SPACING) == 0
-                && v.rem_euclid(ROOM_LIGHT_SPACING) == 0
-                && air.contains_key(&column)
+            if u.rem_euclid(spacing) == 0 && v.rem_euclid(spacing) == 0 && air.contains_key(&column)
             {
                 lights.insert(column);
             }

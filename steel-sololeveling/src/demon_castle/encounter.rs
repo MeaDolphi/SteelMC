@@ -111,6 +111,7 @@ pub fn floor_packs(plan: &FloorPlan, world_seed: u64) -> Vec<Pack> {
         }
         let (floor_spots, gallery_spots) = district_spots(plan, cell);
         let mut centres: Vec<Spot> = Vec::new();
+        let first_ground = packs.len();
         for _ in 0..ground {
             if let Some(pack) = pack_at(
                 &mut rng,
@@ -123,6 +124,7 @@ pub fn floor_packs(plan: &FloorPlan, world_seed: u64) -> Vec<Pack> {
                 packs.push(pack);
             }
         }
+        enlist_berserker(&mut packs[first_ground..]);
         for _ in 0..gallery {
             if let Some(pack) = pack_at(
                 &mut rng,
@@ -147,6 +149,24 @@ pub fn floor_packs(plan: &FloorPlan, world_seed: u64) -> Vec<Pack> {
         }
     }
     packs
+}
+
+/// Makes sure the ground packs of one district hold a berserker: a fighter
+/// that rolled another class takes its place, or else the first foe does.
+fn enlist_berserker(packs: &mut [Pack]) {
+    let berserker = Foe::Class(MobClass::Berserker);
+    let foes = packs.iter_mut().flat_map(|pack| pack.foes.iter_mut());
+    let mut foes: Vec<&mut Foe> = foes.collect();
+    if foes.iter().any(|foe| **foe == berserker) {
+        return;
+    }
+    let slot = foes
+        .iter()
+        .position(|foe| matches!(foe, Foe::Class(_)))
+        .unwrap_or(0);
+    if let Some(foe) = foes.get_mut(slot) {
+        **foe = berserker;
+    }
 }
 
 /// The elite and its escorts standing nearest to a treasure cache.
@@ -427,6 +447,7 @@ mod tests {
 
     use super::{Foe, floor_packs, pack_size};
     use crate::demon_castle::plan::FloorPlan;
+    use crate::dungeon::mobs::MobClass;
 
     #[test]
     fn a_floor_is_crowded_and_grows_with_the_climb() {
@@ -441,6 +462,19 @@ mod tests {
             );
             for pack in &packs {
                 assert_eq!(pack.spots.len(), pack.foes.len());
+            }
+            // Every district with packs fields at least one berserker.
+            let mut districts: Vec<usize> = packs.iter().map(|pack| pack.district).collect();
+            districts.dedup();
+            for district in districts {
+                assert!(
+                    packs
+                        .iter()
+                        .filter(|pack| pack.district == district)
+                        .flat_map(|pack| &pack.foes)
+                        .any(|foe| *foe == Foe::Class(MobClass::Berserker)),
+                    "seed {seed} floor {floor}: district {district} has no berserker"
+                );
             }
             // Every cache has its elite.
             let elites = packs
