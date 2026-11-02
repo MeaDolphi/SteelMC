@@ -537,8 +537,13 @@ impl ServerJob for DungeonGenerationJob {
                     RunStart::Castle { gate, seed } => {
                         let floor = gate.floor.unwrap_or(1);
                         let build_start = Instant::now();
-                        let blocks =
-                            castle_tower::build_floor(instance_world, self.region, *seed, floor);
+                        let blocks = castle_tower::build_floor(
+                            instance_world,
+                            self.region,
+                            *seed,
+                            floor,
+                            castle_tower::FloorBelow::Missing,
+                        );
                         let build_micros = build_start.elapsed().as_micros() as u64;
                         log::info!(
                             "sololeveling: cleared previous instance footprint in {:.2} ms (region {}, {} chunks)",
@@ -650,6 +655,7 @@ impl ServerJob for CastleFloorJob {
                     self.region,
                     self.seed,
                     self.floor,
+                    castle_tower::FloorBelow::Built,
                 );
                 log::info!(
                     "sololeveling: built castle floor {} in {:.2} ms (region {}, {} blocks)",

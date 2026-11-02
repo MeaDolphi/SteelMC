@@ -564,18 +564,42 @@ fn canonical_block(arch: Archetype, salt: u64, x: i32, z: i32, layer: i32) -> Op
         .or_else(|| common_light(salt, x, z, layer))
 }
 
+/// Whether the floor under a floor being built already stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorBelow {
+    /// The climb built the floor below; its ceiling slab fills the stairwell
+    /// the foundation keeps for the staircase.
+    Built,
+    /// The run entered the tower at this floor and nothing stands below, so
+    /// the foundation closes the stairwell instead of opening onto the void.
+    Missing,
+}
+
 /// Returns the block of the tower column `(dx, dz)` of `floor` at absolute
 /// height `y`, or `None` for air and for cells that must keep what a previous
 /// floor built.
 #[must_use]
 pub fn floor_block(seed: u64, floor: u32, dx: i32, dz: i32, y: i32) -> Option<BlockStateId> {
+    floor_block_over(seed, floor, FloorBelow::Built, dx, dz, y)
+}
+
+/// Returns the block of the tower column like [`floor_block`], over a floor
+/// below that may not have been built.
+fn floor_block_over(
+    seed: u64,
+    floor: u32,
+    below: FloorBelow,
+    dx: i32,
+    dz: i32,
+    y: i32,
+) -> Option<BlockStateId> {
     let layer = y - floor_surface_y(floor);
     if !(-1..=CLEARANCE).contains(&layer) {
         return None;
     }
     // The foundation keeps the hole the staircase of the floor below exits
     // through; everything else on the layer is generated as usual.
-    if layer == -1 && floor > 1 && is_arrival_hole(floor, dx, dz) {
+    if layer == -1 && floor > 1 && below == FloorBelow::Built && is_arrival_hole(floor, dx, dz) {
         return None;
     }
     let (x, z) = canonical(floor, dx, dz);
@@ -619,7 +643,13 @@ pub fn tower_chunks(region: InstanceRegion) -> Vec<ChunkPos> {
 /// without that cap the stairwell looks straight into the sky of the world
 /// until it is built. The slab's own stairwell is rotated away, so no shaft
 /// lines up with the one below.
-pub fn build_floor(world: &Arc<World>, region: InstanceRegion, seed: u64, floor: u32) -> usize {
+pub fn build_floor(
+    world: &Arc<World>,
+    region: InstanceRegion,
+    seed: u64,
+    floor: u32,
+    below: FloorBelow,
+) -> usize {
     let origin = BlockPos::from(region.spawn);
     let surface = floor_surface_y(floor);
     let mut failed = 0;
@@ -629,7 +659,7 @@ pub fn build_floor(world: &Arc<World>, region: InstanceRegion, seed: u64, floor:
     for dx in -WALL_OUTER..=WALL_OUTER {
         for dz in -WALL_OUTER..=WALL_OUTER {
             for y in surface - 1..=surface + CLEARANCE {
-                let Some(block) = floor_block(seed, floor, dx, dz, y) else {
+                let Some(block) = floor_block_over(seed, floor, below, dx, dz, y) else {
                     continue;
                 };
                 blocks += 1;
@@ -727,9 +757,9 @@ pub fn floor_entry(region: InstanceRegion, floor: u32) -> DVec3 {
 /// Returns where a hunter entering the tower directly at `floor` stands: the
 /// middle of that floor's arena.
 ///
-/// A climb only ever builds the floors it reaches, so the arrival aisle of a
-/// directly entered floor has an open stairwell under it, and the arena
-/// centre is the one position guaranteed to have a floor.
+/// A climb only ever builds the floors it reaches, so the floor below — and
+/// the landing [`floor_entry`] stands on — does not exist on a directly
+/// entered floor.
 #[must_use]
 pub fn hall_center(region: InstanceRegion, floor: u32) -> DVec3 {
     let pos = at(region, (0, (floor as i32 - 1) * FLOOR_STEP, 0));
@@ -820,10 +850,11 @@ mod tests {
     use steel_utils::axis::Axis;
 
     use super::{
-        Archetype, CLEARANCE, FLIGHT_X_MAX, FLIGHT_X_MIN, FLOOR_STEP, HOLE_X_MIN, INLAY_RADIUS,
-        LANDING_X_MIN, LAVA_INNER, LAVA_OUTER, RAMP_TOP, STRIP_X_MAX, STRIP_X_MIN, STRIP_Z_MAX,
-        STRIP_Z_MIN, TOWER_HALF, WALL_OUTER, canonical, east_stairs, floor_block, floor_entry,
-        floor_surface_y, max_floors, quarter, rot, spawn_spots, stair_facing, stair_layer,
+        Archetype, CLEARANCE, FLIGHT_X_MAX, FLIGHT_X_MIN, FLOOR_STEP, FloorBelow, HOLE_X_MIN,
+        INLAY_RADIUS, LANDING_X_MIN, LAVA_INNER, LAVA_OUTER, RAMP_TOP, STRIP_X_MAX, STRIP_X_MIN,
+        STRIP_Z_MAX, STRIP_Z_MIN, TOWER_HALF, WALL_OUTER, canonical, east_stairs, floor_block,
+        floor_block_over, floor_entry, floor_surface_y, max_floors, quarter, rot, spawn_spots,
+        stair_facing, stair_layer,
     };
     use crate::dungeon::InstanceRegion;
 
@@ -881,6 +912,25 @@ mod tests {
                             "floor {floor}: stairwell cell ({dx}, {dz}) sees the sky"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_directly_entered_floor_has_a_whole_foundation() {
+        init_vanilla_registry();
+        // Nothing stands under the floor a run enters at, so a stairwell kept
+        // in its foundation would be a trench straight into the void.
+        for floor in 2_u32..6 {
+            let surface = floor_surface_y(floor);
+            for dx in -WALL_OUTER..=WALL_OUTER {
+                for dz in -WALL_OUTER..=WALL_OUTER {
+                    assert!(
+                        floor_block_over(7, floor, FloorBelow::Missing, dx, dz, surface - 1)
+                            .is_some(),
+                        "floor {floor}: the foundation is open at ({dx}, {dz})"
+                    );
                 }
             }
         }
