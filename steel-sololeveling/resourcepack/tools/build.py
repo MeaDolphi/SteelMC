@@ -1199,12 +1199,13 @@ def projectile_image(name):
     for y in range(32):
         for x in range(32):
             dx, dy = abs(x - 15.5), abs(y - 15.5)
-            if name == "void_lance":
-                inside = dy <= max(1.0, 7.0 - dx * 0.35) and dx < 15
-            elif name == "shard":
+            if name == "shard":
                 inside = dx + dy * 1.8 < 10
             else:
-                inside = dx * 0.75 + dy < 14 and dx < 10
+                tip = y < 10 and dx <= 0.5 + y * 0.32
+                shaft = 8 <= y <= 30 and dx <= 1.6
+                barbs = 6 <= y <= 12 and dx <= 4.5 - abs(y - 9) * 0.7
+                inside = tip or shaft or barbs
             if not inside:
                 continue
             edge = dx * 0.75 + dy if name != "void_lance" else dy + dx * 0.2

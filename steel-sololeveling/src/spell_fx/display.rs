@@ -3,7 +3,7 @@
 use std::f32::consts::FRAC_PI_2;
 use std::sync::Arc;
 
-use glam::{DVec3, Quat};
+use glam::{DVec3, Quat, Vec3};
 use steel_core::entity::entities::{DisplayBillboard, ItemDisplayEntity};
 use steel_core::entity::{Entity as _, SharedEntity, next_entity_id};
 use steel_core::world::World;
@@ -74,6 +74,46 @@ pub(crate) fn spawn(
     scale: f32,
     horizontal: bool,
 ) -> Option<i32> {
+    spawn_transformed(
+        world,
+        model,
+        position,
+        scale,
+        if horizontal {
+            DisplayBillboard::Fixed
+        } else {
+            DisplayBillboard::Center
+        },
+        rotation(horizontal, 0.0),
+    )
+}
+
+/// Spawns a spear whose long axis points along its flight, not at the camera.
+pub(crate) fn spawn_projectile(
+    world: &Arc<World>,
+    model: SpellModel,
+    position: DVec3,
+    scale: f32,
+    direction: DVec3,
+) -> Option<i32> {
+    spawn_transformed(
+        world,
+        model,
+        position,
+        scale,
+        DisplayBillboard::Fixed,
+        rotation_towards(direction),
+    )
+}
+
+fn spawn_transformed(
+    world: &Arc<World>,
+    model: SpellModel,
+    position: DVec3,
+    scale: f32,
+    billboard: DisplayBillboard,
+    rotation: Quaternionf,
+) -> Option<i32> {
     let display = ItemDisplayEntity::new(
         &vanilla_entities::ITEM_DISPLAY,
         next_entity_id(),
@@ -81,16 +121,8 @@ pub(crate) fn spawn(
         Arc::downgrade(world),
     );
     display.set_item(model.stack());
-    display.set_billboard(if horizontal {
-        DisplayBillboard::Fixed
-    } else {
-        DisplayBillboard::Center
-    });
-    display.set_transformation(
-        Vector3f::ZERO,
-        Vector3f::new(scale, scale, scale),
-        rotation(horizontal, 0.0),
-    );
+    display.set_billboard(billboard);
+    display.set_transformation(Vector3f::ZERO, Vector3f::new(scale, scale, scale), rotation);
     display.set_interpolation(1);
     display.set_brightness(15, 15);
     display.set_persistent(false);
@@ -99,14 +131,60 @@ pub(crate) fn spawn(
     world.try_add_entity(entity).ok().map(|()| id)
 }
 
-/// Rotates a ground rune around its vertical axis, or leaves a projectile
-/// facing the viewer.
+/// Rotates a ground rune only inside its own plane. Rotating around world Y
+/// after laying it down would tilt the circle back towards vertical.
 #[must_use]
 pub(crate) fn rotation(horizontal: bool, spin: f32) -> Quaternionf {
     if !horizontal {
         return Quaternionf::IDENTITY;
     }
-    let rotation = Quat::from_rotation_x(-FRAC_PI_2) * Quat::from_rotation_y(spin);
+    let rotation = Quat::from_rotation_x(-FRAC_PI_2) * Quat::from_rotation_z(spin);
     let [x, y, z, w] = rotation.to_array();
     Quaternionf::new(x, y, z, w)
+}
+
+/// Aligns the model's local Y axis with the flight direction.
+#[must_use]
+pub(crate) fn rotation_towards(direction: DVec3) -> Quaternionf {
+    let direction = direction.normalize_or_zero();
+    if direction.length_squared() < 1e-8 {
+        return Quaternionf::IDENTITY;
+    }
+    let target = Vec3::new(direction.x as f32, direction.y as f32, direction.z as f32);
+    let rotation = Quat::from_rotation_arc(Vec3::Y, target);
+    let [x, y, z, w] = rotation.to_array();
+    Quaternionf::new(x, y, z, w)
+}
+
+#[cfg(test)]
+mod tests {
+    use glam::{DVec3, Quat, Vec3};
+
+    use super::{rotation, rotation_towards};
+
+    #[test]
+    fn rune_spin_never_tilts_its_ground_plane() {
+        for spin in [0.0, 0.7, 2.4, -1.8] {
+            let q = rotation(true, spin);
+            let rotation = Quat::from_xyzw(q.x, q.y, q.z, q.w);
+            let normal = rotation * Vec3::Z;
+            assert!(
+                (normal - Vec3::Y).length() < 1e-5,
+                "spin {spin} tilted the rune: {normal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_spear_points_along_its_flight() {
+        let direction = DVec3::new(2.0, -1.0, 3.0).normalize();
+        let q = rotation_towards(direction);
+        let rotation = Quat::from_xyzw(q.x, q.y, q.z, q.w);
+        let actual = rotation * Vec3::Y;
+        let expected = Vec3::new(direction.x as f32, direction.y as f32, direction.z as f32);
+        assert!(
+            (actual - expected).length() < 1e-5,
+            "{actual:?} != {expected:?}"
+        );
+    }
 }

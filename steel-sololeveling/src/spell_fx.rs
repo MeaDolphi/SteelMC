@@ -233,17 +233,30 @@ pub fn lightning_points(from: DVec3, to: DVec3) -> Vec<DVec3> {
 
 /// Draws a bright, jagged lightning bolt.
 pub fn lightning(world: &World, from: DVec3, to: DVec3) {
-    let points = lightning_points(from, to);
-    shape(
-        world,
-        ParticleData::simple(&particle::ELECTRIC_SPARK),
-        &points,
-    );
-    shape(
-        world,
-        ParticleData::simple(&particle::END_ROD),
-        &points.iter().step_by(3).copied().collect::<Vec<_>>(),
-    );
+    for offset in [
+        DVec3::ZERO,
+        DVec3::new(0.16, 0.08, -0.12),
+        DVec3::new(-0.14, -0.06, 0.16),
+    ] {
+        let points = lightning_points(from + offset, to - offset);
+        for point in &points {
+            world.send_particles(
+                ParticleData::simple(&particle::ELECTRIC_SPARK),
+                *point,
+                2,
+                DVec3::ZERO,
+                0.0,
+            );
+        }
+        shape(
+            world,
+            ParticleData::simple(&particle::END_ROD),
+            &points.iter().step_by(2).copied().collect::<Vec<_>>(),
+        );
+    }
+    let center = from.lerp(to, 0.5);
+    flash(world, center);
+    burst(world, &particle::ELECTRIC_SPARK, center, 24, 0.4, 0.06);
 }
 
 /// A projectile trail: the theme's primary particle along the whole path and

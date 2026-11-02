@@ -673,31 +673,111 @@ impl SoloLevelingState {
             ),
             SpellId::Fireball => (
                 fx::display::SpellModel::Fireball,
-                1.8,
+                1.5,
                 FIREBALL_DAMAGE * caster.power,
                 80 * caster.burn,
             ),
             SpellId::IceSpear => (
                 fx::display::SpellModel::IceSpear,
-                1.4,
+                1.2,
                 ICE_SPEAR_DAMAGE * caster.power,
                 0,
             ),
             _ => return,
         };
-        let entity = fx::display::spawn(&caster.world, model, caster.eye, scale, false);
+        let direction = caster.look.normalize_or_zero();
+        let start = caster.eye + direction * 1.6 - DVec3::new(0.0, 0.25, 0.0);
+        let entity = if spell == SpellId::Fireball {
+            fx::display::spawn(&caster.world, model, start, scale, false)
+        } else {
+            fx::display::spawn_projectile(&caster.world, model, start, scale, direction)
+        };
         self.spell_runtime.lock().projectiles.push(SpellProjectile {
             owner: caster.player.gameprofile.id(),
             world: caster.world.key.clone(),
             spell,
-            position: caster.eye,
-            direction: caster.look.normalize_or_zero(),
-            remaining: AIM_RANGE,
+            position: start,
+            direction,
+            remaining: (AIM_RANGE - 1.6).max(1.0),
             last_tick: caster.now,
             damage,
             burn_ticks,
             entity,
         });
+    }
+
+    fn projectile_trail(world: &Arc<World>, projectile: &SpellProjectile, from: DVec3) {
+        fx::trail(
+            world,
+            &fx::theme(projectile.spell),
+            from,
+            projectile.position,
+        );
+        match projectile.spell {
+            SpellId::Fireball => {
+                fx::burst(
+                    world,
+                    &vanilla_particle_types::FLAME,
+                    projectile.position,
+                    12,
+                    0.28,
+                    0.04,
+                );
+                fx::burst(
+                    world,
+                    &vanilla_particle_types::LARGE_SMOKE,
+                    projectile.position,
+                    5,
+                    0.35,
+                    0.02,
+                );
+                fx::burst(
+                    world,
+                    &vanilla_particle_types::LAVA,
+                    projectile.position,
+                    3,
+                    0.3,
+                    0.02,
+                );
+            }
+            SpellId::IceSpear => {
+                fx::burst(
+                    world,
+                    &vanilla_particle_types::SNOWFLAKE,
+                    projectile.position,
+                    16,
+                    0.35,
+                    0.03,
+                );
+                fx::dust(
+                    world,
+                    fx::theme(projectile.spell).tint,
+                    projectile.position,
+                    10,
+                    0.3,
+                    0.02,
+                );
+            }
+            SpellId::MagicArrow => {
+                fx::burst(
+                    world,
+                    &vanilla_particle_types::END_ROD,
+                    projectile.position,
+                    8,
+                    0.2,
+                    0.02,
+                );
+                fx::burst(
+                    world,
+                    &vanilla_particle_types::ENCHANTED_HIT,
+                    projectile.position,
+                    6,
+                    0.25,
+                    0.03,
+                );
+            }
+            _ => {}
+        }
     }
 
     /// Advances a projectile and returns whether it is still flying.
@@ -726,12 +806,7 @@ impl SoloLevelingState {
         if let Some(entity) = projectile.entity.and_then(|id| world.get_entity_by_id(id)) {
             let _ = entity.try_set_position(projectile.position);
         }
-        fx::trail(
-            world,
-            &fx::theme(projectile.spell),
-            from,
-            projectile.position,
-        );
+        Self::projectile_trail(world, projectile, from);
         let blocked = shot.end.distance(from) < step - 1e-6;
         let target = shot.hits.first();
         if target.is_none() && !blocked && projectile.remaining > 0.0 {
@@ -773,6 +848,8 @@ impl SoloLevelingState {
             SpellId::IceSpear => {
                 let at = target.map_or(projectile.position, |entity| entity.position() + DVec3::Y);
                 fx::impact(world, projectile.spell, at);
+                fx::burst(world, &vanilla_particle_types::SNOWFLAKE, at, 42, 0.9, 0.12);
+                fx::ring_dust(world, fx::theme(projectile.spell).tint, at, 2.2, 32);
                 let mut visuals = self.spell_runtime.lock();
                 for offset in [
                     DVec3::new(1.4, 0.8, 0.0),
