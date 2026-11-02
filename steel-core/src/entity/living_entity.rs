@@ -948,7 +948,14 @@ pub trait LivingEntity: Entity {
         }
 
         let (xd, zd) = self.damage_knockback_direction(source);
-        self.knockback(DAMAGE_KNOCKBACK_POWER, xd, zd);
+        let multiplier = self.level().map_or(1.0, |world| {
+            self.as_living_entity().map_or(1.0, |victim| {
+                world
+                    .gameplay_hooks
+                    .knockback_multiplier(&world, victim, source)
+            })
+        });
+        self.knockback(DAMAGE_KNOCKBACK_POWER * multiplier, xd, zd);
         self.indicate_damage(xd, zd);
     }
 

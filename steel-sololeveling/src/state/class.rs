@@ -254,6 +254,7 @@ impl SoloLevelingState {
         self.tick_class_vault(player);
         self.give_ranger_kit(player);
         self.tick_mana(player);
+        self.tick_shield(player);
         self.tick_enchantments(player);
         self.tick_quests(player);
     }

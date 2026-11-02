@@ -299,6 +299,7 @@ impl GameplayHooks for SoloLevelingHooks {
     fn on_player_death(&self, _server: &Arc<Server>, player: &Player) {
         let uuid = player.gameprofile.id();
         self.state.recall_shadows(uuid);
+        self.state.reset_shield(uuid);
         scenario::on_player_death(uuid);
         self.state.observe_dungeon_player_death(player);
     }
@@ -411,6 +412,9 @@ impl GameplayHooks for SoloLevelingHooks {
         stack: &ItemStack,
         hand: InteractionHand,
     ) -> Option<InteractionResult> {
+        if crate::shield::is_shield(stack) {
+            return Some(self.state.use_shield(player, hand));
+        }
         if item::menu_book::is_menu_book(stack) {
             main_menu::open(player, Arc::clone(&self.state));
             return Some(InteractionResult::Success);
@@ -584,7 +588,17 @@ impl GameplayHooks for SoloLevelingHooks {
         amount: f32,
     ) -> f32 {
         let amount = self.state.class_damage(victim, source, amount);
-        self.state.artifact_damage(victim, source, amount)
+        let amount = self.state.artifact_damage(victim, source, amount);
+        self.state.shield_damage(victim, source, amount)
+    }
+
+    fn knockback_multiplier(
+        &self,
+        _world: &World,
+        victim: &dyn LivingEntity,
+        source: &DamageSource,
+    ) -> f64 {
+        self.state.shield_knockback_multiplier(victim, source)
     }
 
     fn allow_living_entity_damage(

@@ -66,6 +66,7 @@ pub mod session;
 pub mod shadow;
 pub mod shadow_menu;
 pub mod shadow_runtime;
+pub mod shield;
 pub mod shop;
 pub mod shop_menu;
 pub mod sidebar;

@@ -183,9 +183,9 @@ impl Gate {
     /// remain available to E-rank hunters.
     #[must_use]
     pub const fn minimum_hunter_rank(&self) -> HunterRank {
-        // A castle floor is opened for its climber, whatever its rank.
+        // The castle keeps E-rank floors but admits only trained hunters.
         if self.floor.is_some() {
-            return HunterRank::E;
+            return HunterRank::D;
         }
         match self.rank {
             HunterRank::E | HunterRank::D => HunterRank::E,
@@ -1257,8 +1257,14 @@ mod tests {
 
         // A castle portal is a personal climb and never turns red.
         let portal = gates.create_castle(world.clone(), BlockPos::new(60, 70, 20), 0, 3);
+        assert!(
+            gates
+                .enter_at(&world, HunterRank::E, DVec3::new(60.5, 71.0, 20.5), true)
+                .is_none(),
+            "an E hunter cannot enter the castle"
+        );
         let climbed = gates
-            .enter_at(&world, HunterRank::E, DVec3::new(60.5, 71.0, 20.5), true)
+            .enter_at(&world, HunterRank::D, DVec3::new(60.5, 71.0, 20.5), true)
             .expect("the portal admits its climber");
         assert_eq!(climbed.id, portal.id);
         assert!(!climbed.red);

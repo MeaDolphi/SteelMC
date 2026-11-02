@@ -385,7 +385,8 @@ impl Player {
         }
     }
 
-    fn stop_using_item(&self) {
+    /// Stops the active item use and clears its client-visible flag.
+    pub fn stop_using_item(&self) {
         self.living_base.stop_using_item();
         let mut entity_data = self.entity_data.lock();
         let flags = *entity_data.living_entity().living_entity_flags.get();

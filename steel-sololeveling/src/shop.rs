@@ -115,12 +115,12 @@ enum Category {
 
 /// The random table: 80% Rare, 16% Epic and 4% Legendary artifacts.
 const TABLE: [(u32, Category, u64); 6] = [
-    (400, Category::Weapon(Rarity::Rare), 120),
-    (400, Category::Armor(Rarity::Rare), 100),
-    (80, Category::Weapon(Rarity::Epic), 600),
-    (80, Category::Armor(Rarity::Epic), 500),
-    (20, Category::Weapon(Rarity::Legendary), 3_000),
-    (20, Category::Armor(Rarity::Legendary), 2_500),
+    (400, Category::Weapon(Rarity::Rare), 360),
+    (400, Category::Armor(Rarity::Rare), 300),
+    (80, Category::Weapon(Rarity::Epic), 1_800),
+    (80, Category::Armor(Rarity::Epic), 1_500),
+    (20, Category::Weapon(Rarity::Legendary), 9_000),
+    (20, Category::Armor(Rarity::Legendary), 7_500),
 ];
 
 /// Every consumable available at any time, independent of the random window.
@@ -159,7 +159,7 @@ pub fn roll_offer(chance: u32, pick: usize) -> Offer {
                 None
             }
         })
-        .unwrap_or((Category::Armor(Rarity::Rare), 100));
+        .unwrap_or((Category::Armor(Rarity::Rare), 300));
     let item = match category {
         Category::Weapon(rarity) => pick_artifact(&artifact::weapons_of(rarity), pick),
         Category::Armor(rarity) => pick_artifact(&artifact::armors_of(rarity), pick),
@@ -344,18 +344,18 @@ mod tests {
     #[test]
     fn chance_rolls_land_in_the_table_rows() {
         for (chance, price) in [
-            (0, 120),
-            (399, 120),
-            (400, 100),
-            (799, 100),
-            (800, 600),
-            (879, 600),
-            (880, 500),
-            (959, 500),
-            (960, 3_000),
-            (979, 3_000),
-            (980, 2_500),
-            (999, 2_500),
+            (0, 360),
+            (399, 360),
+            (400, 300),
+            (799, 300),
+            (800, 1_800),
+            (879, 1_800),
+            (880, 1_500),
+            (959, 1_500),
+            (960, 9_000),
+            (979, 9_000),
+            (980, 7_500),
+            (999, 7_500),
         ] {
             let offer = roll_offer(chance, 0);
             assert_eq!(offer.price, price, "chance {chance}");

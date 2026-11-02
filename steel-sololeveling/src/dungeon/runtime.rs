@@ -99,6 +99,8 @@ const TEST_GATE_REUSE_RADIUS: f64 = 64.0;
 const TEST_GATE_MAX_ATTEMPTS: u8 = 8;
 /// Unentered gates kept open for every rank a hunter online holds.
 const DEMAND_GATES_PER_RANK: usize = 2;
+/// Ordinary E-rank gates kept on the map even while their runs are active.
+const MIN_E_GATES: usize = 3;
 /// How long a rank may run short of gates before one is added.
 const DEMAND_DELAY_TICKS: u64 = TICKS_PER_SECOND * 120;
 /// How often the open gates are counted against the online ranks.
@@ -2429,12 +2431,7 @@ impl DungeonRuntime {
     }
 
     /// Keeps open gates available for every rank a hunter online in the main
-    /// world holds.
-    ///
-    /// The ten-minute cycle seeds the world, but a fast hunter clears its few
-    /// gates long before the next one. When a rank has fewer than
-    /// [`DEMAND_GATES_PER_RANK`] unentered gates for [`DEMAND_DELAY_TICKS`],
-    /// one gate of exactly that rank is added, up to [`MAX_LIVE_GATES`].
+    /// world holds and at least three ordinary E gates even with no E hunter.
     fn schedule_demand_gates(
         &mut self,
         state: &SoloLevelingState,
@@ -2456,6 +2453,10 @@ impl DungeonRuntime {
             }
             true
         });
+        if let Some(index) = ranks.iter().position(|rank| *rank == HunterRank::E) {
+            ranks.remove(index);
+        }
+        ranks.insert(0, HunterRank::E);
         let gates = self.gates.committed_gates();
         let live = gates.iter().filter(|gate| gate.world == world.key).count();
         self.demand_since.retain(|rank, _| ranks.contains(rank));
@@ -2468,19 +2469,14 @@ impl DungeonRuntime {
             return;
         }
         for rank in ranks {
-            // A gate with a run behind it no longer waits for this rank.
-            let open = gates
-                .iter()
-                .filter(|gate| {
-                    gate.world == world.key && gate.rank == rank && gate.phase == GatePhase::Open
-                })
-                .count();
-            if open >= DEMAND_GATES_PER_RANK {
+            let present = ordinary_gate_count(&gates, &world.key, rank);
+            let required = required_gate_count(rank);
+            if present >= required {
                 self.demand_since.remove(&rank);
                 continue;
             }
             let since = *self.demand_since.entry(rank).or_insert(tick);
-            if tick.saturating_sub(since) < DEMAND_DELAY_TICKS {
+            if rank != HunterRank::E && tick.saturating_sub(since) < DEMAND_DELAY_TICKS {
                 continue;
             }
             self.demand_since.insert(rank, tick);
@@ -4136,6 +4132,21 @@ pub(crate) fn find_player(server: &Server, uuid: Uuid) -> Option<Arc<Player>> {
         .find(|player| player.gameprofile.id() == uuid)
 }
 
+fn required_gate_count(rank: HunterRank) -> usize {
+    if rank == HunterRank::E {
+        MIN_E_GATES
+    } else {
+        DEMAND_GATES_PER_RANK
+    }
+}
+
+fn ordinary_gate_count(gates: &[Gate], world: &Identifier, rank: HunterRank) -> usize {
+    gates
+        .iter()
+        .filter(|gate| gate.world == *world && gate.rank == rank && gate.floor.is_none())
+        .count()
+}
+
 /// Returns the world automatic gates appear in.
 ///
 /// The main world is the default world of the server's default domain, so a
@@ -4678,5 +4689,34 @@ mod tests {
         };
         progress.remaining_mobs.clear();
         assert!(runtime.castle_mob_reward_key(&world, 7, hunter).is_none());
+    }
+
+    #[test]
+    fn e_gate_quota_counts_active_gates_but_not_the_castle() {
+        use glam::DVec3;
+        use steel_utils::Identifier;
+
+        use super::{GateRegistry, ordinary_gate_count, required_gate_count};
+
+        steel_registry::init_vanilla_registry();
+        let world = Identifier::from_steel("overworld");
+        let mut registry = GateRegistry::default();
+        let active =
+            registry.create_ranked(world.clone(), BlockPos::new(20, 70, 20), 0, HunterRank::E);
+        registry.create_ranked(world.clone(), BlockPos::new(40, 70, 20), 0, HunterRank::E);
+        let castle = registry.create_castle(world.clone(), BlockPos::new(60, 70, 20), 0, 1);
+        let revision = registry
+            .begin_persistence()
+            .expect("gate changes should commit")
+            .revision;
+        registry.commit_persistence(revision);
+        registry.activate(active.id);
+        let gates = registry.committed_gates();
+        assert_eq!(ordinary_gate_count(&gates, &world, HunterRank::E), 2);
+        assert_eq!(required_gate_count(HunterRank::E), 3);
+        assert_eq!(required_gate_count(HunterRank::D), 2);
+        assert_eq!(castle.minimum_hunter_rank(), HunterRank::D);
+        assert!(!castle.accepts_hunter(HunterRank::E, DVec3::new(60.5, 71.0, 20.5)));
+        assert!(castle.accepts_hunter(HunterRank::D, DVec3::new(60.5, 71.0, 20.5)));
     }
 }

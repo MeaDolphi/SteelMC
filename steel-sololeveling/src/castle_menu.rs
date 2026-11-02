@@ -29,14 +29,17 @@ const RANKING_SLOT: usize = 15;
 struct View {
     progress: CastleProgress,
     ranking: Vec<RankingEntry>,
+    rank: crate::rank::HunterRank,
     wait: u64,
 }
 
 fn view(state: &SoloLevelingState, uuid: Uuid) -> Option<View> {
+    let rank = state.with_session_mut(uuid, |session| session.stats.rank())?;
     let (progress, ranking) = state.castle_view(uuid)?;
     Some(View {
         progress,
         ranking,
+        rank,
         wait: progress.free_entry_in(merchant::unix_now()),
     })
 }
@@ -87,7 +90,8 @@ fn menu_items(view: Option<&View>) -> Vec<ItemStack> {
             )),
         ],
     );
-    let free = view.wait == 0;
+    let allowed = view.rank >= crate::rank::HunterRank::D;
+    let free = allowed && view.wait == 0;
     items[ENTER_SLOT] = with_lore(
         named(
             ItemStack::new(if free {
@@ -95,7 +99,9 @@ fn menu_items(view: Option<&View>) -> Vec<ItemStack> {
             } else {
                 &vanilla_items::BARRIER
             }),
-            TextComponent::plain(if free {
+            TextComponent::plain(if !allowed {
+                "Нужен ранг D".to_owned()
+            } else if free {
                 "Войти бесплатно".to_owned()
             } else {
                 format!(
@@ -107,6 +113,7 @@ fn menu_items(view: Option<&View>) -> Vec<ItemStack> {
             .color(if free { Color::Green } else { Color::Red }),
         ),
         vec![
+            line("Вход доступен охотникам с ранга D."),
             line(&format!(
                 "Бесплатный вход раз в {} минут.",
                 FREE_ENTRY_SECONDS / 60
@@ -247,6 +254,7 @@ mod tests {
         menu_items(Some(&View {
             progress: CastleProgress::default(),
             ranking: Vec::new(),
+            rank: crate::rank::HunterRank::D,
             wait,
         }))
     }
@@ -259,5 +267,20 @@ mod tests {
             free[ENTER_SLOT], waiting[ENTER_SLOT],
             "a spent free entry must not leave a green button"
         );
+    }
+
+    #[test]
+    fn the_enter_button_requires_rank_d() {
+        let items = menu_items(Some(&View {
+            progress: CastleProgress::default(),
+            ranking: Vec::new(),
+            rank: crate::rank::HunterRank::E,
+            wait: 0,
+        }));
+        let name = items[ENTER_SLOT]
+            .get(steel_registry::data_components::vanilla_components::CUSTOM_NAME)
+            .expect("entry name")
+            .to_plain(&text_components::resolving::NoResolutor);
+        assert_eq!(name, "Нужен ранг D");
     }
 }

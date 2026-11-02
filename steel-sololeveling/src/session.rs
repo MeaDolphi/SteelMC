@@ -25,6 +25,7 @@ use crate::quest::{PENALTY_DELAY_SECONDS, PENALTY_MIN_RANK, SystemQuest};
 use crate::quest_book::QuestBook;
 use crate::rank::HunterRank;
 use crate::shadow::{EliteShadowRoster, ShadowRoster};
+use crate::shield::ShieldGuard;
 use crate::shop::ShopDay;
 use crate::sidebar::SidebarView;
 use crate::spell::{MagicState, SpellBook};
@@ -92,6 +93,8 @@ pub struct HunterSession {
     pub quests: QuestBook,
     /// Mana, cooldowns and running spell effects.
     pub(crate) magic: MagicState,
+    /// Charge of the currently held shield stance.
+    pub shield: ShieldGuard,
     /// Worn enchantment effects and their timers.
     pub(crate) enchant: EnchantState,
     /// Where the hunter stood at the last run count.
@@ -174,6 +177,7 @@ impl HunterSession {
             spells: SpellBook::new(),
             quests: QuestBook::new(),
             magic: MagicState::new(),
+            shield: ShieldGuard::new(),
             enchant: EnchantState::new(),
             run_position: None,
             run_carry: 0.0,

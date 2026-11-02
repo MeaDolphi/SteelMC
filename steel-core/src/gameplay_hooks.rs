@@ -180,6 +180,16 @@ pub trait GameplayHooks: Send + Sync {
         amount
     }
 
+    /// Multiplies the vanilla knockback caused by this source.
+    fn knockback_multiplier(
+        &self,
+        _world: &World,
+        _victim: &dyn LivingEntity,
+        _source: &DamageSource,
+    ) -> f64 {
+        1.0
+    }
+
     /// Called after a block's loot was rolled but before the drops spawn.
     ///
     /// Implementations may drain or replace `drops` to route a themed

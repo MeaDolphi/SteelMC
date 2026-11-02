@@ -106,6 +106,7 @@ pub(crate) fn player(world: &Arc<World>, name: &str, id: i32) -> Arc<Player> {
         ClientInformation::default(),
     ));
     assert!(session.bind_initial_player(&player));
+    player.set_client_loaded(true);
     assert!(world.players.insert(Arc::clone(&player)));
     player
 }

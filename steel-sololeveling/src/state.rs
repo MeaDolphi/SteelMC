@@ -706,10 +706,13 @@ impl SoloLevelingState {
     /// castle key or by today's free entry; returns the floor.
     pub fn request_castle_floor(&self, uuid: Uuid, keyed: bool) -> Result<u32, &'static str> {
         let now = merchant::unix_now();
-        let progress = self
+        let (progress, rank) = self
             .sessions
-            .with_mut(uuid, |session| session.castle)
+            .with_mut(uuid, |session| (session.castle, session.stats.rank()))
             .ok_or("Сессия охотника не найдена.")?;
+        if rank < HunterRank::D {
+            return Err("Замок демонов доступен с ранга D.");
+        }
         if !keyed && progress.free_entry_in(now) > 0 {
             return Err("Бесплатный вход ещё не восстановился: нужен ключ Замка демонов.");
         }
@@ -1707,6 +1710,23 @@ mod tests {
         assert_eq!(loaded.elite_shadows.shadows[0].id, shadow.id);
         assert_eq!(loaded.elite_shadows.shadows[0].source, shadow.source);
 
+        fs::remove_dir_all(directory).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn castle_entry_requires_d_without_spending_the_free_entry() {
+        let player_uuid = Uuid::new_v4();
+        let (state, directory) = new_test_state(player_uuid);
+        assert_eq!(
+            state.request_castle_floor(player_uuid, false),
+            Err("Замок демонов доступен с ранга D.")
+        );
+        assert_eq!(
+            state.with_session_mut(player_uuid, |session| session.castle.free_at),
+            Some(0)
+        );
+        state.with_session_mut(player_uuid, |session| session.stats.level = 10);
+        assert_eq!(state.request_castle_floor(player_uuid, false), Ok(1));
         fs::remove_dir_all(directory).expect("cleanup should succeed");
     }
 
