@@ -259,6 +259,48 @@ pub fn lightning(world: &World, from: DVec3, to: DVec3) {
     burst(world, &particle::ELECTRIC_SPARK, center, 24, 0.4, 0.06);
 }
 
+/// Two counter-wound helices around the last four blocks of a projectile's
+/// trajectory. `phase` makes the wake rotate continuously during flight.
+#[must_use]
+pub fn wake_points(from: DVec3, to: DVec3, phase: f64, radius: f64) -> Vec<DVec3> {
+    let direction = (to - from).normalize_or_zero();
+    let side = if direction.abs_diff_eq(DVec3::Y, 1e-6) {
+        DVec3::X
+    } else {
+        direction.cross(DVec3::Y).normalize_or_zero()
+    };
+    let up = direction.cross(side).normalize_or_zero();
+    let length = from.distance(to).min(4.0);
+    let count = 20;
+    let mut points = Vec::with_capacity(count * 2);
+    for index in 0..count {
+        let t = index as f64 / (count - 1) as f64;
+        let center = to - direction * (length * (1.0 - t));
+        let angle = phase + t * TAU * 1.5;
+        for offset in [0.0, PI] {
+            let a = angle + offset;
+            points.push(center + side * (a.cos() * radius) + up * (a.sin() * radius));
+        }
+    }
+    points
+}
+
+/// Draws a rotating wake of `kind` around the last projectile segment.
+pub fn wake(
+    world: &World,
+    kind: &'static ParticleType,
+    from: DVec3,
+    to: DVec3,
+    phase: f64,
+    radius: f64,
+) {
+    shape(
+        world,
+        ParticleData::simple(kind),
+        &wake_points(from, to, phase, radius),
+    );
+}
+
 /// A projectile trail: the theme's primary particle along the whole path and
 /// its secondary one sparser, so the core reads bright inside a soft wake.
 pub fn trail(world: &World, theme: &SpellTheme, from: DVec3, to: DVec3) {
@@ -575,6 +617,7 @@ mod tests {
 
     use super::{
         cone_points, lightning_points, line_points, ring_points, school_assets, spiral_points,
+        wake_points,
     };
     use crate::item::model::SPELL_MODELS;
     use crate::spell::ALL;
@@ -650,6 +693,22 @@ mod tests {
             points[1..points.len() - 1]
                 .iter()
                 .any(|point| (point.z - from.z).abs() > 0.01)
+        );
+    }
+
+    #[test]
+    fn the_wake_stays_around_the_flight_axis_and_rotates() {
+        let from = DVec3::ZERO;
+        let to = DVec3::new(6.0, 0.0, 0.0);
+        let points = wake_points(from, to, 0.0, 0.4);
+        assert_eq!(points.len(), 40);
+        for point in points {
+            let radial = DVec3::new(0.0, point.y, point.z);
+            assert!((radial.length() - 0.4).abs() < 1e-6, "{point:?}");
+        }
+        assert_ne!(
+            wake_points(from, to, 0.0, 0.4),
+            wake_points(from, to, 1.0, 0.4)
         );
     }
 

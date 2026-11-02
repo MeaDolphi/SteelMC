@@ -6,6 +6,7 @@
 //! Mage bonus, robes and magic artifacts raise it through the ordinary
 //! damage hook.
 
+use std::f64::consts::TAU;
 use std::fmt::Write as _;
 use std::mem;
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use std::sync::Arc;
 use glam::DVec3;
 use rustc_hash::FxHashMap;
 use steel_core::entity::damage::DamageSource;
+use steel_core::entity::entities::ItemDisplayEntity;
 use steel_core::entity::{Entity, LivingEntity, MobEffectInstance, RemovalReason, SharedEntity};
 use steel_core::inventory::container::Container as _;
 use steel_core::inventory::equipment::EquipmentSlot;
@@ -22,12 +24,13 @@ use steel_core::server::Server;
 use steel_core::world::World;
 use steel_protocol::packets::game::CSetExperience;
 use steel_registry::blocks::block_state_ext::BlockStateExt as _;
+use steel_registry::entity_data::{Quaternionf, Vector3f};
 use steel_registry::item_stack::ItemStack;
 use steel_registry::mob_effect::MobEffectRef;
 use steel_registry::{vanilla_damage_types, vanilla_mob_effects, vanilla_particle_types};
 use steel_utils::geometry::WorldAabb;
 use steel_utils::types::InteractionHand;
-use steel_utils::{BlockPos, Identifier};
+use steel_utils::{BlockPos, Downcast as _, Identifier};
 use text_components::format::Color;
 use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
@@ -50,6 +53,8 @@ use crate::spell_fx as fx;
 
 /// Reach of aimed spells, in blocks.
 const AIM_RANGE: f64 = 24.0;
+/// Reach of real flying projectiles, in blocks.
+const PROJECTILE_RANGE: f64 = 48.0;
 /// Reach of the Meteor and the Void Lance, in blocks.
 const LONG_RANGE: f64 = 32.0;
 /// Step of a line-of-sight trace, in blocks.
@@ -117,10 +122,16 @@ struct SpellProjectile {
     position: DVec3,
     direction: DVec3,
     remaining: f64,
+    started: u64,
     last_tick: u64,
     damage: f32,
     burn_ticks: i32,
     entity: Option<i32>,
+}
+
+enum ProjectileStep {
+    Flying,
+    Impact(Option<SharedEntity>),
 }
 
 /// A Sanctuary circle.
@@ -185,6 +196,7 @@ fn touches(entity: &dyn Entity, point: DVec3) -> bool {
 struct Trace {
     end: DVec3,
     hits: Vec<SharedEntity>,
+    blocked: bool,
 }
 
 /// Walks from `from` along `direction` until a solid block or `range`,
@@ -200,10 +212,12 @@ fn trace(
     let direction = direction.normalize_or_zero();
     let mut hits: Vec<SharedEntity> = Vec::new();
     let mut end = from;
+    let mut blocked = false;
     let steps = (range / TRACE_STEP) as u32;
     for step in 1..=steps {
         let point = from + direction * (f64::from(step) * TRACE_STEP);
         if !passable(world, point) {
+            blocked = true;
             break;
         }
         end = point;
@@ -219,7 +233,10 @@ fn trace(
             break;
         }
     }
-    Trace { end, hits }
+    if !blocked && (pierce || hits.is_empty()) {
+        end = from + direction * range;
+    }
+    Trace { end, hits, blocked }
 }
 
 /// Returns the living mobs within `radius` of `center`.
@@ -698,7 +715,8 @@ impl SoloLevelingState {
             spell,
             position: start,
             direction,
-            remaining: (AIM_RANGE - 1.6).max(1.0),
+            remaining: (PROJECTILE_RANGE - 1.6).max(1.0),
+            started: caster.now,
             last_tick: caster.now,
             damage,
             burn_ticks,
@@ -713,8 +731,17 @@ impl SoloLevelingState {
             from,
             projectile.position,
         );
+        let phase = projectile.last_tick.saturating_sub(projectile.started) as f64 / 500.0 * TAU;
         match projectile.spell {
             SpellId::Fireball => {
+                fx::wake(
+                    world,
+                    &vanilla_particle_types::FLAME,
+                    from,
+                    projectile.position,
+                    phase,
+                    0.45,
+                );
                 fx::burst(
                     world,
                     &vanilla_particle_types::FLAME,
@@ -741,6 +768,14 @@ impl SoloLevelingState {
                 );
             }
             SpellId::IceSpear => {
+                fx::wake(
+                    world,
+                    &vanilla_particle_types::SNOWFLAKE,
+                    from,
+                    projectile.position,
+                    phase,
+                    0.38,
+                );
                 fx::burst(
                     world,
                     &vanilla_particle_types::SNOWFLAKE,
@@ -759,6 +794,14 @@ impl SoloLevelingState {
                 );
             }
             SpellId::MagicArrow => {
+                fx::wake(
+                    world,
+                    &vanilla_particle_types::END_ROD,
+                    from,
+                    projectile.position,
+                    phase,
+                    0.3,
+                );
                 fx::burst(
                     world,
                     &vanilla_particle_types::END_ROD,
@@ -793,11 +836,26 @@ impl SoloLevelingState {
             Self::discard_projectile(world, projectile);
             return false;
         }
+        match Self::step_projectile(world, projectile, now) {
+            ProjectileStep::Flying => true,
+            ProjectileStep::Impact(target) => {
+                self.impact_projectile(world, &owner, projectile, target.as_ref());
+                Self::discard_projectile(world, projectile);
+                false
+            }
+        }
+    }
+
+    fn step_projectile(
+        world: &Arc<World>,
+        projectile: &mut SpellProjectile,
+        now: u64,
+    ) -> ProjectileStep {
         let elapsed = now.saturating_sub(projectile.last_tick).min(250);
         projectile.last_tick = now;
         let step = (PROJECTILE_SPEED * elapsed as f64 / 1_000.0).min(projectile.remaining);
         if step <= 0.0 {
-            return true;
+            return ProjectileStep::Flying;
         }
         let from = projectile.position;
         let shot = trace(world, from, projectile.direction, step, false, is_enemy);
@@ -805,16 +863,24 @@ impl SoloLevelingState {
         projectile.remaining -= step;
         if let Some(entity) = projectile.entity.and_then(|id| world.get_entity_by_id(id)) {
             let _ = entity.try_set_position(projectile.position);
+            if projectile.spell == SpellId::Fireball
+                && let Some(display) = entity.downcast_ref::<ItemDisplayEntity>()
+            {
+                let elapsed = now.saturating_sub(projectile.started) as f32 / 1_000.0;
+                let scale = 1.45 + 0.18 * (elapsed * 7.0).sin();
+                display.set_transformation(
+                    Vector3f::ZERO,
+                    Vector3f::new(scale, scale, scale),
+                    Quaternionf::IDENTITY,
+                );
+            }
         }
         Self::projectile_trail(world, projectile, from);
-        let blocked = shot.end.distance(from) < step - 1e-6;
         let target = shot.hits.first();
-        if target.is_none() && !blocked && projectile.remaining > 0.0 {
-            return true;
+        if target.is_none() && !shot.blocked && projectile.remaining > 0.0 {
+            return ProjectileStep::Flying;
         }
-        self.impact_projectile(world, &owner, projectile, target);
-        Self::discard_projectile(world, projectile);
-        false
+        ProjectileStep::Impact(target.cloned())
     }
 
     fn impact_projectile(
@@ -1900,13 +1966,75 @@ fn holds_grimoire(player: &Player) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use glam::DVec3;
+    use tokio::runtime::Runtime;
+    use toml::{Value, map::Map};
+    use uuid::Uuid;
 
     use super::{
         CHAIN_LIGHTNING_DAMAGE, FIREBALL_DAMAGE, ICE_SPEAR_DAMAGE, MAGIC_ARROW_DAMAGE,
-        MANA_STORM_DAMAGE_PER_SECOND, METEOR_DAMAGE, VOID_LANCE_DAMAGE, cast_cost, compass,
+        MANA_STORM_DAMAGE_PER_SECOND, METEOR_DAMAGE, ProjectileStep, SpellProjectile,
+        VOID_LANCE_DAMAGE, cast_cost, compass,
     };
     use crate::spell::{SpellGear, SpellId};
+    use crate::state::SoloLevelingState;
+    use steel_core::entity::damage::DamageHistory;
+    use steel_core::gameplay_hooks::NoopGameplayHooks;
+    use steel_core::level_data::{GameTimeSource, WorldGenerationSettings};
+    use steel_core::world::{World, WorldConfig, WorldStorageConfig};
+    use steel_core::worldgen::{ChunkGeneratorType, EmptyChunkGenerator};
+    use steel_registry::{init_vanilla_registry, vanilla_dimension_types};
+    use steel_utils::Identifier;
+    use steel_utils::types::{Difficulty, GameType};
+
+    fn projectile_world() -> (Arc<World>, Arc<DamageHistory>, Arc<Runtime>) {
+        init_vanilla_registry();
+        let dimension = &vanilla_dimension_types::OVERWORLD;
+        let generation_settings = WorldGenerationSettings::from_generator_config(
+            Identifier::vanilla_static("empty"),
+            &Value::Table(Map::new()),
+            dimension.key.clone(),
+            dimension.min_y,
+            dimension.height,
+        );
+        let history = Arc::new(DamageHistory::default());
+        let runtime = Arc::new(Runtime::new().expect("test runtime"));
+        let generation_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("test generation pool"),
+        );
+        let world = runtime
+            .block_on(World::new_with_config(
+                Arc::clone(&runtime),
+                Identifier::vanilla_static("spell_projectile_test"),
+                dimension,
+                0,
+                WorldConfig {
+                    damage_history: Arc::clone(&history),
+                    gameplay_hooks: Arc::new(NoopGameplayHooks),
+                    game_time_source: GameTimeSource::Primary,
+                    storage: WorldStorageConfig::RamOnly,
+                    level_data_path: None,
+                    generator: Arc::new(ChunkGeneratorType::Empty(EmptyChunkGenerator::new())),
+                    generation_settings,
+                    view_distance: 2,
+                    simulation_distance: 2,
+                    max_chained_neighbor_updates: 1_000,
+                    compression: None,
+                    is_flat: true,
+                    sea_level: 64,
+                    default_gamemode: GameType::Survival,
+                    difficulty: Difficulty::Normal,
+                },
+                generation_pool,
+            ))
+            .expect("test world");
+        (world, history, runtime)
+    }
 
     #[test]
     fn wrath_halves_the_cost_and_compass_points_the_right_way() {
@@ -1955,5 +2083,51 @@ mod tests {
         for pair in per_cast.windows(2) {
             assert!(pair[0] <= pair[1], "{pair:?} breaks the tier order");
         }
+    }
+
+    #[test]
+    fn a_free_projectile_travels_its_entire_range() {
+        let (world, _history, _runtime) = projectile_world();
+        assert!(
+            super::passable(&world, DVec3::ZERO),
+            "start block: {:?}",
+            world.get_block_state(steel_utils::BlockPos::ZERO)
+        );
+        let mut projectile = SpellProjectile {
+            owner: Uuid::new_v4(),
+            world: world.key.clone(),
+            spell: SpellId::MagicArrow,
+            position: DVec3::ZERO,
+            direction: DVec3::X,
+            remaining: 46.4,
+            started: 0,
+            last_tick: 0,
+            damage: 5.0,
+            burn_ticks: 0,
+            entity: None,
+        };
+        let mut ticks = 0;
+        for now in (50..=2_000).step_by(50) {
+            ticks += 1;
+            if !matches!(
+                SoloLevelingState::step_projectile(&world, &mut projectile, now),
+                ProjectileStep::Flying
+            ) {
+                break;
+            }
+        }
+        assert!(
+            (33..=34).contains(&ticks),
+            "stopped at {:?} after {ticks} ticks, remaining {}, block {:?}",
+            projectile.position,
+            projectile.remaining,
+            world.get_block_state(steel_utils::BlockPos::from(projectile.position))
+        );
+        assert!(
+            (projectile.position.x - 46.4).abs() < 1e-6,
+            "{:?}",
+            projectile.position
+        );
+        assert!(projectile.remaining.abs() < 1e-6);
     }
 }
