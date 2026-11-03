@@ -39,5 +39,8 @@ uuid.workspace = true
 # Logging
 log.workspace = true
 
+[dev-dependencies]
+steel-core = { workspace = true, features = ["test-framework"] }
+
 [lints]
 workspace = true

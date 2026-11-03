@@ -1,6 +1,8 @@
 use std::sync::{Arc, Weak};
 
-use steel_core::config::RuntimeConfig;
+use steel_core::chunk::chunk_request::{ChunkRequest, ChunkRequestState, ChunkTicketKind};
+use steel_core::chunk::status::ChunkStatus;
+use steel_core::config::{ResolvedDomainConfig, RuntimeConfig};
 use steel_core::entity::damage::DamageHistory;
 use steel_core::gameplay_hooks::GameplayHooks;
 use steel_core::level_data::{GameTimeSource, WorldGenerationSettings};
@@ -25,6 +27,7 @@ pub(crate) struct TestWorld {
 
 pub(crate) fn world(gameplay_hooks: Arc<dyn GameplayHooks>) -> TestWorld {
     init_vanilla_registry();
+    steel_core::behavior::init_behaviors();
     let dimension = &vanilla_dimension_types::OVERWORLD;
     let generation_settings = WorldGenerationSettings::from_generator_config(
         Identifier::vanilla_static("empty"),
@@ -72,6 +75,42 @@ pub(crate) fn world(gameplay_hooks: Arc<dyn GameplayHooks>) -> TestWorld {
         _history: history,
         _runtime: runtime,
     }
+}
+
+pub(crate) fn load_full_chunks(world: &Arc<World>, positions: Vec<steel_utils::ChunkPos>) {
+    let request = world.chunk_map.request_chunks(ChunkRequest {
+        status: ChunkStatus::Full,
+        positions,
+        ticket_kind: ChunkTicketKind::Command,
+    });
+    let _runtime_guard = world.chunk_map.chunk_runtime.enter();
+    for _ in 0..10_000 {
+        world.chunk_map.flint_advance_scheduling();
+        if request.poll() == ChunkRequestState::Ready {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("test chunks did not become ready: {:?}", request.poll());
+}
+
+pub(crate) fn server(fixture: &TestWorld) -> Arc<steel_core::server::Server> {
+    let domain = fixture.world.domain().to_owned();
+    let domains = [ResolvedDomainConfig {
+        name: domain.clone(),
+        default_world: fixture.world.key.clone(),
+        worlds: vec![fixture.world.key.clone()],
+    }];
+    fixture
+        ._runtime
+        .block_on(steel_core::server::test_server_with_worlds_and_config(
+            domain,
+            &domains,
+            std::slice::from_ref(&fixture.world),
+            steel_core::permission::PermissionSubjectIndex::new(),
+            Arc::new(RuntimeConfig::default()),
+        ))
+        .expect("test server")
 }
 
 pub(crate) fn player(world: &Arc<World>, name: &str, id: i32) -> Arc<Player> {

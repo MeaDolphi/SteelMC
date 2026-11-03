@@ -41,7 +41,7 @@ use super::gate_vortex::GateVortices;
 use super::generator::{Room, RoomRole, Theme};
 use super::instance::{
     FrameStyle, SpawnedMob, build_dungeon, dungeon_chunks, erase_footprint, footprint_chunks,
-    gate_footprint, gate_frame_chunks, gate_frame_is_clear, gate_frame_matches,
+    gate_footprint, gate_frame_chunks, gate_frame_cleanup_complete, gate_frame_matches,
     gate_ground_is_level, gate_space_is_clear, open_dungeon_exit, opening_contains,
     place_gate_frame, remove_gate_frame, spawn_city_break_mob, spawn_dungeon_boss,
     spawn_dungeon_wave, spawn_gate_label, spawn_room_mobs,
@@ -1236,12 +1236,8 @@ impl DungeonRuntime {
     /// Restores the durable gate registry after the main world has been loaded.
     pub fn restore_gate_registry(&mut self, snapshot: GateRegistrySnapshot) -> Result<(), String> {
         self.gates.restore(snapshot, 0)?;
-        // The server tick restarts at zero every session while a persisted
-        // next_wave_tick is an absolute tick of the previous one, so a
-        // restored break would wait out the old uptime before its next wave.
-        // The wave mobs themselves are re-adopted from the world (see
-        // [`Self::adopt_gate_break_orphans`]), so the next wave may spawn as
-        // soon as the adopted wave is cleared.
+        // Breaks are disabled: restored waves never resume, so their old
+        // absolute tick schedule is irrelevant to the one-time retirement.
         for break_state in self.gates.breaks_mut() {
             break_state.next_wave_tick = 0;
         }
@@ -1386,8 +1382,8 @@ impl DungeonRuntime {
         if tick.is_multiple_of(VORTEX_SYNC_TICKS) {
             self.vortices.sync(server, self.gates.values());
         }
-        let mut actions = self.tick_gate_breaks(server, tick);
-        actions.extend(self.tick_runs(state, server, tick));
+        self.retire_disabled_breaks(server);
+        let mut actions = self.tick_runs(state, server, tick);
         actions.extend(self.return_strays(server));
         actions
     }
@@ -1928,9 +1924,7 @@ impl DungeonRuntime {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
-        for id in self.gates.unused_ids_at(now) {
-            self.gates.start_break(id);
-        }
+        self.gates.expire_unused_at(now);
     }
 
     fn gate_break_participants(server: &Server, gate: &Gate) -> Vec<Uuid> {
@@ -1973,6 +1967,51 @@ impl DungeonRuntime {
             .collect()
     }
 
+    fn retire_disabled_breaks(&mut self, server: &Arc<Server>) {
+        for break_state in self.gates.breaks() {
+            let id = break_state.gate.id;
+            if break_state.wave > 0
+                && let Some(world) = server.worlds.get(&break_state.gate.world)
+                && let Some(active) = self.gates.break_mut(id)
+            {
+                Self::adopt_gate_break_orphans(&mut self.gate_break_tracks, active, world, 0);
+            }
+            if let Some(track) = self.gate_break_tracks.remove(&id) {
+                for entity_id in track.labels.keys() {
+                    if let Some(entity) = server
+                        .worlds
+                        .get(&track.world)
+                        .and_then(|world| world.get_entity_by_id(*entity_id))
+                    {
+                        entity.set_removed(RemovalReason::Discarded);
+                    }
+                }
+            }
+            for entity_id in break_state.remaining_mobs {
+                if let Some(entity) = server
+                    .worlds
+                    .get(&break_state.gate.world)
+                    .and_then(|world| world.get_entity_by_id(entity_id))
+                {
+                    entity.set_removed(RemovalReason::Discarded);
+                }
+            }
+            let Some(gate) = self.gates.clear_break(id) else {
+                continue;
+            };
+            let Some(world) = server.worlds.get(&gate.world) else {
+                continue;
+            };
+            remove_gate_frame(world, &gate);
+            if gate_frame_cleanup_complete(world, &gate) {
+                self.gates.acknowledge_gate_cleanup(id);
+            } else {
+                self.queue_gate_cleanup(Arc::clone(world), gate);
+            }
+        }
+    }
+
+    #[expect(dead_code, reason = "Прорывы временно отключены")]
     fn tick_gate_breaks(&mut self, server: &Arc<Server>, tick: u64) -> Vec<RunAction> {
         let mut actions = Vec::new();
         let mut cleared = Vec::new();
@@ -2080,7 +2119,8 @@ impl DungeonRuntime {
                 // site is verified clear.
                 if let Some(world) = server.worlds.get(&gate.world) {
                     remove_gate_frame(world, &gate);
-                    if gate_frame_is_clear(world, &gate) && self.gates.acknowledge_gate_cleanup(id)
+                    if gate_frame_cleanup_complete(world, &gate)
+                        && self.gates.acknowledge_gate_cleanup(id)
                     {
                         log::info!(
                             "sololeveling: removed the gate frame in {} at {:?}",
@@ -2141,11 +2181,8 @@ impl DungeonRuntime {
     /// Adopts break wave mobs that lost their track back into the break.
     ///
     /// The break state persists across restarts, but its mobs live in chunks,
-    /// so after a restore they are back in the world untracked: no plates, no
-    /// class abilities, and they never count toward the wave. Adoption is
-    /// preferred over sweeping them because they keep the stats and plates
-    /// they spawned with, and respawning a fresh wave on top would double the
-    /// fight. Runs once a second per break that already spawned a wave.
+    /// so after a restore they are back in the world untracked. Adoption also
+    /// lets disabled breaks find and discard those mobs without resuming them.
     fn adopt_gate_break_orphans(
         tracks: &mut FxHashMap<u64, GateBreakTrack>,
         break_state: &mut GateBreak,
@@ -2341,16 +2378,24 @@ impl DungeonRuntime {
                         self.completed_legacy_gate_cleanups.insert(record_index);
                         continue;
                     }
-                    if gate_frame_is_clear(&cleanup.world, &gate) {
+                    if gate_frame_cleanup_complete(&cleanup.world, &gate) {
                         self.completed_legacy_gate_cleanups.insert(record_index);
                     } else if gate_frame_matches(&cleanup.world, &gate) {
                         remove_gate_frame(&cleanup.world, &gate);
-                        self.completed_legacy_gate_cleanups.insert(record_index);
-                        log::info!(
-                            "sololeveling: removed verified legacy orphan gate frame in {} at {:?}",
-                            gate.world,
-                            gate.entrance
-                        );
+                        if gate_frame_cleanup_complete(&cleanup.world, &gate) {
+                            self.completed_legacy_gate_cleanups.insert(record_index);
+                            log::info!(
+                                "sololeveling: removed verified legacy orphan gate frame in {} at {:?}",
+                                gate.world,
+                                gate.entrance
+                            );
+                        } else {
+                            log::warn!(
+                                "sololeveling: legacy gate cleanup is incomplete in {} at {:?}; retrying",
+                                gate.world,
+                                gate.entrance
+                            );
+                        }
                     } else {
                         self.blocked_legacy_gate_cleanups.insert(record_index);
                         log::warn!(
@@ -2382,7 +2427,7 @@ impl DungeonRuntime {
                 ChunkRequestState::Ready => {
                     let cleanup = self.pending_gate_cleanup.swap_remove(index);
                     remove_gate_frame(&cleanup.world, &cleanup.gate);
-                    if gate_frame_is_clear(&cleanup.world, &cleanup.gate) {
+                    if gate_frame_cleanup_complete(&cleanup.world, &cleanup.gate) {
                         self.gates.acknowledge_gate_cleanup(cleanup.gate.id);
                     } else {
                         log::warn!(
@@ -4465,37 +4510,192 @@ mod tests {
     }
 
     #[test]
-    fn restored_break_does_not_wait_out_the_previous_session_uptime() {
-        use steel_utils::Identifier;
+    fn restored_break_is_retired_without_spawning_or_rewarding_a_wave() {
+        use glam::DVec3;
+        use steel_core::entity::{Entity as _, entities::ZombieEntity, next_entity_id};
+        use steel_registry::vanilla_entities;
+        use steel_utils::WorldAabb;
 
-        use crate::dungeon::{GateBreak, GateRegistry};
+        use crate::dungeon::GateRegistry;
+        use crate::dungeon::instance::{
+            gate_frame_chunks, gate_frame_cleanup_complete, place_gate_frame,
+        };
+        use crate::state::SoloLevelingState;
 
+        let fixture =
+            crate::test_support::world(Arc::new(steel_core::gameplay_hooks::NoopGameplayHooks));
+        let world = Arc::clone(&fixture.world);
+        let server = crate::test_support::server(&fixture);
         let mut gates = GateRegistry::default();
         let gate = gates.create_ranked(
-            Identifier::from_steel("overworld"),
+            world.key.clone(),
             BlockPos::new(20, 70, 20),
             500_000,
             HunterRank::C,
         );
-        let break_state = gates.start_break(gate.id).expect("gate should break");
-        // The previous session died mid-break: an absolute tick far ahead of
-        // the tick counter, which restarts at zero on every boot.
-        *gates.break_mut(gate.id).expect("break state should exist") = GateBreak {
-            next_wave_tick: 500_600,
-            ..break_state
-        };
-        let write = gates.begin_persistence().expect("break is dirty");
-        let snapshot = write.snapshot;
+        gates.start_break(gate.id).expect("old gate break");
+        gates.break_mut(gate.id).expect("old break state").wave = 1;
+        let snapshot = gates.begin_persistence().expect("break is dirty").snapshot;
 
         let mut runtime = DungeonRuntime::default();
         runtime
             .restore_gate_registry(snapshot)
             .expect("snapshot should restore");
-        let restored = runtime.gates.breaks().pop().expect("one break").wave_due(0);
+        crate::test_support::load_full_chunks(&world, gate_frame_chunks(gate.entrance));
+        assert!(place_gate_frame(
+            &world,
+            gate.entrance,
+            super::FrameStyle::Normal,
+        ));
+
+        let first = Arc::new(ZombieEntity::new(
+            &vanilla_entities::ZOMBIE,
+            next_entity_id(),
+            DVec3::new(20.5, 71.0, 20.5),
+            Arc::downgrade(&world),
+        ));
+        let second = Arc::new(ZombieEntity::new(
+            &vanilla_entities::ZOMBIE,
+            next_entity_id(),
+            DVec3::new(22.5, 71.0, 20.5),
+            Arc::downgrade(&world),
+        ));
+        second.set_custom_name(Some(MobLabel::mob(Theme::Crypt, MobClass::Shaman).text()));
+        world.try_add_entity(first.clone()).expect("wave mob");
+        world
+            .try_add_entity(second.clone())
+            .expect("untracked restored mob");
+        runtime
+            .gates
+            .break_mut(gate.id)
+            .expect("restored break")
+            .remaining_mobs
+            .push(first.id());
+        let mut track = GateBreakTrack {
+            world: world.key.clone(),
+            ..GateBreakTrack::default()
+        };
+        track.adopt(vec![break_mob(first.id(), MobClass::Warrior)], 0);
+        runtime.gate_break_tracks.insert(gate.id, track);
+
+        runtime.retire_disabled_breaks(&server);
+
+        assert!(first.is_removed());
+        assert!(second.is_removed());
+        assert!(runtime.gates.breaks().is_empty());
+        assert!(!runtime.gate_break_tracks.contains_key(&gate.id));
+        assert!(runtime.gates.retired_gates().is_empty());
+        assert!(gate_frame_cleanup_complete(&world, &gate));
+
+        let directory = std::env::temp_dir().join(format!("gate-retirement-{}", Uuid::new_v4()));
+        let state = SoloLevelingState::new(directory.clone()).expect("test state");
+        let actions = runtime.tick(&state, &server, 1);
         assert!(
-            restored,
-            "a restored break may spawn its next wave as soon as the adopted wave is cleared"
+            !actions
+                .iter()
+                .any(|action| matches!(action, super::RunAction::CityDefenseWave { .. }))
         );
+        let area = WorldAabb::new(-10.0, -60.0, -10.0, 100.0, 100.0, 100.0);
+        assert!(world.get_entities_in_aabb(&area).is_empty());
+        std::fs::remove_dir_all(directory).expect("cleanup test state");
+    }
+
+    #[test]
+    fn unloaded_break_frame_is_queued_not_acknowledged() {
+        use crate::dungeon::instance::gate_frame_chunks;
+
+        let fixture =
+            crate::test_support::world(Arc::new(steel_core::gameplay_hooks::NoopGameplayHooks));
+        let world = Arc::clone(&fixture.world);
+        let server = crate::test_support::server(&fixture);
+        let mut runtime = DungeonRuntime::default();
+        let gate = runtime.gates.create_ranked(
+            world.key.clone(),
+            BlockPos::new(20, 70, 20),
+            0,
+            HunterRank::C,
+        );
+        runtime.gates.start_break(gate.id);
+
+        runtime.retire_disabled_breaks(&server);
+
+        assert!(runtime.gates.breaks().is_empty());
+        assert_eq!(runtime.gates.retired_gates().len(), 1);
+        assert_eq!(runtime.pending_gate_cleanup.len(), 1);
+
+        crate::test_support::load_full_chunks(&world, gate_frame_chunks(gate.entrance));
+        runtime.finish_gate_cleanup();
+        assert!(runtime.pending_gate_cleanup.is_empty());
+        assert!(runtime.gates.retired_gates().is_empty());
+    }
+
+    #[test]
+    fn legacy_cleanup_preserves_live_frames_and_removes_orphans() {
+        use crate::dungeon::LegacyGateCleanup;
+        use crate::dungeon::instance::{
+            FrameStyle, gate_frame_chunks, gate_frame_cleanup_complete, place_gate_frame,
+            standing_frame_style,
+        };
+
+        let fixture =
+            crate::test_support::world(Arc::new(steel_core::gameplay_hooks::NoopGameplayHooks));
+        let world = Arc::clone(&fixture.world);
+        let server = crate::test_support::server(&fixture);
+        let mut runtime = DungeonRuntime::default();
+        let live = runtime.gates.create_ranked(
+            world.key.clone(),
+            BlockPos::new(4, 64, 4),
+            0,
+            HunterRank::E,
+        );
+        let orphan = LegacyGateCleanup {
+            world: world.key.clone(),
+            entrance: [20, 64, 4],
+            red: false,
+        }
+        .gate();
+        runtime.legacy_gate_cleanups = vec![
+            LegacyGateCleanup {
+                world: world.key.clone(),
+                entrance: [4, 64, 4],
+                red: false,
+            },
+            LegacyGateCleanup {
+                world: world.key.clone(),
+                entrance: [20, 64, 4],
+                red: false,
+            },
+        ];
+        let mut chunks = gate_frame_chunks(live.entrance);
+        chunks.extend(gate_frame_chunks(orphan.entrance));
+        crate::test_support::load_full_chunks(&world, chunks.clone());
+        assert!(place_gate_frame(&world, live.entrance, FrameStyle::Red));
+        assert!(place_gate_frame(
+            &world,
+            orphan.entrance,
+            FrameStyle::Castle,
+        ));
+
+        runtime.schedule_legacy_gate_cleanups(&server);
+        crate::test_support::load_full_chunks(&world, chunks.clone());
+        runtime.finish_legacy_gate_cleanups();
+
+        assert!(runtime.pending_legacy_gate_cleanups.is_empty());
+        assert!(runtime.completed_legacy_gate_cleanups.contains(&0));
+        assert!(runtime.completed_legacy_gate_cleanups.contains(&1));
+        assert!(runtime.blocked_legacy_gate_cleanups.is_empty());
+        assert_eq!(
+            standing_frame_style(&world, live.entrance),
+            Some(FrameStyle::Red)
+        );
+        assert!(gate_frame_cleanup_complete(&world, &orphan));
+
+        runtime.gates.remove(live.id);
+        runtime.schedule_retired_gate_cleanups(&server);
+        crate::test_support::load_full_chunks(&world, chunks);
+        runtime.finish_gate_cleanup();
+        assert!(runtime.gates.retired_gates().is_empty());
+        assert!(gate_frame_cleanup_complete(&world, &live));
     }
 
     #[test]
@@ -4718,5 +4918,39 @@ mod tests {
         assert_eq!(castle.minimum_hunter_rank(), HunterRank::D);
         assert!(!castle.accepts_hunter(HunterRank::E, DVec3::new(60.5, 71.0, 20.5)));
         assert!(castle.accepts_hunter(HunterRank::D, DVec3::new(60.5, 71.0, 20.5)));
+    }
+
+    #[test]
+    fn expired_gates_are_removed_without_starting_a_break() {
+        use steel_utils::Identifier;
+
+        use super::GateRetirementReason;
+
+        let world = Identifier::from_steel("overworld");
+        let mut runtime = DungeonRuntime::default();
+        let gate = runtime
+            .gates
+            .create_ranked(world, BlockPos::new(20, 70, 20), 0, HunterRank::E);
+        let mut snapshot = runtime
+            .gates
+            .begin_persistence()
+            .expect("new gate should be dirty")
+            .snapshot;
+        snapshot.gates[0].created_at_unix_seconds = 0;
+        runtime
+            .gates
+            .restore(snapshot, 0)
+            .expect("restore expired gate");
+        runtime.expire_gates();
+        assert!(runtime.gates.gate(gate.id).is_none());
+        assert!(runtime.gates.breaks().is_empty());
+        assert!(
+            runtime
+                .gates
+                .retired_gates()
+                .iter()
+                .any(|(retired, reason)| retired.id == gate.id
+                    && *reason == GateRetirementReason::Expired)
+        );
     }
 }

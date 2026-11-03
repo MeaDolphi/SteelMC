@@ -406,32 +406,23 @@ pub fn remove_gate_frame(world: &Arc<World>, gate: &Gate) {
     }
 }
 
-/// Returns whether a legacy gate frame exactly matches its expected pattern.
+/// Returns whether a recorded frame has any block of a known gate style.
 #[must_use]
 pub fn gate_frame_matches(world: &Arc<World>, gate: &Gate) -> bool {
-    let style = FrameStyle::from_gate(gate);
     gate_frame_positions(gate.entrance)
         .into_iter()
-        .all(|pos| world.get_block_state(pos) == frame_block(style, gate.entrance, pos))
-        && (1..4).all(|height| {
-            (0..2).all(|offset| {
-                world
-                    .get_block_state(BlockPos::new(
-                        gate.entrance.x() + offset,
-                        gate.entrance.y() + height,
-                        gate.entrance.z(),
-                    ))
-                    .is_air()
-            })
-        })
+        .any(|pos| is_frame_block(gate.entrance, pos, world.get_block_state(pos)))
 }
 
-/// Returns whether every expected frame location is already clear.
+/// Returns whether every frame chunk is loaded and no known frame block remains.
 #[must_use]
-pub fn gate_frame_is_clear(world: &Arc<World>, gate: &Gate) -> bool {
-    gate_frame_positions(gate.entrance)
+pub fn gate_frame_cleanup_complete(world: &Arc<World>, gate: &Gate) -> bool {
+    gate_frame_chunks(gate.entrance)
         .into_iter()
-        .all(|pos| world.get_block_state(pos).is_air())
+        .all(|pos| world.chunk_map.with_full_chunk(pos, |_| ()).is_some())
+        && gate_frame_positions(gate.entrance)
+            .into_iter()
+            .all(|pos| !is_frame_block(gate.entrance, pos, world.get_block_state(pos)))
 }
 
 /// Builds every room, corridor and light of one generated dungeon.
@@ -937,7 +928,8 @@ mod tests {
 
     use super::{
         CRYSTAL_ORE, FrameStyle, INSTANCE_FLOOR_Y, at, dungeon_chunks, frame_block, gate_footprint,
-        gate_frame_chunks, gate_is_level_at, opening_contains, penalty_arena_chunks,
+        gate_frame_chunks, gate_frame_positions, gate_is_level_at, opening_contains,
+        penalty_arena_chunks,
     };
     use crate::dungeon::generator::{Part, THEMES};
     use crate::dungeon::{DungeonLayout, InstanceRegion};
@@ -1111,6 +1103,85 @@ mod tests {
                 let chunk = ChunkPos::from_block_pos(BlockPos::new(x, INSTANCE_FLOOR_Y, z));
                 assert!(chunks.contains(&chunk), "arena writes {chunk:?}");
             }
+        }
+    }
+
+    fn frame_fixture(style: FrameStyle) -> (crate::test_support::TestWorld, crate::dungeon::Gate) {
+        let fixture = crate::test_support::world(std::sync::Arc::new(
+            steel_core::gameplay_hooks::NoopGameplayHooks,
+        ));
+        let gate = crate::dungeon::LegacyGateCleanup {
+            world: fixture.world.key.clone(),
+            entrance: [4, 64, 4],
+            red: false,
+        }
+        .gate();
+        crate::test_support::load_full_chunks(&fixture.world, gate_frame_chunks(gate.entrance));
+        assert!(super::place_gate_frame(
+            &fixture.world,
+            gate.entrance,
+            style
+        ));
+        (fixture, gate)
+    }
+
+    #[test]
+    fn cleanup_recognizes_every_known_frame_style() {
+        for style in [FrameStyle::Normal, FrameStyle::Red, FrameStyle::Castle] {
+            let (fixture, gate) = frame_fixture(style);
+            assert!(super::gate_frame_matches(&fixture.world, &gate));
+            super::remove_gate_frame(&fixture.world, &gate);
+            assert!(super::gate_frame_cleanup_complete(&fixture.world, &gate));
+            assert!(super::gate_space_is_clear(&fixture.world, gate.entrance));
+        }
+    }
+
+    #[test]
+    fn frame_cleanup_handles_partial_frames_and_keeps_unrelated_blocks() {
+        use steel_utils::types::UpdateFlags;
+
+        let (fixture, gate) = frame_fixture(FrameStyle::Red);
+        let foreign = gate_frame_positions(gate.entrance)[0];
+        let mixed_style = gate_frame_positions(gate.entrance)[1];
+        assert!(fixture.world.set_block(
+            foreign,
+            vanilla_blocks::STONE.default_state(),
+            UpdateFlags::UPDATE_ALL,
+        ));
+        assert!(fixture.world.set_block(
+            mixed_style,
+            vanilla_blocks::QUARTZ_BLOCK.default_state(),
+            UpdateFlags::UPDATE_ALL,
+        ));
+        assert!(super::gate_frame_matches(&fixture.world, &gate));
+        super::remove_gate_frame(&fixture.world, &gate);
+        assert!(super::gate_frame_cleanup_complete(&fixture.world, &gate));
+        assert_eq!(
+            fixture.world.get_block_state(foreign),
+            vanilla_blocks::STONE.default_state()
+        );
+        for pos in gate_frame_positions(gate.entrance) {
+            if pos != foreign {
+                assert!(fixture.world.get_block_state(pos).is_air());
+            }
+        }
+
+        let (fixture, gate) = frame_fixture(FrameStyle::Normal);
+        for pos in gate_frame_positions(gate.entrance) {
+            assert!(fixture.world.set_block(
+                pos,
+                vanilla_blocks::STONE.default_state(),
+                UpdateFlags::UPDATE_ALL,
+            ));
+        }
+        assert!(!super::gate_frame_matches(&fixture.world, &gate));
+        super::remove_gate_frame(&fixture.world, &gate);
+        assert!(super::gate_frame_cleanup_complete(&fixture.world, &gate));
+        for pos in gate_frame_positions(gate.entrance) {
+            assert_eq!(
+                fixture.world.get_block_state(pos),
+                vanilla_blocks::STONE.default_state()
+            );
         }
     }
 }
