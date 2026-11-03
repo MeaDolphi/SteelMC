@@ -582,8 +582,7 @@ fn add_chambers(
 
 fn room_for(rng: &mut SplitMix, (x, z): (i32, i32), role: RoomRole) -> Room {
     let (shape, half, height) = match role {
-        // The entrance is a plain hall so the arrival column is always free.
-        RoomRole::Entrance => (Shape::Hall, (rng.range(4, 5), rng.range(4, 5)), 5),
+        RoomRole::Entrance => (Shape::Colonnade, (10, 10), 8),
         // The boss room must fit the boss, the exit frame and the fight itself.
         RoomRole::Boss => (
             if rng.chance(50) {
@@ -1123,7 +1122,7 @@ fn fits(
 }
 
 /// Recolours floor blocks into a mosaic: a centre medallion, a runner from
-/// the medallion to every doorway and, in the boss room, a ring at the walls.
+/// the medallion to every doorway and, in the largest halls, a ring at the walls.
 fn floor_pattern(room: &Room, doors: &[Doorway], solid: &mut FxHashMap<(i32, i32, i32), Part>) {
     let (cx, cz) = room.center;
     let (hx, hz) = room.half;
@@ -1148,7 +1147,7 @@ fn floor_pattern(room: &Room, doors: &[Doorway], solid: &mut FxHashMap<(i32, i32
             a += door.side;
         }
     }
-    if room.role == RoomRole::Boss {
+    if matches!(room.role, RoomRole::Entrance | RoomRole::Boss) {
         for u in -hx..=hx {
             recolour_floor(solid, cx + u, cz + hz - 1);
             recolour_floor(solid, cx + u, cz - hz + 1);
@@ -1228,7 +1227,7 @@ fn frame_doorways(room: &Room, doors: &[Doorway], solid: &mut FxHashMap<(i32, i3
 }
 
 /// Hanging lights on chains: every tall enough room gets one in the centre,
-/// wide combat and boss rooms get two more so big floors stay lit.
+/// wide furnished rooms get two more so big floors stay lit.
 fn hang_lanterns(
     room: &Room,
     air: &FxHashMap<(i32, i32), Column>,
@@ -1241,7 +1240,11 @@ fn hang_lanterns(
     }
     let (cx, cz) = room.center;
     let mut lanterns = vec![(cx, cz)];
-    if matches!(room.role, RoomRole::Combat | RoomRole::Boss) && room.half.0 >= 9 {
+    if matches!(
+        room.role,
+        RoomRole::Entrance | RoomRole::Combat | RoomRole::Boss
+    ) && room.half.0 >= 9
+    {
         let spread = room.half.0 / 2;
         lanterns.extend([(cx + spread, cz), (cx - spread, cz)]);
     }
@@ -1329,8 +1332,8 @@ fn place_pilasters(
     }
 }
 
-/// One themed feature per combat and boss room, against the first wall where
-/// it fits: crypt sarcophagi, ice icicles, nether lava basins, desert
+/// One themed feature per furnished room, against the first wall where it
+/// fits: crypt sarcophagi, ice icicles, nether lava basins, desert
 /// obelisks, jungle ruin mounds, deep-dark sculk spikes, end chorus stalks.
 #[expect(
     clippy::too_many_arguments,
@@ -1524,7 +1527,10 @@ fn decorate(
         floor_pattern(room, &doors, solid);
         frame_doorways(room, &doors, solid);
         hang_lanterns(room, air, &reachable, solid);
-        if !matches!(room.role, RoomRole::Combat | RoomRole::Boss) {
+        if !matches!(
+            room.role,
+            RoomRole::Entrance | RoomRole::Combat | RoomRole::Boss
+        ) {
             continue;
         }
         let mut taken: FxHashSet<(i32, i32)> = FxHashSet::default();
@@ -1837,12 +1843,15 @@ mod tests {
     }
 
     #[test]
-    fn combat_and_boss_rooms_are_dressed() {
+    fn furnished_rooms_are_dressed() {
         let mut min_dressed = usize::MAX;
         for seed in 0..100 {
             let blueprint = Blueprint::generate(seed, 4);
             for room in &blueprint.rooms {
-                if !matches!(room.role, RoomRole::Combat | RoomRole::Boss) {
+                if !matches!(
+                    room.role,
+                    RoomRole::Entrance | RoomRole::Combat | RoomRole::Boss
+                ) {
                     continue;
                 }
                 let (hx, hz) = room.half;
@@ -1891,8 +1900,51 @@ mod tests {
         }
         assert!(
             min_dressed >= 2,
-            "a combat or boss room ended up with only {min_dressed} dressed cells"
+            "a furnished room ended up with only {min_dressed} dressed cells"
         );
+    }
+
+    #[test]
+    fn large_blue_gate_entrances_are_furnished_and_keep_arrival_clear() {
+        for theme in THEMES {
+            for seed in 0..12 {
+                let blueprint = Blueprint::generate_with_theme(seed, 4, theme);
+                let entrance = blueprint.entrance();
+                assert_eq!(entrance.half, (10, 10));
+                assert_eq!(entrance.height, 8);
+                assert_eq!(entrance.shape, super::Shape::Colonnade);
+
+                let dressed = blueprint
+                    .blocks
+                    .iter()
+                    .filter(|block| {
+                        block.offset.0.abs() <= entrance.half.0
+                            && block.offset.2.abs() <= entrance.half.1
+                            && matches!(block.part, Part::Platform | Part::Decor | Part::Lava)
+                    })
+                    .count();
+                assert!(dressed >= 2, "{theme:?} seed {seed}: {dressed}");
+                let chains = blueprint
+                    .blocks
+                    .iter()
+                    .filter(|block| {
+                        block.offset.0.abs() <= entrance.half.0
+                            && block.offset.2.abs() <= entrance.half.1
+                            && block.part == Part::Chain
+                    })
+                    .count();
+                assert!(chains >= 3, "{theme:?} seed {seed}: {chains}");
+                for y in 0..=2 {
+                    assert!(
+                        !blueprint
+                            .blocks
+                            .iter()
+                            .any(|block| block.offset == (0, y, 0)),
+                        "{theme:?} seed {seed}: arrival is blocked at y={y}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
