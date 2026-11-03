@@ -53,6 +53,8 @@ pub struct SidebarView {
     pub quest: SystemQuest,
     /// Taken contracts, personal first.
     pub contracts: Vec<(ContractScope, Contract)>,
+    /// Current introductory goal, when hints are enabled.
+    pub guide_next: Option<String>,
 }
 
 /// One sidebar line: a stable `owner` key paired with the text shown for it.
@@ -138,6 +140,8 @@ fn lines(view: &SidebarView) -> Vec<Line> {
         ),
         if quest.penalty_pending {
             line("penalty", "Штрафная зона: ожидает", Color::Red)
+        } else if let Some(next) = &view.guide_next {
+            line("guide", format!("Далее: {next}"), Color::Aqua)
         } else {
             line("penalty", "Штрафная зона: нет", Color::DarkGray)
         },
@@ -249,6 +253,7 @@ mod tests {
             system_points: SystemPoints::zero(),
             quest: SystemQuest::new(1),
             contracts: vec![(ContractScope::Personal, contract); contracts],
+            guide_next: None,
         }
     }
 
@@ -260,6 +265,21 @@ mod tests {
         assert_eq!(lines(&view(0)).len(), 10);
         assert_eq!(lines(&view(1)).len(), 12);
         assert_eq!(lines(&view(7)).len(), 10 + 1 + CONTRACT_LINES + 1);
+    }
+
+    #[test]
+    fn guide_uses_the_optional_line_without_hiding_a_penalty() {
+        let mut guided = view(7);
+        guided.guide_next = Some("Первые врата".to_owned());
+        let owners: Vec<_> = lines(&guided).into_iter().map(|line| line.owner).collect();
+        assert!(owners.len() <= 15);
+        assert!(owners.contains(&"guide".to_owned()));
+        assert!(!owners.contains(&"penalty".to_owned()));
+
+        guided.quest.penalty_pending = true;
+        let owners: Vec<_> = lines(&guided).into_iter().map(|line| line.owner).collect();
+        assert!(owners.contains(&"penalty".to_owned()));
+        assert!(!owners.contains(&"guide".to_owned()));
     }
 
     #[test]

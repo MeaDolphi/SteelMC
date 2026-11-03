@@ -153,10 +153,25 @@ impl GameplayHooks for SoloLevelingHooks {
         self.state.offer_resource_pack(player);
         match self.state.take_prepared_player(player_uuid) {
             Some(data) => {
+                let show_guide = data.starter.claimable() && !data.quests.guide_hidden;
                 data.stats.apply_to(&mut player.attributes().lock());
                 data.class
                     .apply_to(&mut player.attributes().lock(), data.stats.rank());
                 self.state.begin_session(player_uuid, data);
+                if show_guide {
+                    player.send_message(
+                        &TextComponent::plain(
+                            "Система: вы охотник ранга E. Начните с набора Ассоциации.",
+                        )
+                        .color(Color::Aqua),
+                    );
+                    player.send_message(
+                        &TextComponent::plain(
+                            "Книга «Система» в 9-м слоте: ПКМ → «Профиль и справка» → «Быстрый старт».",
+                        )
+                        .color(Color::Gold),
+                    );
+                }
                 if let Some((_, view)) = self.state.sidebar_update(player_uuid) {
                     sidebar::show(player, &view);
                 }

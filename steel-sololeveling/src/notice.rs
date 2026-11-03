@@ -33,6 +33,8 @@ pub struct Notice {
     pub rank_up: Option<HunterRank>,
     /// These levels first crossed the Second Awakening threshold.
     pub awakening_hint: bool,
+    /// Whether newcomer guidance is enabled for this hunter.
+    pub guide_hints: bool,
     /// Items received: identity used to merge repeats, shown name, count.
     pub loot: Vec<(String, TextComponent, i32)>,
 }
@@ -102,6 +104,12 @@ impl Notice {
                 ))
                 .color(Color::Aqua),
             );
+            if self.guide_hints {
+                player.send_message(
+                    &TextComponent::plain("Распределить очки: Система → Охотник.")
+                        .color(Color::Gray),
+                );
+            }
         }
         if let Some(rank) = self.rank_up {
             player.send_message(

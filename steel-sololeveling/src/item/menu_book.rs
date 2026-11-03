@@ -29,7 +29,11 @@ pub fn stack() -> ItemStack {
             ItemStack::new(&vanilla_items::ENCHANTED_BOOK),
             TextComponent::plain("Система").color(Color::Aqua),
         ),
-        vec![TextComponent::plain("Правый клик — главное меню.").color(Color::Gray)],
+        vec![
+            TextComponent::plain("Девятый слот панели. Правый клик — главное меню.")
+                .color(Color::Gray),
+            TextComponent::plain("Справка и быстрый старт — в профиле.").color(Color::Gray),
+        ],
     );
     write_tag(&mut stack, record(KIND));
     super::model::apply(&mut stack, MODEL);

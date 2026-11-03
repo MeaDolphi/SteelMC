@@ -526,6 +526,7 @@ mod tests {
             system_points: session.system_points,
             quest: session.quest,
             contracts: Vec::new(),
+            guide_next: None,
         };
         assert_eq!(
             session.sidebar_changed(&view),

@@ -17,6 +17,7 @@ use text_components::format::Color;
 use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
+use crate::guide_menu;
 use crate::item::serial::{self, STARTER_WEAPONS, SerialId};
 use crate::item::{append_lore, named, with_lore};
 use crate::main_menu;
@@ -33,6 +34,7 @@ const WEAPON_SLOTS: [usize; 3] = [11, 13, 15];
 const MERCHANT_SLOT: usize = 22;
 /// Button that hands out a pickaxe an earlier claim still owes.
 const PICKAXE_SLOT: usize = 20;
+const GUIDE_SLOT: usize = 18;
 const BACK_SLOT: usize = 26;
 
 /// Opens the starter-kit desk.
@@ -83,6 +85,16 @@ fn menu_items(view: Option<StarterKit>, uuid: Uuid) -> Vec<ItemStack> {
             ],
         );
     }
+    items[GUIDE_SLOT] = with_lore(
+        named(
+            ItemStack::new(&vanilla_items::ENCHANTED_BOOK),
+            TextComponent::plain("Как начать").color(Color::Aqua),
+        ),
+        vec![
+            TextComponent::plain("Текущая цель и краткая справка по системам.").color(Color::Gray),
+            TextComponent::plain("Клик — открыть помощник.").color(Color::Yellow),
+        ],
+    );
     items[MERCHANT_SLOT] = with_lore(
         named(
             ItemStack::new(&vanilla_items::EMERALD),
@@ -199,6 +211,10 @@ impl MenuKind for StarterMenuKind {
         }
         if slot - self.buttons.start() == BACK_SLOT {
             main_menu::open(player, Arc::clone(&self.state));
+            return ClickOutcome::Consume;
+        }
+        if slot - self.buttons.start() == GUIDE_SLOT {
+            guide_menu::open(player, Arc::clone(&self.state));
             return ClickOutcome::Consume;
         }
         if slot - self.buttons.start() == MERCHANT_SLOT {

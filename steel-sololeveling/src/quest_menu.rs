@@ -178,13 +178,31 @@ pub fn open_path(player: &Player, state: &Arc<SoloLevelingState>) {
             ],
         );
     }
+    items[49] = with_lore(
+        named(
+            ItemStack::new(&vanilla_items::ENCHANTED_BOOK),
+            line("Быстрый старт", Color::Aqua),
+        ),
+        vec![
+            line("Текущая цель и краткая справка по системам.", Color::Gray),
+            line("Клик — открыть помощник.", Color::Yellow),
+        ],
+    );
+    let state = Arc::clone(state);
     ui::open_buttons(
         player,
-        Arc::clone(state),
+        Arc::clone(&state),
         line("Путь охотника", Color::Gold),
         6,
         items,
-        Box::new(|_, _, _| After::Keep),
+        Box::new(move |player, slot, _| {
+            if slot == 49 {
+                crate::guide_menu::open(player, Arc::clone(&state));
+                After::Replaced
+            } else {
+                After::Keep
+            }
+        }),
     );
 }
 

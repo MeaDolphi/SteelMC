@@ -221,7 +221,7 @@ impl SoloLevelingState {
             self.notify(
                 player_uuid,
                 &format!(
-                    "Система определила ваш врождённый навык: {}.",
+                    "Система определила ваш врождённый навык: {}. Активация: Ctrl+Q пустой рукой.",
                     innate.title()
                 ),
             );
@@ -955,6 +955,12 @@ impl SoloLevelingState {
             won: session.won,
             system_points: session.system_points,
             quest: session.quest,
+            guide_next: if session.quests.guide_hidden {
+                None
+            } else {
+                crate::guide::next_step(&session.quests.achievements)
+                    .map(|step| step.title().to_owned())
+            },
             contracts: session
                 .organization
                 .contracts
@@ -998,8 +1004,12 @@ impl SoloLevelingState {
 
     /// Records committed experience and system points to show the hunter.
     pub fn notify_progress(&self, uuid: Uuid, reward: HunterReward, level_up: LevelUp, level: u32) {
+        let guide_hints = self
+            .with_session_mut(uuid, |session| !session.quests.guide_hidden)
+            .unwrap_or(false);
         let mut notices = self.notices.lock();
         let notice = notices.entry(uuid).or_default();
+        notice.guide_hints = guide_hints;
         notice.experience = notice.experience.saturating_add(reward.experience);
         notice.system_points = notice.system_points.saturating_add(reward.system_points);
         if level_up.levels_gained > 0 {

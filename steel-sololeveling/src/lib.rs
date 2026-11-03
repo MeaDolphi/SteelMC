@@ -35,6 +35,8 @@ pub mod economy;
 pub mod enchant_menu;
 pub mod gate_menu;
 pub mod gear;
+pub mod guide;
+pub mod guide_menu;
 pub mod guild;
 pub mod guild_bank;
 pub mod guild_menu;

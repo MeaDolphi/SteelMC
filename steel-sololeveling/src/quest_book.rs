@@ -535,6 +535,9 @@ pub struct QuestBook {
     /// Progress of the Second Awakening quest chain.
     #[serde(default)]
     pub job_change: JobChangeProgress,
+    /// Hide newcomer hints while leaving the guide itself available.
+    #[serde(default)]
+    pub guide_hidden: bool,
 }
 
 /// What recording a goal finished.
@@ -567,6 +570,7 @@ impl QuestBook {
             temple_key_day: 0,
             temple_key_rolled: false,
             job_change: JobChangeProgress::None,
+            guide_hidden: false,
         }
     }
 
@@ -800,8 +804,12 @@ mod tests {
         let mut book = QuestBook::new();
         book.roll_over(3, 0, HunterRank::C, None, counter());
         book.record(Goal::Crystal, 4);
+        book.guide_hidden = true;
         let back: QuestBook =
             serde_json::from_str(&serde_json::to_string(&book).expect("encode")).expect("decode");
         assert_eq!(back, book);
+        assert!(back.guide_hidden);
+        let old: QuestBook = serde_json::from_str("{}").expect("old save");
+        assert!(!old.guide_hidden);
     }
 }

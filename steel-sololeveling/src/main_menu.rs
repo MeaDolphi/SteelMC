@@ -19,6 +19,7 @@ use crate::auction_menu;
 use crate::castle_menu;
 use crate::class_menu;
 use crate::deferred_inventory_menu;
+use crate::guide_menu;
 use crate::guild_menu;
 use crate::hunter_stats_menu;
 use crate::item::{named, with_lore};
@@ -231,11 +232,12 @@ fn profile_item(state: &SoloLevelingState, uuid: Uuid) -> ItemStack {
     with_lore(
         named(
             ItemStack::new(&vanilla_items::PLAYER_HEAD),
-            TextComponent::plain("Профиль охотника").color(Color::Aqua),
+            TextComponent::plain("Профиль и справка").color(Color::Aqua),
         ),
         lines
             .into_iter()
             .map(|line| TextComponent::plain(line).color(Color::White))
+            .chain([TextComponent::plain("Клик — справка и быстрый старт.").color(Color::Yellow)])
             .collect(),
     )
 }
@@ -307,7 +309,12 @@ impl MenuKind for MainMenuKind {
         if !self.buttons.contains(slot) {
             return ClickOutcome::Fallthrough;
         }
-        if let Some(category) = category_at(slot - self.buttons.start()) {
+        let slot = slot - self.buttons.start();
+        if slot == PROFILE_SLOT {
+            guide_menu::open(player, Arc::clone(&self.state));
+            return ClickOutcome::Consume;
+        }
+        if let Some(category) = category_at(slot) {
             self.act(category, player);
         }
         ClickOutcome::Consume
