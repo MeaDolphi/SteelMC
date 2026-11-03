@@ -199,9 +199,9 @@ fn menu_items(state: &SoloLevelingState, uuid: Uuid) -> Vec<ItemStack> {
                 view.book.available_points(view.stats.level)
             ))
             .color(Color::Aqua),
-            TextComponent::plain("ПКМ пустой рукой — классовый навык.").color(Color::Gray),
-            TextComponent::plain("Shift + ПКМ пустой рукой — общий навык.").color(Color::Gray),
-            TextComponent::plain("Q пустой рукой — врождённый навык.").color(Color::Gray),
+            TextComponent::plain("Q пустой рукой — классовый навык.").color(Color::Gray),
+            TextComponent::plain("Shift + Q пустой рукой — общий навык.").color(Color::Gray),
+            TextComponent::plain("Ctrl + Q пустой рукой — врождённый навык.").color(Color::Gray),
             TextComponent::plain("Набор меняется только вне подземелий.").color(Color::Gray),
         ],
     );
@@ -211,7 +211,7 @@ fn menu_items(state: &SoloLevelingState, uuid: Uuid) -> Vec<ItemStack> {
             view.book.class_rank(class),
             false,
             false,
-            "ПКМ пустой рукой",
+            "Q пустой рукой",
         );
     } else {
         items[CLASS_SLOT] = with_lore(
@@ -228,7 +228,7 @@ fn menu_items(state: &SoloLevelingState, uuid: Uuid) -> Vec<ItemStack> {
             view.book.general_rank(skill),
             view.book.selected_general == Some(skill),
             false,
-            "Shift + ПКМ пустой рукой",
+            "Shift + Q пустой рукой",
         );
     }
     if let Some(innate) = view.book.innate_skill {
@@ -237,7 +237,7 @@ fn menu_items(state: &SoloLevelingState, uuid: Uuid) -> Vec<ItemStack> {
             view.book.general_rank(innate),
             false,
             true,
-            "Q пустой рукой",
+            "Ctrl + Q пустой рукой",
         );
     }
     items[RESET_SLOT] = with_lore(
@@ -302,9 +302,9 @@ mod tests {
             "Отпор",
             "Рывок тени",
             "Врождённый:",
-            "ПКМ пустой рукой",
-            "Shift + ПКМ пустой рукой",
             "Q пустой рукой",
+            "Shift + Q пустой рукой",
+            "Ctrl + Q пустой рукой",
             "Сбросить навыки",
             "Главное меню",
         ] {

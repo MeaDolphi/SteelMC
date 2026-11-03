@@ -427,15 +427,7 @@ impl GameplayHooks for SoloLevelingHooks {
             } else {
                 crate::state::CombatSkillSlot::Class
             };
-            if let Err(error) = self.state.use_combat_skill(player, slot) {
-                let message = match error {
-                    crate::state::SkillUseError::Cooldown(seconds) => {
-                        format!("Навык перезаряжается: {seconds} с.")
-                    }
-                    _ => error.message().to_owned(),
-                };
-                player.send_action_bar(TextComponent::plain(message).color(Color::Red));
-            }
+            self.use_empty_hand_skill(player, slot);
             return Some(InteractionResult::Success);
         }
         // The grimoire works from either hand, so a Mage staff can sit in
@@ -460,24 +452,27 @@ impl GameplayHooks for SoloLevelingHooks {
         item::consume::use_item(&self.state, player, stack, hand)
     }
 
+    fn on_player_drop_key(&self, player: &Player, stack: &ItemStack, all: bool) -> bool {
+        if !stack.is_empty() {
+            return true;
+        }
+        let slot = if all {
+            crate::state::CombatSkillSlot::Innate
+        } else if player.is_crouching() {
+            crate::state::CombatSkillSlot::General
+        } else {
+            crate::state::CombatSkillSlot::Class
+        };
+        self.use_empty_hand_skill(player, slot);
+        false
+    }
+
     fn allow_item_drop(&self, player: &Player, stack: &ItemStack, off_hand: &ItemStack) -> bool {
         // The drop key on the grimoire, or on a Mage staff held with the
         // grimoire in the off hand, cycles the prepared spells instead.
         // Core passes the off hand, so this never locks the inventory: the
         // hook can run while it is held, and locking it here would invert
         // this crate's lock order against the session-taking tick paths.
-        if stack.is_empty() {
-            if let Err(error) = self.state.use_innate_combat_skill(player) {
-                let message = match error {
-                    crate::state::SkillUseError::Cooldown(seconds) => {
-                        format!("Навык перезаряжается: {seconds} с.")
-                    }
-                    _ => error.message().to_owned(),
-                };
-                player.send_action_bar(TextComponent::plain(message).color(Color::Red));
-            }
-            return false;
-        }
         match drop_decision(stack, off_hand) {
             DropDecision::CycleSpell => {
                 self.state.cycle_spell(player);
@@ -819,6 +814,18 @@ impl GameplayHooks for SoloLevelingHooks {
 }
 
 impl SoloLevelingHooks {
+    fn use_empty_hand_skill(&self, player: &Player, slot: crate::state::CombatSkillSlot) {
+        if let Err(error) = self.state.use_drop_key_combat_skill(player, slot) {
+            let message = match error {
+                crate::state::SkillUseError::Cooldown(seconds) => {
+                    format!("Навык перезаряжается: {seconds} с.")
+                }
+                _ => error.message().to_owned(),
+            };
+            player.send_action_bar(TextComponent::plain(message).color(Color::Red));
+        }
+    }
+
     fn handle_gate_menu_action(&self, player: &Player, action: GateMenuAction) {
         match action {
             GateMenuAction::OpenPage(page) => {
@@ -1133,7 +1140,7 @@ mod tests {
     use steel_core::entity::damage::DamageSource;
     use steel_core::entity::entities::ZombieEntity;
     use steel_core::entity::{Entity as _, LivingEntity as _, SharedEntity, next_entity_id};
-    use steel_core::gameplay_hooks::{BlockMutationCause, GameplayHooks, NoopGameplayHooks};
+    use steel_core::gameplay_hooks::{BlockMutationCause, NoopGameplayHooks};
     use steel_core::inventory::container::Container as _;
     use steel_core::player::player_inventory::PlayerInventory;
     use steel_registry::item_stack::ItemStack;
@@ -1141,10 +1148,7 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn empty_hand_use_packet_invokes_class_and_general_skills() {
-        use steel_protocol::packets::game::SUseItem;
-        use steel_utils::types::InteractionHand;
-
+    fn empty_hand_drop_keys_invoke_class_and_general_skills() {
         let directory =
             std::env::temp_dir().join(format!("empty-hand-use-test-{}", Uuid::new_v4()));
         let state = Arc::new(SoloLevelingState::new(directory.clone()).expect("state"));
@@ -1176,21 +1180,19 @@ mod tests {
             .world
             .try_add_entity(mob.clone())
             .expect("target entity");
-        let use_main_hand = |sequence| {
-            player.handle_use_item(SUseItem {
-                hand: InteractionHand::MainHand,
-                sequence,
-                y_rot: 0.0,
-                x_rot: 0.0,
-            });
-        };
 
         let initial_health = mob.get_health();
-        use_main_hand(1);
-        assert!(mob.get_health() < initial_health, "class skill must hit");
+        player.drop_from_selected(false);
+        assert!(
+            mob.get_health() < initial_health,
+            "Q must use the class skill"
+        );
         player.set_crouching(true);
-        use_main_hand(2);
-        assert!(player.velocity().length() > 0.0, "general skill must run");
+        player.drop_from_selected(false);
+        assert!(
+            player.velocity().length() > 0.0,
+            "Shift+Q must use the general skill"
+        );
         let cooldown = state.with_session_mut(uuid, |session| {
             session
                 .combat_skills
@@ -1198,7 +1200,7 @@ mod tests {
                 .get(&CombatSkill::QuickStep)
                 .copied()
         });
-        use_main_hand(3);
+        player.drop_from_selected(false);
         assert_eq!(
             state.with_session_mut(uuid, |session| {
                 session
@@ -1208,7 +1210,7 @@ mod tests {
                     .copied()
             }),
             cooldown,
-            "a repeated click must not restart the cooldown"
+            "a repeated key press must not restart the cooldown"
         );
 
         drop(mob);
@@ -1219,37 +1221,36 @@ mod tests {
     }
 
     #[test]
-    fn empty_hand_q_uses_innate_skill_without_dropping() {
+    fn ctrl_q_empty_hand_uses_innate_skill_without_dropping() {
         init_vanilla_registry();
-        let world = crate::test_support::world(Arc::new(NoopGameplayHooks));
+        let directory = std::env::temp_dir().join(format!("innate-drop-test-{}", Uuid::new_v4()));
+        let state = Arc::new(SoloLevelingState::new(directory.clone()).expect("state"));
+        let hooks = Arc::new(SoloLevelingHooks::new(Arc::clone(&state)));
+        let world = crate::test_support::world(hooks);
         let player = crate::test_support::player(&world.world, "Hunter", next_entity_id());
         let uuid = player.gameprofile.id();
-        let directory = std::env::temp_dir().join(format!("innate-drop-test-{}", Uuid::new_v4()));
-        {
-            let state = Arc::new(SoloLevelingState::new(directory.clone()).expect("state"));
-            let mut data = SoloLevelingPlayerData::new(uuid);
-            data.combat_skills.innate_skill = Some(CombatSkill::QuickStep);
-            data.combat_skills.ranks.insert(CombatSkill::QuickStep, 1);
-            data.combat_skills.ranks.insert(CombatSkill::Repulse, 1);
-            data.combat_skills.selected_general = Some(CombatSkill::Repulse);
-            state.begin_session(uuid, data);
-            let hooks = SoloLevelingHooks::new(Arc::clone(&state));
-            let empty = ItemStack::empty();
+        let mut data = SoloLevelingPlayerData::new(uuid);
+        data.combat_skills.innate_skill = Some(CombatSkill::QuickStep);
+        data.combat_skills.ranks.insert(CombatSkill::QuickStep, 1);
+        data.combat_skills.ranks.insert(CombatSkill::Repulse, 1);
+        data.combat_skills.selected_general = Some(CombatSkill::Repulse);
+        state.begin_session(uuid, data);
 
-            assert!(!GameplayHooks::allow_item_drop(
-                &hooks, &player, &empty, &empty,
-            ));
-            assert!(player.inventory.lock().get_selected_item().is_empty());
-            assert!(
-                state
-                    .with_session_mut(uuid, |session| {
-                        let now = CombatSkillBook::now();
-                        !session.combat_skills.ready(CombatSkill::QuickStep, now)
-                            && session.combat_skills.ready(CombatSkill::Repulse, now)
-                    })
-                    .unwrap_or(false)
-            );
-        }
+        player.drop_from_selected(true);
+
+        assert!(player.inventory.lock().get_selected_item().is_empty());
+        assert!(
+            state
+                .with_session_mut(uuid, |session| {
+                    let now = CombatSkillBook::now();
+                    !session.combat_skills.ready(CombatSkill::QuickStep, now)
+                        && session.combat_skills.ready(CombatSkill::Repulse, now)
+                })
+                .unwrap_or(false)
+        );
+        drop(player);
+        drop(world);
+        drop(state);
         std::fs::remove_dir_all(directory).expect("cleanup");
     }
 

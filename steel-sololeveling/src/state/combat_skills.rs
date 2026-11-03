@@ -166,13 +166,17 @@ pub enum CombatSkillSlot {
 }
 
 impl SoloLevelingState {
-    /// Resolves the shared player entity required by effects from the drop hook.
-    pub fn use_innate_combat_skill(&self, player: &Player) -> Result<(), SkillUseError> {
+    /// Resolves the shared player entity required by effects from the drop-key hook.
+    pub fn use_drop_key_combat_skill(
+        &self,
+        player: &Player,
+        slot: CombatSkillSlot,
+    ) -> Result<(), SkillUseError> {
         let uuid = player.gameprofile.id();
         let Some(player) = player.get_world().players.get_by_uuid(&uuid) else {
             return Err(SkillUseError::NoTarget);
         };
-        self.use_combat_skill(&player, CombatSkillSlot::Innate)
+        self.use_combat_skill(&player, slot)
     }
 
     /// Applies one of the three independent active skill slots.
@@ -984,7 +988,9 @@ mod tests {
             session.combat_skills.innate_skill = Some(CombatSkill::QuickStep);
         });
         assert!(matches!(
-            fixture.state.use_innate_combat_skill(&fixture.player),
+            fixture
+                .state
+                .use_drop_key_combat_skill(&fixture.player, CombatSkillSlot::Innate),
             Err(SkillUseError::Cooldown(_))
         ));
 
@@ -996,13 +1002,15 @@ mod tests {
             session.combat_skills.innate_skill = Some(CombatSkill::SecondWind);
         });
         assert_eq!(
-            fixture.state.use_innate_combat_skill(&fixture.player),
+            fixture
+                .state
+                .use_drop_key_combat_skill(&fixture.player, CombatSkillSlot::Innate),
             Err(SkillUseError::NoTarget)
         );
         fixture.player.set_health(10.0);
         fixture
             .state
-            .use_innate_combat_skill(&fixture.player)
+            .use_drop_key_combat_skill(&fixture.player, CombatSkillSlot::Innate)
             .expect("innate second wind");
         assert!(fixture.player.get_health() > 10.0);
 

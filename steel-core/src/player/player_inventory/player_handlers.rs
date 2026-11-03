@@ -1047,10 +1047,13 @@ impl Player {
                 inventory.get_item_in_hand(InteractionHand::OffHand).clone(),
             )
         };
-        if !self
-            .get_world()
+        let world = self.get_world();
+        if !world
             .gameplay_hooks
-            .allow_item_drop(self, &selected, &off_hand)
+            .on_player_drop_key(self, &selected, all)
+            || !world
+                .gameplay_hooks
+                .allow_item_drop(self, &selected, &off_hand)
         {
             self.send_inventory_to_remote();
             return;

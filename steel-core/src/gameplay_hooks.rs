@@ -278,6 +278,14 @@ pub trait GameplayHooks: Send + Sync {
         false
     }
 
+    /// Called for an explicit drop-key press before [`Self::allow_item_drop`].
+    ///
+    /// `all` is true for Ctrl+Q and false for Q. Returning `false` cancels the
+    /// drop and resynchronizes the inventory. The default preserves normal dropping.
+    fn on_player_drop_key(&self, _player: &Player, _stack: &ItemStack, _all: bool) -> bool {
+        true
+    }
+
     /// Called before a player throws or drops an item, including death drops;
     /// `false` destroys the stack instead of spawning it in the world.
     ///
