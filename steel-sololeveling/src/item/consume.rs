@@ -23,7 +23,7 @@ use crate::state::SoloLevelingState;
 /// Handles a right-click on a themed item; `None` means "not a themed item".
 #[must_use]
 pub fn use_item(
-    state: &SoloLevelingState,
+    state: &Arc<SoloLevelingState>,
     player: &Arc<Player>,
     stack: &ItemStack,
     hand: InteractionHand,
@@ -127,11 +127,12 @@ pub fn use_item(
     }
 
     let kind = chest::kind_of(stack)?;
-    Some(open_chest(player, stack, hand, kind))
+    Some(open_chest(state, player, stack, hand, kind))
 }
 
 /// Opens a chest item, rolling or reusing its already rolled reward.
 fn open_chest(
+    state: &Arc<SoloLevelingState>,
     player: &Arc<Player>,
     stack: &ItemStack,
     hand: InteractionHand,
@@ -177,7 +178,7 @@ fn open_chest(
                     [chest::Reward::Shadow(0); 3]
                 }
             };
-            super::choice_menu::open(player, hand, bound_owner, &options);
+            super::choice_menu::open(player, state.to_owned(), hand, bound_owner, &options);
             InteractionResult::Success
         }
     }

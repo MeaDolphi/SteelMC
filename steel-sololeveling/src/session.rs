@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::abilities::{AbilityCooldowns, ActiveAbilities};
 use crate::castle::CastleProgress;
+use crate::combat_skill::{CombatSkillBook, CombatSkillRuntime};
 use crate::economy::{PaymentError, SystemPoints, Won};
 use crate::item::enchantment::EnchantState;
 use crate::merchant::{MerchantRecord, PERSONAL_OFFERS};
@@ -89,6 +90,10 @@ pub struct HunterSession {
     pub castle: CastleProgress,
     /// Unlocked and prepared spells.
     pub spells: SpellBook,
+    /// Learned combat skills and their persistent cooldowns.
+    pub combat_skills: CombatSkillBook,
+    /// Runtime-only combat effects.
+    pub(crate) combat_runtime: CombatSkillRuntime,
     /// Quests, errands, trials and achievements of the hunter.
     pub quests: QuestBook,
     /// Mana, cooldowns and running spell effects.
@@ -175,6 +180,8 @@ impl HunterSession {
                 free_at: 0,
             },
             spells: SpellBook::new(),
+            combat_skills: CombatSkillBook::new(),
+            combat_runtime: CombatSkillRuntime::new(),
             quests: QuestBook::new(),
             magic: MagicState::new(),
             shield: ShieldGuard::new(),
@@ -216,6 +223,7 @@ impl HunterSession {
             merchant: self.merchant,
             castle: self.castle,
             spells: self.spells.clone(),
+            combat_skills: self.combat_skills.clone(),
             quests: self.quests.clone(),
         }
     }

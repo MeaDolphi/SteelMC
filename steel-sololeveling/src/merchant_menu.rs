@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::crafting_menu;
 use crate::item::{append_lore, named, with_lore};
+use crate::main_menu;
 use crate::merchant::{
     self, MerchantOffer, MerchantRecord, PERSONAL_DISCOUNT_PERCENT, PERSONAL_PERIOD_SECONDS,
     SHARED_PERIOD_SECONDS, Showcase,
@@ -46,6 +47,7 @@ const ORDERS_SLOT: usize = 49;
 const BUYBACK_SLOT: usize = 47;
 /// Button that returns from the permanent starter showcase.
 const BACK_SLOT: usize = 49;
+const MAIN_BACK_SLOT: usize = 53;
 
 /// Opens the merchant for a hunter at the board.
 pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
@@ -248,6 +250,7 @@ fn menu_items(view: Option<&View>) -> Vec<ItemStack> {
     for (slot, offer) in PERSONAL_SLOTS.into_iter().zip(&view.personal) {
         items[slot] = offer_item(view, *offer);
     }
+    items[MAIN_BACK_SLOT] = ui::main_menu_button();
     items
 }
 
@@ -346,6 +349,10 @@ impl MenuKind for MerchantMenuKind {
             return ClickOutcome::Fallthrough;
         }
         let slot = slot - self.buttons.start();
+        if !self.essentials && slot == MAIN_BACK_SLOT {
+            main_menu::open(player, Arc::clone(&self.state));
+            return ClickOutcome::Consume;
+        }
         if self.essentials && slot == BACK_SLOT {
             open(player, Arc::clone(&self.state));
             return ClickOutcome::Consume;
@@ -410,6 +417,7 @@ pub fn open_buyback(player: &Player, state: Arc<SoloLevelingState>) {
     let items = buyback_items(&choices);
     ui::open_buttons(
         player,
+        Arc::clone(&state),
         TextComponent::plain("Скупка").color(Color::Gold),
         if choices.len() > 27 { 6 } else { 3 },
         items,

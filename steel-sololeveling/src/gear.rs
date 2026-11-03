@@ -306,6 +306,7 @@ pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
     contents[53] = info();
     open_guarded_buttons(
         player,
+        Arc::clone(&state),
         TextComponent::plain("Снаряжение").color(Color::DarkPurple),
         6,
         contents,

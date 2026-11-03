@@ -12,13 +12,16 @@ use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
 use crate::item::{append_lore, named, with_lore};
+use crate::main_menu;
 use crate::shop::{self, Offer, ShopDay};
 use crate::state::SoloLevelingState;
+use crate::ui;
 
 const MENU_SLOTS: usize = 27;
 const BALANCE_SLOT: usize = 4;
 const RANDOM_TAB_SLOT: usize = 0;
 const PERMANENT_TAB_SLOT: usize = 1;
+const BACK_SLOT: usize = 26;
 /// Offers fill the middle of rows two and three, five per row.
 const FIRST_ROW_START: usize = 11;
 const SECOND_ROW_START: usize = 20;
@@ -77,6 +80,7 @@ fn shop_view(state: &SoloLevelingState, uuid: Uuid) -> Option<(ShopDay, u64)> {
 
 fn render_items(view: Option<(ShopDay, u64)>, uuid: Uuid, tab: ShopTab) -> Vec<ItemStack> {
     let mut items = vec![ItemStack::empty(); MENU_SLOTS];
+    items[BACK_SLOT] = ui::main_menu_button();
     let Some((day, points)) = view else {
         return items;
     };
@@ -250,6 +254,10 @@ impl MenuKind for ShopMenuKind {
             return ClickOutcome::Fallthrough;
         }
         let slot = slot - self.buttons.start();
+        if slot == BACK_SLOT {
+            main_menu::open(player, Arc::clone(&self.state));
+            return ClickOutcome::Consume;
+        }
         if slot == RANDOM_TAB_SLOT {
             open_tab(player, Arc::clone(&self.state), ShopTab::Random);
             return ClickOutcome::Consume;

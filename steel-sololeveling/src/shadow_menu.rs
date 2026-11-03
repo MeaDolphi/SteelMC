@@ -18,6 +18,7 @@ use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
 use crate::item::{named, with_lore};
+use crate::main_menu;
 use crate::shadow::{
     ATTACK_PER_POINT, BossSource, ELITE_SHADOW_DAMAGE_MULTIPLIER, ELITE_SHADOW_HEALTH_MULTIPLIER,
     ELITE_SHADOW_SPEED_MULTIPLIER, EliteShadow, HEALTH_PER_POINT, MAX_ELITE_SHADOW_SLOTS,
@@ -37,6 +38,7 @@ const INFO_SLOT: usize = 49;
 const FILTER_SLOT: usize = 50;
 const RECALL_ALL_SLOT: usize = 51;
 const NEXT_SLOT: usize = 53;
+const MAIN_BACK_SLOT: usize = 52;
 
 const DETAIL_SLOTS: usize = 27;
 const DETAIL_SHADOW_SLOT: usize = 4;
@@ -255,6 +257,7 @@ impl ArmyView {
         items[MODE_SLOT] = mode_item(self.mode);
         items[FILTER_SLOT] = filter_item(self.filter);
         items[RECALL_ALL_SLOT] = button(&vanilla_items::BARRIER, "Отозвать всех", Color::Red);
+        items[MAIN_BACK_SLOT] = ui::main_menu_button();
         items[INFO_SLOT] = with_lore(
             named(
                 ItemStack::new(&vanilla_items::ECHO_SHARD),
@@ -498,6 +501,10 @@ impl MenuKind for ArmyMenuKind {
         }
         let owner = player.gameprofile.id();
         let local = slot - self.buttons.start();
+        if local == MAIN_BACK_SLOT {
+            main_menu::open(player, Arc::clone(&self.state));
+            return ClickOutcome::Consume;
+        }
         let view = ArmyView::read(&self.state, owner, self.page, self.filter);
         match local {
             PREVIOUS_SLOT => self.page = view.page.saturating_sub(1),
@@ -859,6 +866,7 @@ impl EliteArmyView {
         );
         items[MODE_SLOT] = mode_item(self.mode);
         items[RECALL_ALL_SLOT] = button(&vanilla_items::BARRIER, "Отозвать элитных", Color::Red);
+        items[MAIN_BACK_SLOT] = ui::main_menu_button();
         items[INFO_SLOT] = with_lore(
             named(
                 ItemStack::new(&vanilla_items::ECHO_SHARD),
@@ -1046,6 +1054,10 @@ impl MenuKind for EliteArmyMenuKind {
         }
         let owner = player.gameprofile.id();
         let local = slot - self.buttons.start();
+        if local == MAIN_BACK_SLOT {
+            main_menu::open(player, Arc::clone(&self.state));
+            return ClickOutcome::Consume;
+        }
         let view = EliteArmyView::read(&self.state, owner, self.page);
         match local {
             PREVIOUS_SLOT => self.page = view.page.saturating_sub(1),

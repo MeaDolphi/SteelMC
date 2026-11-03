@@ -31,6 +31,7 @@ pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
     let items = menu_items(&state, uuid);
     ui::open_buttons(
         player,
+        Arc::clone(&state),
         TextComponent::plain("Гримуар Системы").color(Color::DarkPurple),
         6,
         items,

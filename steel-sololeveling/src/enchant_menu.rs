@@ -139,6 +139,7 @@ pub fn open_picker(player: &Player, state: Arc<SoloLevelingState>) {
         .collect();
     open_buttons(
         player,
+        Arc::clone(&state),
         TextComponent::plain("Выберите артефакт").color(Color::DarkAqua),
         if choices.len() > 27 { 6 } else { 3 },
         items,

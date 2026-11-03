@@ -208,6 +208,7 @@ impl GameplayHooks for SoloLevelingHooks {
         self.state.tick_artifacts(player);
         self.state.tick_class(player);
         item::menu_book::keep_in_place(player);
+        item::combat_skill_book::keep_in_place(player);
         item::dungeon_map::keep_in_place(player, self.state.dungeon_map_id(player));
         if player.tick_count() % 20 == 0 {
             if is_instance_world(&player.get_world()) {
@@ -419,6 +420,18 @@ impl GameplayHooks for SoloLevelingHooks {
             main_menu::open(player, Arc::clone(&self.state));
             return Some(InteractionResult::Success);
         }
+        if item::combat_skill_book::is_combat_skill_book(stack) {
+            if let Err(error) = self.state.use_combat_skill(player, player.is_crouching()) {
+                let message = match error {
+                    crate::state::SkillUseError::Cooldown(seconds) => {
+                        format!("Навык перезаряжается: {seconds} с.")
+                    }
+                    _ => error.message().to_owned(),
+                };
+                player.send_message(&TextComponent::plain(message).color(Color::Red));
+            }
+            return Some(InteractionResult::Success);
+        }
         // The grimoire works from either hand, so a Mage staff can sit in
         // the other one.
         if item::grimoire::is_grimoire(stack) {
@@ -589,7 +602,16 @@ impl GameplayHooks for SoloLevelingHooks {
     ) -> f32 {
         let amount = self.state.class_damage(victim, source, amount);
         let amount = self.state.artifact_damage(victim, source, amount);
-        self.state.shield_damage(victim, source, amount)
+        let amount = self.state.shield_damage(victim, source, amount);
+        if source
+            .causing_entity()
+            .and_then(|attacker| attacker.as_player())
+            .is_some_and(|attacker| self.state.consume_stealth_strike(attacker))
+        {
+            amount * 1.5
+        } else {
+            amount
+        }
     }
 
     fn knockback_multiplier(
@@ -881,6 +903,7 @@ fn keeps_projectile_ammo(ammo: &ItemStack) -> bool {
 /// is not the run's own marked loot stays as well. Materials and loot drop.
 fn keeps_item_on_death(stack: &ItemStack, instance_world: bool) -> bool {
     item::grimoire::is_grimoire(stack)
+        || item::combat_skill_book::is_combat_skill_book(stack)
         || item::menu_book::is_menu_book(stack)
         || item::dungeon_map::is_dungeon_map(stack)
         || item::serial::of(stack).is_some()
@@ -910,6 +933,7 @@ fn drop_decision(stack: &ItemStack, off_hand: &ItemStack) -> DropDecision {
         return DropDecision::CycleSpell;
     }
     if item::menu_book::is_menu_book(stack)
+        || item::combat_skill_book::is_combat_skill_book(stack)
         || item::dungeon_map::is_dungeon_map(stack)
         || !item::binding::may_drop(stack)
     {

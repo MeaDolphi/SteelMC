@@ -3,7 +3,9 @@
 mod abilities;
 mod auction;
 mod class;
+mod combat_skills;
 pub use auction::{AuctionRequest, LotView};
+pub use combat_skills::SkillUseError;
 mod organization;
 pub use organization::{BoardView, GroupPayout};
 pub use persistence::StarterError;
@@ -212,6 +214,7 @@ impl SoloLevelingState {
         session.merchant = data.merchant;
         session.castle = data.castle;
         session.spells = data.spells;
+        session.combat_skills = data.combat_skills;
         session.quests = data.quests;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1633,6 +1636,7 @@ mod tests {
                 merchant: MerchantRecord::default(),
                 castle: CastleProgress::default(),
                 spells: SpellBook::default(),
+                combat_skills: crate::combat_skill::CombatSkillBook::default(),
                 quests: QuestBook::default(),
             },
         );
@@ -1700,6 +1704,7 @@ mod tests {
             merchant: MerchantRecord::default(),
             castle: CastleProgress::default(),
             spells: SpellBook::default(),
+            combat_skills: crate::combat_skill::CombatSkillBook::default(),
             quests: QuestBook::default(),
         };
         service.storage.save(&data).expect("save elite roster");
@@ -1760,6 +1765,7 @@ mod tests {
             merchant: MerchantRecord::default(),
             castle: CastleProgress::default(),
             spells: SpellBook::default(),
+            combat_skills: crate::combat_skill::CombatSkillBook::default(),
             quests: QuestBook::default(),
         }
     }

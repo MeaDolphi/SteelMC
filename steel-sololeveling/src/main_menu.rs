@@ -28,6 +28,7 @@ use crate::pay_menu;
 use crate::quest_menu;
 use crate::shadow_menu;
 use crate::shop_menu;
+use crate::skill_menu;
 use crate::sound::SystemSound;
 use crate::state::{GateMenuAction, SoloLevelingState};
 
@@ -54,10 +55,12 @@ enum Category {
     Castle,
     Errands,
     Path,
+    Skills,
 }
 
 /// Categories and the menu slot each one sits in.
-const CATEGORIES: [(usize, Category); 17] = [
+const CATEGORIES: [(usize, Category); 18] = [
+    (9, Category::Skills),
     (10, Category::Hunter),
     (11, Category::Shop),
     (12, Category::Contracts),
@@ -103,6 +106,7 @@ impl Category {
             Self::Castle => &vanilla_items::NETHER_BRICK,
             Self::Errands => &vanilla_items::PAPER,
             Self::Path => &vanilla_items::FILLED_MAP,
+            Self::Skills => &vanilla_items::ENCHANTED_BOOK,
         }
     }
 
@@ -125,6 +129,7 @@ impl Category {
             Self::Castle => "Замок демонов",
             Self::Errands => "Поручения Системы",
             Self::Path => "Путь охотника",
+            Self::Skills => "Навыки",
         }
     }
 
@@ -162,6 +167,7 @@ impl Category {
             ],
             Self::Errands => &["Три поручения дня и три", "испытания недели с наградами."],
             Self::Path => &["Разовые достижения охотника", "с наградой в Won."],
+            Self::Skills => &["Классовый и общий навык,", "улучшение и сброс очков."],
         }
     }
 
@@ -274,6 +280,7 @@ impl MainMenuKind {
             Category::Castle => castle_menu::open(player, Arc::clone(state)),
             Category::Errands => quest_menu::open_errands(player, state),
             Category::Path => quest_menu::open_path(player, state),
+            Category::Skills => skill_menu::open(player, Arc::clone(state)),
         }
     }
 }

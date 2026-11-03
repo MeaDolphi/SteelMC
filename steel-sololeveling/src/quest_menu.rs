@@ -111,6 +111,7 @@ pub fn open_errands(player: &Player, state: &Arc<SoloLevelingState>) {
     }
     ui::open_buttons(
         player,
+        Arc::clone(state),
         line("Поручения Системы", Color::Aqua),
         3,
         items,
@@ -179,6 +180,7 @@ pub fn open_path(player: &Player, state: &Arc<SoloLevelingState>) {
     }
     ui::open_buttons(
         player,
+        Arc::clone(state),
         line("Путь охотника", Color::Gold),
         6,
         items,

@@ -76,6 +76,7 @@ fn open_founding(player: &Player, state: Arc<SoloLevelingState>) {
     );
     ui::open_buttons(
         player,
+        Arc::clone(&state),
         TextComponent::plain("Гильдия").color(Color::Gold),
         3,
         items,
@@ -86,6 +87,7 @@ fn open_founding(player: &Player, state: Arc<SoloLevelingState>) {
             let create_state = Arc::clone(&state);
             ui::ask_text(
                 player,
+                Arc::clone(&state),
                 "Название гильдии",
                 "Название",
                 Arc::new(move |player, name| {
@@ -197,6 +199,7 @@ fn open_guild(player: &Player, state: Arc<SoloLevelingState>, guild: &Guild) {
     let items = guild_items(&state, viewer, guild);
     ui::open_buttons(
         player,
+        Arc::clone(&state),
         TextComponent::plain(format!("Гильдия {}", guild.name)).color(Color::Gold),
         6,
         items,
@@ -267,6 +270,7 @@ fn guild_click(state: &Arc<SoloLevelingState>, player: &Player, slot: usize) -> 
             let deposit_state = Arc::clone(state);
             ui::pick_amount(
                 player,
+                Arc::clone(&deposit_state),
                 "Взнос в казну",
                 "Won",
                 balance.min(100),
@@ -286,6 +290,7 @@ fn guild_click(state: &Arc<SoloLevelingState>, player: &Player, slot: usize) -> 
             let leave_state = Arc::clone(state);
             ui::confirm(
                 player,
+                Arc::clone(&leave_state),
                 &format!("Покинуть гильдию {}?", guild.name),
                 Arc::new(move |player| {
                     match leave_state.leave_guild(player.gameprofile.id()) {
@@ -352,6 +357,7 @@ fn open_member(
     items[BACK_SLOT] = ui::button(&vanilla_items::ARROW, "Назад", Color::Yellow, &[]);
     ui::open_buttons(
         player,
+        Arc::clone(&state),
         TextComponent::plain(name.clone()).color(Color::Gold),
         3,
         items,
@@ -366,6 +372,7 @@ fn open_member(
                 let kicked = name.clone();
                 ui::confirm(
                     player,
+                    Arc::clone(&kick_state),
                     &format!("Исключить {kicked} из гильдии?"),
                     Arc::new(move |player| {
                         match kick_state.remove_guild_member(player.gameprofile.id(), target) {

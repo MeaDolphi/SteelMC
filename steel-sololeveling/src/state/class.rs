@@ -256,6 +256,7 @@ impl SoloLevelingState {
         self.tick_mana(player);
         self.tick_shield(player);
         self.tick_enchantments(player);
+        self.tick_combat_skills(player);
         self.tick_quests(player);
     }
 

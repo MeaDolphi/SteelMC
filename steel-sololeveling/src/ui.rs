@@ -18,6 +18,7 @@ use text_components::{Modifier as _, TextComponent};
 use uuid::Uuid;
 
 use crate::item::{model, named, with_lore};
+use crate::main_menu;
 use crate::state::SoloLevelingState;
 
 /// What a button click asks of its menu.
@@ -53,6 +54,26 @@ pub fn button(icon: ItemRef, title: impl Into<String>, color: Color, lore: &[&st
         lore.iter()
             .map(|line| TextComponent::plain((*line).to_owned()).color(Color::Gray))
             .collect(),
+    )
+}
+
+/// Standard return to the immediate parent menu.
+#[must_use]
+pub fn back_button() -> ItemStack {
+    styled(
+        button(&vanilla_items::ARROW, "Назад", Color::Yellow, &[]),
+        "ui/previous",
+    )
+}
+
+/// Standard return to the System main menu.
+#[must_use]
+pub fn main_menu_button() -> ItemStack {
+    button(
+        &vanilla_items::NETHER_STAR,
+        "Главное меню",
+        Color::Aqua,
+        &[],
     )
 }
 
@@ -99,27 +120,43 @@ pub fn tell(player: &Player, text: &str, color: Color) {
 /// Opens a chest of `rows` rows whose clicks all go to `handler`.
 pub fn open_buttons(
     player: &Player,
+    state: Arc<SoloLevelingState>,
     title: TextComponent,
     rows: usize,
     items: Vec<ItemStack>,
     handler: Handler,
 ) {
-    open_buttons_inner(player, title, rows, items, handler, false);
+    open_buttons_inner(player, state, title, rows, items, handler, false);
 }
 
 /// Opens buttons that cannot receive or release real items by any menu action.
 pub fn open_guarded_buttons(
     player: &Player,
+    state: Arc<SoloLevelingState>,
     title: TextComponent,
     rows: usize,
     items: Vec<ItemStack>,
     handler: Handler,
 ) {
-    open_buttons_inner(player, title, rows, items, handler, true);
+    open_buttons_inner(player, state, title, rows, items, handler, true);
+}
+
+fn navigation_slot(items: &[ItemStack]) -> Option<usize> {
+    let bottom = items.len().saturating_sub(9);
+    (bottom..items.len())
+        .rev()
+        .find(|slot| items[*slot].is_empty())
+}
+
+fn install_main_return(items: &mut [ItemStack]) -> Option<usize> {
+    let slot = navigation_slot(items)?;
+    items[slot] = main_menu_button();
+    Some(slot)
 }
 
 fn open_buttons_inner(
     player: &Player,
+    state: Arc<SoloLevelingState>,
     title: TextComponent,
     rows: usize,
     items: Vec<ItemStack>,
@@ -134,6 +171,7 @@ fn open_buttons_inner(
     let slots = if rows > 3 { 54 } else { 27 };
     let mut items = items;
     items.resize(slots, ItemStack::empty());
+    let navigation_slot = install_main_return(&mut items);
     player.open_menu(title, move |context| {
         let container = SimpleContainer::from_items(items).into_shared();
         let mut builder = MenuBuilder::new(menu_type, context.container_id);
@@ -147,17 +185,21 @@ fn open_buttons_inner(
         };
         builder.player_inventory(&context.player.inventory);
         builder.build(ButtonMenuKind {
+            state,
             buttons,
             container,
             handler,
+            navigation_slot,
         })
     });
 }
 
 struct ButtonMenuKind {
+    state: Arc<SoloLevelingState>,
     buttons: Section,
     container: Shared<SimpleContainer>,
     handler: Handler,
+    navigation_slot: Option<usize>,
 }
 
 // SAFETY: This Solo Leveling-owned key uniquely identifies the concrete menu kind.
@@ -183,7 +225,13 @@ impl MenuKind for ButtonMenuKind {
         if !self.buttons.contains(slot) {
             return ClickOutcome::Fallthrough;
         }
-        if let After::Redraw(items) = (self.handler)(player, slot - self.buttons.start(), button) {
+        let slot = slot - self.buttons.start();
+        if self.navigation_slot == Some(slot) {
+            main_menu::open(player, Arc::clone(&self.state));
+            return ClickOutcome::Consume;
+        }
+        if let After::Redraw(mut items) = (self.handler)(player, slot, button) {
+            self.navigation_slot = install_main_return(&mut items);
             let id = ContainerId::from_arc(&self.container);
             if let Some(container) = guard.get_typed_mut::<SimpleContainer>(id) {
                 for (index, item) in items.into_iter().enumerate() {
@@ -198,7 +246,7 @@ impl MenuKind for ButtonMenuKind {
 /// Lists online hunters other than the viewer and reports the one clicked.
 pub fn pick_player(
     player: &Player,
-    state: &SoloLevelingState,
+    state: &Arc<SoloLevelingState>,
     title: &str,
     exclude: &[Uuid],
     on_pick: OnPlayer,
@@ -239,6 +287,7 @@ pub fn pick_player(
     }
     open_buttons(
         player,
+        Arc::clone(state),
         TextComponent::plain(title.to_owned()).color(Color::DarkAqua),
         6,
         items,
@@ -316,6 +365,7 @@ fn amount_items(title: &str, unit: &str, amount: u64, min: u64, max: u64) -> Vec
 /// Asks for a number between `min` and `max` with +/- buttons.
 pub fn pick_amount(
     player: &Player,
+    state: Arc<SoloLevelingState>,
     title: &str,
     unit: &str,
     initial: u64,
@@ -328,6 +378,7 @@ pub fn pick_amount(
     let mut amount = initial.clamp(min, max);
     open_buttons(
         player,
+        state,
         TextComponent::plain(title.clone()).color(Color::Gold),
         3,
         amount_items(&title, &unit, amount, min, max),
@@ -350,7 +401,24 @@ pub fn pick_amount(
 }
 
 /// Asks for a yes before an irreversible action.
-pub fn confirm(player: &Player, question: &str, on_yes: OnConfirm) {
+pub fn confirm(player: &Player, state: Arc<SoloLevelingState>, question: &str, on_yes: OnConfirm) {
+    confirm_with_back(
+        player,
+        state,
+        question,
+        on_yes,
+        Arc::new(|player| player.close_container()),
+    );
+}
+
+/// Asks for a yes and returns to the calling menu on either answer.
+pub fn confirm_with_back(
+    player: &Player,
+    state: Arc<SoloLevelingState>,
+    question: &str,
+    on_yes: OnConfirm,
+    on_no: OnConfirm,
+) {
     let mut items = vec![ItemStack::empty(); 27];
     items[4] = button(&vanilla_items::PAPER, question.to_owned(), Color::Gold, &[]);
     items[11] = styled(
@@ -363,6 +431,7 @@ pub fn confirm(player: &Player, question: &str, on_yes: OnConfirm) {
     );
     open_buttons(
         player,
+        state,
         TextComponent::plain("Подтверждение").color(Color::Gold),
         3,
         items,
@@ -372,7 +441,7 @@ pub fn confirm(player: &Player, question: &str, on_yes: OnConfirm) {
                 After::Replaced
             }
             15 => {
-                player.close_container();
+                on_no(player);
                 After::Replaced
             }
             _ => After::Keep,
@@ -384,7 +453,13 @@ pub fn confirm(player: &Player, question: &str, on_yes: OnConfirm) {
 ///
 /// The hunter edits the paper's name and clicks the result (or the paper) to
 /// submit. Nothing is ever repaired or renamed: the anvil is only an input.
-pub fn ask_text(player: &Player, title: &str, placeholder: &str, on_submit: OnText) {
+pub fn ask_text(
+    player: &Player,
+    state: Arc<SoloLevelingState>,
+    title: &str,
+    placeholder: &str,
+    on_submit: OnText,
+) {
     let placeholder = placeholder.to_owned();
     player.open_menu(
         TextComponent::plain(title.to_owned()).color(Color::Gold),
@@ -394,7 +469,7 @@ pub fn ask_text(player: &Player, title: &str, placeholder: &str, on_submit: OnTe
                     ItemStack::new(&vanilla_items::PAPER),
                     TextComponent::plain(placeholder.clone()),
                 ),
-                ItemStack::empty(),
+                main_menu_button(),
                 ItemStack::empty(),
             ])
             .into_shared();
@@ -402,6 +477,7 @@ pub fn ask_text(player: &Player, title: &str, placeholder: &str, on_submit: OnTe
             let buttons = builder.section_all(Arc::clone(&container));
             builder.player_inventory(&context.player.inventory);
             builder.build(TextInputKind {
+                state,
                 buttons,
                 container,
                 placeholder,
@@ -413,6 +489,7 @@ pub fn ask_text(player: &Player, title: &str, placeholder: &str, on_submit: OnTe
 }
 
 struct TextInputKind {
+    state: Arc<SoloLevelingState>,
     buttons: Section,
     container: Shared<SimpleContainer>,
     placeholder: String,
@@ -464,6 +541,10 @@ impl MenuKind for TextInputKind {
         if !matches!(click, Click::Pickup { .. }) {
             return ClickOutcome::Consume;
         }
+        if slot == 1 {
+            main_menu::open(player, Arc::clone(&self.state));
+            return ClickOutcome::Consume;
+        }
         if self.text.is_empty() || self.text == self.placeholder {
             tell(player, "Сначала впишите текст в поле сверху.", Color::Red);
             return ClickOutcome::Consume;
@@ -496,5 +577,18 @@ mod tests {
         slots.dedup();
         assert_eq!(slots.len(), count);
         assert!(slots.iter().all(|slot| *slot < 27));
+    }
+
+    #[test]
+    fn main_return_uses_the_last_free_bottom_slot() {
+        use steel_registry::vanilla_items;
+
+        steel_registry::init_vanilla_registry();
+        let mut items = vec![steel_registry::item_stack::ItemStack::empty(); 27];
+        items[26] = steel_registry::item_stack::ItemStack::new(&vanilla_items::PAPER);
+        assert_eq!(super::navigation_slot(&items), Some(25));
+        assert_eq!(super::install_main_return(&mut items), Some(25));
+        items[25] = steel_registry::item_stack::ItemStack::new(&vanilla_items::PAPER);
+        assert_eq!(super::navigation_slot(&items), Some(24));
     }
 }

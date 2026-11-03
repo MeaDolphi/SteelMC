@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::abilities::AbilityCooldowns;
 use crate::castle::CastleProgress;
+use crate::combat_skill::CombatSkillBook;
 use crate::economy::{SystemPoints, Won};
 use crate::gear::SavedGear;
 use crate::merchant::MerchantRecord;
@@ -88,6 +89,9 @@ pub struct SoloLevelingPlayerData {
     /// Unlocked and prepared spells.
     #[serde(default)]
     pub spells: SpellBook,
+    /// Learned combat skills and their persistent cooldowns.
+    #[serde(default)]
+    pub combat_skills: CombatSkillBook,
     /// Quests, errands, trials and achievements of the hunter.
     #[serde(default)]
     pub quests: QuestBook,
@@ -116,6 +120,7 @@ impl SoloLevelingPlayerData {
             merchant: MerchantRecord::default(),
             castle: CastleProgress::default(),
             spells: SpellBook::default(),
+            combat_skills: CombatSkillBook::default(),
             quests: QuestBook::default(),
         }
     }

@@ -16,6 +16,7 @@ use text_components::TextComponent;
 use text_components::format::Color;
 use uuid::Uuid;
 
+use crate::main_menu;
 use crate::party::Party;
 use crate::state::SoloLevelingState;
 use crate::ui;
@@ -26,6 +27,7 @@ const FIRST_MEMBER_SLOT: usize = 10;
 const INVITE_SLOT: usize = 20;
 const ACCEPT_SLOT: usize = 22;
 const LEAVE_SLOT: usize = 24;
+const BACK_SLOT: usize = 26;
 
 /// What the menu draws for one viewer: their party and pending invitation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +139,7 @@ fn items(state: &SoloLevelingState, uuid: Uuid, view: &PartyView) -> Vec<ItemSta
     if view.party.is_some() {
         items[LEAVE_SLOT] = ui::button(&vanilla_items::BARRIER, "Покинуть группу", Color::Red, &[]);
     }
+    items[BACK_SLOT] = ui::main_menu_button();
     items
 }
 
@@ -195,6 +198,10 @@ impl MenuKind for PartyMenuKind {
         };
         if !self.buttons.contains(slot) {
             return ClickOutcome::Fallthrough;
+        }
+        if slot - self.buttons.start() == BACK_SLOT {
+            main_menu::open(player, Arc::clone(&self.state));
+            return ClickOutcome::Consume;
         }
         let uuid = player.gameprofile.id();
         match slot - self.buttons.start() {
@@ -287,6 +294,7 @@ impl PartyMenuKind {
         let state = Arc::clone(&self.state);
         ui::confirm(
             player,
+            Arc::clone(&state),
             &format!("Исключить {name} из группы?"),
             Arc::new(move |player| {
                 match state.kick_from_party(player.gameprofile.id(), member) {

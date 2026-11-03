@@ -1,8 +1,8 @@
 //! The Adventurer Organization board menu.
 //!
 //! The left five columns offer every template by rank and objective. Column
-//! seven lists the hunter's personal contracts, column eight the party's group
-//! contracts and column nine, below the help book, the guild's contracts.
+//! six lists the hunter's personal contracts, column seven the party's group
+//! contracts and column eight, below the help book, the guild's contracts.
 //! Every click acts on live state and then redraws the menu.
 
 use std::sync::Arc;
@@ -17,23 +17,26 @@ use text_components::format::Color;
 use text_components::{Modifier as _, TextComponent};
 
 use crate::item::{named, with_lore};
+use crate::main_menu;
 use crate::organization::{
     Contract, GROUP_LIMIT, GUILD_LIMIT, GUILD_SCALE, OBJECTIVES, Objective, OrganizationError,
     PERSONAL_LIMIT, RANKS, Template,
 };
 use crate::starter_menu;
 use crate::state::{BoardView, SoloLevelingState};
+use crate::ui;
 
 const COLUMNS: usize = 9;
 const SLOTS: usize = 54;
-const PERSONAL_COLUMN: usize = 6;
-const GROUP_COLUMN: usize = 7;
-const GUILD_COLUMN: usize = 8;
+const PERSONAL_COLUMN: usize = 5;
+const GROUP_COLUMN: usize = 6;
+const GUILD_COLUMN: usize = 7;
 const HELP_SLOT: usize = 8;
+const BACK_SLOT: usize = 53;
 /// Objective columns shown on the board.
-const OFFER_COLUMNS: usize = 6;
-/// Offer slots of the board: six columns of six rows.
-const OFFER_SLOTS: usize = 36;
+const OFFER_COLUMNS: usize = 5;
+/// Offer slots of the board: five columns of six rows.
+const OFFER_SLOTS: usize = 30;
 /// Ticks between board offer rerolls: twenty minutes, and every hunter sees
 /// the same board of one bucket.
 pub const OFFER_REFRESH_TICKS: u64 = 20 * 60 * 20;
@@ -162,6 +165,7 @@ fn menu_items(view: Option<&BoardView>, at_board: bool, offers: &[Template]) -> 
                 None => ItemStack::empty(),
             },
             None if slot == HELP_SLOT => help_item(view),
+            None if slot == BACK_SLOT => ui::main_menu_button(),
             None => ItemStack::empty(),
         };
     }
@@ -459,6 +463,10 @@ impl MenuKind for OrganizationMenuKind {
         if !self.buttons.contains(slot) {
             return ClickOutcome::Fallthrough;
         }
+        if slot - self.buttons.start() == BACK_SLOT {
+            main_menu::open(player, Arc::clone(&self.state));
+            return ClickOutcome::Consume;
+        }
         if self.at_board && slot - self.buttons.start() == HELP_SLOT {
             starter_menu::open(player, Arc::clone(&self.state));
             return ClickOutcome::Consume;
@@ -531,18 +539,18 @@ mod tests {
         let offers = rolled_offers(3);
         assert_eq!(button_at(0, &offers), Some(Button::Offer(offers[0])));
         assert_eq!(
-            button_at(5 * 9 + 5, &offers),
-            Some(Button::Offer(offers[35]))
+            button_at(5 * 9 + 4, &offers),
+            Some(Button::Offer(offers[29]))
         );
-        assert_eq!(button_at(6, &offers), Some(Button::Personal(0)));
-        assert_eq!(button_at(2 * 9 + 6, &offers), Some(Button::Personal(2)));
-        assert_eq!(button_at(3 * 9 + 6, &offers), None);
-        assert_eq!(button_at(9 + 7, &offers), Some(Button::Group(1)));
-        assert_eq!(button_at(2 * 9 + 7, &offers), None);
+        assert_eq!(button_at(5, &offers), Some(Button::Personal(0)));
+        assert_eq!(button_at(2 * 9 + 5, &offers), Some(Button::Personal(2)));
+        assert_eq!(button_at(3 * 9 + 5, &offers), None);
+        assert_eq!(button_at(9 + 6, &offers), Some(Button::Group(1)));
+        assert_eq!(button_at(2 * 9 + 6, &offers), None);
         assert_eq!(button_at(8, &offers), None);
-        assert_eq!(button_at(9 + 8, &offers), Some(Button::Guild(0)));
-        assert_eq!(button_at(2 * 9 + 8, &offers), Some(Button::Guild(1)));
-        assert_eq!(button_at(3 * 9 + 8, &offers), None);
+        assert_eq!(button_at(9 + 7, &offers), Some(Button::Guild(0)));
+        assert_eq!(button_at(2 * 9 + 7, &offers), Some(Button::Guild(1)));
+        assert_eq!(button_at(3 * 9 + 7, &offers), None);
     }
 
     #[test]

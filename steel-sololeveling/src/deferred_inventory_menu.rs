@@ -77,6 +77,7 @@ pub fn open(player: &Player, state: Arc<SoloLevelingState>, page: usize) {
         .collect();
     open_guarded_buttons(
         player,
+        Arc::clone(&state),
         TextComponent::plain("Хранилище Системы").color(Color::Aqua),
         6,
         contents,

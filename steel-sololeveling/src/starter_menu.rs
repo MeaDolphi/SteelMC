@@ -19,9 +19,11 @@ use uuid::Uuid;
 
 use crate::item::serial::{self, STARTER_WEAPONS, SerialId};
 use crate::item::{append_lore, named, with_lore};
+use crate::main_menu;
 use crate::merchant_menu;
 use crate::starter::{self, StarterKit};
 use crate::state::{SoloLevelingState, StarterError};
+use crate::ui;
 
 const MENU_SLOTS: usize = 27;
 const INFO_SLOT: usize = 4;
@@ -31,6 +33,7 @@ const WEAPON_SLOTS: [usize; 3] = [11, 13, 15];
 const MERCHANT_SLOT: usize = 22;
 /// Button that hands out a pickaxe an earlier claim still owes.
 const PICKAXE_SLOT: usize = 20;
+const BACK_SLOT: usize = 26;
 
 /// Opens the starter-kit desk.
 pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
@@ -91,6 +94,7 @@ fn menu_items(view: Option<StarterKit>, uuid: Uuid) -> Vec<ItemStack> {
             TextComponent::plain("Клик — открыть витрины.").color(Color::Yellow),
         ],
     );
+    items[BACK_SLOT] = ui::main_menu_button();
     items
 }
 
@@ -192,6 +196,10 @@ impl MenuKind for StarterMenuKind {
         };
         if !self.buttons.contains(slot) {
             return ClickOutcome::Fallthrough;
+        }
+        if slot - self.buttons.start() == BACK_SLOT {
+            main_menu::open(player, Arc::clone(&self.state));
+            return ClickOutcome::Consume;
         }
         if slot - self.buttons.start() == MERCHANT_SLOT {
             merchant_menu::open(player, Arc::clone(&self.state));

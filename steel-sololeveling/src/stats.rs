@@ -141,6 +141,19 @@ impl HunterStats {
         }
     }
 
+    /// Returns every allocated point to the unspent pool without changing level or experience.
+    pub const fn reset_allocations(&mut self) -> u32 {
+        let refunded =
+            self.strength + self.vitality + self.agility + self.intelligence + self.sense;
+        self.unspent_points = self.unspent_points.saturating_add(refunded);
+        self.strength = 0;
+        self.vitality = 0;
+        self.agility = 0;
+        self.intelligence = 0;
+        self.sense = 0;
+        refunded
+    }
+
     /// Removes one point from one of the nonzero allocated stats.
     ///
     /// `roll` selects among the eligible values, keeping selection policy at
@@ -404,5 +417,26 @@ mod tests {
         assert_eq!(stats.experience, 0);
         assert_eq!(stats.unspent_points, 2 * STAT_POINTS_PER_LEVEL);
         assert_eq!(stats.experience_to_next_level(), 121);
+    }
+
+    #[test]
+    fn reset_allocations_refunds_every_stat_once_without_losing_progress() {
+        let mut stats = HunterStats {
+            level: 12,
+            experience: 50,
+            unspent_points: 2,
+            strength: 3,
+            vitality: 4,
+            agility: 5,
+            intelligence: 6,
+            sense: 7,
+        };
+        assert_eq!(stats.reset_allocations(), 25);
+        assert_eq!(stats.unspent_points, 27);
+        assert_eq!((stats.strength, stats.vitality, stats.agility), (0, 0, 0));
+        assert_eq!((stats.intelligence, stats.sense), (0, 0));
+        assert_eq!((stats.level, stats.experience), (12, 50));
+        assert_eq!(stats.reset_allocations(), 0);
+        assert_eq!(stats.unspent_points, 27);
     }
 }

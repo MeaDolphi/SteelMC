@@ -520,6 +520,41 @@ impl ShadowRuntime {
         displaced
     }
 
+    /// Returns the nearest summoned body of `owner` in the same world and within `range`.
+    #[must_use]
+    pub fn nearest_shadow(
+        &self,
+        owner: Uuid,
+        world: &World,
+        position: DVec3,
+        range: f64,
+    ) -> Option<SharedEntity> {
+        let ordinary = self
+            .active
+            .values()
+            .map(|active| (active.owner, &active.entity));
+        let elite = self
+            .elite_active
+            .values()
+            .map(|active| (active.owner, &active.entity));
+        ordinary
+            .chain(elite)
+            .filter(|(shadow_owner, entity)| {
+                *shadow_owner == owner
+                    && !entity.is_removed()
+                    && entity.level().is_some_and(|level| level.key == world.key)
+                    && entity.position().distance(position) <= range
+            })
+            .map(|(_, entity)| entity)
+            .min_by(|first, second| {
+                first
+                    .position()
+                    .distance(position)
+                    .total_cmp(&second.position().distance(position))
+            })
+            .cloned()
+    }
+
     /// Returns the roster ids of the shadows one hunter has summoned.
     #[must_use]
     pub fn active_shadows(&self, owner: Uuid) -> Vec<Uuid> {
@@ -806,6 +841,13 @@ impl ShadowBrood {
             occupied.push(larva.position());
             self.larvae.push(larva);
         }
+    }
+}
+
+#[cfg(test)]
+impl ShadowRuntime {
+    pub(crate) fn spawn_for_test(&mut self, hunter: &Player, shadow: &Shadow) {
+        self.spawn(hunter, shadow).expect("test shadow");
     }
 }
 

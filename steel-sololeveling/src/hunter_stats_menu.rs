@@ -15,14 +15,18 @@ use text_components::Modifier as _;
 use text_components::TextComponent;
 use text_components::format::Color;
 
+use crate::main_menu;
 use crate::state::SoloLevelingState;
 use crate::stats::{HunterStat, HunterStats};
+use crate::ui;
 
 const STRENGTH_SLOT: usize = 0;
 const VITALITY_SLOT: usize = 1;
 const AGILITY_SLOT: usize = 2;
 const INTELLIGENCE_SLOT: usize = 3;
 const SENSE_SLOT: usize = 4;
+const RESET_SLOT: usize = 22;
+const BACK_SLOT: usize = 26;
 /// Opens the hunter-stat allocation menu for an online player.
 pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
     player.open_menu(
@@ -38,7 +42,7 @@ fn build(container_id: u8, player: &Player, state: Arc<SoloLevelingState>) -> Me
         .unwrap_or_default();
     let container = SimpleContainer::from_items(menu_items(&hunter_stats)).into_shared();
 
-    let mut builder = MenuBuilder::new(&vanilla_menu_types::GENERIC_9X1, container_id);
+    let mut builder = MenuBuilder::new(&vanilla_menu_types::GENERIC_9X3, container_id);
     let buttons = builder.section_all(Arc::clone(&container));
     builder.player_inventory(&player.inventory);
     builder.build(HunterStatsMenuKind {
@@ -49,7 +53,7 @@ fn build(container_id: u8, player: &Player, state: Arc<SoloLevelingState>) -> Me
 }
 
 fn menu_items(stats: &HunterStats) -> Vec<ItemStack> {
-    vec![
+    let mut items = vec![
         stat_item(
             &vanilla_items::IRON_SWORD,
             "Сила",
@@ -78,13 +82,26 @@ fn menu_items(stats: &HunterStats) -> Vec<ItemStack> {
             &vanilla_items::SPYGLASS,
             "Чутьё",
             stats.sense,
-            "Пока не даёт боевого бонуса",
+            "Перезарядка боевых навыков: -1% за очко, до -30%",
         ),
         ItemStack::empty(),
         points_item(stats.unspent_points),
         level_item(stats),
         experience_item(stats),
-    ]
+    ];
+    items.resize(27, ItemStack::empty());
+    items[RESET_SLOT] = ui::button(
+        &vanilla_items::REDSTONE,
+        "Сбросить характеристики",
+        Color::Red,
+        &[
+            "Вернуть все распределённые очки.",
+            "Уровень и опыт не изменятся.",
+            "Только в городе, с подтверждением.",
+        ],
+    );
+    items[BACK_SLOT] = ui::back_button();
+    items
 }
 
 fn stat_item(item: ItemRef, name: &str, value: u32, effect: &str) -> ItemStack {
@@ -197,8 +214,30 @@ impl MenuKind for HunterStatsMenuKind {
         if !self.buttons.contains(slot) {
             return ClickOutcome::Fallthrough;
         }
+        let slot = slot - self.buttons.start();
+        if slot == BACK_SLOT {
+            main_menu::open(player, Arc::clone(&self.state));
+            return ClickOutcome::Consume;
+        }
+        if slot == RESET_SLOT {
+            let yes = Arc::clone(&self.state);
+            let no = Arc::clone(&self.state);
+            ui::confirm_with_back(
+                player,
+                Arc::clone(&self.state),
+                "Вернуть все распределённые очки характеристик?",
+                Arc::new(move |player| {
+                    if let Err(error) = yes.reset_hunter_stats(player) {
+                        ui::tell(player, error, Color::Red);
+                    }
+                    open(player, Arc::clone(&yes));
+                }),
+                Arc::new(move |player| open(player, Arc::clone(&no))),
+            );
+            return ClickOutcome::Consume;
+        }
 
-        let Some(stat) = stat_for_slot(slot - self.buttons.start()) else {
+        let Some(stat) = stat_for_slot(slot) else {
             return ClickOutcome::Consume;
         };
         let Some(stats) = self.state.allocate_point(player.gameprofile.id(), stat) else {
@@ -262,7 +301,7 @@ mod tests {
             ..HunterStats::new()
         };
         let items = menu_items(&stats);
-        assert_eq!(items.len(), 9);
+        assert_eq!(items.len(), 27);
         let text = items.iter().map(item_text).collect::<Vec<_>>().join("\n");
         for expected in [
             "Сила",
@@ -272,7 +311,9 @@ mod tests {
             "Чутьё",
             "Текущее значение: 3",
             "Мана: +5 за очко · восстановление: +0,1/с",
-            "Пока не даёт боевого бонуса",
+            "Перезарядка боевых навыков: -1% за очко, до -30%",
+            "Сбросить характеристики",
+            "Назад",
             "Доступно: 6",
             "Уровень 12 · ранг D",
             &format!("50 / {} XP", stats.experience_to_next_level()),

@@ -24,6 +24,7 @@ use crate::auction::{
     COMMISSION_PERCENT, LotKind, MAX_ACTIVE_LOTS, MAX_DURATION_HOURS, MIN_DURATION_HOURS,
 };
 use crate::item::{append_lore, binding};
+use crate::main_menu;
 use crate::state::{AuctionRequest, LotView, SoloLevelingState};
 use crate::ui::{self, After};
 
@@ -33,6 +34,7 @@ const SELL_SLOT: usize = 47;
 const INFO_SLOT: usize = 49;
 const MINE_SLOT: usize = 51;
 const NEXT_SLOT: usize = 53;
+const BACK_SLOT: usize = 52;
 /// Highest price the menu offers; larger prices stay possible by command.
 const MAX_MENU_PRICE: u64 = 10_000_000;
 
@@ -189,6 +191,7 @@ fn menu_items(view: Option<&View>) -> Vec<ItemStack> {
             "Клик сюда — обновить.",
         ],
     );
+    items[BACK_SLOT] = ui::main_menu_button();
     items
 }
 
@@ -273,6 +276,10 @@ impl MenuKind for AuctionMenuKind {
         let local = slot - self.buttons.start();
         let viewer = player.gameprofile.id();
         match local {
+            BACK_SLOT => {
+                main_menu::open(player, Arc::clone(&self.state));
+                return ClickOutcome::Consume;
+            }
             PREVIOUS_SLOT => self.page = self.page.saturating_sub(1),
             NEXT_SLOT => self.page = self.page.saturating_add(1),
             INFO_SLOT => {}
@@ -324,6 +331,7 @@ impl MenuKind for AuctionMenuKind {
                         let bid_handle = Weak::clone(&handle);
                         ui::pick_amount(
                             player,
+                            Arc::clone(&bid_state),
                             &format!("Ставка на лот #{}", lot.id),
                             "Won",
                             minimum,
@@ -458,6 +466,7 @@ pub fn open_picker(player: &Player, state: Arc<SoloLevelingState>) {
         .collect();
     ui::open_buttons(
         player,
+        Arc::clone(&state),
         TextComponent::plain("Выберите предмет").color(Color::Gold),
         if choices.len() > 27 { 6 } else { 3 },
         items,
@@ -495,6 +504,7 @@ fn open_sell(player: &Player, state: Arc<SoloLevelingState>, chosen: (usize, Ite
     );
     ui::open_buttons(
         player,
+        Arc::clone(&state),
         TextComponent::plain("Выставить лот").color(Color::Gold),
         3,
         items,
@@ -508,6 +518,7 @@ fn open_sell(player: &Player, state: Arc<SoloLevelingState>, chosen: (usize, Ite
             let chosen = chosen.clone();
             ui::pick_amount(
                 player,
+                Arc::clone(&price_state),
                 if kind == LotKind::FixedPrice {
                     "Цена лота"
                 } else {
@@ -522,6 +533,7 @@ fn open_sell(player: &Player, state: Arc<SoloLevelingState>, chosen: (usize, Ite
                     let chosen = chosen.clone();
                     ui::pick_amount(
                         player,
+                        Arc::clone(&hours_state),
                         "Срок лота",
                         "ч",
                         12,

@@ -17,11 +17,13 @@ use crate::castle::{self, CHECKPOINT_EVERY, CastleProgress, FREE_ENTRY_SECONDS, 
 use crate::item::{named, with_lore};
 use crate::merchant;
 use crate::state::SoloLevelingState;
+use crate::ui;
 
 const MENU_SLOTS: usize = 27;
 const PROGRESS_SLOT: usize = 11;
 const ENTER_SLOT: usize = 13;
 const RANKING_SLOT: usize = 15;
+const BACK_SLOT: usize = 26;
 
 /// Everything the page shows; a change redraws it. The wait is part of the
 /// view, so a spent free entry turns the enter button red on the next tick.
@@ -147,6 +149,7 @@ fn menu_items(view: Option<&View>) -> Vec<ItemStack> {
         ),
         lines,
     );
+    items[BACK_SLOT] = ui::main_menu_button();
     items
 }
 
@@ -216,6 +219,10 @@ impl MenuKind for CastleMenuKind {
         };
         if !self.buttons.contains(slot) {
             return ClickOutcome::Fallthrough;
+        }
+        if slot - self.buttons.start() == BACK_SLOT {
+            crate::main_menu::open(player, Arc::clone(&self.state));
+            return ClickOutcome::Consume;
         }
         if slot - self.buttons.start() != ENTER_SLOT {
             return ClickOutcome::Consume;

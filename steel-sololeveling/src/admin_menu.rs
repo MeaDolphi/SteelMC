@@ -111,6 +111,7 @@ pub fn open(admin: &Player, state: Arc<SoloLevelingState>) {
     let candidates_for_handler = candidates.clone();
     open_guarded_buttons(
         admin,
+        Arc::clone(&state),
         TextComponent::plain("Админ: выбор игрока").color(Color::DarkRed),
         6,
         items,
@@ -159,6 +160,7 @@ fn open_editor(admin: &Player, state: Arc<SoloLevelingState>, target: Uuid, targ
     };
     open_guarded_buttons(
         admin,
+        Arc::clone(&state),
         TextComponent::plain(format!("Админ: {target_name}")).color(Color::DarkRed),
         6,
         items,
@@ -524,6 +526,7 @@ fn open_class_submenu(
 
     open_guarded_buttons(
         admin,
+        Arc::clone(&state),
         TextComponent::plain("Админ: класс").color(Color::DarkAqua),
         3,
         items,
@@ -575,6 +578,7 @@ fn open_rank_submenu(
 
     open_guarded_buttons(
         admin,
+        Arc::clone(&state),
         TextComponent::plain("Админ: ранг").color(Color::DarkAqua),
         3,
         items,
@@ -608,6 +612,7 @@ fn ask_won_amount(
     let state_for_submit = Arc::clone(&state);
     ui::ask_text(
         admin,
+        Arc::clone(&state),
         "Сумма Won",
         "0",
         Arc::new(move |admin, text| {
@@ -649,6 +654,7 @@ fn ask_points_amount(
     let state_for_submit = Arc::clone(&state);
     ui::ask_text(
         admin,
+        Arc::clone(&state),
         "Сумма очков",
         "0",
         Arc::new(move |admin, text| {
@@ -870,6 +876,7 @@ mod tests {
                 merchant: MerchantRecord::default(),
                 castle: CastleProgress::default(),
                 spells: SpellBook::default(),
+                combat_skills: crate::combat_skill::CombatSkillBook::default(),
                 quests: QuestBook::default(),
             },
         );

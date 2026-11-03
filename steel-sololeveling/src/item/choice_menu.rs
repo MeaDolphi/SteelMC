@@ -18,11 +18,15 @@ use text_components::{Modifier as _, TextComponent};
 
 use super::binding;
 use super::chest::{self, ChestKind, Reward};
+use crate::main_menu;
+use crate::state::SoloLevelingState;
+use crate::ui;
 use uuid::Uuid;
 
 /// Opens the choice menu of a chest the player is holding in `hand`.
 pub fn open(
     player: &Arc<Player>,
+    state: Arc<SoloLevelingState>,
     hand: InteractionHand,
     bound_owner: Option<Uuid>,
     options: &[Reward; 3],
@@ -33,6 +37,7 @@ pub fn open(
         build(
             context.container_id,
             context.player,
+            state,
             hand,
             bound_owner,
             &options,
@@ -43,15 +48,17 @@ pub fn open(
 fn build(
     container_id: u8,
     player: &Player,
+    state: Arc<SoloLevelingState>,
     hand: InteractionHand,
     bound_owner: Option<Uuid>,
     options: &[Reward; 3],
 ) -> Menu {
     let container = SimpleContainer::from_items(menu_items(options, bound_owner)).into_shared();
-    let mut builder = MenuBuilder::new(&vanilla_menu_types::GENERIC_9X1, container_id);
+    let mut builder = MenuBuilder::new(&vanilla_menu_types::GENERIC_9X3, container_id);
     let buttons = builder.section_all(Arc::clone(&container));
     builder.player_inventory(&player.inventory);
     builder.build(ChoiceMenuKind {
+        state,
         buttons,
         container,
         hand,
@@ -61,12 +68,13 @@ fn build(
 }
 
 fn menu_items(options: &[Reward; 3], bound_owner: Option<Uuid>) -> Vec<ItemStack> {
-    let mut items = vec![ItemStack::empty(); 9];
+    let mut items = vec![ItemStack::empty(); 27];
     for (index, option) in options.iter().enumerate() {
         if let Some(slot) = items.get_mut(index) {
             *slot = reward_stack(*option, bound_owner);
         }
     }
+    items[26] = ui::main_menu_button();
     items
 }
 
@@ -109,6 +117,7 @@ fn can_fit_after_hand_shrink(
 }
 
 struct ChoiceMenuKind {
+    state: Arc<SoloLevelingState>,
     buttons: Section,
     container: Shared<SimpleContainer>,
     hand: InteractionHand,
@@ -142,6 +151,10 @@ impl MenuKind for ChoiceMenuKind {
         };
         if !self.buttons.contains(slot) {
             return ClickOutcome::Fallthrough;
+        }
+        if slot - self.buttons.start() == 26 {
+            main_menu::open(player, Arc::clone(&self.state));
+            return ClickOutcome::Consume;
         }
         let Some(option) = slot
             .checked_sub(self.buttons.start())

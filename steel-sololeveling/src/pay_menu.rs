@@ -44,6 +44,7 @@ pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
             let pay_state = Arc::clone(&pick_state);
             ui::pick_amount(
                 player,
+                Arc::clone(&pay_state),
                 &format!("Перевод: {name}"),
                 "Won",
                 balance.min(100),

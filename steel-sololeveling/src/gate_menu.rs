@@ -139,6 +139,7 @@ pub fn open(player: &Player, state: Arc<SoloLevelingState>, page: usize) {
     }
     open_guarded_buttons(
         player,
+        Arc::clone(&state),
         TextComponent::plain("Врата Системы").color(Color::DarkPurple),
         6,
         contents,

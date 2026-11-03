@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::class::{self, HunterClass};
 use crate::dungeon::is_instance_world;
 use crate::item::{append_lore, named, with_lore};
+use crate::main_menu;
 use crate::rank::HunterRank;
 use crate::sound::SystemSound;
 use crate::state::SoloLevelingState;
@@ -38,6 +39,7 @@ const GRIMOIRE_SLOT: usize = 22;
 const VAULT_SLOT: usize = 20;
 /// Button that starts the Second Awakening trial.
 const AWAKENING_SLOT: usize = 24;
+const BACK_SLOT: usize = 26;
 /// Vault menu page size.
 const VAULT_PAGE_SIZE: usize = 45;
 
@@ -130,6 +132,7 @@ pub fn open_vault(player: &Player, state: Arc<SoloLevelingState>, page: usize) {
         .collect();
     open_guarded_buttons(
         player,
+        Arc::clone(&state),
         TextComponent::plain("Хранилище класса").color(Color::Aqua),
         6,
         contents,
@@ -305,6 +308,7 @@ fn menu_items(state: &SoloLevelingState, uuid: Uuid) -> Vec<ItemStack> {
             ],
         );
     }
+    items[BACK_SLOT] = crate::ui::main_menu_button();
     items
 }
 
@@ -336,6 +340,10 @@ impl MenuKind for ClassMenuKind {
         };
         if !self.buttons.contains(slot) {
             return ClickOutcome::Fallthrough;
+        }
+        if slot - self.buttons.start() == BACK_SLOT {
+            main_menu::open(player, Arc::clone(&self.state));
+            return ClickOutcome::Consume;
         }
         if slot - self.buttons.start() == GRIMOIRE_SLOT {
             let uuid = player.gameprofile.id();
