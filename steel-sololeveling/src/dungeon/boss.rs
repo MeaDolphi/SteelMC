@@ -477,14 +477,15 @@ pub fn boss_for_gate(kind: BossKind, rank: HunterRank, red: bool) -> DungeonBoss
             HunterRank::S => (2.0, 32.0, 5.0, 8.0, 8.0, 0.7, 1.5),
         };
     let multiplier = if red { RED_GATE_SCALE } else { 1.0 };
+    let offense = if kind == BossKind::Archmage { 1.5 } else { 1.0 };
     let (health, damage, speed, size) = kind.proportions();
     DungeonBoss {
         kind,
         scale: (scale * size).max(1.1),
         health_multiplier: health_multiplier * multiplier * health,
-        damage_multiplier: damage_multiplier * multiplier * damage,
+        damage_multiplier: damage_multiplier * multiplier * damage * offense,
         speed_multiplier: speed,
-        power: ZOMBIE_ATTACK_DAMAGE * damage_multiplier * multiplier,
+        power: ZOMBIE_ATTACK_DAMAGE * damage_multiplier * multiplier * offense,
         armor,
         armor_toughness: toughness,
         knockback_resistance: resistance,
@@ -1144,8 +1145,8 @@ mod tests {
         assert!(assassin.health_multiplier < mage.health_multiplier);
         assert!(assassin.speed_multiplier > warlord.speed_multiplier);
         assert!(mage.speed_multiplier < warlord.speed_multiplier);
-        // Spells scale from the rank, not from the mage's weak melee.
-        assert_eq!(mage.power, warlord.power);
+        assert_eq!(mage.damage_multiplier, warlord.damage_multiplier * 0.9);
+        assert_eq!(mage.power, warlord.power * 1.5);
     }
 
     #[test]

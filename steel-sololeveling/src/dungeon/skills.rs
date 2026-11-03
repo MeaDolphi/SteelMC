@@ -33,6 +33,12 @@ const SHAMAN_COOLDOWN_TICKS: u64 = 120;
 const SHAMAN_RANGE: f64 = 8.0;
 /// Share of an ally's maximum health one chant restores.
 const SHAMAN_HEAL_SHARE: f32 = 0.25;
+/// Ticks between two damaging mage bolts.
+const MAGE_COOLDOWN_TICKS: u64 = 80;
+/// Reach of a mage bolt.
+const MAGE_RANGE: f64 = 14.0;
+/// Share of the wave's ability power in one mage bolt.
+const MAGE_DAMAGE_SHARE: f32 = 0.5;
 /// Distance at which a bomber lights its charge.
 const BOMBER_TRIGGER_RANGE: f64 = 3.0;
 /// Fuse of a lit charge.
@@ -106,7 +112,7 @@ impl MobSkills {
     pub fn track(&mut self, id: i32, class: MobClass, tick: u64) {
         if matches!(
             class,
-            MobClass::Shaman | MobClass::Bomber | MobClass::Broodmother
+            MobClass::Mage | MobClass::Shaman | MobClass::Bomber | MobClass::Broodmother
         ) {
             self.casters.insert(
                 id,
@@ -149,6 +155,23 @@ impl MobSkills {
                 .map(|hunter| hunter.distance(position))
                 .fold(f64::INFINITY, f64::min);
             match state.class {
+                MobClass::Mage => {
+                    if tick >= state.ready_tick
+                        && nearest <= MAGE_RANGE
+                        && let Some(target) = nearest_mage_target(world, position)
+                    {
+                        state.ready_tick = tick + MAGE_COOLDOWN_TICKS;
+                        out.actions.push(SkillAction {
+                            world: world.key.clone(),
+                            caster: *id,
+                            kind: SkillKind::ArcaneBolt {
+                                target,
+                                power: power * MAGE_DAMAGE_SHARE,
+                            },
+                        });
+                    }
+                    true
+                }
                 MobClass::Shaman => {
                     if tick >= state.ready_tick && nearest <= AWARE_RANGE {
                         let targets = allies
@@ -221,11 +244,33 @@ impl MobSkills {
                     }
                     true
                 }
-                MobClass::Warrior | MobClass::Guard | MobClass::Berserker => false,
+                MobClass::Warrior | MobClass::Guard | MobClass::Berserker | MobClass::Archer => {
+                    false
+                }
             }
         });
         out
     }
+}
+
+fn nearest_mage_target(world: &Arc<World>, position: DVec3) -> Option<i32> {
+    let from = position + DVec3::new(0.0, EYE_HEIGHT, 0.0);
+    let mut nearest = None;
+    world.players.iter_players(|_, player| {
+        if player.is_dead_or_dying() {
+            return true;
+        }
+        let distance = player.position().distance(position);
+        if distance > MAGE_RANGE {
+            return true;
+        }
+        let closer = nearest.is_none_or(|(_, best): (i32, f64)| distance < best);
+        if closer && line_of_sight(world, from, player.position() + DVec3::new(0.0, 1.0, 0.0)) {
+            nearest = Some((player.id(), distance));
+        }
+        true
+    });
+    nearest.map(|(id, _)| id)
 }
 
 fn hatch(world: &Arc<World>, around: DVec3, occupied: &[DVec3]) -> Option<SharedEntity> {
@@ -350,6 +395,8 @@ pub struct SkillAction {
 
 #[derive(Debug, Clone)]
 enum SkillKind {
+    /// A mage launches a damaging bolt at one hunter.
+    ArcaneBolt { target: i32, power: f32 },
     /// A shaman heals and empowers its allies.
     Chant { targets: Vec<i32> },
     /// A bomber blows up, hurting hunters around it.
@@ -357,7 +404,7 @@ enum SkillKind {
 }
 
 impl SkillAction {
-    /// Heals, buffs or blasts; a caster that died in the meantime does nothing.
+    /// Applies the ability; a caster that died in the meantime does nothing.
     pub fn apply(&self, server: &Server) {
         let Some(world) = server.worlds.get(&self.world) else {
             return;
@@ -372,10 +419,43 @@ impl SkillAction {
             return;
         }
         match &self.kind {
+            SkillKind::ArcaneBolt { target, power } => {
+                arcane_bolt(world, &caster, *target, *power);
+            }
             SkillKind::Chant { targets } => chant(world, &caster, targets),
             SkillKind::Blast { power } => blast(world, &caster, *power),
         }
     }
+}
+
+fn arcane_bolt(world: &Arc<World>, caster: &SharedEntity, target: i32, power: f32) {
+    let Some(target) = world.get_entity_by_id(target) else {
+        return;
+    };
+    if target
+        .as_living_entity()
+        .is_none_or(LivingEntity::is_dead_or_dying)
+    {
+        return;
+    }
+    let from = caster.position() + DVec3::new(0.0, EYE_HEIGHT, 0.0);
+    let to = target.position() + DVec3::new(0.0, 1.0, 0.0);
+    if !line_of_sight(world, from, to) {
+        return;
+    }
+    for step in 0..=24 {
+        world.send_particles(
+            ParticleData::simple(&vanilla_particle_types::END_ROD),
+            from.lerp(to, f64::from(step) / 24.0),
+            1,
+            DVec3::ZERO,
+            0.0,
+        );
+    }
+    play(caster, &sound_events::ENTITY_EVOKER_CAST_SPELL, 1.2);
+    let source = DamageSource::environment(&vanilla_damage_types::MAGIC)
+        .with_causing_entity(Arc::clone(caster));
+    target.hurt(world, &source, power);
 }
 
 fn chant(world: &World, caster: &SharedEntity, targets: &[i32]) {
@@ -483,5 +563,51 @@ mod tests {
             f64::from(pos.y()),
             f64::from(pos.z()) + 0.5,
         )
+    }
+
+    #[test]
+    fn mage_bolt_damages_its_target_and_observes_cooldown() {
+        use std::sync::Arc;
+
+        use steel_core::entity::{
+            Entity as _, LivingEntity as _, entities::ZombieEntity, next_entity_id,
+        };
+        use steel_registry::vanilla_entities;
+
+        use super::{MobClass, MobSkills, SkillKind};
+
+        let fixture =
+            crate::test_support::world(Arc::new(steel_core::gameplay_hooks::NoopGameplayHooks));
+        let world = Arc::clone(&fixture.world);
+        let server = crate::test_support::server(&fixture);
+        crate::test_support::load_full_chunks(&world, vec![steel_utils::ChunkPos::new(0, 0)]);
+        let caster = Arc::new(ZombieEntity::new(
+            &vanilla_entities::ZOMBIE,
+            next_entity_id(),
+            DVec3::new(0.5, 65.0, 0.5),
+            Arc::downgrade(&world),
+        ));
+        world.try_add_entity(caster.clone()).expect("caster");
+        let player = crate::test_support::player(&world, "Target", next_entity_id());
+        world.try_add_entity(player.clone()).expect("player");
+        let _ = player.teleport(DVec3::new(6.5, 65.0, 0.5), 0.0, 0.0);
+        let health = player.get_health();
+
+        let mut skills = MobSkills::default();
+        skills.track(caster.id(), MobClass::Mage, 0);
+        let out = skills.tick(&world, &[player.position()], &[], 10.0, 40);
+        assert_eq!(out.actions.len(), 1);
+        assert!(matches!(
+            out.actions[0].kind,
+            SkillKind::ArcaneBolt { target, power } if target == player.id() && power == 5.0
+        ));
+        out.actions[0].apply(&server);
+        assert_eq!(player.get_health(), health - 5.0);
+
+        let next = skills.tick(&world, &[player.position()], &[], 10.0, 41);
+        assert!(next.actions.is_empty());
+        caster.set_removed(steel_core::entity::RemovalReason::Discarded);
+        out.actions[0].apply(&server);
+        assert_eq!(player.get_health(), health - 5.0);
     }
 }

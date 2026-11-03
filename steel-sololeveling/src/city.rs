@@ -134,6 +134,35 @@ pub fn gate_candidate(center: BlockPos) -> BlockPos {
     )
 }
 
+/// Every entrance position an automatic gate can roll around one plaza center.
+#[must_use]
+pub fn gate_site_candidates(center: BlockPos) -> Vec<BlockPos> {
+    let mut candidates = Vec::new();
+    for x in -GATE_SITE_SPREAD..=GATE_SITE_SPREAD {
+        for z in -GATE_SITE_SPREAD..=GATE_SITE_SPREAD {
+            candidates.push(BlockPos::new(center.x() + x, center.y(), center.z() + z));
+        }
+    }
+    candidates
+}
+
+/// Block bounds containing every possible frame around one plaza center.
+#[must_use]
+pub fn gate_site_scan_bounds(center: BlockPos) -> (BlockPos, BlockPos) {
+    (
+        BlockPos::new(
+            center.x() - GATE_SITE_SPREAD - 1,
+            center.y(),
+            center.z() - GATE_SITE_SPREAD,
+        ),
+        BlockPos::new(
+            center.x() + GATE_SITE_SPREAD + 2,
+            center.y(),
+            center.z() + GATE_SITE_SPREAD,
+        ),
+    )
+}
+
 /// Lots from the plaza to the edge of the city, in every direction.
 const CITY_TILES: i32 = 6;
 /// Lot of the gate plazas on the city edge, counted from the plaza.

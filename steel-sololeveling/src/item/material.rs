@@ -188,7 +188,8 @@ pub const fn mob_table(class: MobClass) -> &'static [(Material, u32)] {
         MobClass::Warrior => &[(Material::MagicMetal, 60)],
         MobClass::Guard => &[(Material::MagicMetal, 60), (Material::ChitinPlate, 15)],
         MobClass::Berserker => &[(Material::MagicMetal, 40), (Material::ToughHide, 40)],
-        MobClass::Shaman => &[(Material::ManaFiber, 60)],
+        MobClass::Archer => &[(Material::ToughHide, 40), (Material::MagicMetal, 20)],
+        MobClass::Mage | MobClass::Shaman => &[(Material::ManaFiber, 60)],
         MobClass::Bomber => &[(Material::ToughHide, 20), (Material::ManaFiber, 20)],
         MobClass::Broodmother => &[
             (Material::ChitinPlate, 70),

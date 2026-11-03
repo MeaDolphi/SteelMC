@@ -40,11 +40,12 @@ use super::gate_site;
 use super::gate_vortex::GateVortices;
 use super::generator::{Room, RoomRole, Theme};
 use super::instance::{
-    FrameStyle, SpawnedMob, build_dungeon, dungeon_chunks, erase_footprint, footprint_chunks,
-    gate_footprint, gate_frame_chunks, gate_frame_cleanup_complete, gate_frame_matches,
-    gate_ground_is_level, gate_space_is_clear, open_dungeon_exit, opening_contains,
-    place_gate_frame, remove_gate_frame, spawn_city_break_mob, spawn_dungeon_boss,
-    spawn_dungeon_wave, spawn_gate_label, spawn_room_mobs,
+    FrameStyle, SpawnedMob, build_dungeon, chunks_covering, dungeon_chunks, erase_footprint,
+    footprint_chunks, gate_footprint, gate_frame_chunks, gate_frame_cleanup_complete,
+    gate_frame_matches, gate_ground_is_level, gate_space_is_clear, open_dungeon_exit,
+    opening_contains, place_gate_frame, remove_gate_frame, spawn_city_break_mob,
+    spawn_dungeon_boss, spawn_dungeon_wave, spawn_gate_label, spawn_room_mobs,
+    standing_frame_style,
 };
 use super::map::{self, DungeonMap, ZoneStatus};
 use super::mobs::{MobClass, MobLabel};
@@ -114,6 +115,8 @@ const GATE_MAX_SITE_ATTEMPTS: u8 = 12;
 const TRIBE_CALLS: [f32; 2] = [0.66, 0.33];
 /// Ticks between two checks that every standing gate shows its swirl.
 const VORTEX_SYNC_TICKS: u64 = 20;
+/// Ticks between sweeps of loaded city entities left by disabled breaks.
+const CITY_BREAK_MOB_SWEEP_INTERVAL_TICKS: u64 = 100;
 /// Ticks between repeated explanations of why a gate refuses a hunter.
 const GATE_REFUSAL_INTERVAL_TICKS: u64 = 60;
 
@@ -235,6 +238,9 @@ pub struct DungeonRuntime {
     pending_legacy_gate_cleanups: Vec<PendingLegacyGateCleanup>,
     completed_legacy_gate_cleanups: FxHashSet<usize>,
     blocked_legacy_gate_cleanups: FxHashSet<usize>,
+    /// Automatic gate plazas still to scan for frames left without a registry entry.
+    orphan_frame_scan_next: usize,
+    pending_orphan_frame_scan: Option<PendingOrphanFrameScan>,
     /// Instance mobs to discard once a [`Server`] handle is available again.
     spent_mobs: Vec<(Identifier, i32)>,
     /// Loot removed from instance entities and delivered after the runtime lock.
@@ -332,6 +338,12 @@ struct PendingLegacyGateCleanup {
     index: usize,
     world: Arc<World>,
     gate: Gate,
+    request: ChunkRequestHandle,
+}
+
+struct PendingOrphanFrameScan {
+    world: Arc<World>,
+    center: BlockPos,
     request: ChunkRequestHandle,
 }
 
@@ -1358,6 +1370,9 @@ impl DungeonRuntime {
         server: &Arc<Server>,
         tick: u64,
     ) -> Vec<RunAction> {
+        self.schedule_orphan_frame_scan(server);
+        self.finish_orphan_frame_scan();
+        self.sweep_city_break_mobs(server, tick);
         self.schedule_legacy_gate_cleanups(server);
         self.finish_legacy_gate_cleanups();
         self.finish_gate_cleanup();
@@ -2328,6 +2343,124 @@ impl DungeonRuntime {
                 continue;
             };
             self.queue_gate_cleanup(Arc::clone(world), gate);
+        }
+    }
+
+    fn queue_orphan_frame_scan(&mut self, world: Arc<World>, center: BlockPos) {
+        let (min, max) = city::gate_site_scan_bounds(center);
+        let request = world.chunk_map.request_chunks(ChunkRequest {
+            status: ChunkStatus::Full,
+            positions: chunks_covering(min, max),
+            ticket_kind: ChunkTicketKind::Command,
+        });
+        self.pending_orphan_frame_scan = Some(PendingOrphanFrameScan {
+            world,
+            center,
+            request,
+        });
+    }
+
+    fn schedule_orphan_frame_scan(&mut self, server: &Server) {
+        if self.pending_orphan_frame_scan.is_some()
+            || self.orphan_frame_scan_next >= city::GATE_SITE_OFFSETS.len()
+        {
+            return;
+        }
+        let Some(world) = main_world(server) else {
+            return;
+        };
+        let spawn = world.level_data.read().data().spawn_pos();
+        let (dx, dz) = city::GATE_SITE_OFFSETS[self.orphan_frame_scan_next];
+        self.orphan_frame_scan_next += 1;
+        let center = BlockPos::new(spawn.x() + dx, spawn.y(), spawn.z() + dz);
+        self.queue_orphan_frame_scan(Arc::clone(world), center);
+    }
+
+    fn finish_orphan_frame_scan(&mut self) {
+        let Some(scan) = self.pending_orphan_frame_scan.as_ref() else {
+            return;
+        };
+        match scan.request.poll() {
+            ChunkRequestState::Pending { .. } => return,
+            ChunkRequestState::Cancelled => {
+                let scan = self.pending_orphan_frame_scan.take().expect("pending scan");
+                self.queue_orphan_frame_scan(scan.world, scan.center);
+                return;
+            }
+            ChunkRequestState::Ready => {}
+        }
+        let scan = self.pending_orphan_frame_scan.take().expect("pending scan");
+        let mut removed = 0;
+        let mut retry = false;
+        for entrance in city::gate_site_candidates(scan.center) {
+            if self.gates.has_gate_at(&scan.world.key, entrance)
+                || standing_frame_style(&scan.world, entrance).is_none()
+            {
+                continue;
+            }
+            let gate = LegacyGateCleanup {
+                world: scan.world.key.clone(),
+                entrance: [entrance.x(), entrance.y(), entrance.z()],
+                red: false,
+            }
+            .gate();
+            remove_gate_frame(&scan.world, &gate);
+            if gate_frame_cleanup_complete(&scan.world, &gate) {
+                removed += 1;
+            } else {
+                retry = true;
+            }
+        }
+        if removed > 0 {
+            log::info!(
+                "sololeveling: removed {removed} orphaned gate frame(s) without registry entries in {}",
+                scan.world.key
+            );
+        }
+        if retry {
+            log::warn!(
+                "sololeveling: orphan gate frame scan is incomplete in {}; retrying",
+                scan.world.key
+            );
+            self.queue_orphan_frame_scan(scan.world, scan.center);
+        }
+    }
+
+    fn sweep_city_break_mobs(&self, server: &Server, tick: u64) {
+        if !tick.is_multiple_of(CITY_BREAK_MOB_SWEEP_INTERVAL_TICKS) {
+            return;
+        }
+        let Some(world) = main_world(server) else {
+            return;
+        };
+        let spawn = world.level_data.read().data().spawn_pos();
+        let (x, z) = (f64::from(spawn.x()), f64::from(spawn.z()));
+        let area = WorldAabb::new(
+            x - 320.0,
+            f64::from(world.get_min_y()),
+            z - 320.0,
+            x + 320.0,
+            f64::from(world.get_min_y() + world.get_height()),
+            z + 320.0,
+        );
+        let mut removed = 0;
+        for entity in world.get_entities_in_aabb_matching(&area, is_adoptable_break_mob) {
+            if entity
+                .custom_name()
+                .as_ref()
+                .and_then(break_mob_class)
+                .is_none()
+            {
+                continue;
+            }
+            entity.set_removed(RemovalReason::Discarded);
+            removed += 1;
+        }
+        if removed > 0 {
+            log::info!(
+                "sololeveling: discarded {removed} orphaned gate-break mob(s) in {}",
+                world.key
+            );
         }
     }
 
@@ -4627,6 +4760,109 @@ mod tests {
         runtime.finish_gate_cleanup();
         assert!(runtime.pending_gate_cleanup.is_empty());
         assert!(runtime.gates.retired_gates().is_empty());
+    }
+
+    #[test]
+    fn orphan_scan_removes_full_frames_without_touching_live_or_partial_ones() {
+        use steel_registry::vanilla_blocks;
+        use steel_utils::types::UpdateFlags;
+
+        use crate::city;
+        use crate::dungeon::instance::{
+            FrameStyle, chunks_covering, gate_frame_cleanup_complete, place_gate_frame,
+            standing_frame_style,
+        };
+
+        let fixture =
+            crate::test_support::world(Arc::new(steel_core::gameplay_hooks::NoopGameplayHooks));
+        let world = Arc::clone(&fixture.world);
+        let mut runtime = DungeonRuntime::default();
+        let center = BlockPos::new(4, 64, 4);
+        let live = runtime.gates.create_ranked(
+            world.key.clone(),
+            BlockPos::new(8, 64, 4),
+            0,
+            HunterRank::E,
+        );
+        let (min, max) = city::gate_site_scan_bounds(center);
+        crate::test_support::load_full_chunks(&world, chunks_covering(min, max));
+        assert!(place_gate_frame(&world, center, FrameStyle::Normal));
+        assert!(place_gate_frame(&world, live.entrance, FrameStyle::Red));
+        let partial = BlockPos::new(12, 64, 4);
+        let foreign = BlockPos::new(4, 65, 5);
+        assert!(world.set_block(
+            partial,
+            vanilla_blocks::QUARTZ_BLOCK.default_state(),
+            UpdateFlags::UPDATE_ALL,
+        ));
+        assert!(world.set_block(
+            foreign,
+            vanilla_blocks::STONE.default_state(),
+            UpdateFlags::UPDATE_ALL,
+        ));
+
+        runtime.queue_orphan_frame_scan(Arc::clone(&world), center);
+        crate::test_support::load_full_chunks(&world, chunks_covering(min, max));
+        runtime.finish_orphan_frame_scan();
+
+        let orphan = crate::dungeon::LegacyGateCleanup {
+            world: world.key.clone(),
+            entrance: [center.x(), center.y(), center.z()],
+            red: false,
+        }
+        .gate();
+        assert!(gate_frame_cleanup_complete(&world, &orphan));
+        assert_eq!(
+            standing_frame_style(&world, live.entrance),
+            Some(FrameStyle::Red)
+        );
+        assert_eq!(
+            world.get_block_state(partial),
+            vanilla_blocks::QUARTZ_BLOCK.default_state()
+        );
+        assert_eq!(
+            world.get_block_state(foreign),
+            vanilla_blocks::STONE.default_state()
+        );
+        assert!(runtime.pending_orphan_frame_scan.is_none());
+    }
+
+    #[test]
+    fn city_sweep_discards_only_unallied_break_mobs() {
+        use glam::DVec3;
+        use steel_core::entity::{Entity as _, entities::ZombieEntity, next_entity_id};
+        use steel_registry::vanilla_entities;
+
+        let fixture =
+            crate::test_support::world(Arc::new(steel_core::gameplay_hooks::NoopGameplayHooks));
+        let world = Arc::clone(&fixture.world);
+        let server = crate::test_support::server(&fixture);
+        crate::test_support::load_full_chunks(&world, vec![steel_utils::ChunkPos::new(0, 0)]);
+        let spawn = |class: Option<MobClass>, x: f64| {
+            let entity = Arc::new(ZombieEntity::new(
+                &vanilla_entities::ZOMBIE,
+                next_entity_id(),
+                DVec3::new(x, 65.0, 0.5),
+                Arc::downgrade(&world),
+            ));
+            if let Some(class) = class {
+                entity.set_custom_name(Some(MobLabel::mob(Theme::Crypt, class).text()));
+            }
+            world.try_add_entity(entity.clone()).expect("city mob");
+            entity
+        };
+        let hostile = spawn(Some(MobClass::Warrior), 0.5);
+        let allied = spawn(Some(MobClass::Mage), 2.5);
+        allied.set_runtime_allied_owner(Some(Uuid::new_v4()));
+        let plain = spawn(None, 4.5);
+        let runtime = DungeonRuntime::default();
+
+        runtime.sweep_city_break_mobs(&server, 0);
+
+        assert!(hostile.is_removed());
+        assert!(!allied.is_removed());
+        assert!(!plain.is_removed());
+        assert!(runtime.gates.breaks().is_empty());
     }
 
     #[test]

@@ -864,7 +864,10 @@ impl SoloLevelingState {
         }
         // Materials go to the credited hunter only, like the mob reward.
         if let Some((hunter, class, rank)) = materials {
-            if !matches!(class, MobClass::Warrior | MobClass::Guard) {
+            if !matches!(
+                class,
+                MobClass::Warrior | MobClass::Guard | MobClass::Archer
+            ) {
                 self.record_goal(hunter, Goal::EliteKill, 1);
             }
             let stacks = material::roll_mob(class, rank, || rand::random_range(0..100));

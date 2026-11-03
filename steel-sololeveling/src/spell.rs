@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::rank::HunterRank;
 
 /// Mana of a Mage with no Intelligence.
-pub const BASE_MANA: f32 = 100.0;
+pub const BASE_MANA: f32 = 20.0;
 /// Extra maximum mana per point of Intelligence.
 pub const MANA_PER_INTELLIGENCE: f32 = 5.0;
 /// Mana restored per second with no Intelligence.
@@ -933,8 +933,8 @@ mod tests {
 
     #[test]
     fn mana_grows_with_intelligence() {
-        assert!((max_mana(0) - 100.0).abs() < f32::EPSILON);
-        assert!((max_mana(10) - 150.0).abs() < f32::EPSILON);
+        assert!((max_mana(0) - 20.0).abs() < f32::EPSILON);
+        assert!((max_mana(10) - 70.0).abs() < f32::EPSILON);
         assert!((mana_regen(10, false) - 3.0).abs() < 1e-6);
         assert!((mana_regen(10, true) - 6.0).abs() < 1e-6);
     }

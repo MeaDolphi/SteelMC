@@ -542,9 +542,8 @@ pub struct SpawnedMob {
 
 /// Spawns the fixed wave of combat room `room`.
 ///
-/// The wave is all zombie bodies: Steel has no arrow projectile or
-/// ranged-attack goal yet, so a skeleton could only be a melee mob, which is
-/// not what vanilla does. Variety comes from the classes instead.
+/// Melee fighters share a zombie body, while archers use the skeleton's real
+/// bow-and-arrow AI and mages cast through the dungeon skill system.
 pub fn spawn_dungeon_wave(
     world: &Arc<World>,
     region: InstanceRegion,
@@ -595,14 +594,12 @@ pub fn spawn_room_mobs(
         let mob = if theme == Theme::SnowElves {
             spawn_elf(world, position, roll, wave, rank)
         } else {
-            spawn_class_mob(
-                world,
-                theme,
-                position,
-                MobClass::from_roll(roll),
-                wave,
-                rank,
-            )
+            let class = MobClass::from_gate_roll(roll);
+            if class == MobClass::Archer {
+                spawn_archer(world, theme, position, wave, MobLabel::mob(theme, class))
+            } else {
+                spawn_class_mob(world, theme, position, class, wave, rank)
+            }
         };
         if let Some(mob) = mob {
             spawned.push(mob);
@@ -684,7 +681,7 @@ pub(crate) fn spawn_archer(
     label.show(world, living);
     Some(SpawnedMob {
         id: entity.id(),
-        class: MobClass::Warrior,
+        class: MobClass::Archer,
         label,
     })
 }
@@ -1183,5 +1180,62 @@ mod tests {
                 vanilla_blocks::STONE.default_state()
             );
         }
+    }
+
+    #[test]
+    fn ordinary_ranged_classes_have_real_bodies_and_equipment() {
+        use steel_core::inventory::equipment::EquipmentSlot;
+        use steel_registry::{vanilla_entities, vanilla_items};
+
+        use crate::dungeon::generator::Theme;
+        use crate::dungeon::mobs::{MobClass, MobLabel};
+        use crate::dungeon::wave_for_gate;
+        use crate::rank::HunterRank;
+
+        let (fixture, _) = frame_fixture(FrameStyle::Normal);
+        let position = BlockPos::new(4, 65, 4);
+        let wave = wave_for_gate(HunterRank::E, false);
+        let archer = super::spawn_archer(
+            &fixture.world,
+            Theme::Crypt,
+            position,
+            wave,
+            MobLabel::mob(Theme::Crypt, MobClass::Archer),
+        )
+        .expect("archer");
+        let mage = super::spawn_class_mob(
+            &fixture.world,
+            Theme::Crypt,
+            position,
+            MobClass::Mage,
+            wave,
+            HunterRank::E,
+        )
+        .expect("mage");
+
+        let archer_entity = fixture.world.get_entity_by_id(archer.id).expect("body");
+        assert_eq!(archer.class, MobClass::Archer);
+        assert_eq!(archer.label.title, "Лучник");
+        assert_eq!(
+            archer_entity.entity_type().key,
+            vanilla_entities::SKELETON.key
+        );
+        let archer_living = archer_entity.as_living_entity().expect("living");
+        let mut bow = steel_registry::item_stack::ItemStack::empty();
+        archer_living.with_equipment_slot(EquipmentSlot::MainHand, &mut |stack| {
+            bow = stack.clone();
+        });
+        assert!(bow.is(&vanilla_items::BOW));
+
+        let mage_entity = fixture.world.get_entity_by_id(mage.id).expect("body");
+        assert_eq!(mage.class, MobClass::Mage);
+        assert_eq!(mage.label.title, "Маг");
+        assert_eq!(mage_entity.entity_type().key, vanilla_entities::ZOMBIE.key);
+        let mage_living = mage_entity.as_living_entity().expect("living");
+        let mut staff = steel_registry::item_stack::ItemStack::empty();
+        mage_living.with_equipment_slot(EquipmentSlot::MainHand, &mut |stack| {
+            staff = stack.clone();
+        });
+        assert!(staff.is(&vanilla_items::BLAZE_ROD));
     }
 }

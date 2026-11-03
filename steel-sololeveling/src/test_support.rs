@@ -28,6 +28,7 @@ pub(crate) struct TestWorld {
 pub(crate) fn world(gameplay_hooks: Arc<dyn GameplayHooks>) -> TestWorld {
     init_vanilla_registry();
     steel_core::behavior::init_behaviors();
+    steel_core::entity::init_entities();
     let dimension = &vanilla_dimension_types::OVERWORLD;
     let generation_settings = WorldGenerationSettings::from_generator_config(
         Identifier::vanilla_static("empty"),

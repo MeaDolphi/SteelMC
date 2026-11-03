@@ -81,6 +81,10 @@ pub enum MobClass {
     Guard,
     /// A fast, frail axe-wielder that hits hard.
     Berserker,
+    /// A skeleton that shoots arrows from range.
+    Archer,
+    /// A frail caster that launches damaging magic at hunters.
+    Mage,
     /// A frail caster that heals and empowers the mobs around it.
     Shaman,
     /// A fast runner with a charge on its head that blows up next to hunters.
@@ -91,10 +95,12 @@ pub enum MobClass {
 
 impl MobClass {
     /// Every class, in roll order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::Warrior,
         Self::Guard,
         Self::Berserker,
+        Self::Archer,
+        Self::Mage,
         Self::Shaman,
         Self::Bomber,
         Self::Broodmother,
@@ -114,6 +120,21 @@ impl MobClass {
         }
     }
 
+    /// Returns an ordinary gate class, including a quarter of ranged fighters.
+    #[must_use]
+    pub const fn from_gate_roll(roll: u64) -> Self {
+        match roll % 16 {
+            0..=3 => Self::Warrior,
+            4 | 5 => Self::Guard,
+            6..=8 => Self::Berserker,
+            9 | 10 => Self::Archer,
+            11 | 12 => Self::Mage,
+            13 => Self::Shaman,
+            14 => Self::Bomber,
+            _ => Self::Broodmother,
+        }
+    }
+
     /// Returns the Russian class name.
     #[must_use]
     pub const fn display_name(self) -> &'static str {
@@ -121,6 +142,8 @@ impl MobClass {
             Self::Warrior => "Воин",
             Self::Guard => "Страж",
             Self::Berserker => "Берсерк",
+            Self::Archer => "Лучник",
+            Self::Mage => "Маг",
             Self::Shaman => "Шаман",
             Self::Bomber => "Подрывник",
             Self::Broodmother => "Матка роя",
@@ -134,6 +157,8 @@ impl MobClass {
             Self::Warrior => Color::White,
             Self::Guard => Color::Aqua,
             Self::Berserker => Color::Red,
+            Self::Archer => Color::Yellow,
+            Self::Mage => Color::LightPurple,
             Self::Shaman => Color::Green,
             Self::Bomber => Color::Gold,
             Self::Broodmother => Color::DarkPurple,
@@ -147,6 +172,8 @@ impl MobClass {
             Self::Warrior => (1.0, 1.0, 1.0),
             Self::Guard => (1.4, 0.8, 0.85),
             Self::Berserker => (0.8, 1.4, 1.25),
+            Self::Archer => (0.8, 0.9, 1.0),
+            Self::Mage => (0.7, 0.6, 0.9),
             Self::Shaman => (0.7, 0.5, 0.95),
             Self::Bomber => (0.6, 0.5, 1.35),
             Self::Broodmother => (1.7, 0.7, 0.8),
@@ -158,14 +185,15 @@ impl MobClass {
         let weapon: ItemRef = match self {
             Self::Warrior | Self::Berserker => weapon_for(self, rank),
             Self::Guard => &vanilla_items::SHIELD,
-            Self::Shaman => &vanilla_items::BLAZE_ROD,
+            Self::Archer => &vanilla_items::BOW,
+            Self::Mage | Self::Shaman => &vanilla_items::BLAZE_ROD,
             Self::Bomber | Self::Broodmother => &vanilla_items::AIR,
         };
         let mut items = vec![(EquipmentSlot::MainHand, ItemStack::new(weapon))];
         match self {
             // The charge is worn so hunters can tell a bomber from afar.
             Self::Bomber => items.push((EquipmentSlot::Head, ItemStack::new(&vanilla_items::TNT))),
-            Self::Shaman => items.push((
+            Self::Mage | Self::Shaman => items.push((
                 EquipmentSlot::Head,
                 ItemStack::new(&vanilla_items::LEATHER_HELMET),
             )),
@@ -173,7 +201,7 @@ impl MobClass {
                 EquipmentSlot::Chest,
                 ItemStack::new(&vanilla_items::CHAINMAIL_CHESTPLATE),
             )),
-            Self::Warrior | Self::Guard | Self::Berserker => {}
+            Self::Warrior | Self::Guard | Self::Berserker | Self::Archer => {}
         }
         if self == Self::Guard {
             items.push((
@@ -351,7 +379,7 @@ impl MobLabel {
             is_broodmother: class == MobClass::Broodmother,
             rarity: if matches!(
                 class,
-                MobClass::Shaman | MobClass::Bomber | MobClass::Broodmother
+                MobClass::Mage | MobClass::Shaman | MobClass::Bomber | MobClass::Broodmother
             ) {
                 MobRarity::Rare
             } else {
@@ -398,6 +426,23 @@ mod tests {
         assert_eq!(count(MobClass::Guard), 3);
         assert_eq!(count(MobClass::Berserker), 3);
         assert_eq!(count(MobClass::Shaman), 2);
+        assert_eq!(count(MobClass::Bomber), 1);
+        assert_eq!(count(MobClass::Broodmother), 1);
+    }
+
+    #[test]
+    fn ordinary_gate_waves_include_archers_and_mages() {
+        let count = |class| {
+            (0..16)
+                .filter(|roll| MobClass::from_gate_roll(*roll) == class)
+                .count()
+        };
+        assert_eq!(count(MobClass::Warrior), 4);
+        assert_eq!(count(MobClass::Guard), 2);
+        assert_eq!(count(MobClass::Berserker), 3);
+        assert_eq!(count(MobClass::Archer), 2);
+        assert_eq!(count(MobClass::Mage), 2);
+        assert_eq!(count(MobClass::Shaman), 1);
         assert_eq!(count(MobClass::Bomber), 1);
         assert_eq!(count(MobClass::Broodmother), 1);
     }

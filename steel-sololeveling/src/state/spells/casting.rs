@@ -444,4 +444,11 @@ mod tests {
         assert_eq!(fixture.resources(), (88.0, Some(4_600)));
         assert_eq!(fixture.state.spell_runtime.lock().projectiles.len(), 1);
     }
+
+    #[test]
+    fn saved_mana_is_capped_by_the_base_maximum() {
+        let fixture = Fixture::new();
+        fixture.state.tick_mana(&fixture.player);
+        assert_eq!(fixture.resources().0, 20.0);
+    }
 }
