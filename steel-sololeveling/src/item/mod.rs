@@ -15,7 +15,6 @@ pub mod artifact;
 pub mod binding;
 pub mod chest;
 pub mod choice_menu;
-pub mod combat_skill_book;
 pub mod consume;
 pub mod crystal;
 pub mod dungeon_map;

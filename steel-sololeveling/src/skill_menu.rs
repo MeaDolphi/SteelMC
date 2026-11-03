@@ -20,10 +20,11 @@ use crate::stats::HunterStats;
 use crate::ui::{self, After};
 
 const INFO_SLOT: usize = 4;
-const CLASS_SLOT: usize = 11;
-const GENERAL_SLOTS: [usize; 2] = [12, 13];
-const RESET_SLOT: usize = 22;
-const BACK_SLOT: usize = 26;
+const CLASS_SLOT: usize = 10;
+const INNATE_SLOT: usize = 16;
+const GENERAL_SLOTS: [usize; 6] = [19, 20, 21, 22, 23, 24];
+const RESET_SLOT: usize = 30;
+const BACK_SLOT: usize = 35;
 
 #[derive(Clone)]
 struct View {
@@ -37,7 +38,7 @@ pub fn open(player: &Player, state: Arc<SoloLevelingState>) {
         player,
         Arc::clone(&state),
         TextComponent::plain("Боевые навыки").color(Color::Gold),
-        3,
+        4,
         menu_items(&state, player.gameprofile.id()),
         Box::new(move |player, slot, _| click(&state, player, slot)),
     );
@@ -73,20 +74,28 @@ fn click(state: &Arc<SoloLevelingState>, player: &Player, slot: usize) -> After 
         );
         return After::Keep;
     }
+    let uuid = player.gameprofile.id();
     let result = match slot {
-        CLASS_SLOT => state.upgrade_class_skill(player.gameprofile.id()),
-        slot if slot == GENERAL_SLOTS[0] => {
-            state.upgrade_general_skill(player.gameprofile.id(), CombatSkill::DaggerThrow)
+        CLASS_SLOT => state.upgrade_class_skill(uuid),
+        INNATE_SLOT => state.upgrade_innate_skill(uuid),
+        _ => {
+            let Some(index) = GENERAL_SLOTS
+                .iter()
+                .position(|candidate| *candidate == slot)
+            else {
+                return After::Keep;
+            };
+            let skill = CombatSkill::GENERAL[index];
+            match state.upgrade_general_skill(uuid, skill) {
+                Err(UpgradeError::MaxRank) => state.select_general_skill(uuid, skill).map(|()| 3),
+                result => result,
+            }
         }
-        slot if slot == GENERAL_SLOTS[1] => {
-            state.upgrade_general_skill(player.gameprofile.id(), CombatSkill::ShadowExchange)
-        }
-        _ => return After::Keep,
     };
     if let Err(error) = result {
         ui::tell(player, upgrade_error(error), Color::Red);
     }
-    After::Redraw(menu_items(state, player.gameprofile.id()))
+    After::Redraw(menu_items(state, uuid))
 }
 
 fn upgrade_error(error: UpgradeError) -> &'static str {
@@ -96,6 +105,7 @@ fn upgrade_error(error: UpgradeError) -> &'static str {
         UpgradeError::MaxRank => "Навык уже имеет максимальный уровень III.",
         UpgradeError::NoPoints => "Не хватает очков навыков. Они начисляются за уровни охотника.",
         UpgradeError::NotGeneral => "Этот навык нельзя выбрать как общий.",
+        UpgradeError::NotLearned => "Сначала изучите этот навык.",
     }
 }
 
@@ -116,51 +126,68 @@ fn skill_icon(skill: CombatSkill) -> ItemRef {
         CombatSkill::RulersAuthority => &vanilla_items::BLAZE_ROD,
         CombatSkill::DaggerThrow => &vanilla_items::IRON_HOE,
         CombatSkill::ShadowExchange => &vanilla_items::ENDER_PEARL,
+        CombatSkill::QuickStep => &vanilla_items::FEATHER,
+        CombatSkill::SecondWind => &vanilla_items::GOLDEN_APPLE,
+        CombatSkill::Repulse => &vanilla_items::PISTON,
+        CombatSkill::ShadowStep => &vanilla_items::ENDER_EYE,
     }
 }
 
-fn skill_item(_view: &View, skill: CombatSkill, rank: u8, selected: bool) -> ItemStack {
+fn skill_item(
+    skill: CombatSkill,
+    rank: u8,
+    selected: bool,
+    free_base: bool,
+    activation: &'static str,
+) -> ItemStack {
+    let title = if free_base {
+        format!("Врождённый: {}", skill.title())
+    } else {
+        skill.title().to_owned()
+    };
     let mut lore = vec![
         TextComponent::plain(skill.description()).color(Color::Gray),
         TextComponent::plain(format!("Уровень: {rank} / 3")).color(Color::Aqua),
         TextComponent::plain(format!("Перезарядка: {} с", skill.cooldown_seconds()))
             .color(Color::Gray),
+        TextComponent::plain(activation).color(Color::Aqua),
     ];
     if rank < 3 {
-        lore.push(
-            TextComponent::plain(format!(
-                "Следующий уровень: {} очков навыков",
-                skill.next_rank_cost(rank)
-            ))
-            .color(Color::Gold),
-        );
+        if free_base && rank == 0 {
+            lore.push(
+                TextComponent::plain("Первый уровень получен бесплатно.").color(Color::Green),
+            );
+        } else {
+            lore.push(
+                TextComponent::plain(format!(
+                    "Следующий уровень: {} очков навыков",
+                    skill.next_rank_cost(rank)
+                ))
+                .color(Color::Gold),
+            );
+        }
         lore.push(TextComponent::plain("Клик — изучить или улучшить.").color(Color::Yellow));
     } else {
         lore.push(TextComponent::plain("Максимальный уровень.").color(Color::Green));
     }
     if selected {
-        lore.push(TextComponent::plain("Выбрано для Shift + ПКМ.").color(Color::Green));
+        lore.push(TextComponent::plain("Выбран общим навыком.").color(Color::Green));
     }
     with_lore(
         named(
             ItemStack::new(skill_icon(skill)),
-            TextComponent::plain(skill.title()).color(if selected {
-                Color::Green
-            } else {
-                Color::Gold
-            }),
+            TextComponent::plain(title).color(if selected { Color::Green } else { Color::Gold }),
         ),
         lore,
     )
 }
 
 fn menu_items(state: &SoloLevelingState, uuid: Uuid) -> Vec<ItemStack> {
-    let mut items = vec![ItemStack::empty(); 27];
+    let mut items = vec![ItemStack::empty(); 36];
     let Some(view) = view(state, uuid) else {
         items[BACK_SLOT] = ui::main_menu_button();
         return items;
     };
-    let class_skill = view.class.map(CombatSkill::for_class);
     items[INFO_SLOT] = with_lore(
         named(
             ItemStack::new(&vanilla_items::ENCHANTED_BOOK),
@@ -172,17 +199,19 @@ fn menu_items(state: &SoloLevelingState, uuid: Uuid) -> Vec<ItemStack> {
                 view.book.available_points(view.stats.level)
             ))
             .color(Color::Aqua),
-            TextComponent::plain("ПКМ — классовый навык.").color(Color::Gray),
-            TextComponent::plain("Shift + ПКМ — общий навык.").color(Color::Gray),
+            TextComponent::plain("ПКМ пустой рукой — классовый навык.").color(Color::Gray),
+            TextComponent::plain("Shift + ПКМ пустой рукой — общий навык.").color(Color::Gray),
+            TextComponent::plain("Q пустой рукой — врождённый навык.").color(Color::Gray),
             TextComponent::plain("Набор меняется только вне подземелий.").color(Color::Gray),
         ],
     );
-    if let Some(skill) = class_skill {
+    if let Some(class) = view.class {
         items[CLASS_SLOT] = skill_item(
-            &view,
-            skill,
-            view.class.map_or(0, |class| view.book.class_rank(class)),
+            CombatSkill::for_class(class),
+            view.book.class_rank(class),
             false,
+            false,
+            "ПКМ пустой рукой",
         );
     } else {
         items[CLASS_SLOT] = with_lore(
@@ -195,10 +224,20 @@ fn menu_items(state: &SoloLevelingState, uuid: Uuid) -> Vec<ItemStack> {
     }
     for (slot, skill) in GENERAL_SLOTS.into_iter().zip(CombatSkill::GENERAL) {
         items[slot] = skill_item(
-            &view,
             skill,
             view.book.general_rank(skill),
             view.book.selected_general == Some(skill),
+            false,
+            "Shift + ПКМ пустой рукой",
+        );
+    }
+    if let Some(innate) = view.book.innate_skill {
+        items[INNATE_SLOT] = skill_item(
+            innate,
+            view.book.general_rank(innate),
+            false,
+            true,
+            "Q пустой рукой",
         );
     }
     items[RESET_SLOT] = with_lore(
@@ -208,7 +247,8 @@ fn menu_items(state: &SoloLevelingState, uuid: Uuid) -> Vec<ItemStack> {
         ),
         vec![
             TextComponent::plain("Вернуть потраченные очки навыков.").color(Color::Gray),
-            TextComponent::plain("Базовый классовый навык сохранится.").color(Color::Gray),
+            TextComponent::plain("Классовый навык и врождённый I уровня сохранятся.")
+                .color(Color::Gray),
             TextComponent::plain("Только в городе, с подтверждением.").color(Color::Gray),
         ],
     );
@@ -228,7 +268,7 @@ mod tests {
     use crate::state::SoloLevelingState;
 
     #[test]
-    fn menu_shows_skills_reset_and_main_return() {
+    fn menu_shows_all_skill_slots_and_empty_hand_controls() {
         let directory = std::env::temp_dir().join(format!("skill-menu-test-{}", Uuid::new_v4()));
         let state = SoloLevelingState::new(directory.clone()).expect("state");
         let uuid = Uuid::new_v4();
@@ -257,6 +297,14 @@ mod tests {
             "Рассечение",
             "Бросок кинжала",
             "Обмен тенью",
+            "Быстрый шаг",
+            "Второе дыхание",
+            "Отпор",
+            "Рывок тени",
+            "Врождённый:",
+            "ПКМ пустой рукой",
+            "Shift + ПКМ пустой рукой",
+            "Q пустой рукой",
             "Сбросить навыки",
             "Главное меню",
         ] {

@@ -5,7 +5,7 @@ mod auction;
 mod class;
 mod combat_skills;
 pub use auction::{AuctionRequest, LotView};
-pub use combat_skills::SkillUseError;
+pub use combat_skills::{CombatSkillSlot, SkillUseError};
 mod organization;
 pub use organization::{BoardView, GroupPayout};
 pub use persistence::StarterError;
@@ -214,7 +214,18 @@ impl SoloLevelingState {
         session.merchant = data.merchant;
         session.castle = data.castle;
         session.spells = data.spells;
+        let new_innate = data.combat_skills.innate_skill.is_none();
         session.combat_skills = data.combat_skills;
+        let innate = session.combat_skills.ensure_innate(player_uuid);
+        if new_innate {
+            self.notify(
+                player_uuid,
+                &format!(
+                    "Система определила ваш врождённый навык: {}.",
+                    innate.title()
+                ),
+            );
+        }
         session.quests = data.quests;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

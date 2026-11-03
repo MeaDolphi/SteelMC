@@ -63,6 +63,34 @@ impl SoloLevelingState {
         }
     }
 
+    pub fn select_general_skill(&self, uuid: Uuid, skill: CombatSkill) -> Result<(), UpgradeError> {
+        let result =
+            self.with_session_mut(uuid, |session| session.combat_skills.select_general(skill));
+        match result {
+            Some(Ok(())) => {
+                self.save_after_skill_change(uuid);
+                Ok(())
+            }
+            Some(Err(error)) => Err(error),
+            None => Err(UpgradeError::NotGeneral),
+        }
+    }
+
+    /// Upgrades the persistent innate skill without changing the general selection.
+    pub fn upgrade_innate_skill(&self, uuid: Uuid) -> Result<u8, UpgradeError> {
+        let result = self.with_session_mut(uuid, |session| {
+            session.combat_skills.upgrade_innate(session.stats.level)
+        });
+        match result {
+            Some(Ok(rank)) => {
+                self.save_after_skill_change(uuid);
+                Ok(rank)
+            }
+            Some(Err(error)) => Err(error),
+            None => Err(UpgradeError::NotGeneral),
+        }
+    }
+
     fn save_after_skill_change(&self, uuid: Uuid) {
         if let Err(error) = self.save_session(uuid) {
             log::warn!("sololeveling: failed to persist combat skills of {uuid}: {error}");
@@ -130,35 +158,56 @@ impl SkillUseError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CombatSkillSlot {
+    Class,
+    General,
+    Innate,
+}
+
 impl SoloLevelingState {
-    /// Applies the class skill, or the selected general skill when `general` is true.
+    /// Resolves the shared player entity required by effects from the drop hook.
+    pub fn use_innate_combat_skill(&self, player: &Player) -> Result<(), SkillUseError> {
+        let uuid = player.gameprofile.id();
+        let Some(player) = player.get_world().players.get_by_uuid(&uuid) else {
+            return Err(SkillUseError::NoTarget);
+        };
+        self.use_combat_skill(&player, CombatSkillSlot::Innate)
+    }
+
+    /// Applies one of the three independent active skill slots.
     pub fn use_combat_skill(
         &self,
         player: &Arc<Player>,
-        general: bool,
+        slot: CombatSkillSlot,
     ) -> Result<(), SkillUseError> {
         let uuid = player.gameprofile.id();
         let now = CombatSkillBook::now();
         let (skill, rank, stats) = self
             .with_session_mut(uuid, |session| {
-                let skill = if general {
-                    session
+                let skill = match slot {
+                    CombatSkillSlot::General => session
                         .combat_skills
                         .selected_general
-                        .ok_or(SkillUseError::NoSkill)?
-                } else {
-                    let class = session.class.class.ok_or(SkillUseError::NoClass)?;
-                    session
+                        .ok_or(SkillUseError::NoSkill)?,
+                    CombatSkillSlot::Innate => session
                         .combat_skills
-                        .unlock_class(class, session.stats.rank());
-                    CombatSkill::for_class(class)
+                        .innate_skill
+                        .ok_or(SkillUseError::NoSkill)?,
+                    CombatSkillSlot::Class => {
+                        let class = session.class.class.ok_or(SkillUseError::NoClass)?;
+                        session
+                            .combat_skills
+                            .unlock_class(class, session.stats.rank());
+                        CombatSkill::for_class(class)
+                    }
                 };
-                let rank = if general {
-                    session.combat_skills.general_rank(skill)
-                } else {
+                let rank = if slot == CombatSkillSlot::Class {
                     session
                         .combat_skills
                         .class_rank(session.class.class.ok_or(SkillUseError::NoClass)?)
+                } else {
+                    session.combat_skills.general_rank(skill)
                 };
                 if rank == 0 {
                     return Err(SkillUseError::NoSkill);
@@ -199,6 +248,22 @@ impl SoloLevelingState {
                 shoot_skill_arrow(player, &world, rank, stats.strength, false)
             }
             CombatSkill::ShadowExchange => self.apply_shadow_exchange(player, &world, rank),
+            CombatSkill::QuickStep => {
+                let impulse = look_direction(player) * (0.8 + f64::from(rank) * 0.3)
+                    + DVec3::new(0.0, 0.2, 0.0);
+                player.push_impulse(impulse);
+                Ok(())
+            }
+            CombatSkill::SecondWind => {
+                if player.get_health() >= player.get_max_health() {
+                    Err(SkillUseError::NoTarget)
+                } else {
+                    player.heal(4.0 + f32::from(rank) * 2.0);
+                    Ok(())
+                }
+            }
+            CombatSkill::Repulse => self.apply_repulse(player, &world, rank, stats),
+            CombatSkill::ShadowStep => self.apply_shadow_step(player, &world, rank),
         }?;
 
         self.with_session_mut(uuid, |session| {
@@ -348,6 +413,59 @@ impl SoloLevelingState {
             40,
         );
         player.play_sound(&sound_events::ENTITY_EVOKER_CAST_SPELL, 1.0, 0.6);
+        Ok(())
+    }
+
+    fn apply_repulse(
+        &self,
+        player: &Arc<Player>,
+        world: &Arc<World>,
+        rank: u8,
+        stats: HunterStats,
+    ) -> Result<(), SkillUseError> {
+        let radius = 4.0 + f64::from(rank);
+        let targets = physical_targets(player, world, radius, false);
+        if targets.is_empty() {
+            return Err(SkillUseError::NoTarget);
+        }
+        let damage = 1.0 + f32::from(rank) + stats.strength as f32 * 0.03;
+        let source = DamageSource::direct(&vanilla_damage_types::MOB_ATTACK, player.clone());
+        for entity in targets {
+            let away = (entity.position() - player.position()).normalize_or_zero() + DVec3::Y * 0.3;
+            entity.push_impulse(away);
+            entity.hurt(world, &source, damage);
+        }
+        fx::ring(
+            world,
+            &vanilla_particle_types::CRIT,
+            player.position(),
+            radius,
+            24,
+        );
+        Ok(())
+    }
+
+    fn apply_shadow_step(
+        &self,
+        player: &Arc<Player>,
+        world: &Arc<World>,
+        rank: u8,
+    ) -> Result<(), SkillUseError> {
+        let destination = player.position() + look_direction(player) * f64::from(4 + rank * 2);
+        if !standable(world, destination) {
+            return Err(SkillUseError::NoTarget);
+        }
+        player
+            .teleport_to(destination)
+            .map_err(|_| SkillUseError::NoTarget)?;
+        fx::burst(
+            world,
+            &vanilla_particle_types::PORTAL,
+            destination,
+            24,
+            0.5,
+            0.02,
+        );
         Ok(())
     }
 
@@ -679,7 +797,8 @@ mod tests {
             self.state
                 .upgrade_general_skill(self.player.gameprofile.id(), skill)
                 .expect("general skill upgrade");
-            self.state.use_combat_skill(&self.player, true)
+            self.state
+                .use_combat_skill(&self.player, CombatSkillSlot::General)
         }
     }
 
@@ -698,11 +817,13 @@ mod tests {
 
         fixture
             .state
-            .use_combat_skill(&fixture.player, false)
+            .use_combat_skill(&fixture.player, CombatSkillSlot::Class)
             .expect("mutilation");
         assert!((living.get_health() - (initial - 2.0)).abs() < 0.1);
         assert!(matches!(
-            fixture.state.use_combat_skill(&fixture.player, false),
+            fixture
+                .state
+                .use_combat_skill(&fixture.player, CombatSkillSlot::Class),
             Err(SkillUseError::Cooldown(_))
         ));
 
@@ -732,7 +853,7 @@ mod tests {
         let mob = fixture.mob(0.5, 3.5);
         fixture
             .state
-            .use_combat_skill(&fixture.player, false)
+            .use_combat_skill(&fixture.player, CombatSkillSlot::Class)
             .expect("taunt");
         assert!(
             mob.as_mob()
@@ -758,7 +879,7 @@ mod tests {
             });
         fixture
             .state
-            .use_combat_skill(&fixture.player, false)
+            .use_combat_skill(&fixture.player, CombatSkillSlot::Class)
             .expect("stealth");
         assert!(fixture.player.is_invisible());
         assert!(fixture.state.consume_stealth_strike(&fixture.player));
@@ -774,7 +895,7 @@ mod tests {
         let initial = living.get_health();
         fixture
             .state
-            .use_combat_skill(&fixture.player, false)
+            .use_combat_skill(&fixture.player, CombatSkillSlot::Class)
             .expect("ruler");
         assert_eq!(living.get_health(), initial - 3.0);
         assert_eq!(
@@ -787,7 +908,9 @@ mod tests {
             Some(90.0)
         );
         assert!(matches!(
-            fixture.state.use_combat_skill(&fixture.player, false),
+            fixture
+                .state
+                .use_combat_skill(&fixture.player, CombatSkillSlot::Class),
             Err(SkillUseError::Cooldown(_))
         ));
     }
@@ -797,7 +920,7 @@ mod tests {
         let fixture = Fixture::new(HunterClass::Ranger, 50);
         fixture
             .state
-            .use_combat_skill(&fixture.player, false)
+            .use_combat_skill(&fixture.player, CombatSkillSlot::Class)
             .expect("vital shot");
         fixture
             .use_general(CombatSkill::DaggerThrow)
@@ -847,5 +970,89 @@ mod tests {
             .expect("exchange");
         assert_eq!(fixture.player.position(), shadow_position);
         assert_eq!(shadow.position(), hunter_position);
+    }
+
+    #[test]
+    fn new_general_skills_work_from_e_rank() {
+        let fixture = Fixture::new(HunterClass::Fighter, 20);
+        let uuid = fixture.player.gameprofile.id();
+        fixture
+            .use_general(CombatSkill::QuickStep)
+            .expect("quick step");
+        assert!(fixture.player.velocity().length() > 0.0);
+        fixture.state.with_session_mut(uuid, |session| {
+            session.combat_skills.innate_skill = Some(CombatSkill::QuickStep);
+        });
+        assert!(matches!(
+            fixture.state.use_innate_combat_skill(&fixture.player),
+            Err(SkillUseError::Cooldown(_))
+        ));
+
+        fixture
+            .state
+            .upgrade_general_skill(uuid, CombatSkill::SecondWind)
+            .expect("learn second wind");
+        fixture.state.with_session_mut(uuid, |session| {
+            session.combat_skills.innate_skill = Some(CombatSkill::SecondWind);
+        });
+        assert_eq!(
+            fixture.state.use_innate_combat_skill(&fixture.player),
+            Err(SkillUseError::NoTarget)
+        );
+        fixture.player.set_health(10.0);
+        fixture
+            .state
+            .use_innate_combat_skill(&fixture.player)
+            .expect("innate second wind");
+        assert!(fixture.player.get_health() > 10.0);
+
+        let mob = fixture.mob(0.5, 3.5);
+        let living = mob.as_living_entity().expect("living");
+        let initial = living.get_health();
+        fixture.use_general(CombatSkill::Repulse).expect("repulse");
+        assert!(living.get_health() < initial);
+        assert!(mob.velocity().length() > 0.0);
+
+        let rank = fixture
+            .state
+            .upgrade_general_skill(uuid, CombatSkill::ShadowStep)
+            .expect("learn shadow step");
+        let destination = fixture.player.position() + DVec3::Z * f64::from(4 + rank * 2);
+        let floor = BlockPos::from(destination).offset(0, -1, 0);
+        assert!(fixture.world.world.set_block(
+            floor,
+            vanilla_blocks::STONE.default_state(),
+            UpdateFlags::UPDATE_ALL,
+        ));
+        fixture
+            .player
+            .teleport(fixture.player.position(), 0.0, -90.0)
+            .expect("aim up");
+        assert_eq!(
+            fixture
+                .state
+                .use_combat_skill(&fixture.player, CombatSkillSlot::General),
+            Err(SkillUseError::NoTarget)
+        );
+        fixture
+            .player
+            .teleport(fixture.player.position(), 0.0, 0.0)
+            .expect("aim forward");
+        assert_eq!(fixture.player.rotation(), (0.0, 0.0));
+        assert!(
+            standable(&fixture.world.world, destination),
+            "destination {destination:?} has invalid support at {floor:?}"
+        );
+        fixture
+            .state
+            .use_combat_skill(&fixture.player, CombatSkillSlot::General)
+            .expect("safe shadow step after rejected destination");
+        assert_eq!(fixture.player.position(), destination);
+        assert_eq!(
+            fixture
+                .state
+                .upgrade_general_skill(uuid, CombatSkill::ShadowExchange),
+            Ok(1)
+        );
     }
 }

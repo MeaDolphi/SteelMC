@@ -13,6 +13,7 @@ use steel_core::entity::LivingEntity;
 use steel_core::entity::SharedEntity;
 use steel_core::entity::damage::DamageSource;
 use steel_core::gameplay_hooks::{BlockMutationCause, GameplayHooks};
+use steel_core::inventory::container::Container as _;
 use steel_core::player::Player;
 use steel_core::server::Server;
 use steel_core::world::World;
@@ -208,7 +209,7 @@ impl GameplayHooks for SoloLevelingHooks {
         self.state.tick_artifacts(player);
         self.state.tick_class(player);
         item::menu_book::keep_in_place(player);
-        item::combat_skill_book::keep_in_place(player);
+        retire_legacy_combat_book(player);
         item::dungeon_map::keep_in_place(player, self.state.dungeon_map_id(player));
         if player.tick_count() % 20 == 0 {
             if is_instance_world(&player.get_world()) {
@@ -420,15 +421,20 @@ impl GameplayHooks for SoloLevelingHooks {
             main_menu::open(player, Arc::clone(&self.state));
             return Some(InteractionResult::Success);
         }
-        if item::combat_skill_book::is_combat_skill_book(stack) {
-            if let Err(error) = self.state.use_combat_skill(player, player.is_crouching()) {
+        if stack.is_empty() {
+            let slot = if player.is_crouching() {
+                crate::state::CombatSkillSlot::General
+            } else {
+                crate::state::CombatSkillSlot::Class
+            };
+            if let Err(error) = self.state.use_combat_skill(player, slot) {
                 let message = match error {
                     crate::state::SkillUseError::Cooldown(seconds) => {
                         format!("Навык перезаряжается: {seconds} с.")
                     }
                     _ => error.message().to_owned(),
                 };
-                player.send_message(&TextComponent::plain(message).color(Color::Red));
+                player.send_action_bar(TextComponent::plain(message).color(Color::Red));
             }
             return Some(InteractionResult::Success);
         }
@@ -460,6 +466,18 @@ impl GameplayHooks for SoloLevelingHooks {
         // Core passes the off hand, so this never locks the inventory: the
         // hook can run while it is held, and locking it here would invert
         // this crate's lock order against the session-taking tick paths.
+        if stack.is_empty() {
+            if let Err(error) = self.state.use_innate_combat_skill(player) {
+                let message = match error {
+                    crate::state::SkillUseError::Cooldown(seconds) => {
+                        format!("Навык перезаряжается: {seconds} с.")
+                    }
+                    _ => error.message().to_owned(),
+                };
+                player.send_action_bar(TextComponent::plain(message).color(Color::Red));
+            }
+            return false;
+        }
         match drop_decision(stack, off_hand) {
             DropDecision::CycleSpell => {
                 self.state.cycle_spell(player);
@@ -903,7 +921,6 @@ fn keeps_projectile_ammo(ammo: &ItemStack) -> bool {
 /// is not the run's own marked loot stays as well. Materials and loot drop.
 fn keeps_item_on_death(stack: &ItemStack, instance_world: bool) -> bool {
     item::grimoire::is_grimoire(stack)
-        || item::combat_skill_book::is_combat_skill_book(stack)
         || item::menu_book::is_menu_book(stack)
         || item::dungeon_map::is_dungeon_map(stack)
         || item::serial::of(stack).is_some()
@@ -923,6 +940,18 @@ enum DropDecision {
     Allow,
 }
 
+fn retire_legacy_combat_book(player: &Player) {
+    if player.inventory_transaction_active() {
+        return;
+    }
+    let mut inventory = player.inventory.lock();
+    for slot in 0..inventory.get_container_size() {
+        if item::read_kind(inventory.get_item(slot), "combat_skill_book").is_some() {
+            inventory.set_item(slot, ItemStack::empty());
+        }
+    }
+}
+
 /// Resolves a drop without touching player state: dropping the grimoire, or a
 /// Mage staff while the grimoire sits in the off hand, cycles the prepared
 /// spells; the System book and personally bound stacks never leave the hunter.
@@ -933,7 +962,6 @@ fn drop_decision(stack: &ItemStack, off_hand: &ItemStack) -> DropDecision {
         return DropDecision::CycleSpell;
     }
     if item::menu_book::is_menu_book(stack)
-        || item::combat_skill_book::is_combat_skill_book(stack)
         || item::dungeon_map::is_dungeon_map(stack)
         || !item::binding::may_drop(stack)
     {
@@ -1092,22 +1120,80 @@ fn announce_quest(state: &SoloLevelingState, player: &Player, update: QuestUpdat
 #[cfg(test)]
 mod tests {
     use super::{
-        DropDecision, allows_city_mutation, allows_instance_mutation, allows_player_damage,
-        death_hunter, drop_decision, give_or_drop, is_shadow_tank, keeps_item_on_death,
-        keeps_projectile_ammo,
+        DropDecision, SoloLevelingHooks, allows_city_mutation, allows_instance_mutation,
+        allows_player_damage, death_hunter, drop_decision, give_or_drop, is_shadow_tank,
+        keeps_item_on_death, keeps_projectile_ammo, retire_legacy_combat_book,
     };
-    use crate::item::{artifact, grimoire, menu_book, serial};
+    use crate::combat_skill::{CombatSkill, CombatSkillBook};
+    use crate::item::{self, artifact, grimoire, menu_book, serial};
+    use crate::player_data::SoloLevelingPlayerData;
+    use crate::state::SoloLevelingState;
     use glam::DVec3;
     use std::sync::{Arc, Weak};
     use steel_core::entity::damage::DamageSource;
     use steel_core::entity::entities::ZombieEntity;
-    use steel_core::entity::{Entity as _, LivingEntity as _, SharedEntity};
-    use steel_core::gameplay_hooks::BlockMutationCause;
+    use steel_core::entity::{Entity as _, LivingEntity as _, SharedEntity, next_entity_id};
+    use steel_core::gameplay_hooks::{BlockMutationCause, GameplayHooks, NoopGameplayHooks};
     use steel_core::inventory::container::Container as _;
     use steel_core::player::player_inventory::PlayerInventory;
     use steel_registry::item_stack::ItemStack;
     use steel_registry::{init_vanilla_registry, vanilla_entities, vanilla_items};
     use uuid::Uuid;
+
+    #[test]
+    fn empty_hand_q_uses_innate_skill_without_dropping() {
+        init_vanilla_registry();
+        let world = crate::test_support::world(Arc::new(NoopGameplayHooks));
+        let player = crate::test_support::player(&world.world, "Hunter", next_entity_id());
+        let uuid = player.gameprofile.id();
+        let directory = std::env::temp_dir().join(format!("innate-drop-test-{}", Uuid::new_v4()));
+        {
+            let state = Arc::new(SoloLevelingState::new(directory.clone()).expect("state"));
+            let mut data = SoloLevelingPlayerData::new(uuid);
+            data.combat_skills.innate_skill = Some(CombatSkill::QuickStep);
+            data.combat_skills.ranks.insert(CombatSkill::QuickStep, 1);
+            data.combat_skills.ranks.insert(CombatSkill::Repulse, 1);
+            data.combat_skills.selected_general = Some(CombatSkill::Repulse);
+            state.begin_session(uuid, data);
+            let hooks = SoloLevelingHooks::new(Arc::clone(&state));
+            let empty = ItemStack::empty();
+
+            assert!(!GameplayHooks::allow_item_drop(
+                &hooks, &player, &empty, &empty,
+            ));
+            assert!(player.inventory.lock().get_selected_item().is_empty());
+            assert!(
+                state
+                    .with_session_mut(uuid, |session| {
+                        let now = CombatSkillBook::now();
+                        !session.combat_skills.ready(CombatSkill::QuickStep, now)
+                            && session.combat_skills.ready(CombatSkill::Repulse, now)
+                    })
+                    .unwrap_or(false)
+            );
+        }
+        std::fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn legacy_combat_book_is_removed_without_touching_other_items() {
+        init_vanilla_registry();
+        let world = crate::test_support::world(Arc::new(NoopGameplayHooks));
+        let player = crate::test_support::player(&world.world, "Hunter", next_entity_id());
+        let mut legacy = ItemStack::new(&vanilla_items::BOOK);
+        item::write_tag(&mut legacy, item::record("combat_skill_book"));
+        player.inventory.lock().set_item(0, legacy);
+        player
+            .inventory
+            .lock()
+            .set_item(1, ItemStack::new(&vanilla_items::BOOK));
+
+        retire_legacy_combat_book(&player);
+
+        let inventory = player.inventory.lock();
+        assert!(inventory.get_item(0).is_empty());
+        assert!(inventory.get_item(1).is(&vanilla_items::BOOK));
+    }
 
     #[test]
     fn serial_and_artifact_gear_survives_death_but_materials_and_loot_drop() {
