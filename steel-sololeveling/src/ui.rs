@@ -149,8 +149,12 @@ fn navigation_slot(items: &[ItemStack]) -> Option<usize> {
 }
 
 fn install_main_return(items: &mut [ItemStack]) -> Option<usize> {
+    let button = main_menu_button();
+    if let Some(slot) = items.iter().position(|item| *item == button) {
+        return Some(slot);
+    }
     let slot = navigation_slot(items)?;
-    items[slot] = main_menu_button();
+    items[slot] = button;
     Some(slot)
 }
 
@@ -577,6 +581,24 @@ mod tests {
         slots.dedup();
         assert_eq!(slots.len(), count);
         assert!(slots.iter().all(|slot| *slot < 27));
+    }
+
+    #[test]
+    fn existing_main_return_is_reused_without_a_duplicate() {
+        use steel_registry::item_stack::ItemStack;
+
+        steel_registry::init_vanilla_registry();
+        let mut items = vec![ItemStack::empty(); 27];
+        items[26] = super::main_menu_button();
+        assert_eq!(super::install_main_return(&mut items), Some(26));
+        assert!(items[25].is_empty());
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| **item == super::main_menu_button())
+                .count(),
+            1
+        );
     }
 
     #[test]

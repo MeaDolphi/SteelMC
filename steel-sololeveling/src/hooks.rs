@@ -1141,6 +1141,84 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
+    fn empty_hand_use_packet_invokes_class_and_general_skills() {
+        use steel_protocol::packets::game::SUseItem;
+        use steel_utils::types::InteractionHand;
+
+        let directory =
+            std::env::temp_dir().join(format!("empty-hand-use-test-{}", Uuid::new_v4()));
+        let state = Arc::new(SoloLevelingState::new(directory.clone()).expect("state"));
+        let hooks = Arc::new(SoloLevelingHooks::new(Arc::clone(&state)));
+        let world = crate::test_support::world(hooks);
+        crate::test_support::load_full_chunks(&world.world, vec![steel_utils::ChunkPos::new(0, 0)]);
+        let player = crate::test_support::player(&world.world, "Hunter", next_entity_id());
+        world
+            .world
+            .try_add_entity(player.clone())
+            .expect("player entity");
+        player
+            .teleport(DVec3::new(0.5, 65.0, 0.5), 0.0, 0.0)
+            .expect("place hunter");
+        let uuid = player.gameprofile.id();
+        let mut data = SoloLevelingPlayerData::new(uuid);
+        data.stats.level = 20;
+        data.class.class = Some(crate::class::HunterClass::Fighter);
+        data.combat_skills.ranks.insert(CombatSkill::QuickStep, 1);
+        data.combat_skills.selected_general = Some(CombatSkill::QuickStep);
+        state.begin_session(uuid, data);
+        let mob = Arc::new(ZombieEntity::new(
+            &vanilla_entities::ZOMBIE,
+            next_entity_id(),
+            DVec3::new(0.5, 65.0, 3.5),
+            Arc::downgrade(&world.world),
+        ));
+        world
+            .world
+            .try_add_entity(mob.clone())
+            .expect("target entity");
+        let use_main_hand = |sequence| {
+            player.handle_use_item(SUseItem {
+                hand: InteractionHand::MainHand,
+                sequence,
+                y_rot: 0.0,
+                x_rot: 0.0,
+            });
+        };
+
+        let initial_health = mob.get_health();
+        use_main_hand(1);
+        assert!(mob.get_health() < initial_health, "class skill must hit");
+        player.set_crouching(true);
+        use_main_hand(2);
+        assert!(player.velocity().length() > 0.0, "general skill must run");
+        let cooldown = state.with_session_mut(uuid, |session| {
+            session
+                .combat_skills
+                .cooldowns
+                .get(&CombatSkill::QuickStep)
+                .copied()
+        });
+        use_main_hand(3);
+        assert_eq!(
+            state.with_session_mut(uuid, |session| {
+                session
+                    .combat_skills
+                    .cooldowns
+                    .get(&CombatSkill::QuickStep)
+                    .copied()
+            }),
+            cooldown,
+            "a repeated click must not restart the cooldown"
+        );
+
+        drop(mob);
+        drop(player);
+        drop(world);
+        drop(state);
+        std::fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
     fn empty_hand_q_uses_innate_skill_without_dropping() {
         init_vanilla_registry();
         let world = crate::test_support::world(Arc::new(NoopGameplayHooks));

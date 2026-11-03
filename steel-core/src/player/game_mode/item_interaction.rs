@@ -161,6 +161,15 @@ pub fn use_item_on(
         return result;
     }
 
+    if is_empty
+        && let Some(result) =
+            world
+                .gameplay_hooks
+                .on_player_use_item(player, world, &stack_before_use, hand)
+    {
+        return result;
+    }
+
     InteractionResult::Pass
 }
 
@@ -188,20 +197,20 @@ pub fn use_item(
     let (is_empty, item_ref, stack_before_use) =
         inventory_access.with_item(|item| (item.is_empty(), item.item, item.clone()));
 
+    if !is_empty && player.is_item_on_cooldown(&stack_before_use) {
+        return InteractionResult::Pass;
+    }
+
+    if let Some(result) =
+        world
+            .gameplay_hooks
+            .on_player_use_item(player, world, &stack_before_use, hand)
+    {
+        player.apply_item_use_cooldown(&stack_before_use);
+        return result;
+    }
+
     if !is_empty {
-        if player.is_item_on_cooldown(&stack_before_use) {
-            return InteractionResult::Pass;
-        }
-
-        if let Some(result) =
-            world
-                .gameplay_hooks
-                .on_player_use_item(player, world, &stack_before_use, hand)
-        {
-            player.apply_item_use_cooldown(&stack_before_use);
-            return result;
-        }
-
         let mut context = crate::behavior::UseItemContext::new(
             player,
             hand,
@@ -247,14 +256,6 @@ impl Player {
 
         self.ack_block_changes_up_to(packet.sequence);
 
-        let item_stack_is_empty = {
-            let inventory = self.inventory.lock();
-            inventory.get_item_in_hand(packet.hand).is_empty()
-        };
-        if item_stack_is_empty {
-            return;
-        }
-
         let current_rotation = self.rotation();
         // Vanilla entity setters discard each non-finite rotation component independently.
         let target_component = |value: f32, current: f32| {
@@ -284,12 +285,19 @@ impl Player {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::use_item;
     use crate::behavior::{InteractionResult, init_behaviors};
     use crate::entity::Entity as _;
+    use crate::gameplay_hooks::GameplayHooks;
+    use crate::player::Player;
     use crate::player::connection::NetworkConnection as _;
-    use crate::test_support::{TestPlayerBuilder, fresh_test_world, insert_ready_full_chunk};
+    use crate::test_support::{
+        TestPlayerBuilder, fresh_test_world, fresh_test_world_with_gameplay_hooks,
+        insert_ready_full_chunk,
+    };
+    use crate::world::World;
     use glam::DVec3;
     use steel_protocol::packets::game::SUseItem;
     use steel_registry::{
@@ -309,6 +317,79 @@ mod tests {
     };
 
     use super::use_item_on;
+
+    #[derive(Default)]
+    struct EmptyHandProbe {
+        uses: AtomicUsize,
+    }
+
+    impl GameplayHooks for EmptyHandProbe {
+        fn on_player_use_item(
+            &self,
+            _player: &Arc<Player>,
+            _world: &Arc<World>,
+            stack: &ItemStack,
+            _hand: InteractionHand,
+        ) -> Option<InteractionResult> {
+            if stack.is_empty() {
+                self.uses.fetch_add(1, Ordering::Relaxed);
+                return Some(InteractionResult::Success);
+            }
+            None
+        }
+    }
+
+    #[test]
+    fn empty_hand_reaches_the_gameplay_hook_from_air_and_an_ordinary_block() {
+        let probe = Arc::new(EmptyHandProbe::default());
+        let world_fixture = fresh_test_world_with_gameplay_hooks(
+            "empty_hand_item_interaction",
+            Arc::clone(&probe) as Arc<dyn GameplayHooks>,
+        );
+        let world = &world_fixture.world;
+        init_behaviors();
+        let player = TestPlayerBuilder::new(Arc::clone(world), "TestPlayer", 1).build();
+        player.set_client_loaded(true);
+        player.handle_use_item(SUseItem {
+            hand: InteractionHand::MainHand,
+            sequence: 1,
+            y_rot: 0.0,
+            x_rot: 0.0,
+        });
+        assert_eq!(probe.uses.load(Ordering::Relaxed), 1);
+
+        let pos = BlockPos::new(0, 64, 0);
+        insert_ready_full_chunk(world, ChunkPos::from_block_pos(pos));
+        assert!(world.set_block(
+            pos,
+            vanilla_blocks::STONE.default_state(),
+            UpdateFlags::UPDATE_ALL,
+        ));
+        let hit = BlockHitResult {
+            location: DVec3::new(0.5, 65.0, 0.5),
+            direction: Direction::Up,
+            block_pos: pos,
+            miss: false,
+            inside: false,
+            world_border_hit: false,
+        };
+        assert_eq!(
+            use_item_on(&player, world, InteractionHand::MainHand, &hit),
+            InteractionResult::Success
+        );
+        assert_eq!(probe.uses.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn empty_hand_still_passes_without_a_gameplay_hook() {
+        let world_fixture = fresh_test_world("empty_hand_without_gameplay_hook");
+        let player =
+            TestPlayerBuilder::new(Arc::clone(&world_fixture.world), "TestPlayer", 1).build();
+        assert_eq!(
+            use_item(&player, &world_fixture.world, InteractionHand::MainHand),
+            InteractionResult::Pass
+        );
+    }
 
     #[test]
     fn use_item_discards_non_finite_rotation_components() {

@@ -230,10 +230,11 @@ pub trait GameplayHooks: Send + Sync {
         true
     }
 
-    /// Called when a player uses an item, before the item's vanilla behavior.
+    /// Called when a player uses an item or an empty hand, before vanilla behavior.
+    /// After an unconsumed block interaction, an empty hand reaches this hook too.
     ///
     /// Returning `Some` replaces the vanilla result, which is how a gameplay
-    /// layer can consume its own themed item types.
+    /// layer can consume its own themed item types and hand interactions.
     fn on_player_use_item(
         &self,
         _player: &Arc<Player>,

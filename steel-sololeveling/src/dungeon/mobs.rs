@@ -183,8 +183,7 @@ impl MobClass {
     /// Equips the class's weapon and armor and adjusts its speed and armor.
     pub fn equip(self, living: &dyn LivingEntity, rank: HunterRank, theme: Theme) {
         let weapon: ItemRef = match self {
-            Self::Warrior | Self::Berserker => weapon_for(self, rank),
-            Self::Guard => &vanilla_items::SHIELD,
+            Self::Warrior | Self::Guard | Self::Berserker => weapon_for(self, rank),
             Self::Archer => &vanilla_items::BOW,
             Self::Mage | Self::Shaman => &vanilla_items::BLAZE_ROD,
             Self::Bomber | Self::Broodmother => &vanilla_items::AIR,
@@ -204,6 +203,10 @@ impl MobClass {
             Self::Warrior | Self::Guard | Self::Berserker | Self::Archer => {}
         }
         if self == Self::Guard {
+            items.push((
+                EquipmentSlot::OffHand,
+                ItemStack::new(&vanilla_items::SHIELD),
+            ));
             items.push((
                 EquipmentSlot::Head,
                 ItemStack::new(&vanilla_items::IRON_HELMET),
@@ -285,8 +288,8 @@ fn skin_piece(holder: &'static LazyLock<Item>, theme: Theme) -> ItemStack {
 ///
 /// A held weapon adds its full vanilla attack bonus on top of the rank-scaled
 /// base damage, so an iron axe alone more than tripled an E-rank berserker's
-/// hit. The two lowest ranks therefore carry wooden and stone tools; the
-/// higher ranks keep the boss gear tier.
+/// hit. The two lowest ranks therefore carry wooden and stone tools; guards
+/// use the same weapon tiers as warriors, and higher ranks keep the boss tier.
 fn weapon_for(class: MobClass, rank: HunterRank) -> ItemRef {
     let axe = class == MobClass::Berserker;
     match (rank, BossGear::for_rank(rank)) {
@@ -456,6 +459,33 @@ mod tests {
         assert_eq!(common.arise_chance_percent(), 10);
         assert!(rare.arise_chance_percent() < common.arise_chance_percent());
         assert!(MobRarity::Boss.arise_chance_percent() < rare.arise_chance_percent());
+    }
+
+    #[test]
+    fn guard_carries_a_ranked_sword_and_keeps_the_shield_in_the_off_hand() {
+        use glam::DVec3;
+        use std::sync::Weak;
+        use steel_core::entity::LivingEntity as _;
+        use steel_core::entity::entities::ZombieEntity;
+        use steel_core::inventory::equipment::EquipmentSlot;
+        use steel_registry::{init_vanilla_registry, vanilla_entities, vanilla_items};
+
+        use crate::rank::HunterRank;
+
+        init_vanilla_registry();
+        let guard = ZombieEntity::new(&vanilla_entities::ZOMBIE, 1, DVec3::ZERO, Weak::new());
+        MobClass::Guard.equip(&guard, HunterRank::E, Theme::Crypt);
+        for (slot, expected) in [
+            (EquipmentSlot::MainHand, &vanilla_items::WOODEN_SWORD),
+            (EquipmentSlot::OffHand, &vanilla_items::SHIELD),
+        ] {
+            guard.with_equipment_slot(slot, &mut |stack| {
+                assert!(stack.is(expected), "unexpected equipment in {slot:?}");
+            });
+        }
+        guard.with_equipment_slot(EquipmentSlot::Chest, &mut |stack| {
+            assert!(!stack.is_empty(), "the guard keeps its themed armor");
+        });
     }
 
     #[test]
